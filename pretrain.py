@@ -15,13 +15,14 @@ Install requirements
     pip install transformers datasets tqdm huggingface_hub wandb
 
 Runtime guide
-    +----------------------+-------------------+-----------------------------+
-    | mode                 | hardware          | notes                       |
-    +----------------------+-------------------+-----------------------------+
-    | smoke_test_20_steps  | CPU or single GPU | synthetic offline pipeline  |
-    | --dry_run            | single GPU        | 10M-token sanity run        |
-    | full Stage 1         | Kaggle/Colab GPU  | FineWeb stream + Hub sync   |
-    +----------------------+-------------------+-----------------------------+
+    +----------------------+-------------------+----------------------------------------------+
+    | mode                 | hardware          | notes                                        |
+    +----------------------+-------------------+----------------------------------------------+
+    | smoke_test_20_steps  | CPU or single GPU | synthetic offline pipeline                   |
+    | --dry_run            | single GPU        | 10M-token sanity run                         |
+    | full Stage 1         | single GPU        | original training path                       |
+    | full Stage 1         | 2x T4 / multi-GPU | auto DDP when >=2 CUDA devices are visible   |
+    +----------------------+-------------------+----------------------------------------------+
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import math
 import os
 import random
 import shutil
+import socket
 import sys
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -42,7 +44,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -182,7 +187,6 @@ class TokenStream:
             name=self.cfg.dataset_config,
             split="train",
             streaming=True,
-            trust_remote_code=True,
         )
         # reason: reshuffle document order every epoch to break shard-local periodicity.
         return ds.shuffle(buffer_size=self.cfg.shuffle_buffer, seed=self.cfg.seed + epoch)
@@ -197,9 +201,10 @@ class TokenStream:
         """Return a stable document hash for train/val separation."""
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
-    def build_val_buffer(self) -> None:
+    def build_val_buffer(self, verbose: bool = True) -> None:
         """Materialize a held-out validation token buffer before training starts."""
-        print(f"  Building val buffer ({self.cfg.val_tokens:,} tokens) ...")
+        if verbose:
+            print(f"  Building val buffer ({self.cfg.val_tokens:,} tokens) ...")
         stream = self._shuffled_stream(epoch=-1)
         buf: List[int] = []
 
@@ -216,7 +221,8 @@ class TokenStream:
                 break
 
         self._val_ids = buf[: self.cfg.val_tokens]
-        print(f"  Val buffer: {len(self._val_ids):,} tokens from {len(self._val_doc_hashes):,} docs")
+        if verbose:
+            print(f"  Val buffer: {len(self._val_ids):,} tokens from {len(self._val_doc_hashes):,} docs")
 
     def iter_train_chunks(self, epoch: int) -> Iterator[torch.Tensor]:
         """Yield Tensor[chunk_size] training chunks for one deterministic epoch pass."""
@@ -343,6 +349,78 @@ def cosine_with_warmup(
 
 
 
+def dist_is_initialized() -> bool:
+    """Return True when torch.distributed collectives are ready to use."""
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_main_process(rank: int) -> bool:
+    """Return True for rank zero, the only process that writes logs or checkpoints."""
+    return rank == 0
+
+
+def distributed_mean(value: float, device: torch.device) -> float:
+    """Average one scalar across all ranks when DDP is active."""
+    if not dist_is_initialized():
+        return float(value)
+    tensor = torch.tensor([value], device=device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= dist.get_world_size()
+    return float(tensor.item())
+
+
+def distributed_sum_int(value: int, device: torch.device) -> int:
+    """Sum one integer across all ranks when DDP is active."""
+    if not dist_is_initialized():
+        return int(value)
+    tensor = torch.tensor([value], device=device, dtype=torch.long)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return int(tensor.item())
+
+
+def distributed_min_int(value: int, device: torch.device) -> int:
+    """Compute the minimum integer across ranks when DDP is active."""
+    if not dist_is_initialized():
+        return int(value)
+    tensor = torch.tensor([value], device=device, dtype=torch.int32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
+    return int(tensor.item())
+
+
+def find_free_port() -> int:
+    """Return a free localhost TCP port for single-node DDP spawning."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def shard_train_chunk_iterator(
+    chunk_iter: Iterator[torch.Tensor],
+    rank: int,
+    world_size: int,
+    global_skip_chunks: int,
+) -> Iterator[torch.Tensor]:
+    """Shard the deterministic global chunk stream across ranks without overlap."""
+    if world_size <= 1:
+        return itertools.islice(chunk_iter, global_skip_chunks, None)
+    # reason: every rank must consume a disjoint slice of the same global chunk order.
+    return itertools.islice(chunk_iter, global_skip_chunks + rank, None, world_size)
+
+
+def take_local_micro_batch(
+    chunk_iter: Iterator[torch.Tensor],
+    local_batch_size: int,
+) -> List[torch.Tensor]:
+    """Collect exactly one per-rank micro-batch from a sharded chunk iterator."""
+    chunks: List[torch.Tensor] = []
+    for _ in range(local_batch_size):
+        try:
+            chunks.append(next(chunk_iter))
+        except StopIteration:
+            break
+    return chunks
+
+
 def autocast_context(device: torch.device, dtype: torch.dtype):
     """Return an autocast context that only activates on CUDA."""
     return torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda"))
@@ -383,7 +461,7 @@ def checkpoint_step_from_name(name: str) -> int:
 
 
 def effective_tokens_per_step(cfg: PretrainConfig) -> int:
-    """Return tokens consumed by one optimizer step."""
+    """Return the global token count consumed by one optimizer step."""
     return cfg.batch_size * cfg.grad_accum * cfg.chunk_size
 
 
@@ -394,7 +472,7 @@ def stage1_success_banner(step: int, preset: str) -> None:
         "  * Stage 1 criterion met:\n"
         "    val_ce < 3.0  AND  mean UWR > 0.05 (non-degenerate generation)\n"
         "    Load this checkpoint into Stage 2:\n"
-        "      python train_sft_phase2.py \\\n"
+        "      python train_sft.py \\\n"
         f"        --preset {preset} \\\n"
         f"        --resume_from runs/stage1/checkpoint-{step:07d} \\\n"
         "        --ema_decay 0.995"
@@ -639,6 +717,7 @@ def load_latest_checkpoint(
     device: torch.device,
     cfg: PretrainConfig,
     hf_token: Optional[str],
+    verbose: bool = True,
 ) -> Tuple[int, int, int, int]:
     """Restore the newest valid checkpoint from disk first, then Hub if needed."""
 
@@ -673,14 +752,16 @@ def load_latest_checkpoint(
         state = _try_load(output_dir)
         if state is not None:
             result = _restore(state)
-            print(f"  [resume] exact file step={result[0]} tokens={result[3]:,}")
+            if verbose:
+                print(f"  [resume] exact file step={result[0]} tokens={result[3]:,}")
             return result
         search_root = output_dir.parent
     elif exact_state.exists():
         state = _try_load(exact_state)
         if state is not None:
             result = _restore(state)
-            print(f"  [resume] exact dir  {output_dir.name}  step={result[0]}  tokens={result[3]:,}")
+            if verbose:
+                print(f"  [resume] exact dir  {output_dir.name}  step={result[0]}  tokens={result[3]:,}")
             return result
         search_root = output_dir.parent if output_dir.name.startswith("checkpoint-") else output_dir
     elif output_dir.name.startswith("checkpoint-"):
@@ -700,7 +781,8 @@ def load_latest_checkpoint(
         state = _try_load(candidate / "training_state.pt")
         if state is not None:
             result = _restore(state)
-            print(f"  [resume] local  {candidate.name}  step={result[0]}  tokens={result[3]:,}")
+            if verbose:
+                print(f"  [resume] local  {candidate.name}  step={result[0]}  tokens={result[3]:,}")
             return result
 
     if cfg.push_to_hub and hf_token:
@@ -725,7 +807,8 @@ def load_latest_checkpoint(
                 local_dir = local_root / ckpt_name
                 if local_dir.exists():
                     shutil.rmtree(local_dir, ignore_errors=True)
-                print(f"  [resume] downloading {ckpt_name} from Hub ...")
+                if verbose:
+                    print(f"  [resume] downloading {ckpt_name} from Hub ...")
                 snapshot_download(
                     repo_id=cfg.hf_repo_id,
                     local_dir=str(local_root),
@@ -735,14 +818,18 @@ def load_latest_checkpoint(
                 state = _try_load(local_dir / "training_state.pt")
                 if state is not None:
                     result = _restore(state)
-                    print(f"  [resume] hub    {ckpt_name}  step={result[0]}  tokens={result[3]:,}")
+                    if verbose:
+                        print(f"  [resume] hub    {ckpt_name}  step={result[0]}  tokens={result[3]:,}")
                     return result
         except RepositoryNotFoundError:
-            print(f"  [resume] Hub repo {cfg.hf_repo_id} does not exist yet.")
+            if verbose:
+                print(f"  [resume] Hub repo {cfg.hf_repo_id} does not exist yet.")
         except Exception as exc:
-            print(f"  [resume] Hub fallback failed: {exc}")
+            if verbose:
+                print(f"  [resume] Hub fallback failed: {exc}")
 
-    print("  [resume] No checkpoint found - starting from scratch.")
+    if verbose:
+        print("  [resume] No checkpoint found - starting from scratch.")
     return (0, 0, 0, 0)
 
 
@@ -886,6 +973,8 @@ def print_header(
     device: torch.device,
     dtype: torch.dtype,
     total_steps: int,
+    world_size: int,
+    local_batch_size: int,
 ) -> None:
     """Print a compact startup summary for the pre-training run."""
     print()
@@ -900,7 +989,10 @@ def print_header(
         f"heads={model_config.n_heads}/{model_config.n_kv_heads}"
     )
     print(f"  chunk_size       : {cfg.chunk_size}")
-    print(f"  batch x accum    : {cfg.batch_size} x {cfg.grad_accum}")
+    print(f"  batch x accum    : {cfg.batch_size} global x {cfg.grad_accum}")
+    if world_size > 1:
+        print(f"  world_size       : {world_size}  (DDP auto-enabled)")
+        print(f"  per_gpu_batch    : {local_batch_size}")
     print(f"  tokens / step    : {effective_tokens_per_step(cfg):,}")
     print(f"  token_budget     : {cfg.token_budget:,}")
     print(f"  total_steps      : {total_steps:,}")
@@ -1161,8 +1253,48 @@ def smoke_test_20_steps() -> None:
 
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    """Parse CLI arguments, stream FineWeb-Edu, and run Stage 1 pre-training."""
+def _distributed_worker(local_rank: int, world_size: int, master_port: int, argv: List[str]) -> None:
+    """Spawned DDP worker entrypoint for single-node multi-GPU training."""
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(local_rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    raise SystemExit(run_training(argv))
+
+
+def maybe_launch_multi_gpu(cfg: PretrainConfig, argv: List[str]) -> bool:
+    """Auto-launch one DDP worker per visible CUDA device when that is usable."""
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    world_size = torch.cuda.device_count()
+    if world_size < 2:
+        return False
+    if cfg.batch_size < world_size or (cfg.batch_size % world_size) != 0:
+        print(
+            f"[ddp] detected {world_size} CUDA devices, but batch_size={cfg.batch_size} "
+            "cannot be split evenly across ranks; using the original single-process path."
+        )
+        return False
+
+    per_gpu = cfg.batch_size // world_size
+    print(
+        f"[ddp] detected {world_size} CUDA devices; launching single-node DDP "
+        f"with global batch_size={cfg.batch_size} ({per_gpu} per GPU)."
+    )
+    mp.spawn(
+        _distributed_worker,
+        nprocs=world_size,
+        args=(world_size, find_free_port(), list(argv)),
+        join=True,
+    )
+    return True
+
+
+def run_training(argv: Optional[List[str]] = None) -> int:
+    """Run the actual training job in either single-process or DDP mode."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     cfg = args_to_config(args)
@@ -1175,9 +1307,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     if cfg.grad_accum <= 0 or cfg.batch_size <= 0:
         raise SystemExit("batch_size and grad_accum must both be positive")
 
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    distributed = world_size > 1
+    process_group_owner = False
+
+    if distributed and (cfg.batch_size < world_size or (cfg.batch_size % world_size) != 0):
+        raise SystemExit(
+            f"For DDP, batch_size must be divisible by world_size. "
+            f"Got batch_size={cfg.batch_size}, world_size={world_size}."
+        )
+
+    if distributed and not dist_is_initialized():
+        if not torch.cuda.is_available():
+            raise SystemExit("DDP auto-launch expects CUDA GPUs, but CUDA is not available.")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+            device_id=torch.device(f"cuda:{local_rank}"),
+        )
+        process_group_owner = True
+
     set_seed(cfg.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if distributed:
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     if device.type == "cuda":
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -1186,221 +1347,335 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         dtype = torch.float32
 
-    wandb_run = init_wandb(cfg)
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg.tokenizer_name,
-        use_fast=True,
-        trust_remote_code=True,
-    )
-    if tokenizer.eos_token_id is None:
-        if tokenizer.eos_token is None:
-            raise SystemExit("Tokenizer has no EOS token; Stage 1 packing requires a document separator.")
-        tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model_config = BaselineConfig(
-        vocab_size=math.ceil(len(tokenizer) / 128) * 128,
-        max_seq_len=cfg.chunk_size,
-        **PRESETS[cfg.preset],
-    )
-    assert model_config.max_seq_len == cfg.chunk_size, (
-        f"chunk_size={cfg.chunk_size} must equal model max_seq_len={model_config.max_seq_len}"
-    )
-
-    total_steps = max(1, math.ceil(cfg.token_budget / max(effective_tokens_per_step(cfg), 1)))
-    print_header(cfg, model_config, tokenizer, device, dtype, total_steps)
+    local_batch_size = cfg.batch_size // world_size if distributed else cfg.batch_size
+    wandb_run = init_wandb(cfg) if is_main_process(rank) else None
 
     try:
-        model = BaselineTRMMamba(model_config).to(device=device, dtype=dtype)
-    except ImportError as exc:
-        raise SystemExit(str(exc)) from exc
-    model.train()
-
-    n_params = count_parameters(model)
-    print(f"Model parameters : {n_params:,} ({n_params / 1e6:.1f} M)")
-    print()
-
-    token_stream = TokenStream(cfg, tokenizer, tokenizer.eos_token_id)
-    token_stream.build_val_buffer()
-
-    optimizer = build_optimizer(model, cfg)
-    scheduler = cosine_with_warmup(
-        optimizer=optimizer,
-        warmup_steps=cfg.warmup_steps,
-        total_steps=total_steps,
-        min_lr_ratio=cfg.min_lr_ratio,
-    )
-    scaler = None
-    if device.type == "cuda":
-        scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
-    ema = ModelEMA(model, decay=cfg.ema_decay)
-    spike_monitor = SpikeMonitor(threshold=cfg.spike_threshold)
-
-    resume_search = Path(args.resume_from) if args.resume_from else Path(cfg.output_dir)
-    step, start_epoch, chunks_in_epoch, tokens_processed = load_latest_checkpoint(
-        output_dir=resume_search,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        ema=ema,
-        device=device,
-        cfg=cfg,
-        hf_token=hf_token,
-    )
-
-    if tokens_processed >= cfg.token_budget:
-        print(
-            f"[done] Resumed checkpoint already met the token budget: "
-            f"{tokens_processed:,} >= {cfg.token_budget:,}"
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg.tokenizer_name,
+            use_fast=True,
         )
-        return 0
+        if tokenizer.eos_token_id is None:
+            if tokenizer.eos_token is None:
+                raise SystemExit("Tokenizer has no EOS token; Stage 1 packing requires a document separator.")
+            tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
+        if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-    output_dir = Path(cfg.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+        model_config = BaselineConfig(
+            vocab_size=math.ceil(len(tokenizer) / 128) * 128,
+            max_seq_len=cfg.chunk_size,
+            **PRESETS[cfg.preset],
+        )
+        assert model_config.max_seq_len == cfg.chunk_size, (
+            f"chunk_size={cfg.chunk_size} must equal model max_seq_len={model_config.max_seq_len}"
+        )
 
-    col_hdr = (
-        f"{'step':>7}  {'train_ce':>9}  {'val_ce':>9}  {'smth':>9}  "
-        f"{'gnorm':>7}  {'lr':>9}  {'VRAM':>7}  {'tok/s':>9}"
-    )
-    print(col_hdr)
-    print("-" * len(col_hdr))
+        total_steps = max(1, math.ceil(cfg.token_budget / max(effective_tokens_per_step(cfg), 1)))
+        if is_main_process(rank):
+            print_header(
+                cfg=cfg,
+                model_config=model_config,
+                tokenizer=tokenizer,
+                device=device,
+                dtype=dtype,
+                total_steps=total_steps,
+                world_size=world_size,
+                local_batch_size=local_batch_size,
+            )
 
-    last_val_ce: Optional[float] = None
-    last_mean_uwr = 0.0
-    success_announced = False
-    last_saved_step = step
-    train_start = time.perf_counter()
-    tokens_since_log = 0
-    optimizer.zero_grad(set_to_none=True)
+        try:
+            raw_model = BaselineTRMMamba(model_config).to(device=device, dtype=dtype)
+        except ImportError as exc:
+            raise SystemExit(str(exc)) from exc
+        raw_model.train()
 
-    pbar = tqdm(total=total_steps, initial=step, desc="Stage1", dynamic_ncols=True)
-    current_epoch = start_epoch
+        n_params = count_parameters(raw_model)
+        if is_main_process(rank):
+            print(f"Model parameters : {n_params:,} ({n_params / 1e6:.1f} M)")
+            print()
 
-    for epoch in range(start_epoch, cfg.num_epochs):
-        current_epoch = epoch
-        skip_chunks = chunks_in_epoch if epoch == start_epoch else 0
-        epoch_offset = token_stream.epoch_offset(epoch)
-        print(f"  epoch {epoch}  offset={epoch_offset}  skipping={skip_chunks} chunks")
+        token_stream = TokenStream(cfg, tokenizer, tokenizer.eos_token_id)
+        token_stream.build_val_buffer(verbose=is_main_process(rank))
 
-        chunk_iter = itertools.islice(token_stream.iter_train_chunks(epoch), skip_chunks, None)
-        micro_batch: List[torch.Tensor] = []
-        micro_step = 0
-        accum_loss = 0.0
+        optimizer = build_optimizer(raw_model, cfg)
+        scheduler = cosine_with_warmup(
+            optimizer=optimizer,
+            warmup_steps=cfg.warmup_steps,
+            total_steps=total_steps,
+            min_lr_ratio=cfg.min_lr_ratio,
+        )
+        scaler = None
+        if device.type == "cuda":
+            scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
+        ema = ModelEMA(raw_model, decay=cfg.ema_decay)
+        spike_monitor = SpikeMonitor(threshold=cfg.spike_threshold)
 
-        for chunk in chunk_iter:
-            micro_batch.append(chunk)
-            if len(micro_batch) < cfg.batch_size:
-                continue
-
-            tokens = torch.stack(micro_batch).to(device)
-            micro_batch = []
-            micro_step += 1
-            tokens_since_log += tokens.numel()
-
-            with autocast_context(device, dtype):
-                logits = model(tokens)
-            loss = pretrain_loss(logits, tokens)
-            if scaler is not None:
-                scaler.scale(loss / cfg.grad_accum).backward()
-            else:
-                (loss / cfg.grad_accum).backward()
-            accum_loss += loss.detach().item()
-
-            if micro_step % cfg.grad_accum != 0:
-                continue
-
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm))
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-            ema.update(model)
-
-            step += 1
-            pbar.update(1)
-            tokens_processed += effective_tokens_per_step(cfg)
-            chunks_in_epoch += cfg.batch_size * cfg.grad_accum
-            mean_loss = accum_loss / cfg.grad_accum
-            accum_loss = 0.0
-            pbar.set_postfix(ce=f"{mean_loss:.3f}", gnorm=f"{grad_norm:.3f}")
-
-            if spike_monitor.update(step, mean_loss):
-                tqdm.write(
-                    f"  [spike] step={step}  raw={mean_loss:.4f}  ema={spike_monitor.smoothed:.4f}"
-                )
-
-            if step % cfg.log_every == 0 or step == 1:
-                elapsed = max(time.perf_counter() - train_start, 1e-6)
-                tok_s = tokens_since_log / elapsed
-                cur_lr = scheduler.get_last_lr()[0]
-                val_str = f"{last_val_ce:.4f}" if last_val_ce is not None else "-"
-                tqdm.write(
-                    f"{step:7d}  {mean_loss:9.4f}  {val_str:>9}  {spike_monitor.smoothed:9.4f}  "
-                    f"{grad_norm:7.4f}  {cur_lr:9.2e}  {vram_gb(device):7.3f}  {tok_s:9.0f}"
-                )
-                maybe_log_wandb(
-                    step,
-                    {
-                        "train/ce": mean_loss,
-                        "train/ce_smooth": spike_monitor.smoothed,
-                        "train/grad_norm": grad_norm,
-                        "train/lr": cur_lr,
-                        "train/tok_s": tok_s,
-                        "train/vram_gb": vram_gb(device),
-                        "train/tokens_processed": tokens_processed,
-                    },
-                    wandb_run,
-                )
-                train_start = time.perf_counter()
-                tokens_since_log = 0
-
-            if step % cfg.val_every == 0 or tokens_processed >= cfg.token_budget:
-                last_val_ce = compute_val_ce(
-                    model=model,
+        resume_search = Path(args.resume_from) if args.resume_from else Path(cfg.output_dir)
+        if distributed:
+            if is_main_process(rank):
+                step, start_epoch, chunks_in_epoch, tokens_processed = load_latest_checkpoint(
+                    output_dir=resume_search,
+                    model=raw_model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
                     ema=ema,
-                    token_stream=token_stream,
                     device=device,
-                    dtype=dtype,
-                    vocab_size=model_config.vocab_size,
-                    batch_size=cfg.batch_size,
+                    cfg=cfg,
+                    hf_token=hf_token,
+                    verbose=True,
                 )
-                tqdm.write(f"  [val] step={step}  val_ce={last_val_ce:.4f}")
-                maybe_log_wandb(step, {"val/ce": last_val_ce}, wandb_run)
-                if last_val_ce < 3.0 and last_mean_uwr > 0.05 and not success_announced:
-                    stage1_success_banner(step, cfg.preset)
-                    success_announced = True
-
-            if step % cfg.gen_every == 0 or tokens_processed >= cfg.token_budget:
-                last_mean_uwr = run_generation_callback(
-                    model=model,
-                    tokenizer=tokenizer,
+                dist.barrier()
+            else:
+                dist.barrier()
+                step, start_epoch, chunks_in_epoch, tokens_processed = load_latest_checkpoint(
+                    output_dir=resume_search,
+                    model=raw_model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    ema=ema,
                     device=device,
-                    dtype=dtype,
-                    step=step,
-                    max_new_tokens=cfg.gen_max_tokens,
-                    max_seq_len=model_config.max_seq_len,
-                    wandb_run=wandb_run,
+                    cfg=cfg,
+                    hf_token=hf_token,
+                    verbose=False,
                 )
-                if last_val_ce is not None and last_val_ce < 3.0 and last_mean_uwr > 0.05 and not success_announced:
-                    stage1_success_banner(step, cfg.preset)
-                    success_announced = True
+        else:
+            step, start_epoch, chunks_in_epoch, tokens_processed = load_latest_checkpoint(
+                output_dir=resume_search,
+                model=raw_model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                ema=ema,
+                device=device,
+                cfg=cfg,
+                hf_token=hf_token,
+                verbose=True,
+            )
 
-            if step % cfg.save_every == 0:
+        train_model = raw_model
+        if distributed:
+            train_model = DDP(
+                raw_model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                broadcast_buffers=False,
+            )
+
+        if tokens_processed >= cfg.token_budget:
+            if is_main_process(rank):
+                print(
+                    f"[done] Resumed checkpoint already met the token budget: "
+                    f"{tokens_processed:,} >= {cfg.token_budget:,}"
+                )
+            if distributed:
+                dist.barrier()
+            return 0
+
+        output_dir = Path(cfg.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        col_hdr = (
+            f"{'step':>7}  {'train_ce':>9}  {'val_ce':>9}  {'smth':>9}  "
+            f"{'gnorm':>7}  {'lr':>9}  {'VRAM':>7}  {'tok/s':>9}"
+        )
+        if is_main_process(rank):
+            print(col_hdr)
+            print("-" * len(col_hdr))
+
+        last_val_ce: Optional[float] = None
+        last_mean_uwr = 0.0
+        success_announced = False
+        last_saved_step = step
+        train_start = time.perf_counter()
+        tokens_since_log = 0
+        optimizer.zero_grad(set_to_none=True)
+
+        pbar = None
+        if is_main_process(rank):
+            pbar = tqdm(total=total_steps, initial=step, desc="Stage1", dynamic_ncols=True)
+        current_epoch = start_epoch
+
+        for epoch in range(start_epoch, cfg.num_epochs):
+            current_epoch = epoch
+            skip_chunks = chunks_in_epoch if epoch == start_epoch else 0
+            epoch_offset = token_stream.epoch_offset(epoch)
+            if is_main_process(rank):
+                print(f"  epoch {epoch}  offset={epoch_offset}  skipping={skip_chunks} chunks")
+
+            global_chunk_iter = token_stream.iter_train_chunks(epoch)
+            chunk_iter = shard_train_chunk_iterator(global_chunk_iter, rank, world_size, skip_chunks)
+
+            while True:
+                accum_loss = 0.0
+                step_ready = True
+
+                for _ in range(cfg.grad_accum):
+                    micro_chunks = take_local_micro_batch(chunk_iter, local_batch_size)
+                    has_full_batch = int(len(micro_chunks) == local_batch_size)
+                    if distributed:
+                        # reason: all ranks must either advance one full micro-step together or stop together.
+                        has_full_batch = distributed_min_int(has_full_batch, device)
+                    if not has_full_batch:
+                        step_ready = False
+                        break
+
+                    tokens = torch.stack(micro_chunks).to(device)
+                    tokens_since_log += tokens.numel()
+
+                    with autocast_context(device, dtype):
+                        logits = train_model(tokens)
+                    loss = pretrain_loss(logits, tokens)
+                    if scaler is not None:
+                        scaler.scale(loss / cfg.grad_accum).backward()
+                    else:
+                        (loss / cfg.grad_accum).backward()
+                    accum_loss += loss.detach().item()
+
+                if not step_ready:
+                    optimizer.zero_grad(set_to_none=True)
+                    break
+
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(raw_model.parameters(), cfg.max_grad_norm))
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                ema.update(raw_model)
+
+                step += 1
+                tokens_processed += effective_tokens_per_step(cfg)
+                chunks_in_epoch += cfg.batch_size * cfg.grad_accum
+                mean_loss = distributed_mean(accum_loss / cfg.grad_accum, device)
+                grad_norm_log = distributed_mean(grad_norm, device)
+
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(ce=f"{mean_loss:.3f}", gnorm=f"{grad_norm_log:.3f}")
+
+                if is_main_process(rank) and spike_monitor.update(step, mean_loss):
+                    tqdm.write(
+                        f"  [spike] step={step}  raw={mean_loss:.4f}  ema={spike_monitor.smoothed:.4f}"
+                    )
+
+                if step % cfg.log_every == 0 or step == 1:
+                    global_tokens_since_log = distributed_sum_int(tokens_since_log, device)
+                    cur_lr = scheduler.get_last_lr()[0]
+                    if is_main_process(rank):
+                        elapsed = max(time.perf_counter() - train_start, 1e-6)
+                        tok_s = global_tokens_since_log / elapsed
+                        val_str = f"{last_val_ce:.4f}" if last_val_ce is not None else "-"
+                        tqdm.write(
+                            f"{step:7d}  {mean_loss:9.4f}  {val_str:>9}  {spike_monitor.smoothed:9.4f}  "
+                            f"{grad_norm_log:7.4f}  {cur_lr:9.2e}  {vram_gb(device):7.3f}  {tok_s:9.0f}"
+                        )
+                        maybe_log_wandb(
+                            step,
+                            {
+                                "train/ce": mean_loss,
+                                "train/ce_smooth": spike_monitor.smoothed,
+                                "train/grad_norm": grad_norm_log,
+                                "train/lr": cur_lr,
+                                "train/tok_s": tok_s,
+                                "train/vram_gb": vram_gb(device),
+                                "train/tokens_processed": tokens_processed,
+                                "train/world_size": world_size,
+                            },
+                            wandb_run,
+                        )
+                    train_start = time.perf_counter()
+                    tokens_since_log = 0
+
+                need_val = (step % cfg.val_every == 0) or (tokens_processed >= cfg.token_budget)
+                if need_val:
+                    if is_main_process(rank):
+                        last_val_ce = compute_val_ce(
+                            model=raw_model,
+                            ema=ema,
+                            token_stream=token_stream,
+                            device=device,
+                            dtype=dtype,
+                            vocab_size=model_config.vocab_size,
+                            batch_size=local_batch_size,
+                        )
+                        tqdm.write(f"  [val] step={step}  val_ce={last_val_ce:.4f}")
+                        maybe_log_wandb(step, {"val/ce": last_val_ce}, wandb_run)
+                        if last_val_ce < 3.0 and last_mean_uwr > 0.05 and not success_announced:
+                            stage1_success_banner(step, cfg.preset)
+                            success_announced = True
+                    if distributed:
+                        dist.barrier()
+
+                need_gen = (step % cfg.gen_every == 0) or (tokens_processed >= cfg.token_budget)
+                if need_gen:
+                    if is_main_process(rank):
+                        last_mean_uwr = run_generation_callback(
+                            model=raw_model,
+                            tokenizer=tokenizer,
+                            device=device,
+                            dtype=dtype,
+                            step=step,
+                            max_new_tokens=cfg.gen_max_tokens,
+                            max_seq_len=model_config.max_seq_len,
+                            wandb_run=wandb_run,
+                        )
+                        if last_val_ce is not None and last_val_ce < 3.0 and last_mean_uwr > 0.05 and not success_announced:
+                            stage1_success_banner(step, cfg.preset)
+                            success_announced = True
+                    if distributed:
+                        dist.barrier()
+
+                need_save = step % cfg.save_every == 0
+                if need_save:
+                    if is_main_process(rank):
+                        ckpt_path = save_checkpoint(
+                            output_dir=output_dir,
+                            step=step,
+                            epoch=epoch,
+                            chunks_in_epoch=chunks_in_epoch,
+                            tokens_processed=tokens_processed,
+                            model=raw_model,
+                            model_config=model_config,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            scaler=scaler,
+                            ema=ema,
+                            val_ce=last_val_ce,
+                            cfg=cfg,
+                            hf_token=hf_token,
+                        )
+                        if ckpt_path is not None:
+                            last_saved_step = step
+                    if distributed:
+                        dist.barrier()
+
+                if tokens_processed >= cfg.token_budget or step >= total_steps:
+                    break
+
+            if tokens_processed >= cfg.token_budget or step >= total_steps:
+                break
+            chunks_in_epoch = 0
+
+        if pbar is not None:
+            pbar.close()
+
+        need_final_save = step != last_saved_step
+        if need_final_save:
+            if is_main_process(rank):
                 ckpt_path = save_checkpoint(
                     output_dir=output_dir,
                     step=step,
-                    epoch=epoch,
+                    epoch=current_epoch if cfg.num_epochs > 0 else 0,
                     chunks_in_epoch=chunks_in_epoch,
                     tokens_processed=tokens_processed,
-                    model=model,
+                    model=raw_model,
                     model_config=model_config,
                     optimizer=optimizer,
                     scheduler=scheduler,
@@ -1412,64 +1687,57 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
                 if ckpt_path is not None:
                     last_saved_step = step
+            if distributed:
+                dist.barrier()
 
-            if tokens_processed >= cfg.token_budget or step >= total_steps:
-                break
+        if is_main_process(rank):
+            spike_rate = len(spike_monitor.spikes) / max(step, 1)
+            print()
+            print("=" * 72)
+            print("  Stage 1 complete")
+            print("=" * 72)
+            print(f"  optimizer steps : {step:,}")
+            print(f"  tokens processed: {tokens_processed:,} / {cfg.token_budget:,}")
+            print(f"  final val_ce    : {last_val_ce if last_val_ce is not None else 'n/a'}")
+            print(f"  last mean UWR   : {last_mean_uwr:.4f}")
+            print(f"  spike count     : {len(spike_monitor.spikes)} ({spike_rate:.2%} of steps)")
+            if device.type == "cuda":
+                peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                print(f"  peak VRAM       : {peak:.2f} GiB")
+            if distributed:
+                print(f"  world_size      : {world_size}")
+            if spike_rate > 0.10:
+                print("  advice          : spike rate > 10% - try --shuffle_buffer 20000 and restart")
+            elif tokens_processed < cfg.token_budget:
+                print("  advice          : increase --num_epochs or lower --token_budget for this pass")
+            elif last_val_ce is not None and last_val_ce >= 3.0:
+                print("  advice          : extend to --token_budget 3000000000 if spikes are clean")
+            print("=" * 72)
 
-        if tokens_processed >= cfg.token_budget or step >= total_steps:
-            break
-        chunks_in_epoch = 0
+        if wandb_run is not None:
+            import wandb
 
-    pbar.close()
+            wandb.finish()
+        if distributed:
+            dist.barrier()
+        return 0
+    finally:
+        if process_group_owner and dist_is_initialized():
+            dist.destroy_process_group()
 
-    if step != last_saved_step:
-        ckpt_path = save_checkpoint(
-            output_dir=output_dir,
-            step=step,
-            epoch=current_epoch if cfg.num_epochs > 0 else 0,
-            chunks_in_epoch=chunks_in_epoch,
-            tokens_processed=tokens_processed,
-            model=model,
-            model_config=model_config,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            ema=ema,
-            val_ce=last_val_ce,
-            cfg=cfg,
-            hf_token=hf_token,
-        )
-        if ckpt_path is not None:
-            last_saved_step = step
 
-    spike_rate = len(spike_monitor.spikes) / max(step, 1)
-    print()
-    print("=" * 72)
-    print("  Stage 1 complete")
-    print("=" * 72)
-    print(f"  optimizer steps : {step:,}")
-    print(f"  tokens processed: {tokens_processed:,} / {cfg.token_budget:,}")
-    print(f"  final val_ce    : {last_val_ce if last_val_ce is not None else 'n/a'}")
-    print(f"  last mean UWR   : {last_mean_uwr:.4f}")
-    print(f"  spike count     : {len(spike_monitor.spikes)} ({spike_rate:.2%} of steps)")
-    if device.type == "cuda":
-        peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-        print(f"  peak VRAM       : {peak:.2f} GiB")
-    if spike_rate > 0.10:
-        print("  advice          : spike rate > 10% - try --shuffle_buffer 20000 and restart")
-    elif tokens_processed < cfg.token_budget:
-        print("  advice          : increase --num_epochs or lower --token_budget for this pass")
-    elif last_val_ce is not None and last_val_ce >= 3.0:
-        print("  advice          : extend to --token_budget 3000000000 if spikes are clean")
-    print("=" * 72)
-
-    if wandb_run is not None:
-        import wandb
-
-        wandb.finish()
-    return 0
+def main(argv: Optional[List[str]] = None) -> int:
+    """Parse CLI arguments and auto-launch DDP on multi-GPU Kaggle-style hosts."""
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv_list)
+    cfg = args_to_config(args)
+    if maybe_launch_multi_gpu(cfg, argv_list):
+        return 0
+    return run_training(argv_list)
 
 
 if __name__ == "__main__":
-    smoke_test_20_steps()
+    if int(os.environ.get("WORLD_SIZE", "1")) == 1:
+        smoke_test_20_steps()
     raise SystemExit(main())
