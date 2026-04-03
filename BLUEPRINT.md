@@ -26,25 +26,34 @@ on SFT data. Output: comma-loops and "the the the". Three root causes:
 | Stage | Name | Status | Gate |
 |---|---|---|---|
 | 0 | Architecture & Viability | ✅ COMPLETE | All 4 gates passed |
-| 1 | Pre-training | 🟡 READY — script verified, not yet run on Kaggle | Run pretrain.py |
-| 2 | SFT | 🔴 BLOCKED — 2 bugs + multi-dataset not implemented | Fix bugs first |
+| 1 | Pre-training | 🟡 IN PROGRESS on Kaggle Dual T4 — step ~1700 / 61,036 | val_ce < 3.0 + UWR > 0.05 |
+| 2 | SFT | 🔴 BLOCKED — 3 bugs + multi-dataset not implemented | Fix bugs first |
 | 3 | Recursive Inference | ⬜ NOT STARTED | Stage 2 val_ce < 1.5 |
 | 4 | GRPO | ⬜ NOT STARTED | Stage 3 gate |
 | 5 | Quantization | ⬜ NOT STARTED | Stage 4 or 3 gate |
 
 ### Immediate next action
 
+**URGENT: Fix Bug 5 in pretrain.py before the Kaggle session resets.**
+The Hub 401 at step 1000 means no checkpoint has been saved yet.
+Apply the `save_checkpoint` patch from Part 7 and restart, OR fix the HF token.
+
 ```bash
-# On Kaggle (T4), after --dry_run passes 6-point checklist:
-python pretrain.py \
-  --preset nano \
-  --token_budget 2_000_000_000 \
-  --push_to_hub \
-  --hf_token $HF_TOKEN \
-  --wandb_mode online
+# Option A: fix the HF token and restart from scratch (session still running)
+# Set HF_TOKEN correctly in Kaggle secrets, then re-run.
+
+# Option B: patch save_checkpoint to always finalize locally (see Bug 5 fix)
+# then restart — this is the safer long-term fix regardless.
 ```
 
-Success: script prints banner when `val_ce < 3.0` AND `mean_uwr > 0.05`.
+After Stage 1 completes (`val_ce < 3.0` AND `mean_uwr > 0.05`):
+```bash
+python train_sft.py \
+  --preset nano \
+  --resume_from runs/stage1/checkpoint-XXXXXXX \
+  --ema_decay 0.995
+```
+BUT: fix Bugs 1–3 in `train_sft.py` first (see Part 7).
 
 ---
 
@@ -200,56 +209,47 @@ Two-pass to avoid double-initializing tied weights.
 
 ---
 
-### Stage 1 — Pre-training 🟡 READY
+### Stage 1 — Pre-training 🟡 IN PROGRESS
 
 **Gate:** Stage 0 all gates passed ✅
 
-**Script:** `pretrain.py` — verified offline, smoke test passes.
+**Script:** `pretrain.py`
+**Hardware:** Kaggle Dual T4, DDP world_size=2
+**Status:** Running — step ~1700 / 61,036 (~2.8% complete). See terminal_log.md for full output.
 
-**Six-point dry-run checklist (run this first):**
-```bash
-python pretrain.py --preset nano --dry_run
-```
-- [ ] No import errors; FakeMamba smoke test runs to completion
-- [ ] Initial loss ≈ ln(vocab) = 11.93; loss decreases over 20 steps
-- [ ] Checkpoint round-trip: save → reload restores correct step number
-- [ ] `ema_backbone_state_dict` contains `lm_head.weight` alias
-- [ ] Val buffer builds (2M tokens, document-disjoint from training)
-- [ ] Epoch offset is non-zero for epoch 0; varies across epochs
+**⚠ CRITICAL — Bug 5 active:** Hub 401 at step 1000 caused no checkpoint to be saved.
+Apply the `save_checkpoint` fix from Part 7 before the session resets.
 
-**Full run command (Kaggle T4):**
-```bash
-python pretrain.py \
-  --preset nano \
-  --token_budget 2_000_000_000 \
-  --push_to_hub \
-  --hf_token $HF_TOKEN \
-  --wandb_mode online
-```
+**Dry-run checklist (completed):**
+- [x] No import errors; FakeMamba smoke test passes (epoch_offset=7, loss decreasing)
+- [x] Initial loss ≈ 11.93 (actual 11.98); decreases over 20 steps
+- [x] Checkpoint round-trip verified (step=20 restored correctly)
+- [x] `ema_backbone_state_dict` contains `lm_head.weight` alias
+- [x] Val buffer builds (2M tokens, 1,887 docs, document-disjoint from training)
+- [x] Epoch offset=228 (non-zero for epoch 0) ✓
 
 **Key hyperparameters (nano, 2B tokens):**
 ```
 batch_size=8, grad_accum=4, chunk_size=1024 → 32,768 tokens/step
-total_steps ≈ 61,036
+total_steps = 61,036
 lr=6e-4, warmup=200 steps, cosine decay to 6e-5
 weight_decay=0.1, max_grad_norm=1.0, ema_decay=0.995
 save_every=1000, val_every=500, gen_every=500
-Estimated runtime: ~18.5h at 30k tok/s on T4
+DDP throughput: ~5,800 tok/s. Full run ETA: ~9.4h
 ```
+
+**Live observations (step 1700):**
+- Loss 11.98 → 4.85 (smoothed) — healthy trajectory
+- Val CE 6.38 → 5.68 (confirming generalization)
+- Mean UWR 0.38–0.42 — already above 0.05 success threshold
+- VRAM flat at 2.035 GB — no graph retention
+- Two isolated spikes (steps 1148, 1611); spike rate 0.12%
+- Code prompt loops ("1000...0") expected — FineWeb-Edu has no code
 
 **Success criteria:**
 - [ ] `val_ce < 3.0` AND `mean_uwr > 0.05` (script prints banner when met)
-- [ ] No loss spikes exceeding `smoothed_loss + 0.5` for > 5% of steps
-- [ ] Coherent text completions emerging in gen callback
-
-**Implementation details verified in pretrain.py:**
-- EMA initialized from live weights (NOT zeros) — fixes checkpoint-950 EMA bug
-- Val buffer is document-disjoint (SHA1 hash deduplication)
-- Epoch-varying random offset (`seed + epoch × 104_729`) breaks shard periodicity
-- Checkpoint: write to `.tmp` → Hub push → rename to final (atomic)
-- Smoke test (`smoke_test_20_steps()`) runs unconditionally before `main()` — adds ~30s
-- Generation uses **live weights** (intentional — monitors training in progress)
-- Val CE uses **EMA weights** with save/restore of live weights (correct)
+- [ ] No loss spikes > smoothed+0.5 for > 5% of steps
+- [ ] Coherent text completions in gen callback
 
 **Next action after Stage 1:**
 ```bash
@@ -258,7 +258,7 @@ python train_sft.py \
   --resume_from runs/stage1/checkpoint-XXXXXXX \
   --ema_decay 0.995
 ```
-BUT: fix the two bugs in `train_sft.py` first (see Part 7).
+Fix Bugs 1–3 in `train_sft.py` first (see Part 7).
 
 ---
 
@@ -396,11 +396,11 @@ one tensor for both embedding and lm_head. `ema_backbone_state_dict` MUST explic
 contain `"lm_head.weight"` as an alias to `"token_embedding.weight"`. Verified in
 pretrain.py's `save_checkpoint`.
 
-**Hub push protocol (atomic):**
-1. Write to `checkpoint-NNNNNNN.tmp`
-2. Push `.tmp` to Hub
-3. Rename `.tmp` → final only after Hub confirms
-4. Prune local checkpoints: keep last 3 by default
+**Hub push protocol (corrected — see Bug 5):**
+1. Write fully to `checkpoint-NNNNNNN.tmp`
+2. Rename `.tmp` → `checkpoint-NNNNNNN` immediately (local finalize — always happens)
+3. Prune old local checkpoints
+4. Attempt Hub push from `checkpoint-NNNNNNN` — fire-and-forget, warn on failure, never block
 
 ---
 
@@ -514,12 +514,113 @@ def load_latest_checkpoint(output_dir, model, ema, optimizer, scheduler, scaler,
 
 ---
 
+### Bug 3 — HIGH: `train_sft.py::collate` applies loss to all tokens including the prompt
+
+**Symptom:** Model is trained to predict "User: {question}\n\nAssistant: <think>\n"
+tokens as well as the answer. This causes the model to waste capacity predicting
+its own prompt and biases it toward parroting the question format. Observed as val_ce
+not falling below ~1.5 even with many epochs.
+
+**Root cause:** `collate` copies all token IDs to `labels` unconditionally. Standard
+SFT practice masks the prompt tokens with -100 so only the assistant response is
+supervised.
+
+**Fix — update `collate` to accept a prompt_length per sample, or split at
+the "Assistant:" boundary at tokenize time:**
+```python
+# In load_and_tokenize, record where the assistant response starts:
+prefix = f"User: {q}\n\nAssistant: <think>\n"
+prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+prompt_len  = len(prefix_ids)
+full_ids    = tokenizer.encode(text, add_special_tokens=False)
+samples.append({
+    "input_ids":   torch.tensor(full_ids[:max_seq_len], dtype=torch.long),
+    "prompt_len":  prompt_len,   # NEW
+})
+
+# In collate, mask prompt tokens in labels:
+for i, s in enumerate(samples):
+    ids = s["input_ids"]
+    T   = ids.size(0)
+    input_ids[i, :T] = ids
+    pl = min(s.get("prompt_len", 0), T)
+    labels[i, pl:T]  = ids[pl:]   # only supervise the assistant response
+    mask[i, :T]      = True
+```
+
+**Status:** 🔴 NOT FIXED. Add to Appendix A Change list as Change 0 (highest priority).
+
+---
+
 ### Issue 4 — MEDIUM: Stage 2 multi-dataset mixing not implemented
 
 **Symptom:** `train_sft.py` only loads `Bespoke-Stratos-17k`. The resolved decision
 is a 40/30/30 mix with MetaMathQA and OpenHermes-2.5.
 
 **Status:** 🟡 PENDING. See Appendix A for the full agent prompt that implements this.
+
+---
+
+### Bug 5 — CRITICAL: `pretrain.py::save_checkpoint` abandons local checkpoint on Hub failure
+
+**Symptom:** When `push_to_hub=True` and the Hub upload fails (e.g. 401 Unauthorized),
+`save_checkpoint` returns `None` without renaming the `.tmp` directory to its final
+name. The checkpoint state is written to disk as `.tmp` but is never finalized.
+If the session resets, all progress since the last successful checkpoint is lost.
+
+**Confirmed at:** Step 1000 of the live Kaggle run (401 Unauthorized — HF token not set).
+No checkpoint exists on disk. The run is at step ~1700 with no recovery point.
+
+**Root cause:** Lines 682–686 in `pretrain.py`:
+```python
+if cfg.push_to_hub and hf_token:
+    uploaded = sync_checkpoint_to_hub(tmp_dir, cfg.hf_repo_id, hf_token)
+    if not uploaded:
+        print(f"  [warn] step {step}: Hub sync failed; checkpoint not finalized.")
+        return None   # ← exits before tmp_dir.replace(final_dir)
+```
+
+**Fix — always finalize locally, then attempt Hub push as fire-and-forget:**
+```python
+# In save_checkpoint, reorder the Hub sync AFTER local finalization:
+
+# Step 1: always finalize locally
+if final_dir.exists():
+    shutil.rmtree(final_dir, ignore_errors=True)
+tmp_dir.replace(final_dir)
+print(f"  [ckpt] saved  -> {final_dir}")
+
+# Step 2: prune old local checkpoints
+retain = max(cfg.keep_last, 1)
+existing = sorted([
+    p for p in output_dir.iterdir()
+    if p.is_dir() and p.name.startswith("checkpoint-") and not p.name.endswith(".tmp")
+], key=lambda p: checkpoint_step_from_name(p.name))
+for old in existing[:-retain]:
+    shutil.rmtree(old, ignore_errors=True)
+    print(f"  [ckpt] pruned -> {old.name}")
+
+# Step 3: attempt Hub push (warn on failure, never block)
+if cfg.push_to_hub and hf_token:
+    uploaded = sync_checkpoint_to_hub(final_dir, cfg.hf_repo_id, hf_token)
+    if not uploaded:
+        print(f"  [warn] step {step}: Hub sync failed; local checkpoint retained at {final_dir}")
+
+return final_dir
+```
+
+Also update `Part 6 — Hub push protocol` to reflect the corrected order:
+1. Write fully to `checkpoint-NNNNNNN.tmp`
+2. Rename `.tmp` → `checkpoint-NNNNNNN` (local finalize, always happens)
+3. Attempt Hub push from `checkpoint-NNNNNNN` (fire-and-forget)
+
+**Agent prompt:** `AGENT_PROMPT_pretrain_checkpoint_fix.md` — self-contained, feed directly to a coding agent. Makes 3 surgical changes:
+  - Change 1: `save_checkpoint` — local-first, Hub fire-and-forget
+  - Change 2: `load_latest_checkpoint` + 4 helper functions — explicit path / local / Hub fallback
+  - Change 3: `cleanup_temporary_checkpoints` call at startup
+
+**Status:** 🔴 NOT FIXED. Kaggle file persistence is now enabled (files survive interrupts),
+so local checkpoints are safe once written. Fix this before the next `save_every` fires.
 
 ---
 

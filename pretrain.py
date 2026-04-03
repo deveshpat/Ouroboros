@@ -625,6 +625,17 @@ def sync_checkpoint_to_hub(
 
 
 
+def cleanup_temporary_checkpoints(output_dir: Path) -> None:
+    """Remove stale .tmp checkpoint directories left by previously interrupted runs."""
+    if not output_dir.exists():
+        return
+    for p in output_dir.iterdir():
+        if p.is_dir() and p.name.endswith(".tmp"):
+            print(f"  [cleanup] removing stale tmp checkpoint: {p.name}")
+            shutil.rmtree(p, ignore_errors=True)
+
+
+
 def save_checkpoint(
     output_dir: Path,
     step: int,
@@ -641,17 +652,24 @@ def save_checkpoint(
     cfg: PretrainConfig,
     hf_token: Optional[str],
 ) -> Optional[Path]:
-    """Write a checkpoint atomically, sync to Hub if configured, then finalize it."""
+    """
+    Write a checkpoint to local disk first (always), then attempt Hub push (fire-and-forget).
+
+    Local finalization is never blocked by Hub failures.
+    Returns the finalized local Path on success, None if the local write itself fails.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpt_name = f"checkpoint-{step:07d}"
-    final_dir = output_dir / ckpt_name
-    tmp_dir = output_dir / f"{ckpt_name}.tmp"
+    ckpt_name  = f"checkpoint-{step:07d}"
+    final_dir  = output_dir / ckpt_name
+    tmp_dir    = output_dir / f"{ckpt_name}.tmp"
 
+    # Remove any stale .tmp from a previous interrupted run at this step
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir, ignore_errors=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build EMA shadow dict with lm_head.weight alias for tied embeddings
     shadow = dict(ema.shadow)
     if model_config.tie_embeddings:
         if "lm_head.weight" not in shadow and "token_embedding.weight" in shadow:
@@ -674,28 +692,30 @@ def save_checkpoint(
         "pretrain_config": cfg_dict,
         "val_ce": val_ce,
     }
-    torch.save(state, tmp_dir / "training_state.pt")
 
-    with (tmp_dir / "resolved_backbone_config.json").open("w", encoding="utf-8") as f:
-        json.dump(asdict(model_config), f, indent=2)
+    try:
+        torch.save(state, tmp_dir / "training_state.pt")
+        with (tmp_dir / "resolved_backbone_config.json").open("w", encoding="utf-8") as f:
+            json.dump(asdict(model_config), f, indent=2)
+    except Exception as exc:
+        print(f"  [ckpt] ERROR: could not write checkpoint to {tmp_dir}: {exc}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
 
-    if cfg.push_to_hub and hf_token:
-        uploaded = sync_checkpoint_to_hub(tmp_dir, cfg.hf_repo_id, hf_token)
-        if not uploaded:
-            print(f"  [warn] step {step}: Hub sync failed; checkpoint not finalized.")
-            return None
-
+    # ── Step 1: always finalize locally first ────────────────────────────────
     if final_dir.exists():
         shutil.rmtree(final_dir, ignore_errors=True)
     tmp_dir.replace(final_dir)
     print(f"  [ckpt] saved  -> {final_dir}")
 
+    # ── Step 2: prune old local checkpoints ──────────────────────────────────
     retain = max(cfg.keep_last, 1)
     existing = sorted(
         [
-            p
-            for p in output_dir.iterdir()
-            if p.is_dir() and p.name.startswith("checkpoint-") and not p.name.endswith(".tmp")
+            p for p in output_dir.iterdir()
+            if p.is_dir()
+            and p.name.startswith("checkpoint-")
+            and not p.name.endswith(".tmp")
         ],
         key=lambda p: checkpoint_step_from_name(p.name),
     )
@@ -703,7 +723,119 @@ def save_checkpoint(
         shutil.rmtree(old, ignore_errors=True)
         print(f"  [ckpt] pruned -> {old.name}")
 
+    # ── Step 3: attempt Hub push (fire-and-forget, never blocks) ─────────────
+    if cfg.push_to_hub and hf_token:
+        uploaded = sync_checkpoint_to_hub(final_dir, cfg.hf_repo_id, hf_token)
+        if not uploaded:
+            print(
+                f"  [hub]  warn: step {step} Hub sync failed; "
+                f"local checkpoint retained at {final_dir}"
+            )
+
     return final_dir
+
+
+
+def _list_local_checkpoints(output_dir: Path) -> List[Path]:
+    """
+    Return finalized local checkpoint directories sorted newest-first.
+    Skips .tmp dirs and any directory whose name doesn't parse as a step number.
+    """
+    if not output_dir.exists() or not output_dir.is_dir():
+        return []
+    candidates = []
+    for p in output_dir.iterdir():
+        if p.is_dir() and not p.name.endswith(".tmp"):
+            step = checkpoint_step_from_name(p.name)
+            if step >= 0:
+                candidates.append(p)
+    return sorted(candidates, key=lambda p: checkpoint_step_from_name(p.name), reverse=True)
+
+
+
+def _try_load_state(path: Path, device: torch.device) -> Optional[Dict[str, Any]]:
+    """
+    Load training_state.pt from a checkpoint directory.
+    Returns None (instead of raising) when the checkpoint is missing, incomplete, or corrupted.
+    Required keys: model_state_dict, optimizer, scheduler.
+    """
+    state_path = path / "training_state.pt"
+    if not state_path.exists():
+        return None
+    try:
+        state = torch.load(state_path, map_location=device)
+    except Exception as exc:
+        print(f"  [resume] corrupt checkpoint {path.name}: {exc} — skipping")
+        return None
+    if any(k not in state for k in ("model_state_dict", "optimizer", "scheduler")):
+        print(f"  [resume] incomplete checkpoint {path.name} — skipping")
+        return None
+    return state
+
+
+
+def _list_remote_checkpoint_names(repo_id: str, token: str) -> List[str]:
+    """
+    Return Hub checkpoint directory names sorted newest-first.
+    Returns [] silently on any Hub error (repo not found, bad token, network, etc.).
+    """
+    try:
+        from huggingface_hub import HfApi
+        from huggingface_hub.errors import RepositoryNotFoundError
+    except ImportError:
+        return []
+
+    import re as _re
+    _CKPT_RE = _re.compile(r"^checkpoint-(\d+)$")
+
+    try:
+        api = HfApi(token=token)
+        repo_files = list(api.list_repo_files(repo_id=repo_id, token=token))
+    except Exception:
+        return []
+
+    names = set()
+    for f in repo_files:
+        top = Path(f).parts[0] if Path(f).parts else ""
+        if _CKPT_RE.match(top):
+            names.add(top)
+
+    return sorted(names, key=lambda n: int(_CKPT_RE.match(n).group(1)), reverse=True)
+
+
+
+def _download_checkpoint_from_hub(
+    checkpoint_name: str,
+    output_dir: Path,
+    repo_id: str,
+    token: str,
+) -> Optional[Path]:
+    """
+    Download a single checkpoint directory from the Hub into output_dir.
+    Returns the local path on success, None on any failure.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return None
+
+    local_dir = output_dir / checkpoint_name
+    if local_dir.exists():
+        shutil.rmtree(local_dir, ignore_errors=True)
+
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=str(output_dir),
+            token=token,
+            force_download=True,
+            allow_patterns=[f"{checkpoint_name}/*"],
+        )
+    except Exception as exc:
+        print(f"  [hub]  download failed for {checkpoint_name}: {exc}")
+        return None
+
+    return local_dir if local_dir.exists() else None
 
 
 
@@ -719,19 +851,17 @@ def load_latest_checkpoint(
     hf_token: Optional[str],
     verbose: bool = True,
 ) -> Tuple[int, int, int, int]:
-    """Restore the newest valid checkpoint from disk first, then Hub if needed."""
+    """
+    Resume from the newest valid checkpoint using this priority order:
+      1. output_dir is itself a checkpoint dir (direct path given via --resume_from)
+      2. Newest finalized local checkpoint under output_dir (skip corrupted, try next)
+      3. Newest checkpoint on the Hub (download, then load; only if no local found)
 
-    def _try_load(path: Path) -> Optional[Dict[str, Any]]:
-        try:
-            state = torch.load(path, map_location=device)
-            required = ("model_state_dict", "optimizer", "scheduler")
-            if any(k not in state for k in required):
-                return None
-            return state
-        except Exception:
-            return None
+    Returns (step, epoch, chunks_in_epoch, tokens_processed).
+    Returns (0, 0, 0, 0) and prints a message when no checkpoint is found.
+    """
 
-    def _restore(state: Dict[str, Any]) -> Tuple[int, int, int, int]:
+    def _restore(state: Dict[str, Any], label: str) -> Tuple[int, int, int, int]:
         model.load_state_dict(state["model_state_dict"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
@@ -739,98 +869,48 @@ def load_latest_checkpoint(
             scaler.load_state_dict(state["scaler"])
         if state.get("ema"):
             ema.load_state_dict(state["ema"])
-        return (
-            int(state.get("step", 0)),
-            int(state.get("epoch", 0)),
-            int(state.get("chunks_in_epoch", 0)),
-            int(state.get("tokens_processed", 0)),
-        )
-
-    search_root = output_dir
-    exact_state = output_dir / "training_state.pt"
-    if output_dir.is_file() and output_dir.name == "training_state.pt":
-        state = _try_load(output_dir)
-        if state is not None:
-            result = _restore(state)
-            if verbose:
-                print(f"  [resume] exact file step={result[0]} tokens={result[3]:,}")
-            return result
-        search_root = output_dir.parent
-    elif exact_state.exists():
-        state = _try_load(exact_state)
-        if state is not None:
-            result = _restore(state)
-            if verbose:
-                print(f"  [resume] exact dir  {output_dir.name}  step={result[0]}  tokens={result[3]:,}")
-            return result
-        search_root = output_dir.parent if output_dir.name.startswith("checkpoint-") else output_dir
-    elif output_dir.name.startswith("checkpoint-"):
-        search_root = output_dir.parent
-
-    local_root = search_root if search_root.exists() else output_dir.parent
-    local_ckpts = sorted(
-        [
-            p
-            for p in local_root.glob("checkpoint-*")
-            if p.is_dir() and not p.name.endswith(".tmp") and checkpoint_step_from_name(p.name) >= 0
-        ],
-        key=lambda p: checkpoint_step_from_name(p.name),
-        reverse=True,
-    )
-    for candidate in local_ckpts:
-        state = _try_load(candidate / "training_state.pt")
-        if state is not None:
-            result = _restore(state)
-            if verbose:
-                print(f"  [resume] local  {candidate.name}  step={result[0]}  tokens={result[3]:,}")
-            return result
-
-    if cfg.push_to_hub and hf_token:
-        try:
-            from huggingface_hub import HfApi, snapshot_download
-            from huggingface_hub.errors import RepositoryNotFoundError
-
-            api = HfApi(token=hf_token)
-            files = list(api.list_repo_files(repo_id=cfg.hf_repo_id, token=hf_token))
-            ckpt_names = sorted(
-                {
-                    Path(f).parts[0]
-                    for f in files
-                    if Path(f).parts and Path(f).parts[0].startswith("checkpoint-")
-                },
-                key=checkpoint_step_from_name,
-                reverse=True,
+        step  = int(state.get("step", 0))
+        epoch = int(state.get("epoch", 0))
+        chunks = int(state.get("chunks_in_epoch", 0))
+        tokens = int(state.get("tokens_processed", 0))
+        if verbose:
+            print(
+                f"  [resume] {label}  "
+                f"step={step}  epoch={epoch}  tokens={tokens:,}  val_ce={state.get('val_ce')}"
             )
-            for ckpt_name in ckpt_names:
-                if ckpt_name.endswith(".tmp"):
-                    continue
-                local_dir = local_root / ckpt_name
-                if local_dir.exists():
-                    shutil.rmtree(local_dir, ignore_errors=True)
-                if verbose:
-                    print(f"  [resume] downloading {ckpt_name} from Hub ...")
-                snapshot_download(
-                    repo_id=cfg.hf_repo_id,
-                    local_dir=str(local_root),
-                    token=hf_token,
-                    allow_patterns=[f"{ckpt_name}/*"],
-                )
-                state = _try_load(local_dir / "training_state.pt")
-                if state is not None:
-                    result = _restore(state)
-                    if verbose:
-                        print(f"  [resume] hub    {ckpt_name}  step={result[0]}  tokens={result[3]:,}")
-                    return result
-        except RepositoryNotFoundError:
+        return step, epoch, chunks, tokens
+
+    # ── Case 1: output_dir IS the checkpoint directory ────────────────────────
+    direct_state = _try_load_state(output_dir, device)
+    if direct_state is not None:
+        return _restore(direct_state, f"direct  {output_dir.name}")
+
+    # ── Case 2: scan local checkpoints newest-first ───────────────────────────
+    local_ckpts = _list_local_checkpoints(output_dir)
+    for ckpt_dir in local_ckpts:
+        state = _try_load_state(ckpt_dir, device)
+        if state is not None:
+            return _restore(state, f"local   {ckpt_dir.name}")
+
+    # ── Case 3: Hub fallback (only if local is completely empty) ─────────────
+    if cfg.push_to_hub and hf_token:
+        if verbose:
+            print(f"  [resume] no local checkpoints found; checking Hub ({cfg.hf_repo_id}) ...")
+        for ckpt_name in _list_remote_checkpoint_names(cfg.hf_repo_id, hf_token):
             if verbose:
-                print(f"  [resume] Hub repo {cfg.hf_repo_id} does not exist yet.")
-        except Exception as exc:
+                print(f"  [hub]  downloading {ckpt_name} ...")
+            downloaded = _download_checkpoint_from_hub(ckpt_name, output_dir, cfg.hf_repo_id, hf_token)
+            if downloaded is None:
+                continue
+            state = _try_load_state(downloaded, device)
+            if state is not None:
+                return _restore(state, f"hub     {ckpt_name}")
             if verbose:
-                print(f"  [resume] Hub fallback failed: {exc}")
+                print(f"  [hub]  {ckpt_name} was downloaded but could not be loaded — skipping")
 
     if verbose:
-        print("  [resume] No checkpoint found - starting from scratch.")
-    return (0, 0, 0, 0)
+        print("  [resume] No checkpoint found — starting from scratch.")
+    return 0, 0, 0, 0
 
 
 
@@ -1411,7 +1491,12 @@ def run_training(argv: Optional[List[str]] = None) -> int:
         ema = ModelEMA(raw_model, decay=cfg.ema_decay)
         spike_monitor = SpikeMonitor(threshold=cfg.spike_threshold)
 
-        resume_search = Path(args.resume_from) if args.resume_from else Path(cfg.output_dir)
+        output_dir = Path(cfg.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if is_main_process(rank):
+            cleanup_temporary_checkpoints(output_dir)
+
+        resume_search = Path(args.resume_from) if args.resume_from else output_dir
         if distributed:
             if is_main_process(rank):
                 step, start_epoch, chunks_in_epoch, tokens_processed = load_latest_checkpoint(
@@ -1473,9 +1558,6 @@ def run_training(argv: Optional[List[str]] = None) -> int:
             if distributed:
                 dist.barrier()
             return 0
-
-        output_dir = Path(cfg.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
 
         col_hdr = (
             f"{'step':>7}  {'train_ce':>9}  {'val_ce':>9}  {'smth':>9}  "
