@@ -27,25 +27,39 @@ on SFT data. Output: comma-loops and "the the the". Three root causes:
 |---|---|---|---|
 | 0 | Architecture & Viability | ✅ COMPLETE | All 4 gates passed |
 | 1 | Pre-training | 🟡 IN PROGRESS on Kaggle Dual T4 — step ~3500 / 61,036 | val_ce < 3.0 + UWR > 0.05 |
-| 2 | SFT | 🔴 BLOCKED — 3 bugs + multi-dataset not implemented | Fix bugs first |
-| 3 | Recursive Inference | ⬜ NOT STARTED | Stage 2 val_ce < 1.5 |
+| 2 | SFT | 🔴 BLOCKED — Bug 3 (collate prompt masking) not fixed | Fix Bug 3, then run |
+| 3 | Recursive Inference (Coconut-Ouroboros) | ⬜ NOT STARTED | Stage 2 answer val_ce < 1.5 |
 | 4 | GRPO | ⬜ NOT STARTED | Stage 3 gate |
 | 5 | Quantization | ⬜ NOT STARTED | Stage 4 or 3 gate |
 
 ### Immediate next action
 
-Stage 1 is running and healthy. Bug 5 is fixed and confirmed working in production
-(checkpoint-0002000 resumed cleanly; checkpoint-0003000 saved locally + pushed to Hub).
-
-While Stage 1 runs, fix the 3 bugs in `train_sft.py` using Appendix A so Stage 2 is
-ready to launch immediately after Stage 1 completes.
-
+Stage 1 is running. While it runs:
+ 
+**Action 1 — Fix Bug 3 in `train_sft.py`** (prompt masking in collate).
+See Part 7 → Bug 3 for the exact two-change fix.
+Without this, Stage 2 val_ce includes prompt supervision and cannot be
+used as a Stage 3 baseline.
+ 
+**Action 2 — Stage 3 architecture decisions are settled** (see Appendix B update).
+No code action needed yet. `recursive_finetune.py` to be written after Stage 2 completes.
+Use `stage3_agent_prompt.md` as the agent prompt.
+ 
 ```bash
 # Stage 2 launch (after Stage 1 banner: val_ce < 3.0 AND mean_uwr > 0.05):
 python train_sft.py \
   --preset nano \
   --resume_from runs/stage1/checkpoint-XXXXXXX \
-  --ema_decay 0.995
+  --ema_decay 0.995 \
+  --dataset_mix stratos   # upgrade to full after first successful run
+ 
+# Stage 3 launch (after Stage 2 answer val_ce < 1.5):
+python recursive_finetune.py \
+  --preset nano \
+  --resume_from runs/stage2/checkpoint-XXXXXXX \
+  --n_latent 1 \
+  --stage2_val_ce <record_here> \
+  --output_dir runs/stage3_k1
 ```
 
 ---
@@ -145,6 +159,9 @@ Two-pass to avoid double-initializing tied weights.
 | Pre-training strategy | Train from scratch. Apply to Google TRC immediately (async) |
 | Recursion timing | Post-SFT only. Never train recursion from random init |
 | GRPO implementation | TRL GRPOTrainer. Never reimplement from scratch |
+| Stage 3 recursion mechanism | Coconut-Ouroboros (latent hidden-state injection, K=1→4→16 curriculum). NOT the TRM EMA-loop approach. See stage3_agent_prompt.md. |
+| TRM paper applicability | TRM is an encoder for grid tasks; not directly applicable to autoregressive LLMs. Inspiration only. |
+| Stage 3 Mamba SSM property | SSM state accumulates across latent passes, giving richer scratch-memory than Transformer-Coconut. This is a key architectural advantage. |
 
 ---
 
@@ -160,6 +177,8 @@ Two-pass to avoid double-initializing tied weights.
 | `train_sft.py` | 2 | 🔴 2 BUGS — do not run | See Part 7 |
 | `BLUEPRINT.md` | — | Living document | This file |
 | `terminal_log.md` | — | Verified terminal outputs | Append only |
+| `recursive_finetune.py` | 3 | ⬜ NOT CREATED | Use stage3_agent_prompt.md to generate |
+| `stage3_agent_prompt.md` | 3 | ✅ CREATED | Complete Coconut-Ouroboros agent prompt |
 
 ### Renamed files (reflect manually)
 
@@ -513,49 +532,47 @@ def load_latest_checkpoint(output_dir, model, ema, optimizer, scheduler, scaler,
 ---
 
 ### Bug 3 — HIGH: `train_sft.py::collate` applies loss to all tokens including the prompt
-
-**Symptom:** Model is trained to predict "User: {question}\n\nAssistant: <think>\n"
-tokens as well as the answer. This causes the model to waste capacity predicting
-its own prompt and biases it toward parroting the question format. Observed as val_ce
-not falling below ~1.5 even with many epochs.
-
-**Root cause:** `collate` copies all token IDs to `labels` unconditionally. Standard
-SFT practice masks the prompt tokens with -100 so only the assistant response is
-supervised.
-
-**Fix — update `collate` to accept a prompt_length per sample, or split at
-the "Assistant:" boundary at tokenize time:**
+ 
+**Status:** 🔴 NOT FIXED. Apply before any Stage 2 run.
+ 
+**Why this also blocks Stage 3:**
+The Stage 3 gate check compares answer val_ce with the Stage 2 baseline.
+If the Stage 2 baseline was measured with prompt tokens in the loss, it is
+artificially inflated and the gate threshold is meaningless.
+Fix Bug 3 first, record a clean answer-only Stage 2 val_ce, then use that
+as `--stage2_val_ce` in `recursive_finetune.py`.
+ 
+**Fix — two changes required:**
+ 
+Change 1 — in `load_and_tokenize`, record prompt length:
 ```python
-# In load_and_tokenize, record where the assistant response starts:
-prefix = f"User: {q}\n\nAssistant: <think>\n"
-prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+# Before (current — broken):
+samples.append({"input_ids": torch.tensor(ids[:max_seq_len], dtype=torch.long)})
+ 
+# After (fixed):
+prefix_text = f"User: {q}\n\nAssistant: "
+if r:
+    prefix_text += f"<think>\n"
+prefix_ids  = tokenizer.encode(prefix_text, add_special_tokens=False)
 prompt_len  = len(prefix_ids)
-full_ids    = tokenizer.encode(text, add_special_tokens=False)
 samples.append({
-    "input_ids":   torch.tensor(full_ids[:max_seq_len], dtype=torch.long),
-    "prompt_len":  prompt_len,   # NEW
+    "input_ids":  torch.tensor(ids[:max_seq_len], dtype=torch.long),
+    "prompt_len": prompt_len,
 })
-
-# In collate, mask prompt tokens in labels:
-for i, s in enumerate(samples):
-    ids = s["input_ids"]
-    T   = ids.size(0)
-    input_ids[i, :T] = ids
-    pl = min(s.get("prompt_len", 0), T)
-    labels[i, pl:T]  = ids[pl:]   # only supervise the assistant response
-    mask[i, :T]      = True
 ```
-
-**Status:** 🔴 NOT FIXED. Add to Appendix A Change list as Change 0 (highest priority).
-
----
-
-### Issue 4 — MEDIUM: Stage 2 multi-dataset mixing not implemented
-
-**Symptom:** `train_sft.py` only loads `Bespoke-Stratos-17k`. The resolved decision
-is a 40/30/30 mix with MetaMathQA and OpenHermes-2.5.
-
-**Status:** 🟡 PENDING. See Appendix A for the full agent prompt that implements this.
+ 
+Change 2 — in `collate`, mask prompt tokens in labels:
+```python
+# Before (current — broken):
+labels[idx, :length] = ids   # all tokens supervised
+ 
+# After (fixed):
+pl = min(sample.get("prompt_len", 0), length)
+labels[idx, pl:length] = ids[pl:]   # only response tokens supervised
+```
+ 
+Also apply the same fix in `load_mixed_dataset` for the MetaMathQA and
+OpenHermes extractors (each has its own prefix format).
 
 ---
 
@@ -620,6 +637,24 @@ Also update `Part 6 — Hub push protocol` to reflect the corrected order:
 **Status:** ✅ FIXED and confirmed in production.
 - Session 5 resumed from `checkpoint-0002000` (local load) ✅
 - `checkpoint-0003000` saved locally then pushed to Hub (commit=5e2ba2b8) ✅
+
+---
+
+### Bug 6 — MEDIUM: Stage 2 val_ce measures full-sequence CE, not answer-only CE
+ 
+**Symptom (potential):** If Bug 3 is fixed mid-training and val_ce is recorded
+both before and after, the values are not comparable. The pre-fix val_ce
+includes prompt supervision; the post-fix val_ce does not.
+ 
+**Impact on Stage 3:** The `--stage2_val_ce` argument to `recursive_finetune.py`
+must be the answer-only val_ce from a Stage 2 run with Bug 3 fixed.
+Do NOT use val_ce from the Session 3 dry-run (which used the buggy collate).
+ 
+**Fix:** Record Stage 2 final val_ce only after Bug 3 is confirmed fixed.
+Add a note in terminal_log.md at the start of each Stage 2 run indicating
+whether Bug 3 is fixed.
+ 
+**Status:** 🟡 PENDING — becomes relevant when Stage 2 produces a checkpoint.
 
 ---
 
@@ -887,177 +922,73 @@ python train_sft.py \
 
 ## Appendix B — Stage 3 Agent Prompt
 
-> Self-contained. Feed this entire appendix to a coding agent to produce
-> `recursive_finetune.py`. This must only be run after Stage 2 completes.
-
----
-
-### Task
-
-Create `recursive_finetune.py`: a fine-tuning script that takes a Stage 2 checkpoint
-and incrementally adds recursive inference (SERF mechanism), gated by CE.
-
-### Architecture context
-
-`BaselineTRMMamba` (in `baseline_trm_mamba.py`) is a standard non-recursive model.
-The recursive wrapper loops the hidden states back through the model multiple times.
-**This is an inference-time computation extension, not an architectural change.**
-
-The model must be pre-trained and SFT'd before recursion is introduced. Recursion
-on a random-init or undertrained model produces degenerate output (proven by
-checkpoint-950).
-
-### Recursive forward pass specification
-
-```python
-class RecursiveSERF(nn.Module):
-    """
-    Wraps BaselineTRMMamba with a test-time recursive inference loop.
-    During training, n_loops is fixed per curriculum step.
-    During inference, n_loops can be set to any value.
-    """
-
-    def __init__(self, backbone: BaselineTRMMamba, n_loops: int = 2, ema_decay: float = 0.9):
-        super().__init__()
-        self.backbone = backbone
-        self.n_loops = n_loops
-        self.ema_decay = ema_decay
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        return_all_logits: bool = False,
-    ) -> torch.Tensor:
-        """
-        First pass: standard forward through backbone.
-        Subsequent passes: feed EMA-smoothed hidden states back as
-        pseudo-embeddings, bypassing the token embedding layer.
-
-        The backbone must expose a way to run from embeddings.
-        See 'required backbone modification' below.
-        """
-        # Loop 0 — standard forward
-        logits, hidden = self.backbone.forward_with_hidden(input_ids, attention_mask)
-        all_logits = [logits] if return_all_logits else []
-
-        ema = hidden.detach().clone()   # WARM START — not zeros
-
-        for step in range(1, self.n_loops):
-            # Bias-corrected EMA
-            correction = 1.0 - self.ema_decay ** step
-            loop_input = ema / correction
-            logits, hidden = self.backbone.forward_from_embeddings(
-                loop_input, attention_mask
-            )
-            ema = self.ema_decay * ema + (1.0 - self.ema_decay) * hidden.detach()
-            if return_all_logits:
-                all_logits.append(logits)
-
-        if return_all_logits:
-            return torch.stack(all_logits, dim=0)   # [n_loops, B, T, V]
-        return logits
-```
-
-### Required backbone modification
-
-Add two methods to `BaselineTRMMamba` in `baseline_trm_mamba.py`:
-
-```python
-def forward_with_hidden(
-    self,
-    input_ids: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return (logits, final_hidden_states) for use by RecursiveSERF."""
-    x = self.token_embedding(input_ids)
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(device=input_ids.device, dtype=torch.bool)
-    for group in self.groups:
-        x = group(x, attention_mask)
-    hidden = self.final_norm(x)
-    logits = self.lm_head(hidden)
-    return logits, hidden
-
-def forward_from_embeddings(
-    self,
-    embeddings: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run the backbone from pre-computed embeddings (bypass token embedding)."""
-    x = embeddings
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(device=embeddings.device, dtype=torch.bool)
-    for group in self.groups:
-        x = group(x, attention_mask)
-    hidden = self.final_norm(x)
-    logits = self.lm_head(hidden)
-    return logits, hidden
-```
-
-### Training script specification
-
-`recursive_finetune.py` must:
-
-1. **Load a Stage 2 checkpoint** (via `--resume_from`). Use the fixed
-   `load_latest_checkpoint` from Appendix A (handles direct checkpoint paths).
-
-2. **Wrap the backbone** in `RecursiveSERF` with `n_loops` from CLI arg.
-
-3. **Loss function** — deep supervision (weighted sum across loops):
-   ```python
-   gamma = 0.8
-   n = len(all_logits)   # all_logits: list of [B, T, V] tensors
-   weights = [gamma ** (n - 1 - i) for i in range(n)]
-   total_loss = sum(w * ce_loss(logits, labels) for w, logits in zip(weights, all_logits))
-   total_loss /= sum(weights)   # normalize so loss is comparable across n_loops
-   ```
-
-4. **Curriculum** — in a single run, start with `n_loops=2` for the first third of
-   steps, then `n_loops=4` for the second third. This avoids shock to the model.
-
-5. **Gate check** — after every `val_every` steps, compute val_ce with
-   `n_loops=1` (baseline) AND `n_loops=current`. If
-   `val_ce[n_loops] > val_ce[1] * 1.05`, print a warning and reduce `n_loops` by 1.
-
-6. **Checkpoint format** — same as previous stages plus:
-   ```python
-   "n_loops": int,
-   "recursive_ema_decay": float,
-   ```
-
-7. **CLI args** (minimum):
-   ```
-   --preset           [nano/small/medium]
-   --resume_from      path to Stage 2 checkpoint
-   --n_loops          int (default 4)
-   --token_budget     int (default 500_000_000 for fine-tuning run)
-   --lr               float (default 1e-5, lower than SFT)
-   --output_dir       default runs/stage3
-   --push_to_hub      flag
-   --hf_token
-   --wandb_mode
-   ```
-
-8. **Success criterion** — val_ce at `n_loops=4` ≤ val_ce at `n_loops=1` × 1.05.
-   If met, print: `"Stage 3 gate passed. Proceed to Stage 4 (GRPO)."`
-
-### Verification checklist
-
-```bash
-python recursive_finetune.py \
-  --preset nano \
-  --resume_from runs/stage2/checkpoint-XXXXXXX \
-  --n_loops 2 \
-  --token_budget 100_000 \
-  --wandb_mode disabled
-```
-
-- [ ] Loads Stage 2 checkpoint cleanly (step > 0)
-- [ ] Initial loss ≈ Stage 2 final val_ce (not 11.93 — model is already trained)
-- [ ] Loss at n_loops=2 ≤ loss at n_loops=1 × 1.05 within 100 steps
-- [ ] Gate check fires at val_every and prints both CE values
-- [ ] Checkpoint contains `n_loops` key
+> The original Appendix B (EMA hidden-state loop) is **superseded and incorrect**.
+> It is retained below as an archived note. The correct implementation is in
+> `stage3_agent_prompt.md` (a separate file created during the 2026-04-03 session).
+ 
+### Why the original Appendix B approach was wrong
+ 
+The Samsung TRM paper (arXiv:2510.04871) describes an **encoder** model for
+fixed-size grid tasks (ARC-AGI, Sudoku, Mazes). Its key properties:
+ 
+- **Encoder architecture**: Bidirectional, processes the entire grid simultaneously.
+  Not an autoregressive decoder.
+- **Fixed-size I/O**: Input and output have the same shape. Recursion refines
+  the whole answer grid in-place.
+- **Ground-truth at every loop**: Deep supervision works because the correct
+  grid is known at every recursion step.
+- **EMA of model weights** (not hidden states): TRM uses weight EMA for
+  generalisation, not for the recursion mechanism itself.
+ 
+Applying the "EMA-loop hidden states" approach to an autoregressive LLM:
+- Has no gradient signal — the model gets no feedback saying "use these loops".
+- Does not create new information — averaging hidden states across loops
+  is a linear operation on the same computation.
+- The deep supervision via gamma weights requires ground-truth at each step,
+  which text generation does not have.
+ 
+### Correct approach: Coconut-Ouroboros
+ 
+Based on Meta's Coconut paper (arXiv:2412.06769), adapted for TRM-Mamba.
+ 
+**Core mechanism**: Replace `<think>...</think>` reasoning tokens with K
+*latent thought positions* where the last hidden state is injected directly
+as the next position's input embedding (bypassing the token embedding table).
+ 
+**Mamba SSM advantage**: During each latent pass, the Mamba SSM recurrent
+state propagates a compressed O(d_state) summary of all previous positions.
+Pure Transformer-Coconut only has attention at the latent position; our
+Mamba-Coconut accumulates a persistent scratch-memory in the SSM state
+across all K passes. This is a genuine architectural advantage.
+ 
+**Curriculum (3 sub-stages)**:
+ 
+| Sub-stage | K | Resume from | Output dir | Gate |
+|---|---|---|---|---|
+| 3.1 | 1 | Stage 2 final ckpt | runs/stage3_k1 | answer val_ce ≤ stage2 × 1.05 |
+| 3.2 | 4 | Stage 3.1 final ckpt | runs/stage3_k4 | answer val_ce ≤ stage2 × 1.05 |
+| 3.3 | 16 | Stage 3.2 final ckpt | runs/stage3_k16 | answer val_ce ≤ stage2 × 1.05 |
+ 
+**Key implementation files**:
+- `stage3_agent_prompt.md` — complete coding agent prompt (created 2026-04-03)
+- `recursive_finetune.py` — to be generated by coding agent from above prompt
+- Requires two new methods in `baseline_trm_mamba.py`:
+  `forward_with_hidden()` and `forward_from_embeddings()`
+ 
+**Success criterion**: answer val_ce at K=16 ≤ stage2 answer val_ce × 1.05,
+with coherent generation on GEN_PROMPTS_STAGE3. Print banner and record in terminal_log.md.
+ 
+### Archived: Original Appendix B (for reference only — do not implement)
+ 
+The original approach proposed:
+- `RecursiveSERF` wrapper with n_loops forward passes
+- EMA of hidden states: `ema = decay*ema + (1-decay)*hidden`
+- Deep supervision with gamma=0.8 weights across loops
+- Two new backbone methods: `forward_with_hidden` and `forward_from_embeddings`
+ 
+The `forward_with_hidden` and `forward_from_embeddings` methods ARE still
+needed (for Coconut-Ouroboros), so those signatures are retained.
+The `RecursiveSERF` wrapper and EMA-loop mechanism are discarded.
 
 ---
 
