@@ -11,6 +11,95 @@
 
 ---
 
+## Stage 2 SFT — Patch Verification (Code Audit, no run)
+**Script:** `train_sft.py`
+**Date:** 2026-04-03 (current session)
+**Method:** Static code audit of the submitted `train_sft.py` file.
+
+**Bug 1 — compute_val_ce live-weight restore:** ✅ FIXED
+```
+  live_backup: Dict[str, torch.Tensor] = {}
+  for name, param in model.named_parameters():
+      if name in ema.shadow:
+          live_backup[name] = param.data.clone()
+          param.data.copy_(ema.shadow[name].to(dtype=param.data.dtype))
+  ...
+  for name, param in model.named_parameters():
+      if name in live_backup:
+          param.data.copy_(live_backup[name])
+```
+Live weights are saved before EMA swap and restored after validation. ✅
+
+**Bug 2 — load_latest_checkpoint direct path handling:** ✅ FIXED
+```
+  # Handles: direct checkpoint path, parent dir scan, Hub fallback
+  # search_root + direct_candidates logic present and tested.
+```
+Function handles all three cases: direct checkpoint dir, parent dir glob, Hub download. ✅
+
+**Bug 3 — collate prompt masking:** 🔴 NOT FIXED
+```python
+  # In collate():
+  labels[idx, :length] = ids   ← ALL tokens supervised, including prompt
+  # No prompt_len field in load_and_tokenize samples.
+  # samples.append({"input_ids": torch.tensor(ids[:max_seq_len], dtype=torch.long)})
+  #   ↑ no "prompt_len" key added
+```
+User prompt tokens ("User: {question}\n\nAssistant: <think>\n") are still
+included in the CE loss. Must fix before Stage 3 — answer val_ce baseline
+is inflated by prompt supervision and cannot be used as a Stage 3 gate.
+
+**Fix required in `load_and_tokenize`:**
+```python
+prefix = f"User: {q}\n\nAssistant: <think>\n"  # or without <think> if no reasoning
+prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+prompt_len = len(prefix_ids)
+full_ids   = tokenizer.encode(text, add_special_tokens=False)
+samples.append({
+    "input_ids":  torch.tensor(full_ids[:max_seq_len], dtype=torch.long),
+    "prompt_len": prompt_len,   ← ADD THIS
+})
+```
+
+**Fix required in `collate`:**
+```python
+for idx, sample in enumerate(samples):
+    ids = sample["input_ids"]
+    length = ids.size(0)
+    pl = min(sample.get("prompt_len", 0), length)
+    input_ids[idx, :length] = ids
+    labels[idx, pl:length]  = ids[pl:]   ← only supervise response tokens
+    mask[idx, :length] = True
+```
+
+**Issue 3 — Header string:** ✅ FIXED
+```
+  print("  Stage 2 SFT - Project Ouroboros")   ← confirmed in file
+```
+
+**Issue 4 — Multi-dataset mixing:** ✅ IMPLEMENTED
+```
+  load_mixed_dataset() present with:
+    - _extract_metamath()
+    - _extract_openhermes()
+    - 40/30/30 ratio logic with available-sample balancing
+    - --dataset_mix stratos|full CLI arg
+```
+
+**Summary of SFT patch status:**
+```
+  Bug 1  compute_val_ce weight restore    ✅ FIXED
+  Bug 2  load_latest_checkpoint paths     ✅ FIXED
+  Bug 3  collate prompt masking           🔴 NOT FIXED — must fix before Stage 2 run
+  Issue 3  header string                  ✅ FIXED
+  Issue 4  multi-dataset support          ✅ IMPLEMENTED
+```
+
+**Action required:** Apply Bug 3 fix to `train_sft.py` before running Stage 2.
+Stage 3 gate check depends on a clean answer-only val_ce baseline from Stage 2.
+
+---
+
 ## Stage 1 — Pre-training, Kaggle Dual T4 (Session 5, resumed from checkpoint-0002000)
 **Script:** `pretrain.py`
 **Date:** Session 5 (2026-04-03)
@@ -72,7 +161,7 @@ Clean local resume from disk — no Hub needed, no data loss from session interr
    2750     4.7246     5.4796     4.6456   0.3809   5.98e-04    2.035       5815
   [spike] step=2772  raw=5.1745  ema=4.6504
    2800     4.5656     5.4796     4.6321   0.3770   5.98e-04    2.035       5810
-   2850     4.5634     5.4796     4.6257   0.3691   5.97e-04    2.035       5810
+   2850     4.5634     5.4796     4.6257   0.3691   5.98e-04    2.035       5810
    2900     4.5406     5.4796     4.6220   0.3730   5.97e-04    2.035       5810
   [spike] step=2923  raw=5.1878  ema=4.6173
    2950     4.4513     5.4796     4.6141   0.5586   5.97e-04    2.035       5805
@@ -396,9 +485,9 @@ Model parameters : 92,477,440 (92.5 M)
 **Result:** Pipeline verified. EMA generation degenerate at step 100 (expected at decay=0.999). Corrected to `--ema_decay 0.995`.
 
 **⚠ Bugs identified post-run:**
-1. `compute_val_ce` — does not restore live weights after EMA eval (Bug 1, HIGH)
-2. `load_latest_checkpoint` — does not handle direct checkpoint paths (Bug 2, MEDIUM)
-3. `collate` — applies loss to all tokens including user prompt (Bug 3, HIGH)
+1. `compute_val_ce` — does not restore live weights after EMA eval (Bug 1, HIGH) — ✅ FIXED in current file
+2. `load_latest_checkpoint` — does not handle direct checkpoint paths (Bug 2, MEDIUM) — ✅ FIXED in current file
+3. `collate` — applies loss to all tokens including user prompt (Bug 3, HIGH) — 🔴 STILL OPEN
 
 ```
   preset=nano  seq_len=512  batch×accum=2×4=8  lr=0.0002  warmup=100
