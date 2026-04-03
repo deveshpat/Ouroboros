@@ -11,18 +11,183 @@
 
 ---
 
-## Stage 1 — Pre-training, Kaggle Dual T4 (full run, in progress)
+## Stage 1 — Pre-training, Kaggle Dual T4 (Session 5, resumed from checkpoint-0002000)
 **Script:** `pretrain.py`
-**Date:** Session 4 (current)
+**Date:** Session 5 (2026-04-03)
+**Hardware:** Kaggle Dual T4 (2× T4 16 GB, DDP auto-launched, world_size=2)
+**Status:** 🟡 IN PROGRESS — log captured at step 3500 / 61,036
+
+**Bug 5 fix confirmed:**
+```
+  [resume] local   checkpoint-0002000  step=2000  epoch=0  tokens=65,536,000  val_ce=5.5642
+```
+Clean local resume from disk — no Hub needed, no data loss from session interrupt. ✅
+
+**Training log (steps 2000–3500):**
+```
+   step   train_ce     val_ce       smth    gnorm         lr     VRAM      tok/s
+--------------------------------------------------------------------------------
+  epoch 0  offset=228  skipping=64000 chunks
+
+   2050     4.5941          -     4.8104   0.7031   5.99e-04    2.035       3169
+   2100     4.5080          -     4.7605   0.3906   5.99e-04    2.035       5809
+   2150     4.7421          -     4.7493   0.4121   5.99e-04    2.035       5808
+   2200     4.7011          -     4.7553   0.4277   5.99e-04    2.035       5802
+   2250     4.6945          -     4.7333   0.4043   5.98e-04    2.035       5806
+  [spike] step=2299  raw=5.3932  ema=4.7166
+   2300     5.0453          -     4.7199   0.9805   5.98e-04    2.035       5815
+   2350     4.5325          -     4.7081   0.4570   5.98e-04    2.035       5810
+   2400     4.4693          -     4.6923   0.8672   5.98e-04    2.035       5810
+   2450     4.6070          -     4.6939   0.5508   5.98e-04    2.035       5808
+  [spike] step=2479  raw=5.2191  ema=4.6873
+   2500     4.5709          -     4.6795   0.4023   5.98e-04    2.035       5808
+  [val] step=2500  val_ce=5.4796
+```
+
+**Generation @ step 2500 (~82M tokens seen):**
+```
+  P: The capital of France is
+  C:  the only one that is the most important of the world. The world is the world's most important...
+     uwr=0.202
+  P: In mathematics, a prime number is
+  C:  a simple one. The first thing that is important is that the basic principle of the word is the value...
+     uwr=0.193
+  P: def factorial(n):  """Return n!."""  if n
+  C:  . 1000000000000000000000000000000000000000000000000000000000000000000000...
+     uwr=1.000   (digit loop, expected)
+  P: Neural networks learn by
+  C:  using the same technology as the internet. The internet is a very common type of internet connection...
+     uwr=0.222
+  P: The French Revolution began in
+  C:  the 19th century, when the French Revolution was the first to be a part of the Soviet Union...
+     uwr=0.260
+  Mean UWR: 0.375
+```
+
+```
+   2550     4.8075     5.4796     4.6841   0.6641   5.98e-04    2.035       3181
+   2600     4.5635     5.4796     4.6661   0.3965   5.98e-04    2.035       5802
+   2650     4.5249     5.4796     4.6582   0.4473   5.98e-04    2.035       5806
+   2700     4.4584     5.4796     4.6462   0.5391   5.98e-04    2.035       5810
+   2750     4.7246     5.4796     4.6456   0.3809   5.98e-04    2.035       5815
+  [spike] step=2772  raw=5.1745  ema=4.6504
+   2800     4.5656     5.4796     4.6321   0.3770   5.98e-04    2.035       5810
+   2850     4.5634     5.4796     4.6257   0.3691   5.97e-04    2.035       5810
+   2900     4.5406     5.4796     4.6220   0.3730   5.97e-04    2.035       5810
+  [spike] step=2923  raw=5.1878  ema=4.6173
+   2950     4.4513     5.4796     4.6141   0.5586   5.97e-04    2.035       5805
+   3000     4.4762     5.4796     4.6025   0.4414   5.97e-04    2.035       5823
+  [val] step=3000  val_ce=5.4154
+```
+
+**Generation @ step 3000 (~98M tokens seen):**
+```
+  P: The capital of France is
+  C:  the most important part of the economy. The main purpose of the economy is to make the economy...
+     uwr=0.255
+  P: In mathematics, a prime number is
+  C:  the number of times the number of times the number of people in a given group is 1...
+     uwr=0.152
+  P: def factorial(n):  """Return n!."""  if n
+  C:  . 1000000000000000000000000000000000000000000000000000000000000000000000...
+     uwr=1.000   (digit loop, expected)
+  P: Neural networks learn by
+  C:  the time they are given. The data is then collected from the data and then sent to the data...
+     uwr=0.160
+  P: The French Revolution began in
+  C:  1822, and the French Revolution was the first to be replaced by the French Revolution...
+     uwr=0.150
+  Mean UWR: 0.343
+```
+
+**Checkpoint-0003000 saved and Hub-synced:**
+```
+  [ckpt] saved  -> runs/stage1/checkpoint-0003000
+  [hub] uploading checkpoint-0003000 -> WeirdRunner/Ouroboros ...
+  [hub] uploaded  checkpoint-0003000 (commit=5e2ba2b8)
+```
+Local-first + Hub fire-and-forget confirmed working. ✅
+
+```
+   3050     4.5598     5.4154     4.5969   0.4785   5.97e-04    2.035       3070
+   3100     4.7398     5.4154     4.5867   0.4180   5.97e-04    2.035       5804
+  [spike] step=3112  raw=5.4127  ema=4.5942
+  [spike] step=3146  raw=5.2242  ema=4.6168
+   3150     4.6520     5.4154     4.6142   0.4648   5.97e-04    2.035       5801
+  [spike] step=3160  raw=5.2053  ema=4.6183
+   3200     4.4035     5.4154     4.6143   0.3926   5.97e-04    2.035       5801
+   3250     4.7021     5.4154     4.6059   0.6797   5.97e-04    2.035       5807
+   3300     4.7683     5.4154     4.5951   0.3867   5.97e-04    2.035       5806
+   3350     4.4831     5.4154     4.5798   0.4121   5.97e-04    2.035       5803
+   3400     4.1759     5.4154     4.5612   0.4941   5.96e-04    2.035       5802
+   3450     4.5199     5.4154     4.5482   0.4004   5.96e-04    2.035       5800
+  [spike] step=3475  raw=5.8600  ema=4.5615   ← ⚠ cluster start
+  [spike] step=3476  raw=5.8159  ema=4.5740   ← ⚠ consecutive
+  [spike] step=3477  raw=5.6536  ema=4.5848   ← ⚠ consecutive
+   3500     4.4163     5.4154     4.5772   0.5078   5.96e-04    2.035       5799
+  [val] step=3500  val_ce=5.3622
+```
+
+**Generation @ step 3500 (~115M tokens seen):**
+```
+  P: The capital of France is
+  C:  a major factor in the development of the country. The government of the country is a major factor...
+     uwr=0.217
+  P: In mathematics, a prime number is
+  C:  a number of numbers. The number of numbers is the number of numbers in a number...
+     uwr=0.088   ← repetitive, spike cluster effect
+  P: def factorial(n):  """Return n!."""  if n
+  C: is ll l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l
+     uwr=0.025   ← degenerate (letter loop), spike cluster effect; expected to recover
+  P: Neural networks learn by
+  C:  the way, and the network is a network of networks that can be used to communicate with the network...
+     uwr=0.178
+  P: The French Revolution began in
+  C:  the 19th century, and the French Revolution was the result of the revolution of the 19th century...
+     uwr=0.267
+  Mean UWR: 0.155   ← ⚠ below previous values; correlated with spike cluster 3475–3477
+```
+
+*(Log ends here — run still in progress)*
+
+---
+
+**Loss curve summary (full run to step 3500):**
+
+| Step | Train CE | Smoothed | Val CE | Tokens Seen | Notes |
+|---|---|---|---|---|---|
+| 1 | 11.98 | 11.98 | — | 32k | Random init |
+| 500 | 5.46 | 5.78 | 6.38 | 16.4M | Phrases forming |
+| 1000 | 4.97 | 5.14 | 5.85 | 32.8M | Real sentences |
+| 1500 | 4.89 | 4.91 | 5.68 | 49.2M | Coherent prose |
+| 2000 | — | — | 5.56 | 65.5M | Resumed (ckpt-2000) |
+| 2500 | 4.57 | 4.68 | 5.48 | 82.0M | Consistent drop |
+| 3000 | 4.48 | 4.60 | 5.42 | 98.3M | Hub sync working |
+| 3500 | 4.42 | 4.58 | 5.36 | 114.7M | Spike cluster ⚠ |
+
+**Key observations:**
+- Val CE declining every checkpoint: 6.38 → 5.85 → 5.68 → 5.56 → 5.48 → 5.42 → 5.36 ✅
+- VRAM flat at 2.035 GB throughout — zero graph retention ✅
+- Spike rate: 12 spikes / 3500 steps = 0.34% — well within 10% threshold ✅
+- Spike cluster at 3475–3477 (3 consecutive) is the first cluster seen; isolated spikes
+  before this were all single-step. Watch for recurrence. If another cluster appears,
+  consider increasing `--shuffle_buffer` to 20000.
+- UWR dip at step 3500 is a lagging indicator from the spike cluster and expected to
+  recover at step 4000. Val CE (5.36) did not spike — primary signal is healthy.
+- Code prompt loops (digit/letter) are expected — FineWeb-Edu has negligible code content.
+
+---
+
+## Stage 1 — Pre-training, Kaggle Dual T4 (Session 4, steps 1–1700)
+**Script:** `pretrain.py`
+**Date:** Session 4
 **Hardware:** Kaggle Dual T4 (2× T4 16 GB, DDP auto-launched, world_size=2)
 **Run type:** Full 2B-token run — `token_budget=2_000_000_000`, `total_steps=61,036`
-**Status:** 🟡 IN PROGRESS — log captured at step 1700 / 61,036
+**Status:** 🟡 Session ended at step 1700; resumed in Session 5
 
-**⚠ CRITICAL issue discovered at step 1000:**
-Hub 401 (invalid HF token) caused `save_checkpoint` to abandon the `.tmp` directory
-without finalizing it. No local checkpoint was written. If the session resets before
-the next successful save, all progress is lost. See Bug 5 in BLUEPRINT.md Part 7.
-**Immediate action:** Fix `save_checkpoint` to finalize locally before Hub push.
+**⚠ No checkpoint saved (Bug 5):** Hub 401 at step 1000 caused `save_checkpoint` to
+abandon `.tmp` without renaming to final. Bug 5 was patched before Session 5.
+Session 5 started from scratch (step=0) since no local checkpoint existed from Session 4.
 
 ---
 

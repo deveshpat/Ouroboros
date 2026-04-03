@@ -26,7 +26,7 @@ on SFT data. Output: comma-loops and "the the the". Three root causes:
 | Stage | Name | Status | Gate |
 |---|---|---|---|
 | 0 | Architecture & Viability | ✅ COMPLETE | All 4 gates passed |
-| 1 | Pre-training | 🟡 IN PROGRESS on Kaggle Dual T4 — step ~1700 / 61,036 | val_ce < 3.0 + UWR > 0.05 |
+| 1 | Pre-training | 🟡 IN PROGRESS on Kaggle Dual T4 — step ~3500 / 61,036 | val_ce < 3.0 + UWR > 0.05 |
 | 2 | SFT | 🔴 BLOCKED — 3 bugs + multi-dataset not implemented | Fix bugs first |
 | 3 | Recursive Inference | ⬜ NOT STARTED | Stage 2 val_ce < 1.5 |
 | 4 | GRPO | ⬜ NOT STARTED | Stage 3 gate |
@@ -34,26 +34,19 @@ on SFT data. Output: comma-loops and "the the the". Three root causes:
 
 ### Immediate next action
 
-**URGENT: Fix Bug 5 in pretrain.py before the Kaggle session resets.**
-The Hub 401 at step 1000 means no checkpoint has been saved yet.
-Apply the `save_checkpoint` patch from Part 7 and restart, OR fix the HF token.
+Stage 1 is running and healthy. Bug 5 is fixed and confirmed working in production
+(checkpoint-0002000 resumed cleanly; checkpoint-0003000 saved locally + pushed to Hub).
+
+While Stage 1 runs, fix the 3 bugs in `train_sft.py` using Appendix A so Stage 2 is
+ready to launch immediately after Stage 1 completes.
 
 ```bash
-# Option A: fix the HF token and restart from scratch (session still running)
-# Set HF_TOKEN correctly in Kaggle secrets, then re-run.
-
-# Option B: patch save_checkpoint to always finalize locally (see Bug 5 fix)
-# then restart — this is the safer long-term fix regardless.
-```
-
-After Stage 1 completes (`val_ce < 3.0` AND `mean_uwr > 0.05`):
-```bash
+# Stage 2 launch (after Stage 1 banner: val_ce < 3.0 AND mean_uwr > 0.05):
 python train_sft.py \
   --preset nano \
   --resume_from runs/stage1/checkpoint-XXXXXXX \
   --ema_decay 0.995
 ```
-BUT: fix Bugs 1–3 in `train_sft.py` first (see Part 7).
 
 ---
 
@@ -215,10 +208,12 @@ Two-pass to avoid double-initializing tied weights.
 
 **Script:** `pretrain.py`
 **Hardware:** Kaggle Dual T4, DDP world_size=2
-**Status:** Running — step ~1700 / 61,036 (~2.8% complete). See terminal_log.md for full output.
+**Status:** Running — step ~3500 / 61,036 (~5.7% complete). See terminal_log.md for full output.
 
-**⚠ CRITICAL — Bug 5 active:** Hub 401 at step 1000 caused no checkpoint to be saved.
-Apply the `save_checkpoint` fix from Part 7 before the session resets.
+**Bug 5 fix confirmed working:**
+- Session 5 resumed from `checkpoint-0002000` (step=2000, tokens=65.5M) — clean local load ✅
+- `checkpoint-0003000` saved locally first, then uploaded to Hub (commit=5e2ba2b8) ✅
+- Local-first + Hub fire-and-forget is now the live behaviour.
 
 **Dry-run checklist (completed):**
 - [x] No import errors; FakeMamba smoke test passes (epoch_offset=7, loss decreasing)
@@ -238,13 +233,16 @@ save_every=1000, val_every=500, gen_every=500
 DDP throughput: ~5,800 tok/s. Full run ETA: ~9.4h
 ```
 
-**Live observations (step 1700):**
-- Loss 11.98 → 4.85 (smoothed) — healthy trajectory
-- Val CE 6.38 → 5.68 (confirming generalization)
-- Mean UWR 0.38–0.42 — already above 0.05 success threshold
-- VRAM flat at 2.035 GB — no graph retention
-- Two isolated spikes (steps 1148, 1611); spike rate 0.12%
-- Code prompt loops ("1000...0") expected — FineWeb-Edu has no code
+**Live observations (step 3500):**
+- Val CE declining monotonically: 6.38 → 5.85 → 5.68 → 5.56 → 5.48 → 5.42 → 5.36 ✅
+- VRAM flat at 2.035 GB throughout — no graph retention ✅
+- Mean UWR volatile (0.38 → 0.42 → 0.37 → 0.34 → 0.155 at step 3500)
+  - Drop at step 3500 is correlated with spike cluster at steps 3475–3477; likely transient
+  - Code prompt ("def factorial") consistently degenerate — expected, FineWeb-Edu has no code
+  - UWR on 5 prompts is noisy; val CE is the primary signal
+- Spike rate: 12 spikes in 3500 steps = 0.34% — well within 10% threshold ✅
+- **⚠ Watch:** Steps 3475/3476/3477 had three consecutive spikes (raw=5.86/5.82/5.66).
+  First cluster seen. If another cluster appears within 500 steps, increase `shuffle_buffer`.
 
 **Success criteria:**
 - [ ] `val_ce < 3.0` AND `mean_uwr > 0.05` (script prints banner when met)
@@ -619,8 +617,9 @@ Also update `Part 6 — Hub push protocol` to reflect the corrected order:
   - Change 2: `load_latest_checkpoint` + 4 helper functions — explicit path / local / Hub fallback
   - Change 3: `cleanup_temporary_checkpoints` call at startup
 
-**Status:** 🔴 NOT FIXED. Kaggle file persistence is now enabled (files survive interrupts),
-so local checkpoints are safe once written. Fix this before the next `save_every` fires.
+**Status:** ✅ FIXED and confirmed in production.
+- Session 5 resumed from `checkpoint-0002000` (local load) ✅
+- `checkpoint-0003000` saved locally then pushed to Hub (commit=5e2ba2b8) ✅
 
 ---
 
