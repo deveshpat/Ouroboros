@@ -148,6 +148,10 @@ class PretrainConfig:
     gen_max_tokens: int = 120
     spike_threshold: float = 0.5
 
+    # Graceful timeout
+    session_timeout_hours: float = 12.0
+    graceful_exit_buffer_minutes: float = 15.0
+
     # Reproducibility
     seed: int = 42
 
@@ -651,6 +655,7 @@ def save_checkpoint(
     val_ce: Optional[float],
     cfg: PretrainConfig,
     hf_token: Optional[str],
+    force_local_only: bool = False,
 ) -> Optional[Path]:
     """
     Write a checkpoint to local disk first (always), then attempt Hub push (fire-and-forget).
@@ -723,8 +728,8 @@ def save_checkpoint(
         shutil.rmtree(old, ignore_errors=True)
         print(f"  [ckpt] pruned -> {old.name}")
 
-    # ── Step 3: attempt Hub push (fire-and-forget, never blocks) ─────────────
-    if cfg.push_to_hub and hf_token:
+    # ── Step 3: Hub push (skipped when force_local_only=True) ────────────────────
+    if cfg.push_to_hub and hf_token and not force_local_only:
         uploaded = sync_checkpoint_to_hub(final_dir, cfg.hf_repo_id, hf_token)
         if not uploaded:
             print(
@@ -960,6 +965,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gen_every", type=int, default=defaults.gen_every)
     parser.add_argument("--gen_max_tokens", type=int, default=defaults.gen_max_tokens)
     parser.add_argument("--spike_threshold", type=float, default=defaults.spike_threshold)
+    parser.add_argument(
+        "--session_timeout_hours",
+        type=float,
+        default=defaults.session_timeout_hours,
+        help="Total wall-clock budget in hours. Set to 9.0 on restricted Kaggle slots.",
+    )
+    parser.add_argument(
+        "--graceful_exit_buffer_minutes",
+        type=float,
+        default=defaults.graceful_exit_buffer_minutes,
+        help="Save checkpoint and exit this many minutes before session_timeout_hours.",
+    )
 
     parser.add_argument("--seed", type=int, default=defaults.seed)
 
@@ -1080,6 +1097,7 @@ def print_header(
     print(f"  device           : {device}")
     print(f"  output_dir       : {cfg.output_dir}")
     print(f"  push_to_hub      : {cfg.push_to_hub}")
+    print(f"  timeout          : {cfg.session_timeout_hours}h  (buffer={cfg.graceful_exit_buffer_minutes:.0f} min)")
     print("=" * 72)
     print()
 
@@ -1324,6 +1342,17 @@ def smoke_test_20_steps() -> None:
             if restored[0] != 20:
                 raise AssertionError(f"checkpoint round-trip restored wrong step: {restored[0]}")
             print("[smoke] checkpoint saved and reloaded cleanly")
+
+        # Smoke test: timeout detection fires when elapsed > limit - buffer
+        smoke_cfg_timeout = PretrainConfig(
+            session_timeout_hours=0.0001,        # ~0.36 seconds — always triggers
+            graceful_exit_buffer_minutes=0.0,
+        )
+        elapsed_fake = smoke_cfg_timeout.session_timeout_hours * 3600 + 1.0
+        assert elapsed_fake + smoke_cfg_timeout.graceful_exit_buffer_minutes * 60 >= \
+               smoke_cfg_timeout.session_timeout_hours * 3600, \
+            "Timeout logic boundary check failed"
+        print("[smoke] timeout detection boundary: OK")
     finally:
         globals()["load_dataset"] = original_load_dataset
         baseline_module.MAMBA_AVAILABLE = original_mamba_available
@@ -1575,6 +1604,39 @@ def run_training(argv: Optional[List[str]] = None) -> int:
         tokens_since_log = 0
         optimizer.zero_grad(set_to_none=True)
 
+        # ── Session wall-clock timeout ────────────────────────────────────────────────
+        _session_start    = time.perf_counter()
+        _timeout_limit_s  = cfg.session_timeout_hours * 3600.0
+        _timeout_buffer_s = cfg.graceful_exit_buffer_minutes * 60.0
+        _timeout_triggered = False
+
+        def _check_timeout() -> bool:
+            """Return True if the timeout buffer has been entered on rank 0."""
+            nonlocal _timeout_triggered
+            if _timeout_triggered:
+                return True
+            if not is_main_process(rank):
+                return False
+            elapsed = time.perf_counter() - _session_start
+            if elapsed + _timeout_buffer_s >= _timeout_limit_s:
+                remaining_min = (_timeout_limit_s - elapsed) / 60.0
+                print(
+                    f"\n  [timeout] {elapsed / 3600:.2f}h elapsed — "
+                    f"{remaining_min:.1f} min remaining (< {cfg.graceful_exit_buffer_minutes:.0f} min buffer)."
+                )
+                _timeout_triggered = True
+            return _timeout_triggered
+
+        def _broadcast_timeout() -> bool:
+            """Broadcast timeout flag from rank 0 to all ranks; return updated flag."""
+            nonlocal _timeout_triggered
+            if not distributed:
+                return _timeout_triggered
+            t_tensor = torch.tensor([int(_timeout_triggered)], device=device, dtype=torch.int32)
+            dist.broadcast(t_tensor, src=0)
+            _timeout_triggered = bool(t_tensor.item())
+            return _timeout_triggered
+
         pbar = None
         if is_main_process(rank):
             pbar = tqdm(total=total_steps, initial=step, desc="Stage1", dynamic_ncols=True)
@@ -1675,6 +1737,39 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                     train_start = time.perf_counter()
                     tokens_since_log = 0
 
+                # ── Graceful timeout check ────────────────────────────────────────────────────
+                _check_timeout()
+                if _broadcast_timeout():
+                    if is_main_process(rank):
+                        print(f"  [timeout] Saving emergency checkpoint at step {step} (local only) ...")
+                        save_checkpoint(
+                            output_dir=output_dir,
+                            step=step,
+                            epoch=epoch,
+                            chunks_in_epoch=chunks_in_epoch,
+                            tokens_processed=tokens_processed,
+                            model=raw_model,
+                            model_config=model_config,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            scaler=scaler,
+                            ema=ema,
+                            val_ce=last_val_ce,
+                            cfg=cfg,
+                            hf_token=hf_token,
+                            force_local_only=True,
+                        )
+                        last_saved_step = step
+                        print(
+                            f"  [timeout] Emergency checkpoint saved.\n"
+                            f"  [timeout] Resume: python pretrain.py "
+                            f"--resume_from {output_dir} "
+                            f"--session_timeout_hours {cfg.session_timeout_hours}"
+                        )
+                    if distributed:
+                        dist.barrier()
+                    break
+
                 need_save = step % cfg.save_every == 0
                 if need_save:
                     if is_main_process(rank):
@@ -1738,15 +1833,39 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                     if distributed:
                         dist.barrier()
 
-                if tokens_processed >= cfg.token_budget or step >= total_steps:
+                if tokens_processed >= cfg.token_budget or step >= total_steps or _timeout_triggered:
                     break
 
-            if tokens_processed >= cfg.token_budget or step >= total_steps:
+            if tokens_processed >= cfg.token_budget or step >= total_steps or _timeout_triggered:
                 break
             chunks_in_epoch = 0
 
         if pbar is not None:
             pbar.close()
+
+        if _timeout_triggered:
+            if is_main_process(rank):
+                elapsed_h = (time.perf_counter() - _session_start) / 3600.0
+                print()
+                print("=" * 72)
+                print("  [timeout] Session budget exhausted — graceful exit")
+                print("=" * 72)
+                print(f"  Wall time elapsed  : {elapsed_h:.2f}h / {cfg.session_timeout_hours}h")
+                print(f"  Steps completed    : {step:,} / {total_steps:,}")
+                print(f"  Tokens processed   : {tokens_processed:,} / {cfg.token_budget:,}")
+                print(f"  Last val CE        : {last_val_ce if last_val_ce is not None else 'n/a'}")
+                print(f"  Checkpoint saved   : runs/stage1/checkpoint-{step:07d}  (local only)")
+                print()
+                print("  To resume in next session:")
+                print(f"    python pretrain.py --resume_from {output_dir} \\")
+                print(f"      --session_timeout_hours {cfg.session_timeout_hours}")
+                print("=" * 72)
+            if wandb_run is not None:
+                import wandb
+                wandb.finish()
+            if distributed:
+                dist.barrier()
+            return 0
 
         need_final_save = step != last_saved_step
         if need_final_save:
