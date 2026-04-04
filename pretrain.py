@@ -38,7 +38,6 @@ import shutil
 import socket
 import sys
 import time
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -50,6 +49,24 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+
+from training_utils import (
+    ModelEMA,
+    autocast_context,
+    build_adamw_optimizer,
+    checkpoint_step_from_name,
+    cleanup_temporary_checkpoints,
+    cosine_with_warmup,
+    download_checkpoint_from_hub,
+    ema_scope,
+    list_local_checkpoints,
+    list_remote_checkpoint_names,
+    resolve_hf_token,
+    set_seed,
+    sync_checkpoint_to_hub,
+    try_load_state,
+    vram_gb,
+)
 
 try:
     from transformers import AutoTokenizer
@@ -75,9 +92,6 @@ except ImportError as exc:
     )
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-HF_UPLOAD_TIMEOUT_SECONDS = 300.0
-
 
 PRESETS: Dict[str, Dict[str, Any]] = {
     "nano": dict(d_model=512, n_groups=1, n_heads=8, n_kv_heads=4),
@@ -159,13 +173,6 @@ class PretrainConfig:
     wandb_project: str = "ouroboros-stage1"
     wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
-
-
-def resolve_hf_token(cfg: PretrainConfig) -> Optional[str]:
-    """Return the Hugging Face write token from config or environment only."""
-    if cfg.hf_token:
-        return cfg.hf_token
-    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
 
 class TokenStream:
@@ -303,56 +310,6 @@ def pretrain_loss(logits: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(shift_logits, shift_labels)
 
 
-class ModelEMA:
-    """Exponential Moving Average of model weights."""
-
-    def __init__(self, model: torch.nn.Module, decay: float) -> None:
-        self.decay = decay
-        self.shadow = {
-            name: param.detach().clone()
-            for name, param in model.named_parameters()
-            if param.requires_grad
-        }
-
-    @torch.no_grad()
-    def update(self, model: torch.nn.Module) -> None:
-        one_minus = 1.0 - self.decay
-        for name, param in model.named_parameters():
-            if name in self.shadow:
-                self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=one_minus)
-
-    def state_dict(self) -> Dict[str, Any]:
-        return {"decay": self.decay, "shadow": self.shadow}
-
-    def load_state_dict(self, sd: Dict[str, Any]) -> None:
-        self.decay = float(sd.get("decay", self.decay))
-        for name, tensor in sd.get("shadow", {}).items():
-            if name in self.shadow and self.shadow[name].shape == tensor.shape:
-                self.shadow[name].copy_(tensor)
-
-
-
-def cosine_with_warmup(
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
-    total_steps: int,
-    min_lr_ratio: float,
-) -> LambdaLR:
-    """Linear warmup followed by cosine decay to min_lr_ratio times base LR."""
-
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return (step + 1) / max(warmup_steps, 1)
-        if total_steps <= warmup_steps:
-            return min_lr_ratio
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-    return LambdaLR(optimizer, lr_lambda)
-
-
-
 def dist_is_initialized() -> bool:
     """Return True when torch.distributed collectives are ready to use."""
     return dist.is_available() and dist.is_initialized()
@@ -425,45 +382,6 @@ def take_local_micro_batch(
     return chunks
 
 
-def autocast_context(device: torch.device, dtype: torch.dtype):
-    """Return an autocast context that only activates on CUDA."""
-    return torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda"))
-
-
-
-def set_seed(seed: int) -> None:
-    """Seed Python and PyTorch RNGs for deterministic control flow."""
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-
-def vram_gb(device: torch.device) -> float:
-    """Return allocated VRAM in GiB or 0.0 on CPU."""
-    if device.type != "cuda":
-        return 0.0
-    return torch.cuda.memory_allocated(device) / (1024 ** 3)
-
-
-
-def checkpoint_step_from_name(name: str) -> int:
-    """Extract the numeric step from a checkpoint directory name."""
-    prefix = "checkpoint-"
-    if prefix not in name:
-        return -1
-    tail = name.split(prefix, 1)[1]
-    digits = []
-    for ch in tail:
-        if ch.isdigit():
-            digits.append(ch)
-        else:
-            break
-    return int("".join(digits)) if digits else -1
-
-
-
 def effective_tokens_per_step(cfg: PretrainConfig) -> int:
     """Return the global token count consumed by one optimizer step."""
     return cfg.batch_size * cfg.grad_accum * cfg.chunk_size
@@ -494,12 +412,7 @@ def compute_val_ce(
     batch_size: int,
 ) -> float:
     """Compute held-out per-token CE with EMA weights in batched chunks."""
-    live_backup: Dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        if name in ema.shadow:
-            live_backup[name] = param.data.clone()
-            param.data.copy_(ema.shadow[name].to(device=param.device, dtype=param.dtype))
-
+    _ = vocab_size
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -515,19 +428,16 @@ def compute_val_ce(
         total_loss += loss.item() * n_tokens
         total_tokens += n_tokens
 
-    for chunk in token_stream.val_chunks():
-        batch_buf.append(chunk)
-        if len(batch_buf) == batch_size:
+    with ema_scope(model, ema):
+        for chunk in token_stream.val_chunks():
+            batch_buf.append(chunk)
+            if len(batch_buf) == batch_size:
+                _run_batch(batch_buf)
+                batch_buf = []
+        if batch_buf:
             _run_batch(batch_buf)
-            batch_buf = []
-    if batch_buf:
-        _run_batch(batch_buf)
 
     model.train()
-    for name, param in model.named_parameters():
-        if name in live_backup:
-            param.data.copy_(live_backup[name])
-
     return total_loss / max(total_tokens, 1)
 
 
@@ -587,56 +497,6 @@ def run_generation_callback(
 
     model.train()
     return mean_uwr
-
-
-
-def sync_checkpoint_to_hub(
-    checkpoint_dir: Path,
-    repo_id: str,
-    token: str,
-) -> bool:
-    """Upload one checkpoint directory to the Hugging Face Hub without raising."""
-    try:
-        from huggingface_hub import HfApi
-    except ImportError:
-        print("[hub] huggingface_hub not installed - skipping Hub sync.")
-        return False
-
-    remote_name = checkpoint_dir.name[:-4] if checkpoint_dir.name.endswith(".tmp") else checkpoint_dir.name
-    try:
-        api = HfApi(token=token)
-        api.create_repo(repo_id=repo_id, token=token, private=True, exist_ok=True)
-        print(f"  [hub] uploading {remote_name} -> {repo_id} ...")
-        future = api.upload_folder(
-            repo_id=repo_id,
-            folder_path=str(checkpoint_dir),
-            path_in_repo=remote_name,
-            token=token,
-            commit_message=f"Upload {remote_name}",
-            run_as_future=True,
-        )
-        commit_info = future.result(timeout=HF_UPLOAD_TIMEOUT_SECONDS)
-        oid = getattr(commit_info, "oid", "?")
-        oid_short = oid[:8] if isinstance(oid, str) and oid != "?" else "?"
-        print(f"  [hub] uploaded  {remote_name} (commit={oid_short})")
-        return True
-    except FutureTimeoutError:
-        print(f"  [hub] upload timed out for {remote_name}; local copy retained.")
-        return False
-    except Exception as exc:
-        print(f"  [hub] upload failed for {remote_name}: {exc}")
-        return False
-
-
-
-def cleanup_temporary_checkpoints(output_dir: Path) -> None:
-    """Remove stale .tmp checkpoint directories left by previously interrupted runs."""
-    if not output_dir.exists():
-        return
-    for p in output_dir.iterdir():
-        if p.is_dir() and p.name.endswith(".tmp"):
-            print(f"  [cleanup] removing stale tmp checkpoint: {p.name}")
-            shutil.rmtree(p, ignore_errors=True)
 
 
 
@@ -741,109 +601,6 @@ def save_checkpoint(
 
 
 
-def _list_local_checkpoints(output_dir: Path) -> List[Path]:
-    """
-    Return finalized local checkpoint directories sorted newest-first.
-    Skips .tmp dirs and any directory whose name doesn't parse as a step number.
-    """
-    if not output_dir.exists() or not output_dir.is_dir():
-        return []
-    candidates = []
-    for p in output_dir.iterdir():
-        if p.is_dir() and not p.name.endswith(".tmp"):
-            step = checkpoint_step_from_name(p.name)
-            if step >= 0:
-                candidates.append(p)
-    return sorted(candidates, key=lambda p: checkpoint_step_from_name(p.name), reverse=True)
-
-
-
-def _try_load_state(path: Path, device: torch.device) -> Optional[Dict[str, Any]]:
-    """
-    Load training_state.pt from a checkpoint directory.
-    Returns None (instead of raising) when the checkpoint is missing, incomplete, or corrupted.
-    Required keys: model_state_dict, optimizer, scheduler.
-    """
-    state_path = path / "training_state.pt"
-    if not state_path.exists():
-        return None
-    try:
-        state = torch.load(state_path, map_location=device)
-    except Exception as exc:
-        print(f"  [resume] corrupt checkpoint {path.name}: {exc} — skipping")
-        return None
-    if any(k not in state for k in ("model_state_dict", "optimizer", "scheduler")):
-        print(f"  [resume] incomplete checkpoint {path.name} — skipping")
-        return None
-    return state
-
-
-
-def _list_remote_checkpoint_names(repo_id: str, token: str) -> List[str]:
-    """
-    Return Hub checkpoint directory names sorted newest-first.
-    Returns [] silently on any Hub error (repo not found, bad token, network, etc.).
-    """
-    try:
-        from huggingface_hub import HfApi
-        from huggingface_hub.errors import RepositoryNotFoundError
-    except ImportError:
-        return []
-
-    import re as _re
-    _CKPT_RE = _re.compile(r"^checkpoint-(\d+)$")
-
-    try:
-        api = HfApi(token=token)
-        repo_files = list(api.list_repo_files(repo_id=repo_id, token=token))
-    except Exception:
-        return []
-
-    names = set()
-    for f in repo_files:
-        top = Path(f).parts[0] if Path(f).parts else ""
-        if _CKPT_RE.match(top):
-            names.add(top)
-
-    return sorted(names, key=lambda n: int(_CKPT_RE.match(n).group(1)), reverse=True)
-
-
-
-def _download_checkpoint_from_hub(
-    checkpoint_name: str,
-    output_dir: Path,
-    repo_id: str,
-    token: str,
-) -> Optional[Path]:
-    """
-    Download a single checkpoint directory from the Hub into output_dir.
-    Returns the local path on success, None on any failure.
-    """
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        return None
-
-    local_dir = output_dir / checkpoint_name
-    if local_dir.exists():
-        shutil.rmtree(local_dir, ignore_errors=True)
-
-    try:
-        snapshot_download(
-            repo_id=repo_id,
-            local_dir=str(output_dir),
-            token=token,
-            force_download=True,
-            allow_patterns=[f"{checkpoint_name}/*"],
-        )
-    except Exception as exc:
-        print(f"  [hub]  download failed for {checkpoint_name}: {exc}")
-        return None
-
-    return local_dir if local_dir.exists() else None
-
-
-
 def load_latest_checkpoint(
     output_dir: Path,
     model: BaselineTRMMamba,
@@ -886,14 +643,14 @@ def load_latest_checkpoint(
         return step, epoch, chunks, tokens
 
     # ── Case 1: output_dir IS the checkpoint directory ────────────────────────
-    direct_state = _try_load_state(output_dir, device)
+    direct_state = try_load_state(output_dir, device)
     if direct_state is not None:
         return _restore(direct_state, f"direct  {output_dir.name}")
 
     # ── Case 2: scan local checkpoints newest-first ───────────────────────────
-    local_ckpts = _list_local_checkpoints(output_dir)
+    local_ckpts = list_local_checkpoints(output_dir)
     for ckpt_dir in local_ckpts:
-        state = _try_load_state(ckpt_dir, device)
+        state = try_load_state(ckpt_dir, device)
         if state is not None:
             return _restore(state, f"local   {ckpt_dir.name}")
 
@@ -901,13 +658,13 @@ def load_latest_checkpoint(
     if cfg.push_to_hub and hf_token:
         if verbose:
             print(f"  [resume] no local checkpoints found; checking Hub ({cfg.hf_repo_id}) ...")
-        for ckpt_name in _list_remote_checkpoint_names(cfg.hf_repo_id, hf_token):
+        for ckpt_name in list_remote_checkpoint_names(cfg.hf_repo_id, hf_token):
             if verbose:
                 print(f"  [hub]  downloading {ckpt_name} ...")
-            downloaded = _download_checkpoint_from_hub(ckpt_name, output_dir, cfg.hf_repo_id, hf_token)
+            downloaded = download_checkpoint_from_hub(ckpt_name, output_dir, cfg.hf_repo_id, hf_token)
             if downloaded is None:
                 continue
-            state = _try_load_state(downloaded, device)
+            state = try_load_state(downloaded, device)
             if state is not None:
                 return _restore(state, f"hub     {ckpt_name}")
             if verbose:
@@ -1009,27 +766,17 @@ def args_to_config(args: argparse.Namespace) -> PretrainConfig:
 
 
 def build_optimizer(model: BaselineTRMMamba, cfg: PretrainConfig) -> AdamW:
-    """Build AdamW with separate decay and no-decay parameter groups."""
-    decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
-    no_decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
-    base_kwargs = dict(lr=cfg.lr, betas=(cfg.beta1, cfg.beta2), eps=cfg.adam_eps)
-    try:
-        return AdamW(
-            [
-                {"params": decay_params, "weight_decay": cfg.weight_decay},
-                {"params": no_decay_params, "weight_decay": 0.0},
-            ],
-            fused=torch.cuda.is_available(),
-            **base_kwargs,
-        )
-    except TypeError:
-        return AdamW(
-            [
-                {"params": decay_params, "weight_decay": cfg.weight_decay},
-                {"params": no_decay_params, "weight_decay": 0.0},
-            ],
-            **base_kwargs,
-        )
+    """Build AdamW with shared decay/no-decay grouping logic."""
+    optimizer, _ = build_adamw_optimizer(
+        model=model,
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+        betas=(cfg.beta1, cfg.beta2),
+        eps=cfg.adam_eps,
+        prefer_fused=torch.cuda.is_available(),
+    )
+    return optimizer
+
 
 
 
@@ -1407,7 +1154,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     cfg = args_to_config(args)
-    hf_token = resolve_hf_token(cfg)
+    hf_token = resolve_hf_token(cfg.hf_token)
     if cfg.push_to_hub and not hf_token:
         raise SystemExit("--push_to_hub requires --hf_token or HF_TOKEN/HUGGINGFACE_HUB_TOKEN")
 

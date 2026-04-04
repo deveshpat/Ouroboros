@@ -15,7 +15,7 @@ Key Stage 2 features:
   - Resume from direct checkpoint paths, local output dirs, or Hub fallback.
 
 Stage 2 success criterion:
-  Validation CE < 1.5 AND generated text is semantically coherent
+  Validation CE < 1.5 on answer tokens only AND generated text is semantically coherent
   (not just grammatical) on the test prompts at --gen_every.
 
 Hardware presets (choose via --preset):
@@ -28,7 +28,7 @@ Install:
   pip install transformers datasets wandb tqdm huggingface_hub
 
 Run:
-  python train_sft.py --preset small --output_dir ./runs/phase2_small
+  python train_sft.py --preset small --output_dir ./runs/stage2_small
 
 Dry-run style sanity check:
   python train_sft.py --preset nano --max_samples 300 --max_steps 100 \
@@ -46,7 +46,6 @@ import re
 import shutil
 import sys
 import time
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -58,6 +57,25 @@ try:
     from torch.optim.lr_scheduler import LambdaLR
 except ImportError:
     sys.exit("PyTorch not found. Install: pip install torch")
+
+
+from training_utils import (
+    ModelEMA,
+    autocast_context,
+    build_adamw_optimizer,
+    checkpoint_step_from_name,
+    cleanup_temporary_checkpoints,
+    cosine_with_warmup,
+    download_checkpoint_from_hub,
+    ema_scope,
+    list_local_checkpoints,
+    list_remote_checkpoint_names,
+    resolve_hf_token,
+    set_seed,
+    sync_checkpoint_to_hub,
+    try_load_state,
+    vram_gb,
+)
 
 if not torch.cuda.is_available():
     sys.exit(
@@ -89,9 +107,6 @@ except ImportError as exc:
     )
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-HF_UPLOAD_TIMEOUT_SECONDS = 300.0
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -160,11 +175,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--ema_decay", type=float, default=0.995)
     parser.add_argument("--seed", type=int, default=42)
 
     # I/O
-    parser.add_argument("--output_dir", default="runs/phase2")
+    parser.add_argument("--output_dir", default="runs/stage2")
     parser.add_argument("--save_every", type=int, default=500)
     parser.add_argument("--keep_last", type=int, default=3)
     parser.add_argument(
@@ -217,16 +232,6 @@ GEN_PROMPTS = [
 ]
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def vram_gb(device: torch.device) -> float:
-    return torch.cuda.memory_allocated(device) / (1024 ** 3)
-
-
 def pad_vocab(actual: int, multiple: int = 128) -> int:
     return math.ceil(actual / multiple) * multiple
 
@@ -234,28 +239,6 @@ def pad_vocab(actual: int, multiple: int = 128) -> int:
 def unique_word_ratio(text: str) -> float:
     words = text.split()
     return len(set(words)) / max(len(words), 1)
-
-
-def resolve_hf_token(args: argparse.Namespace) -> Optional[str]:
-    """Return the HF write token from args or environment, never from disk."""
-    if args.hf_token:
-        return args.hf_token
-    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-
-
-def checkpoint_step_from_name(name: str) -> int:
-    """Extract the numeric step from a checkpoint directory name."""
-    prefix = "checkpoint-"
-    if prefix not in name:
-        return -1
-    tail = name.split(prefix, 1)[1]
-    digits: List[str] = []
-    for ch in tail:
-        if ch.isdigit():
-            digits.append(ch)
-        else:
-            break
-    return int("".join(digits)) if digits else -1
 
 
 def sanitize_args_for_serialization(args: argparse.Namespace) -> Dict[str, Any]:
@@ -316,6 +299,33 @@ def _format_training_text(question: str, reasoning: str, answer: str, eos: str) 
         )
     return f"User: {question}\n\nAssistant: {answer}{eos}"
 
+def _build_prompt_prefix(question: str, reasoning: str) -> str:
+    """Build the exact non-supervised prompt prefix for one SFT sample."""
+    prefix = f"User: {question}\n\nAssistant: "
+    if reasoning:
+        prefix += "<think>\n"
+    return prefix
+
+
+def _build_sft_sample(
+    tokenizer,
+    question: str,
+    reasoning: str,
+    answer: str,
+    eos: str,
+    max_seq_len: int,
+) -> Dict[str, Any]:
+    """Tokenize one SFT sample and record the prompt length for loss masking."""
+    text = _format_training_text(question, reasoning, answer, eos)
+    prefix_text = _build_prompt_prefix(question, reasoning)
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    prompt_len = len(tokenizer.encode(prefix_text, add_special_tokens=False))
+    ids = ids[:max_seq_len]
+    return {
+        "input_ids": torch.tensor(ids, dtype=torch.long),
+        "prompt_len": min(prompt_len, len(ids)),
+    }
+
 
 def load_and_tokenize(
     dataset_name: str,
@@ -343,7 +353,7 @@ def load_and_tokenize(
         if len(ids) < 4:
             skipped += 1
             continue
-        samples.append({"input_ids": torch.tensor(ids[:max_seq_len], dtype=torch.long)})
+        samples.append(_build_sft_sample(tokenizer, q, r, a, eos, max_seq_len))
 
     print(f"  {len(samples)} samples kept, {skipped} skipped (missing fields / too short).")
     return samples
@@ -458,12 +468,9 @@ def load_mixed_dataset(
             ids = tokenizer.encode(text, add_special_tokens=False)
             if len(ids) < 4:
                 continue
-            all_samples.append(
-                {
-                    "input_ids": torch.tensor(ids[:max_seq_len], dtype=torch.long),
-                    "source": ds_name,
-                }
-            )
+            sample = _build_sft_sample(tokenizer, q, r, a, eos, max_seq_len)
+            sample["source"] = ds_name
+            all_samples.append(sample)
             kept += 1
             if kept >= target:
                 break
@@ -480,6 +487,24 @@ def load_mixed_dataset(
     return all_samples
 
 
+def split_train_val_samples(
+    all_samples: List[Dict[str, Any]],
+    seed: int,
+    val_fraction: float,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Deterministically split tokenized SFT samples into train and validation sets."""
+    if len(all_samples) < 2:
+        raise ValueError("Need at least 2 samples to create non-empty train and validation splits.")
+
+    generator = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(len(all_samples), generator=generator).tolist()
+    n_val = min(len(all_samples) - 1, max(1, int(len(all_samples) * val_fraction)))
+    val_idx = set(perm[:n_val])
+    train_samples = [sample for idx, sample in enumerate(all_samples) if idx not in val_idx]
+    val_samples = [sample for idx, sample in enumerate(all_samples) if idx in val_idx]
+    return train_samples, val_samples
+
+
 def collate(samples: List[Dict[str, Any]], pad_id: int) -> Dict[str, torch.Tensor]:
     """Pad a micro-batch to the longest example and mask padding in labels."""
     max_len = max(sample["input_ids"].size(0) for sample in samples)
@@ -493,58 +518,11 @@ def collate(samples: List[Dict[str, Any]], pad_id: int) -> Dict[str, torch.Tenso
         ids = sample["input_ids"]
         length = ids.size(0)
         input_ids[idx, :length] = ids
-        labels[idx, :length] = ids
+        pl = min(sample.get("prompt_len", 0), length)
+        labels[idx, pl:length] = ids[pl:]
         mask[idx, :length] = True
 
     return {"input_ids": input_ids, "attention_mask": mask, "labels": labels}
-
-
-def cosine_with_warmup(
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
-    total_steps: int,
-    min_lr_ratio: float,
-) -> LambdaLR:
-    """Linear warmup then cosine decay to min_lr_ratio times base_lr."""
-
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return (step + 1) / max(warmup_steps, 1)
-        if total_steps <= warmup_steps:
-            return min_lr_ratio
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-    return LambdaLR(optimizer, lr_lambda)
-
-
-class ModelEMA:
-    """Exponential Moving Average of model weights."""
-
-    def __init__(self, model: torch.nn.Module, decay: float) -> None:
-        self.decay = decay
-        self.shadow = {
-            name: param.detach().clone()
-            for name, param in model.named_parameters()
-            if param.requires_grad
-        }
-
-    @torch.no_grad()
-    def update(self, model: torch.nn.Module) -> None:
-        one_minus = 1.0 - self.decay
-        for name, param in model.named_parameters():
-            if name in self.shadow:
-                self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=one_minus)
-
-    def state_dict(self) -> Dict[str, Any]:
-        return {"decay": self.decay, "shadow": self.shadow}
-
-    def load_state_dict(self, sd: Dict[str, Any]) -> None:
-        self.decay = float(sd.get("decay", self.decay))
-        for name, tensor in sd.get("shadow", {}).items():
-            if name in self.shadow and self.shadow[name].shape == tensor.shape:
-                self.shadow[name].copy_(tensor)
 
 
 @torch.no_grad()
@@ -560,47 +538,42 @@ def run_generation_callback(
     wandb_run=None,
 ) -> None:
     """Run greedy decoding on the fixed prompts using EMA weights."""
-    live_backup: Dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        if name in ema.shadow:
-            live_backup[name] = param.data.clone()
-            param.data.copy_(ema.shadow[name].to(dtype=param.data.dtype))
-
     model.eval()
     print(f"\n  -- Generation @ step {step} (EMA weights) --")
     wandb_log: Dict[str, str] = {}
     mean_uwr = 0.0
 
-    for prompt in GEN_PROMPTS:
-        prefix = f"User: {prompt}\n\nAssistant: <think>\n"
-        ids = torch.tensor(
-            tokenizer.encode(prefix, add_special_tokens=False),
-            dtype=torch.long,
-            device=device,
-        ).unsqueeze(0)
+    with ema_scope(model, ema):
+        for prompt in GEN_PROMPTS:
+            prefix = f"User: {prompt}\n\nAssistant: <think>\n"
+            ids = torch.tensor(
+                tokenizer.encode(prefix, add_special_tokens=False),
+                dtype=torch.long,
+                device=device,
+            ).unsqueeze(0)
 
-        eos_id = tokenizer.eos_token_id
-        generated: List[int] = []
+            eos_id = tokenizer.eos_token_id
+            generated: List[int] = []
 
-        for _ in range(max_new_tokens):
-            if ids.size(1) > max_seq_len:
-                ids = ids[:, -max_seq_len:]
-            with torch.autocast(device_type="cuda", dtype=dtype):
-                logits = model(ids)
-            next_id = int(logits[:, -1, :].argmax(dim=-1).item())
-            if eos_id is not None and next_id == eos_id:
-                break
-            generated.append(next_id)
-            ids = torch.cat([ids, torch.tensor([[next_id]], device=device)], dim=1)
+            for _ in range(max_new_tokens):
+                if ids.size(1) > max_seq_len:
+                    ids = ids[:, -max_seq_len:]
+                with autocast_context(device, dtype):
+                    logits = model(ids)
+                next_id = int(logits[:, -1, :].argmax(dim=-1).item())
+                if eos_id is not None and next_id == eos_id:
+                    break
+                generated.append(next_id)
+                ids = torch.cat([ids, torch.tensor([[next_id]], device=device)], dim=1)
 
-        output_text = tokenizer.decode(generated, skip_special_tokens=True)
-        uwr = unique_word_ratio(output_text)
-        mean_uwr += uwr
-        display = output_text[:180].replace("\n", " ")
-        print(f"  Q: {prompt}")
-        print(f"  A: {display}")
-        print(f"     uwr={uwr:.3f}")
-        wandb_log[f"gen/{prompt[:40]}"] = output_text
+            output_text = tokenizer.decode(generated, skip_special_tokens=True)
+            uwr = unique_word_ratio(output_text)
+            mean_uwr += uwr
+            display = output_text[:180].replace("\n", " ")
+            print(f"  Q: {prompt}")
+            print(f"  A: {display}")
+            print(f"     uwr={uwr:.3f}")
+            wandb_log[f"gen/{prompt[:40]}"] = output_text
 
     mean_uwr /= max(len(GEN_PROMPTS), 1)
     print(f"  Mean UWR: {mean_uwr:.3f}\n")
@@ -611,9 +584,6 @@ def run_generation_callback(
         wandb.log({"gen/mean_uwr": mean_uwr, **wandb_log}, step=step)
 
     model.train()
-    for name, param in model.named_parameters():
-        if name in live_backup:
-            param.data.copy_(live_backup[name])
 
 
 @torch.no_grad()
@@ -627,90 +597,33 @@ def compute_val_ce(
     batch_size: int,
     vocab_size: int,
 ) -> float:
-    """Compute per-token CE on the validation split using EMA weights, then restore live weights."""
-    live_backup: Dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        if name in ema.shadow:
-            live_backup[name] = param.data.clone()
-            param.data.copy_(ema.shadow[name].to(dtype=param.data.dtype))
-
+    """Compute per-token CE on the validation split using EMA weights."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
 
-    for start in range(0, len(val_samples), batch_size):
-        batch_samples = val_samples[start : start + batch_size]
-        batch = collate(batch_samples, pad_id)
-        input_ids = batch["input_ids"].to(device)
-        attn_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
+    with ema_scope(model, ema):
+        for start in range(0, len(val_samples), batch_size):
+            batch_samples = val_samples[start : start + batch_size]
+            batch = collate(batch_samples, pad_id)
+            input_ids = batch["input_ids"].to(device)
+            attn_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
 
-        with torch.autocast(device_type="cuda", dtype=dtype):
-            logits = model(input_ids, attention_mask=attn_mask)
+            with autocast_context(device, dtype):
+                logits = model(input_ids, attention_mask=attn_mask)
 
-        shift_logits = logits[:, :-1, :].contiguous().view(-1, vocab_size).float()
-        shift_labels = labels[:, 1:].contiguous().view(-1)
-        valid = shift_labels != -100
-        if valid.any():
-            total_loss += F.cross_entropy(
-                shift_logits[valid], shift_labels[valid], reduction="sum"
-            ).item()
-            total_tokens += int(valid.sum().item())
+            shift_logits = logits[:, :-1, :].contiguous().view(-1, vocab_size).float()
+            shift_labels = labels[:, 1:].contiguous().view(-1)
+            valid = shift_labels != -100
+            if valid.any():
+                total_loss += F.cross_entropy(
+                    shift_logits[valid], shift_labels[valid], reduction="sum"
+                ).item()
+                total_tokens += int(valid.sum().item())
 
-    val_ce = total_loss / max(total_tokens, 1)
     model.train()
-    for name, param in model.named_parameters():
-        if name in live_backup:
-            param.data.copy_(live_backup[name])
-    return val_ce
-
-
-def cleanup_temporary_checkpoints(output_dir: Path) -> None:
-    """Remove stale .tmp checkpoint directories left by interrupted runs."""
-    if not output_dir.exists():
-        return
-    for entry in output_dir.iterdir():
-        if entry.is_dir() and entry.name.endswith(".tmp"):
-            print(f"  [cleanup] removing stale tmp checkpoint: {entry.name}")
-            shutil.rmtree(entry, ignore_errors=True)
-
-
-def sync_checkpoint_to_hub(
-    checkpoint_dir: Path,
-    repo_id: str,
-    token: str,
-) -> bool:
-    """Upload one checkpoint directory to the Hugging Face Hub without raising."""
-    try:
-        from huggingface_hub import HfApi
-    except ImportError:
-        print("[hub] huggingface_hub not installed - skipping Hub sync.")
-        return False
-
-    remote_name = checkpoint_dir.name
-    try:
-        api = HfApi(token=token)
-        api.create_repo(repo_id=repo_id, token=token, private=True, exist_ok=True)
-        print(f"  [hub] uploading {remote_name} -> {repo_id} ...")
-        future = api.upload_folder(
-            repo_id=repo_id,
-            folder_path=str(checkpoint_dir),
-            path_in_repo=remote_name,
-            token=token,
-            commit_message=f"Upload {remote_name}",
-            run_as_future=True,
-        )
-        commit_info = future.result(timeout=HF_UPLOAD_TIMEOUT_SECONDS)
-        oid = getattr(commit_info, "oid", "?")
-        oid_short = oid[:8] if isinstance(oid, str) and oid != "?" else "?"
-        print(f"  [hub] uploaded  {remote_name} (commit={oid_short})")
-        return True
-    except FutureTimeoutError:
-        print(f"  [hub] upload timed out for {remote_name}; local copy retained.")
-        return False
-    except Exception as exc:
-        print(f"  [hub] upload failed for {remote_name}: {exc}")
-        return False
+    return total_loss / max(total_tokens, 1)
 
 
 def save_checkpoint(
@@ -724,6 +637,8 @@ def save_checkpoint(
     config: BaselineConfig,
     val_ce: Optional[float],
     keep_last: int,
+    epoch: int,
+    samples_seen: int,
     sft_config: Dict[str, Any],
     push_to_hub: bool = False,
     hf_repo_id: str = "WeirdRunner/Ouroboros",
@@ -748,6 +663,8 @@ def save_checkpoint(
     state = {
         "stage": "sft",
         "step": step,
+        "epoch": epoch,
+        "samples_seen": samples_seen,
         "val_ce": val_ce,
         "model_state_dict": model.state_dict(),
         "ema_backbone_state_dict": shadow,
@@ -800,84 +717,6 @@ def save_checkpoint(
     return final_dir
 
 
-def _list_local_checkpoints(output_dir: Path) -> List[Path]:
-    """Return finalized local checkpoint directories sorted newest-first."""
-    if not output_dir.exists():
-        return []
-    candidates: List[Path] = []
-    for entry in output_dir.iterdir():
-        if entry.is_dir() and not entry.name.endswith(".tmp"):
-            step = checkpoint_step_from_name(entry.name)
-            if step >= 0:
-                candidates.append(entry)
-    return sorted(candidates, key=lambda entry: checkpoint_step_from_name(entry.name), reverse=True)
-
-
-def _try_load_state(path: Path, device: torch.device) -> Optional[Dict[str, Any]]:
-    """Load training_state.pt from a checkpoint directory, returning None on corruption."""
-    state_path = path / "training_state.pt"
-    if not state_path.exists():
-        return None
-    try:
-        return torch.load(state_path, map_location=device)
-    except Exception as exc:
-        print(f"  [resume] corrupt checkpoint {path.name}: {exc} - skipping")
-        return None
-
-
-def _list_remote_checkpoint_names(repo_id: str, token: str) -> List[str]:
-    """Return Hub checkpoint directory names sorted newest-first."""
-    try:
-        from huggingface_hub import HfApi
-    except ImportError:
-        return []
-
-    try:
-        api = HfApi(token=token)
-        repo_files = list(api.list_repo_files(repo_id=repo_id, token=token))
-    except Exception:
-        return []
-
-    names = set()
-    for file_name in repo_files:
-        parts = Path(file_name).parts
-        top = parts[0] if parts else ""
-        if checkpoint_step_from_name(top) >= 0:
-            names.add(top)
-    return sorted(names, key=checkpoint_step_from_name, reverse=True)
-
-
-def _download_checkpoint_from_hub(
-    checkpoint_name: str,
-    output_dir: Path,
-    repo_id: str,
-    token: str,
-) -> Optional[Path]:
-    """Download a single checkpoint directory from the Hub into output_dir."""
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        return None
-
-    local_dir = output_dir / checkpoint_name
-    if local_dir.exists():
-        shutil.rmtree(local_dir, ignore_errors=True)
-
-    try:
-        snapshot_download(
-            repo_id=repo_id,
-            local_dir=str(output_dir),
-            token=token,
-            force_download=True,
-            allow_patterns=[f"{checkpoint_name}/*"],
-        )
-    except Exception as exc:
-        print(f"  [hub]  download failed for {checkpoint_name}: {exc}")
-        return None
-
-    return local_dir if local_dir.exists() else None
-
-
 def _looks_like_pretrain_checkpoint(state: Dict[str, Any]) -> bool:
     """Return True when a checkpoint looks like a Stage 1 pre-training save."""
     return ("pretrain_config" in state) or (
@@ -904,7 +743,7 @@ def load_latest_checkpoint(
     hf_repo_id: str = "WeirdRunner/Ouroboros",
     hf_token: Optional[str] = None,
     verbose: bool = True,
-) -> int:
+) -> Tuple[int, int, int]:
     """Load the newest valid Stage 2 checkpoint or initialize from a Stage 1 checkpoint."""
 
     def _restore(state: Dict[str, Any], label: str) -> Optional[int]:
@@ -914,6 +753,8 @@ def load_latest_checkpoint(
             return None
 
         pretrain_init = _looks_like_pretrain_checkpoint(state) and "sft_config" not in state
+        epoch = int(state.get("epoch", 0))
+        samples_seen = int(state.get("samples_seen", 0))
         model.load_state_dict(state["model_state_dict"])
         if state.get("ema"):
             ema.load_state_dict(state["ema"])
@@ -926,7 +767,7 @@ def load_latest_checkpoint(
                     f"  [init]   {label}  loaded Stage 1 weights; "
                     "resetting optimizer/scheduler for Stage 2."
                 )
-            return 0
+            return 0, 0, 0
 
         if any(key not in state for key in ("optimizer", "scheduler")):
             if verbose:
@@ -939,8 +780,11 @@ def load_latest_checkpoint(
             scaler.load_state_dict(state["scaler"])
         step = int(state.get("step", 0))
         if verbose:
-            print(f"  [resume] {label}  step={step}  val_ce={state.get('val_ce')}")
-        return step
+            print(
+                f"  [resume] {label}  step={step}  epoch={epoch}  "
+                f"samples_seen={samples_seen}  val_ce={state.get('val_ce')}"
+            )
+        return step, epoch, samples_seen
 
     search_root = Path(output_dir)
     direct_candidates: List[Path] = []
@@ -961,12 +805,12 @@ def load_latest_checkpoint(
     local_root = search_root if search_root.exists() else search_root.parent
     seen_paths = set()
 
-    for candidate in direct_candidates + _list_local_checkpoints(local_root):
+    for candidate in direct_candidates + list_local_checkpoints(local_root):
         candidate_str = str(candidate)
         if candidate_str in seen_paths:
             continue
         seen_paths.add(candidate_str)
-        state = _try_load_state(candidate, device)
+        state = try_load_state(candidate, device)
         if state is None:
             continue
         restored = _restore(state, candidate.name)
@@ -976,13 +820,13 @@ def load_latest_checkpoint(
     if push_to_hub and hf_token:
         if verbose:
             print(f"  [resume] no local checkpoints found; checking Hub ({hf_repo_id}) ...")
-        for ckpt_name in _list_remote_checkpoint_names(hf_repo_id, hf_token):
+        for ckpt_name in list_remote_checkpoint_names(hf_repo_id, hf_token):
             if verbose:
                 print(f"  [hub]  downloading {ckpt_name} ...")
-            downloaded = _download_checkpoint_from_hub(ckpt_name, local_root, hf_repo_id, hf_token)
+            downloaded = download_checkpoint_from_hub(ckpt_name, local_root, hf_repo_id, hf_token)
             if downloaded is None:
                 continue
-            state = _try_load_state(downloaded, device)
+            state = try_load_state(downloaded, device)
             if state is None:
                 continue
             restored = _restore(state, ckpt_name)
@@ -991,14 +835,14 @@ def load_latest_checkpoint(
 
     if verbose:
         print("  [resume] No checkpoint found - starting from scratch.")
-    return 0
+    return 0, 0, 0
 
 
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
-    hf_token = resolve_hf_token(args)
+    hf_token = resolve_hf_token(args.hf_token)
     if args.push_to_hub and not hf_token:
         sys.exit("--push_to_hub requires --hf_token or HF_TOKEN/HUGGINGFACE_HUB_TOKEN")
 
@@ -1038,6 +882,7 @@ def main() -> None:
     print(f"  dtype         : {dtype}")
     print(f"  output_dir    : {output_dir}")
     print(f"  dataset_mix   : {args.dataset_mix}")
+    print(f"  answer_only_ce: True")
     print(f"  push_to_hub   : {args.push_to_hub}")
     print("=" * 64)
     print()
@@ -1057,13 +902,11 @@ def main() -> None:
     if not all_samples:
         sys.exit("No samples loaded. Check dataset connectivity and --max_samples.")
 
-    torch.manual_seed(args.seed)
-    perm = torch.randperm(len(all_samples)).tolist()
-    n_val = max(1, int(len(all_samples) * args.val_fraction))
-    val_idx = set(perm[:n_val])
-
-    train_samples = [sample for idx, sample in enumerate(all_samples) if idx not in val_idx]
-    val_samples = [sample for idx, sample in enumerate(all_samples) if idx in val_idx]
+    train_samples, val_samples = split_train_val_samples(
+        all_samples=all_samples,
+        seed=args.seed,
+        val_fraction=args.val_fraction,
+    )
     pad_id = tokenizer.pad_token_id or 0
 
     print(f"  train: {len(train_samples)}  val: {len(val_samples)}")
@@ -1084,28 +927,15 @@ def main() -> None:
     print(f"Vocab  : {padded_vocab:,} (padded from {len(tokenizer):,})")
     print()
 
-    decay_params = [p for p in model.parameters() if p.ndim >= 2 and p.requires_grad]
-    no_decay_params = [p for p in model.parameters() if p.ndim < 2 and p.requires_grad]
-    adamw_base = dict(lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
-    try:
-        optimizer = AdamW(
-            [
-                {"params": decay_params, "weight_decay": args.weight_decay},
-                {"params": no_decay_params, "weight_decay": 0.0},
-            ],
-            fused=True,
-            **adamw_base,
-        )
-        print("Optimizer : AdamW (fused CUDA kernel)")
-    except TypeError:
-        optimizer = AdamW(
-            [
-                {"params": decay_params, "weight_decay": args.weight_decay},
-                {"params": no_decay_params, "weight_decay": 0.0},
-            ],
-            **adamw_base,
-        )
-        print("Optimizer : AdamW (standard)")
+    optimizer, fused_enabled = build_adamw_optimizer(
+        model=model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        prefer_fused=True,
+    )
+    print(f"Optimizer : AdamW ({'fused CUDA kernel' if fused_enabled else 'standard'})")
 
     steps_per_epoch = math.ceil(len(train_samples) / (args.batch_size * args.grad_accum))
     total_steps = args.max_steps if args.max_steps > 0 else steps_per_epoch * args.num_epochs
@@ -1120,7 +950,7 @@ def main() -> None:
     print()
 
     resume_search = Path(args.resume_from) if args.resume_from else output_dir
-    if args.resume_from and _list_local_checkpoints(output_dir):
+    if args.resume_from and list_local_checkpoints(output_dir):
         resume_path = Path(args.resume_from).resolve()
         output_root = output_dir.resolve()
         resume_inside_output = (resume_path == output_root) or (output_root in resume_path.parents)
@@ -1130,7 +960,7 @@ def main() -> None:
     if resume_search.is_dir():
         cleanup_temporary_checkpoints(resume_search)
 
-    start_step = load_latest_checkpoint(
+    start_step, start_epoch, samples_seen = load_latest_checkpoint(
         resume_search,
         model,
         ema,
@@ -1144,9 +974,27 @@ def main() -> None:
         verbose=True,
     )
 
-    sample_idx = (start_step * args.batch_size * args.grad_accum) % max(len(train_samples), 1)
     torch.manual_seed(args.seed)
-    perm_train = torch.randperm(len(train_samples)).tolist()
+    if train_samples:
+        samples_per_step = args.batch_size * args.grad_accum
+        derived_samples_seen = start_step * samples_per_step
+        if samples_seen <= 0:
+            samples_seen = derived_samples_seen
+        elif samples_seen != derived_samples_seen:
+            print(
+                f"  [resume] warning: checkpoint samples_seen={samples_seen} differs from "
+                f"derived value {derived_samples_seen}; trusting checkpoint."
+            )
+        completed_epochs = samples_seen // len(train_samples)
+        sample_idx = samples_seen % len(train_samples)
+        perm_train = []
+        for _ in range(completed_epochs + 1):
+            perm_train = torch.randperm(len(train_samples)).tolist()
+        if start_epoch <= 0:
+            start_epoch = completed_epochs
+    else:
+        sample_idx = 0
+        perm_train = []
 
     col_hdr = f"{'Step':>7}  {'Train CE':>9}  {'Val CE':>9}  {'GNorm':>7}  {'LR':>9}  {'VRAM':>7}  {'Tok/s':>7}"
     print(col_hdr)
@@ -1162,11 +1010,14 @@ def main() -> None:
 
     optimizer.zero_grad(set_to_none=True)
 
+    logical_epoch = start_epoch
+
     while step < total_steps:
         micro_batch: List[Dict[str, Any]] = []
         for _ in range(args.batch_size):
             if sample_idx >= len(train_samples):
                 sample_idx = 0
+                logical_epoch += 1
                 perm_train = torch.randperm(len(train_samples)).tolist()
             micro_batch.append(train_samples[perm_train[sample_idx]])
             sample_idx += 1
@@ -1176,6 +1027,7 @@ def main() -> None:
         attn_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
         tokens_seen += int(attn_mask.sum().item())
+        samples_seen += len(micro_batch)
 
         with torch.autocast(device_type="cuda", dtype=dtype):
             logits = model(input_ids, attention_mask=attn_mask)
@@ -1290,6 +1142,8 @@ def main() -> None:
                 config=config,
                 val_ce=last_val_ce,
                 keep_last=args.keep_last,
+                epoch=logical_epoch,
+                samples_seen=samples_seen,
                 sft_config=sanitize_args_for_serialization(args),
                 push_to_hub=args.push_to_hub,
                 hf_repo_id=args.hf_repo_id,
@@ -1309,7 +1163,7 @@ def main() -> None:
     print(f"  Total time   : {total_time / 60:.1f} min")
     print(f"  Peak VRAM    : {peak_vram_gb:.2f} GB")
     if last_val_ce is not None:
-        print(f"  Final val CE : {last_val_ce:.4f}")
+        print(f"  Final val CE : {last_val_ce:.4f}  (answer tokens only)")
         if last_val_ce < 1.5:
             print("  Status       : SUCCESS - proceed to Phase 3 (incremental recursion)")
         else:

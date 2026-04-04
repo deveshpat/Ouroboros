@@ -210,6 +210,15 @@ def apply_rope(
     return q, k
 
 
+def _is_residual_writer_module(module_name: str) -> bool:
+    """Return True for projections that write back into the residual stream."""
+    return (
+        module_name.endswith(".attn.o_proj")
+        or module_name.endswith(".mlp.down_proj")
+        or module_name.endswith(".mamba.out_proj")
+    )
+
+
 class CausalSelfAttentionGQA(nn.Module):
     """Grouped-query causal self-attention with RoPE and SDPA."""
 
@@ -228,6 +237,38 @@ class CausalSelfAttentionGQA(nn.Module):
         self.v_proj = nn.Linear(config.d_model, config.n_kv_heads * config.head_dim, bias=False)
         self.o_proj = nn.Linear(config.d_model, config.d_model, bias=False)
 
+    def _validate_attention_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        input_shape: Tuple[int, int, int],
+    ) -> None:
+        """Validate the optional [batch, seq] attention mask shape."""
+        if attention_mask is None:
+            return
+        if attention_mask.shape != (batch_size, seq_len):
+            raise ValueError(
+                "attention_mask must have shape [batch, seq]. "
+                f"Got {tuple(attention_mask.shape)} for input {input_shape}."
+            )
+
+    def _build_attention_bias(
+        self,
+        attention_mask: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build the additive bias that combines causal and padding masking."""
+        attn_bias = torch.zeros(batch_size, 1, seq_len, seq_len, dtype=dtype, device=device)
+        causal_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).triu(1)
+        attn_bias.masked_fill_(causal_mask[None, None], float("-inf"))
+        pad_mask = ~attention_mask[:, None, None, :]
+        attn_bias.masked_fill_(pad_mask, float("-inf"))
+        return attn_bias
+
     def forward(
         self,
         x: torch.Tensor,
@@ -236,11 +277,7 @@ class CausalSelfAttentionGQA(nn.Module):
         """Apply causal grouped-query attention to a [B, T, D] hidden-state tensor."""
         batch_size, seq_len, model_dim = x.shape
 
-        if attention_mask is not None and attention_mask.shape != (batch_size, seq_len):
-            raise ValueError(
-                "attention_mask must have shape [batch, seq]. "
-                f"Got {tuple(attention_mask.shape)} for input {tuple(x.shape)}."
-            )
+        self._validate_attention_mask(attention_mask, batch_size, seq_len, tuple(x.shape))
 
         q = self.q_proj(x)
         k = self.k_proj(x)
@@ -268,11 +305,13 @@ class CausalSelfAttentionGQA(nn.Module):
             )
         else:
             # reason: SDPA forbids combining is_causal=True with a custom padding mask.
-            attn_bias = torch.zeros(batch_size, 1, seq_len, seq_len, dtype=q.dtype, device=q.device)
-            causal_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=q.device).triu(1)
-            attn_bias.masked_fill_(causal_mask[None, None], float("-inf"))
-            pad_mask = ~attention_mask[:, None, None, :]
-            attn_bias.masked_fill_(pad_mask, float("-inf"))
+            attn_bias = self._build_attention_bias(
+                attention_mask=attention_mask,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                dtype=q.dtype,
+                device=q.device,
+            )
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -452,12 +491,7 @@ class BaselineTRMMamba(nn.Module):
                     initialized.add(id(module.weight))
 
         for name, module in self.named_modules():
-            scale_this = (
-                name.endswith(".attn.o_proj")
-                or name.endswith(".mlp.down_proj")
-                or name.endswith(".mamba.out_proj")
-            )
-            if not scale_this:
+            if not _is_residual_writer_module(name):
                 continue
 
             weight = getattr(module, "weight", None)
