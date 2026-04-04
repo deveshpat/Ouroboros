@@ -745,9 +745,9 @@ def load_latest_checkpoint(
     hf_token: Optional[str] = None,
     verbose: bool = True,
 ) -> Tuple[int, int, int]:
-    """Load the newest valid Stage 2 checkpoint or initialize from a Stage 1 checkpoint."""
+    """Load the newest valid Stage 2 checkpoint or initialize from the newest Stage 1 checkpoint."""
 
-    def _restore(state: Dict[str, Any], label: str) -> Optional[int]:
+    def _restore(state: Dict[str, Any], label: str) -> Optional[Tuple[int, int, int]]:
         if "model_state_dict" not in state:
             if verbose:
                 print(f"  [resume] incomplete checkpoint {label} - skipping")
@@ -804,39 +804,77 @@ def load_latest_checkpoint(
         search_root = search_root.parent
 
     local_root = search_root if search_root.exists() else search_root.parent
-    seen_paths = set()
+    local_records: List[Dict[str, Any]] = []
+    seen_paths: set[str] = set()
 
     for candidate in direct_candidates + list_local_checkpoints(local_root):
-        candidate_str = str(candidate)
+        candidate_str = str(candidate.resolve()) if candidate.exists() else str(candidate)
         if candidate_str in seen_paths:
             continue
         seen_paths.add(candidate_str)
         state = try_load_state(candidate, device)
         if state is None:
             continue
-        restored = _restore(state, candidate.name)
-        if restored is not None:
-            return restored
+        local_records.append(
+            {
+                "step": int(state.get("step", checkpoint_step_from_name(candidate.name))),
+                "source": "local",
+                "priority": 1,
+                "label": candidate.name,
+                "state": state,
+            }
+        )
 
-    if push_to_hub and hf_token:
-        if verbose:
-            print(f"  [resume] no local checkpoints found; checking Hub ({hf_repo_id}) ...")
+    remote_records: List[Dict[str, Any]] = []
+    if hf_token:
         for ckpt_name in list_remote_checkpoint_names(hf_repo_id, hf_token):
-            if verbose:
-                print(f"  [hub]  downloading {ckpt_name} ...")
-            downloaded = download_checkpoint_from_hub(ckpt_name, local_root, hf_repo_id, hf_token)
-            if downloaded is None:
-                continue
-            state = try_load_state(downloaded, device)
-            if state is None:
-                continue
-            restored = _restore(state, ckpt_name)
+            remote_records.append(
+                {
+                    "step": checkpoint_step_from_name(ckpt_name),
+                    "source": "hub",
+                    "priority": 0,
+                    "label": ckpt_name,
+                }
+            )
+
+    if verbose:
+        local_latest = local_records[0]["step"] if local_records else None
+        hub_latest = remote_records[0]["step"] if remote_records else None
+        print(
+            "  [resume] candidate summary: "
+            f"local_latest={local_latest if local_latest is not None else 'none'}  "
+            f"hub_latest={hub_latest if hub_latest is not None else 'none'}"
+        )
+
+    candidates = sorted(
+        local_records + remote_records,
+        key=lambda record: (int(record.get("step", -1)), int(record.get("priority", 0))),
+        reverse=True,
+    )
+
+    for record in candidates:
+        if record["source"] == "local":
+            restored = _restore(record["state"], record["label"])
             if restored is not None:
                 return restored
+            continue
+
+        if verbose:
+            print(f"  [hub]  downloading {record['label']} ...")
+        downloaded = download_checkpoint_from_hub(record["label"], local_root, hf_repo_id, hf_token)
+        if downloaded is None:
+            continue
+        state = try_load_state(downloaded, device)
+        if state is None:
+            continue
+        restored = _restore(state, record["label"])
+        if restored is not None:
+            return restored
 
     if verbose:
         print("  [resume] No checkpoint found - starting from scratch.")
     return 0, 0, 0
+
 
 
 def main() -> None:

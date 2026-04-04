@@ -614,10 +614,12 @@ def load_latest_checkpoint(
     verbose: bool = True,
 ) -> Tuple[int, int, int, int]:
     """
-    Resume from the newest valid checkpoint using this priority order:
-      1. output_dir is itself a checkpoint dir (direct path given via --resume_from)
-      2. Newest finalized local checkpoint under output_dir (skip corrupted, try next)
-      3. Newest checkpoint on the Hub (download, then load; only if no local found)
+    Resume from the newest valid checkpoint found across both local disk and the Hub.
+
+    Selection policy:
+      1. Scan any explicit checkpoint path plus all local checkpoints under the search root.
+      2. If an HF token is available, also inspect Hub checkpoints.
+      3. Try candidates in descending step order, preferring local over Hub on ties.
 
     Returns (step, epoch, chunks_in_epoch, tokens_processed).
     Returns (0, 0, 0, 0) and prints a message when no checkpoint is found.
@@ -631,7 +633,7 @@ def load_latest_checkpoint(
             scaler.load_state_dict(state["scaler"])
         if state.get("ema"):
             ema.load_state_dict(state["ema"])
-        step  = int(state.get("step", 0))
+        step = int(state.get("step", 0))
         epoch = int(state.get("epoch", 0))
         chunks = int(state.get("chunks_in_epoch", 0))
         tokens = int(state.get("tokens_processed", 0))
@@ -642,36 +644,107 @@ def load_latest_checkpoint(
             )
         return step, epoch, chunks, tokens
 
-    # ── Case 1: output_dir IS the checkpoint directory ────────────────────────
-    direct_state = try_load_state(output_dir, device)
-    if direct_state is not None:
-        return _restore(direct_state, f"direct  {output_dir.name}")
+    search_root = Path(output_dir)
+    direct_candidates: List[Path] = []
 
-    # ── Case 2: scan local checkpoints newest-first ───────────────────────────
-    local_ckpts = list_local_checkpoints(output_dir)
-    for ckpt_dir in local_ckpts:
-        state = try_load_state(ckpt_dir, device)
-        if state is not None:
-            return _restore(state, f"local   {ckpt_dir.name}")
+    if search_root.is_file() and search_root.name == "training_state.pt":
+        direct_candidates.append(search_root.parent)
+        if search_root.parent.name.startswith("checkpoint-"):
+            search_root = search_root.parent.parent
+        else:
+            search_root = search_root.parent
+    elif (search_root / "training_state.pt").exists():
+        direct_candidates.append(search_root)
+        if search_root.name.startswith("checkpoint-"):
+            search_root = search_root.parent
+    elif search_root.name.startswith("checkpoint-"):
+        search_root = search_root.parent
 
-    # ── Case 3: Hub fallback (only if local is completely empty) ─────────────
-    if cfg.push_to_hub and hf_token:
-        if verbose:
-            print(f"  [resume] no local checkpoints found; checking Hub ({cfg.hf_repo_id}) ...")
+    local_root = search_root if search_root.exists() else search_root.parent
+    local_records: List[Dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
+    for candidate in direct_candidates + list_local_checkpoints(local_root):
+        candidate_str = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if candidate_str in seen_paths:
+            continue
+        seen_paths.add(candidate_str)
+        state = try_load_state(candidate, device)
+        if state is None:
+            continue
+        if any(key not in state for key in ("model_state_dict", "optimizer", "scheduler")):
+            if verbose:
+                print(f"  [resume] incomplete checkpoint {candidate.name} - skipping")
+            continue
+        local_records.append(
+            {
+                "step": int(state.get("step", checkpoint_step_from_name(candidate.name))),
+                "source": "local",
+                "priority": 1,
+                "label": candidate.name,
+                "state": state,
+            }
+        )
+
+    remote_records: List[Dict[str, Any]] = []
+    if hf_token:
         for ckpt_name in list_remote_checkpoint_names(cfg.hf_repo_id, hf_token):
-            if verbose:
-                print(f"  [hub]  downloading {ckpt_name} ...")
-            downloaded = download_checkpoint_from_hub(ckpt_name, output_dir, cfg.hf_repo_id, hf_token)
-            if downloaded is None:
-                continue
-            state = try_load_state(downloaded, device)
-            if state is not None:
-                return _restore(state, f"hub     {ckpt_name}")
-            if verbose:
-                print(f"  [hub]  {ckpt_name} was downloaded but could not be loaded — skipping")
+            remote_records.append(
+                {
+                    "step": checkpoint_step_from_name(ckpt_name),
+                    "source": "hub",
+                    "priority": 0,
+                    "label": ckpt_name,
+                }
+            )
 
     if verbose:
-        print("  [resume] No checkpoint found — starting from scratch.")
+        local_latest = local_records[0]["step"] if local_records else None
+        hub_latest = remote_records[0]["step"] if remote_records else None
+        print(
+            "  [resume] candidate summary: "
+            f"local_latest={local_latest if local_latest is not None else 'none'}  "
+            f"hub_latest={hub_latest if hub_latest is not None else 'none'}"
+        )
+
+    candidates = sorted(
+        local_records + remote_records,
+        key=lambda record: (int(record.get("step", -1)), int(record.get("priority", 0))),
+        reverse=True,
+    )
+
+    for record in candidates:
+        if record["source"] == "local":
+            try:
+                return _restore(record["state"], f"local   {record['label']}")
+            except Exception as exc:
+                if verbose:
+                    print(f"  [resume] failed to restore local {record['label']}: {exc} - skipping")
+                continue
+
+        if verbose:
+            print(f"  [hub]  downloading {record['label']} ...")
+        downloaded = download_checkpoint_from_hub(record["label"], local_root, cfg.hf_repo_id, hf_token)
+        if downloaded is None:
+            continue
+        state = try_load_state(downloaded, device)
+        if state is None:
+            if verbose:
+                print(f"  [hub]  {record['label']} was downloaded but could not be loaded - skipping")
+            continue
+        if any(key not in state for key in ("model_state_dict", "optimizer", "scheduler")):
+            if verbose:
+                print(f"  [hub]  incomplete checkpoint {record['label']} - skipping")
+            continue
+        try:
+            return _restore(state, f"hub     {record['label']}")
+        except Exception as exc:
+            if verbose:
+                print(f"  [resume] failed to restore hub {record['label']}: {exc} - skipping")
+            continue
+
+    if verbose:
+        print("  [resume] No checkpoint found - starting from scratch.")
     return 0, 0, 0, 0
 
 
