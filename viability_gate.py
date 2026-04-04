@@ -77,6 +77,14 @@ except ImportError as exc:
         "baseline_trm_mamba.py must be in the current working directory."
     )
 
+from training_utils import (
+    autocast_context,
+    build_adamw_optimizer,
+    pad_vocab_size,
+    set_seed,
+    vram_gb,
+)
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
@@ -122,16 +130,6 @@ GEN_MAX_TOKENS   = 80   # greedy decode this many new tokens per prompt
 
 # ── Utility functions ─────────────────────────────────────────────────────────
 
-def set_seed(seed: int) -> None:
-    """Fix all random state for reproducibility."""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def vram_gb(device: torch.device) -> float:
-    """Return currently allocated VRAM in GB."""
-    return torch.cuda.memory_allocated(device) / (1024 ** 3)
-
 
 def analyze_output(text: str) -> Tuple[bool, float, int]:
     """
@@ -149,10 +147,6 @@ def analyze_output(text: str) -> Tuple[bool, float, int]:
     ucc   = len(set(text))
     return (uwr < G2_UNIQUE_WORD_MIN or ucc < 4), uwr, ucc
 
-
-def pad_vocab_size(actual: int, multiple: int = 128) -> int:
-    """Round vocab_size up to a multiple of 128 for Tensor Core alignment."""
-    return math.ceil(actual / multiple) * multiple
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -263,7 +257,7 @@ def greedy_generate(
         if ids.size(1) > model.config.max_seq_len:
             ids = ids[:, -model.config.max_seq_len:]
 
-        with torch.autocast(device_type="cuda", dtype=dtype):
+        with autocast_context(device, dtype):
             logits = model(ids)  # [1, T, V]
 
         next_id  = int(logits[:, -1, :].argmax(dim=-1).item())
@@ -451,27 +445,15 @@ def main() -> None:
     # No LR schedule — constant LR gives the cleanest convergence signal for
     # a smoke test. We want to know if the *architecture* converges, not if
     # the schedule is tuned correctly.
-    decay_params    = [p for n, p in model.named_parameters()
-                       if p.ndim >= 2 and p.requires_grad]
-    no_decay_params = [p for n, p in model.named_parameters()
-                       if p.ndim <  2 and p.requires_grad]
-
-    adamw_kwargs = dict(lr=LR, betas=(0.9, 0.95), eps=1e-8)
-    try:
-        # fused=True is faster on CUDA but requires PyTorch >= 2.0
-        optimizer = torch.optim.AdamW(
-            [{"params": decay_params,    "weight_decay": WEIGHT_DECAY},
-             {"params": no_decay_params, "weight_decay": 0.0}],
-            fused=True, **adamw_kwargs,
-        )
-        print("Optimizer        : AdamW (fused CUDA kernel)")
-    except TypeError:
-        optimizer = torch.optim.AdamW(
-            [{"params": decay_params,    "weight_decay": WEIGHT_DECAY},
-             {"params": no_decay_params, "weight_decay": 0.0}],
-            **adamw_kwargs,
-        )
-        print("Optimizer        : AdamW (standard)")
+    optimizer, fused_enabled = build_adamw_optimizer(
+        model=model,
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        prefer_fused=True,
+    )
+    print(f"Optimizer        : AdamW ({'fused CUDA kernel' if fused_enabled else 'standard'})")
 
     scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
     print()
@@ -510,7 +492,7 @@ def main() -> None:
         labels    = batch["labels"].to(device)
 
         # ── Forward ───────────────────────────────────────────────────────────
-        with torch.autocast(device_type="cuda", dtype=dtype):
+        with autocast_context(device, dtype):
             logits = model(input_ids, attention_mask=attn_mask)  # [B, T, V]
 
         # Next-token cross-entropy (shift by 1)

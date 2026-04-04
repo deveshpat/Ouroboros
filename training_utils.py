@@ -38,6 +38,12 @@ def vram_gb(device: torch.device) -> float:
     return torch.cuda.memory_allocated(device) / (1024 ** 3)
 
 
+
+
+def pad_vocab_size(actual: int, multiple: int = 128) -> int:
+    """Round vocab_size up to a multiple for Tensor Core friendly shapes."""
+    return math.ceil(actual / multiple) * multiple
+
 def checkpoint_step_from_name(name: str) -> int:
     """Extract the numeric step from a checkpoint directory name."""
     prefix = "checkpoint-"

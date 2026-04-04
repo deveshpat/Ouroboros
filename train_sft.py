@@ -70,6 +70,7 @@ from training_utils import (
     ema_scope,
     list_local_checkpoints,
     list_remote_checkpoint_names,
+    pad_vocab_size,
     resolve_hf_token,
     set_seed,
     sync_checkpoint_to_hub,
@@ -913,7 +914,7 @@ def main() -> None:
     print()
 
     preset_kwargs = PRESETS[args.preset]
-    padded_vocab = pad_vocab(len(tokenizer), 128)
+    padded_vocab = pad_vocab_size(len(tokenizer), 128)
     config = BaselineConfig(vocab_size=padded_vocab, max_seq_len=args.max_seq_len, dropout=0.0, **preset_kwargs)
     model = BaselineTRMMamba(config).to(device=device, dtype=dtype)
     model.train()
