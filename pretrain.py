@@ -1675,6 +1675,30 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                     train_start = time.perf_counter()
                     tokens_since_log = 0
 
+                need_save = step % cfg.save_every == 0
+                if need_save:
+                    if is_main_process(rank):
+                        ckpt_path = save_checkpoint(
+                            output_dir=output_dir,
+                            step=step,
+                            epoch=epoch,
+                            chunks_in_epoch=chunks_in_epoch,
+                            tokens_processed=tokens_processed,
+                            model=raw_model,
+                            model_config=model_config,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            scaler=scaler,
+                            ema=ema,
+                            val_ce=last_val_ce,
+                            cfg=cfg,
+                            hf_token=hf_token,
+                        )
+                        if ckpt_path is not None:
+                            last_saved_step = step
+                    if distributed:
+                        dist.barrier()
+
                 need_val = (step % cfg.val_every == 0) or (tokens_processed >= cfg.token_budget)
                 if need_val:
                     if is_main_process(rank):
@@ -1711,30 +1735,6 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                         if last_val_ce is not None and last_val_ce < 3.0 and last_mean_uwr > 0.05 and not success_announced:
                             stage1_success_banner(step, cfg.preset)
                             success_announced = True
-                    if distributed:
-                        dist.barrier()
-
-                need_save = step % cfg.save_every == 0
-                if need_save:
-                    if is_main_process(rank):
-                        ckpt_path = save_checkpoint(
-                            output_dir=output_dir,
-                            step=step,
-                            epoch=epoch,
-                            chunks_in_epoch=chunks_in_epoch,
-                            tokens_processed=tokens_processed,
-                            model=raw_model,
-                            model_config=model_config,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            scaler=scaler,
-                            ema=ema,
-                            val_ce=last_val_ce,
-                            cfg=cfg,
-                            hf_token=hf_token,
-                        )
-                        if ckpt_path is not None:
-                            last_saved_step = step
                     if distributed:
                         dist.barrier()
 
