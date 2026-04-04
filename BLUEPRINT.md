@@ -26,7 +26,7 @@ on SFT data. Output: comma-loops and "the the the". Three root causes:
 | Stage | Name | Status | Gate |
 |---|---|---|---|
 | 0 | Architecture & Viability | ✅ COMPLETE | All 4 gates passed |
-| 1 | Pre-training | 🟡 IN PROGRESS on Kaggle Dual T4 — step ~3500 / 61,036 | val_ce < 3.0 + UWR > 0.05 |
+| 1 | Pre-training | 🟡 IN PROGRESS on Kaggle Dual T4 — step ~9000 / 61,036 (~14.7%) | val_ce < 3.0 + UWR > 0.05 |
 | 2 | SFT | 🔴 BLOCKED — Bug 3 (collate prompt masking) not fixed | Fix Bug 3, then run |
 | 3 | Recursive Inference (Coconut-Ouroboros) | ⬜ NOT STARTED | Stage 2 answer val_ce < 1.5 |
 | 4 | GRPO | ⬜ NOT STARTED | Stage 3 gate |
@@ -41,11 +41,22 @@ See Part 7 → Bug 3 for the exact two-change fix.
 Without this, Stage 2 val_ce includes prompt supervision and cannot be
 used as a Stage 3 baseline.
  
-**Action 2 — Stage 3 architecture decisions are settled** (see Appendix B update).
+**Action 2 — Increase `--shuffle_buffer` on next Kaggle session restart.**
+Multiple 2–3 step spike clusters have now appeared regularly (see Live Observations).
+Add `--shuffle_buffer 20000` to the resume command.
+ 
+**Action 3 — Stage 3 architecture decisions are settled** (see Appendix B update).
 No code action needed yet. `recursive_finetune.py` to be written after Stage 2 completes.
 Use `stage3_agent_prompt.md` as the agent prompt.
  
 ```bash
+# Stage 1 resume (next session) — add shuffle_buffer:
+python pretrain.py \
+  --preset nano \
+  --resume_from runs/stage1 \
+  --shuffle_buffer 20000 \
+  --session_timeout_hours 12.0
+
 # Stage 2 launch (after Stage 1 banner: val_ce < 3.0 AND mean_uwr > 0.05):
 python train_sft.py \
   --preset nano \
@@ -174,7 +185,7 @@ Two-pass to avoid double-initializing tied weights.
 | `baseline_trm_mamba.py` | 0 | ✅ COMPLETE | All smoke checks passed |
 | `viability_gate.py` | 0 | ✅ COMPLETE | All 4 gates passed |
 | `pretrain.py` | 1 | 🟡 SCRIPT VERIFIED, not run on Kaggle | See Stage 1 |
-| `train_sft.py` | 2 | 🔴 2 BUGS — do not run | See Part 7 |
+| `train_sft.py` | 2 | 🔴 Bug 3 open — do not run | See Part 7 |
 | `BLUEPRINT.md` | — | Living document | This file |
 | `terminal_log.md` | — | Verified terminal outputs | Append only |
 | `recursive_finetune.py` | 3 | ⬜ NOT CREATED | Use stage3_agent_prompt.md to generate |
@@ -227,7 +238,7 @@ Two-pass to avoid double-initializing tied weights.
 
 **Script:** `pretrain.py`
 **Hardware:** Kaggle Dual T4, DDP world_size=2
-**Status:** Running — step ~3500 / 61,036 (~5.7% complete). See terminal_log.md for full output.
+**Status:** Running — step ~9000 / 61,036 (~14.7% complete). See terminal_log.md for full output.
 
 **Bug 5 fix confirmed working:**
 - Session 5 resumed from `checkpoint-0002000` (step=2000, tokens=65.5M) — clean local load ✅
@@ -252,16 +263,18 @@ save_every=1000, val_every=500, gen_every=500
 DDP throughput: ~5,800 tok/s. Full run ETA: ~9.4h
 ```
 
-**Live observations (step 3500):**
-- Val CE declining monotonically: 6.38 → 5.85 → 5.68 → 5.56 → 5.48 → 5.42 → 5.36 ✅
+**Live observations (step 9000):**
+- Val CE declining but plateaued: 6.38 → 5.85 → 5.68 → 5.56 → 5.48 → 5.42 → 5.36 → 5.34 → 5.32 → 5.30 → 5.30 → 5.31 → 5.30 → 5.31 → 5.30 → 5.29 → 5.29 ✅ (still decreasing but very slowly)
+- **⚠ Val CE plateau:** Essentially flat 5.29–5.31 from step 4500–9000 (~147M–295M tokens, 4500 steps). Train CE continues declining (4.59→4.20), gap widening. Not alarming at 14.7% of token budget; expected to break through with more data. Monitor at step 10000.
 - VRAM flat at 2.035 GB throughout — no graph retention ✅
-- Mean UWR volatile (0.38 → 0.42 → 0.37 → 0.34 → 0.155 at step 3500)
-  - Drop at step 3500 is correlated with spike cluster at steps 3475–3477; likely transient
-  - Code prompt ("def factorial") consistently degenerate — expected, FineWeb-Edu has no code
-  - UWR on 5 prompts is noisy; val CE is the primary signal
-- Spike rate: 12 spikes in 3500 steps = 0.34% — well within 10% threshold ✅
-- **⚠ Watch:** Steps 3475/3476/3477 had three consecutive spikes (raw=5.86/5.82/5.66).
-  First cluster seen. If another cluster appears within 500 steps, increase `shuffle_buffer`.
+- **⚠ UWR degradation:** Mean UWR chronically low since step 5000 (0.12–0.19 at most callbacks). "The capital of the city of the city" repetition loop recurring. Val CE is the primary signal and is healthy; UWR is a lagging indicator expected to recover as CE drops.
+- Spike rate: 44 spikes in 9000 steps = 0.49% — within 10% threshold ✅
+- **⚠ Spike clusters now regular:** (3570–3573), (6397–6400), (7971–7987–8000), (8060/8131), (8797/8847/8900). Multiple recurring clusters. Increase `--shuffle_buffer 20000` on next session resume.
+- Code prompt degenerate (digit/letter loops) — expected, FineWeb-Edu has no code.
+
+**Checkpoint status (as of step 9000):**
+- Local (keep_last=3): checkpoint-6000, checkpoint-7000, checkpoint-8000
+- Hub: checkpoint-3000 through checkpoint-8000
 
 **Success criteria:**
 - [ ] `val_ce < 3.0` AND `mean_uwr > 0.05` (script prints banner when met)
@@ -275,7 +288,30 @@ python train_sft.py \
   --resume_from runs/stage1/checkpoint-XXXXXXX \
   --ema_decay 0.995
 ```
-Fix Bugs 1–3 in `train_sft.py` first (see Part 7).
+Fix Bug 3 in `train_sft.py` first (see Part 7).
+
+**Loss curve summary (full run to step 9000):**
+
+| Step | Train CE | Smoothed | Val CE | Tokens Seen | Notes |
+|---|---|---|---|---|---|
+| 1 | 11.98 | 11.98 | — | 32k | Random init |
+| 500 | 5.46 | 5.78 | 6.38 | 16.4M | Phrases forming |
+| 1000 | 4.97 | 5.14 | 5.85 | 32.8M | Real sentences |
+| 1500 | 4.89 | 4.91 | 5.68 | 49.2M | Coherent prose |
+| 2000 | — | — | 5.56 | 65.5M | Resumed (ckpt-2000) |
+| 2500 | 4.57 | 4.68 | 5.48 | 82.0M | Consistent drop |
+| 3000 | 4.48 | 4.60 | 5.42 | 98.3M | Hub sync working |
+| 3500 | 4.42 | 4.58 | 5.36 | 114.7M | Spike cluster ⚠ |
+| 4000 | 4.46 | 4.50 | 5.34 | 131.1M | Val drop slowing |
+| 4500 | 4.59 | 4.50 | 5.32 | 147.5M | |
+| 5000 | 4.47 | 4.45 | 5.30 | 163.8M | Val plateau begins ⚠ |
+| 5500 | 4.37 | 4.39 | 5.30 | 180.2M | Flat |
+| 6000 | 4.31 | 4.36 | 5.31 | 196.6M | Val ticked up slightly |
+| 6500 | 4.32 | 4.35 | 5.30 | 213.0M | |
+| 7000 | 4.45 | 4.34 | 5.31 | 229.4M | |
+| 7500 | 4.32 | 4.32 | 5.30 | 245.8M | |
+| 8000 | 4.92 | 4.31 | 5.29 | 262.1M | Spike cluster (7971/7987/8000) |
+| 8500 | 4.33 | 4.30 | 5.29 | 278.5M | Plateau continues |
 
 ---
 
@@ -283,7 +319,7 @@ Fix Bugs 1–3 in `train_sft.py` first (see Part 7).
 
 **Gate:** Stage 1 `val_ce < 3.0` AND `mean_uwr > 0.05`
 
-**Script:** `train_sft.py` — two bugs and multi-dataset not implemented. See Part 7.
+**Script:** `train_sft.py` — Bug 3 open. See Part 7.
 
 **Agent prompt for fixing train_sft.py:** See Appendix A.
 
