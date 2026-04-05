@@ -242,6 +242,18 @@ def unique_word_ratio(text: str) -> float:
     return len(set(words)) / max(len(words), 1)
 
 
+def masked_token_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> Tuple[int, int]:
+    """Return (n_correct, n_valid) for next-token predictions on supervised labels only."""
+    with torch.no_grad():
+        valid = labels != -100
+        n_valid = int(valid.sum().item())
+        if n_valid == 0:
+            return 0, 0
+        preds = logits.argmax(dim=-1)
+        n_correct = int((preds[valid] == labels[valid]).sum().item())
+        return n_correct, n_valid
+
+
 def sanitize_args_for_serialization(args: argparse.Namespace) -> Dict[str, Any]:
     """Return a JSON-safe args dict with secrets removed."""
     cfg = dict(vars(args))
@@ -588,7 +600,7 @@ def run_generation_callback(
 
 
 @torch.no_grad()
-def compute_val_ce(
+def compute_val_metrics(
     model: BaselineTRMMamba,
     ema: ModelEMA,
     val_samples: List[Dict[str, Any]],
@@ -597,11 +609,12 @@ def compute_val_ce(
     dtype: torch.dtype,
     batch_size: int,
     vocab_size: int,
-) -> float:
-    """Compute per-token CE on the validation split using EMA weights."""
+) -> Tuple[float, float]:
+    """Compute answer-only validation CE and token accuracy using EMA weights."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
+    total_correct = 0
 
     with ema_scope(model, ema):
         for start in range(0, len(val_samples), batch_size):
@@ -621,10 +634,14 @@ def compute_val_ce(
                 total_loss += F.cross_entropy(
                     shift_logits[valid], shift_labels[valid], reduction="sum"
                 ).item()
-                total_tokens += int(valid.sum().item())
+                correct, count = masked_token_accuracy(shift_logits, shift_labels)
+                total_correct += correct
+                total_tokens += count
 
     model.train()
-    return total_loss / max(total_tokens, 1)
+    val_ce = total_loss / max(total_tokens, 1)
+    val_acc = total_correct / max(total_tokens, 1)
+    return val_ce, val_acc
 
 
 def save_checkpoint(
@@ -922,6 +939,7 @@ def main() -> None:
     print(f"  output_dir    : {output_dir}")
     print(f"  dataset_mix   : {args.dataset_mix}")
     print(f"  answer_only_ce: True")
+    print(f"  token_acc     : True  (answer tokens only)")
     print(f"  push_to_hub   : {args.push_to_hub}")
     print("=" * 64)
     print()
@@ -1035,15 +1053,21 @@ def main() -> None:
         sample_idx = 0
         perm_train = []
 
-    col_hdr = f"{'Step':>7}  {'Train CE':>9}  {'Val CE':>9}  {'GNorm':>7}  {'LR':>9}  {'VRAM':>7}  {'Tok/s':>7}"
+    col_hdr = (
+        f"{'Step':>7}  {'Train CE':>9}  {'Train Acc':>10}  {'Val CE':>9}  {'Val Acc':>8}  "
+        f"{'GNorm':>7}  {'LR':>9}  {'VRAM':>7}  {'Tok/s':>7}"
+    )
     print(col_hdr)
-    print("-" * 72)
+    print("-" * len(col_hdr))
 
     pbar = tqdm(total=total_steps, initial=start_step, desc="Training", dynamic_ncols=True)
     step = start_step
     micro_step = 0
     accum_loss = 0.0
+    accum_correct = 0
+    accum_tokens = 0
     last_val_ce: Optional[float] = None
+    last_val_acc: Optional[float] = None
     t0 = time.perf_counter()
     tokens_seen = 0
 
@@ -1074,6 +1098,7 @@ def main() -> None:
         shift_logits = logits[:, :-1, :].contiguous().view(-1, config.vocab_size).float()
         shift_labels = labels[:, 1:].contiguous().view(-1)
         loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+        n_correct, n_valid = masked_token_accuracy(shift_logits, shift_labels)
 
         if dtype == torch.float16:
             scaler.scale(loss / args.grad_accum).backward()
@@ -1081,6 +1106,8 @@ def main() -> None:
             (loss / args.grad_accum).backward()
 
         accum_loss += loss.detach().item()
+        accum_correct += n_correct
+        accum_tokens += n_valid
         micro_step += 1
         if micro_step % args.grad_accum != 0:
             continue
@@ -1101,20 +1128,24 @@ def main() -> None:
 
         step += 1
         mean_ce = accum_loss / args.grad_accum
+        mean_acc = accum_correct / max(accum_tokens, 1)
         accum_loss = 0.0
+        accum_correct = 0
+        accum_tokens = 0
 
         pbar.update(1)
-        pbar.set_postfix(ce=f"{mean_ce:.3f}", gn=f"{grad_norm:.3f}")
+        pbar.set_postfix(ce=f"{mean_ce:.3f}", acc=f"{mean_acc:.3f}", gn=f"{grad_norm:.3f}")
 
         if step % args.log_every == 0 or step == 1:
             elapsed = max(time.perf_counter() - t0, 1e-6)
             tok_s = tokens_seen / elapsed
             cur_lr = scheduler.get_last_lr()[0]
             vram = vram_gb(device)
-            val_str = f"{last_val_ce:.4f}" if last_val_ce is not None else "     -"
+            val_ce_str = f"{last_val_ce:.4f}" if last_val_ce is not None else "        -"
+            val_acc_str = f"{last_val_acc:.4f}" if last_val_acc is not None else "       -"
 
             tqdm.write(
-                f"{step:>7}  {mean_ce:>9.4f}  {val_str:>9}  "
+                f"{step:>7}  {mean_ce:>9.4f}  {mean_acc:>10.4f}  {val_ce_str:>9}  {val_acc_str:>8}  "
                 f"{grad_norm:>7.4f}  {cur_lr:>9.2e}  {vram:>7.3f}  {tok_s:>7.0f}"
             )
 
@@ -1124,6 +1155,7 @@ def main() -> None:
                 wandb.log(
                     {
                         "train/ce": mean_ce,
+                        "train/accuracy": mean_acc,
                         "train/grad_norm": grad_norm,
                         "train/lr": cur_lr,
                         "train/tok_s": tok_s,
@@ -1133,7 +1165,7 @@ def main() -> None:
                 )
 
         if step % args.val_every == 0 or step == total_steps:
-            last_val_ce = compute_val_ce(
+            last_val_ce, last_val_acc = compute_val_metrics(
                 model,
                 ema,
                 val_samples,
@@ -1143,12 +1175,14 @@ def main() -> None:
                 args.batch_size,
                 config.vocab_size,
             )
-            tqdm.write(f"  [val] step={step}  val_ce={last_val_ce:.4f}")
+            tqdm.write(
+                f"  [val] step={step}  val_ce={last_val_ce:.4f}  val_acc={last_val_acc:.4f}"
+            )
 
             if wandb_run is not None:
                 import wandb
 
-                wandb.log({"val/ce": last_val_ce}, step=step)
+                wandb.log({"val/ce": last_val_ce, "val/accuracy": last_val_acc}, step=step)
 
             if last_val_ce < 1.5:
                 tqdm.write(
@@ -1203,6 +1237,8 @@ def main() -> None:
     print(f"  Peak VRAM    : {peak_vram_gb:.2f} GB")
     if last_val_ce is not None:
         print(f"  Final val CE : {last_val_ce:.4f}  (answer tokens only)")
+        if last_val_acc is not None:
+            print(f"  Final val acc: {last_val_acc:.4f}  (answer-token accuracy)")
         if last_val_ce < 1.5:
             print("  Status       : SUCCESS - proceed to Phase 3 (incremental recursion)")
         else:
