@@ -514,8 +514,7 @@ def save_checkpoint(
     ema: ModelEMA,
     val_ce: Optional[float],
     cfg: PretrainConfig,
-    hf_token: Optional[str],
-    force_local_only: bool = False,
+    hf_token: Optional[str]
 ) -> Optional[Path]:
     """
     Write a checkpoint to local disk first (always), then attempt Hub push (fire-and-forget).
@@ -588,8 +587,8 @@ def save_checkpoint(
         shutil.rmtree(old, ignore_errors=True)
         print(f"  [ckpt] pruned -> {old.name}")
 
-    # ── Step 3: Hub push (skipped when force_local_only=True) ────────────────────
-    if cfg.push_to_hub and hf_token and not force_local_only:
+    # ── Step 3: Hub push ────────────────────
+    if cfg.push_to_hub and hf_token:
         uploaded = sync_checkpoint_to_hub(final_dir, cfg.hf_repo_id, hf_token)
         if not uploaded:
             print(
@@ -1561,7 +1560,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                 _check_timeout()
                 if _broadcast_timeout():
                     if is_main_process(rank):
-                        print(f"  [timeout] Saving emergency checkpoint at step {step} (local only) ...")
+                        print(f"  [timeout] Saving emergency checkpoint at step {step} ...")
                         save_checkpoint(
                             output_dir=output_dir,
                             step=step,
@@ -1577,14 +1576,11 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                             val_ce=last_val_ce,
                             cfg=cfg,
                             hf_token=hf_token,
-                            force_local_only=True,
                         )
                         last_saved_step = step
                         print(
                             f"  [timeout] Emergency checkpoint saved.\n"
-                            f"  [timeout] Resume: python pretrain.py "
-                            f"--resume_from {output_dir} "
-                            f"--session_timeout_hours {cfg.session_timeout_hours}"
+                            f"  [timeout] Re-run pretraining!"
                         )
                     if distributed:
                         dist.barrier()
@@ -1674,11 +1670,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                 print(f"  Steps completed    : {step:,} / {total_steps:,}")
                 print(f"  Tokens processed   : {tokens_processed:,} / {cfg.token_budget:,}")
                 print(f"  Last val CE        : {last_val_ce if last_val_ce is not None else 'n/a'}")
-                print(f"  Checkpoint saved   : runs/stage1/checkpoint-{step:07d}  (local only)")
-                print()
-                print("  To resume in next session:")
-                print(f"    python pretrain.py --resume_from {output_dir} \\")
-                print(f"      --session_timeout_hours {cfg.session_timeout_hours}")
+                print(f"  Checkpoint saved   : runs/stage1/checkpoint-{step:07d}")
                 print("=" * 72)
             if wandb_run is not None:
                 import wandb
