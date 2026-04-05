@@ -119,10 +119,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preset",
         choices=["nano", "small", "medium"],
-        default="small",
+        default="nano",
         help="Model size preset. nano=92M, small=270M, medium=760M.",
     )
-    parser.add_argument("--max_seq_len", type=int, default=512)
+    parser.add_argument("--max_seq_len", type=int, default=1024)
 
     # Dataset
     parser.add_argument("--dataset_name", default="bespokelabs/Bespoke-Stratos-17k")
@@ -143,7 +143,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset_mix",
         default="stratos",
         choices=["stratos", "full"],
-        help="'stratos' = Bespoke-Stratos-17k only. 'full' = 40/30/30 mix with MetaMathQA and OpenHermes-2.5.",
+        help="'stratos' = Bespoke-Stratos-17k only. 'full' = Stratos + MetaMathQA + OpenHermes-2.5 + OpenR1-Math-220k + OpenR1-Code.",
     )
 
     # Training
@@ -166,7 +166,7 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Gradient accumulation steps. Effective batch = batch_size * grad_accum.",
     )
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument(
         "--min_lr_ratio",
         type=float,
@@ -270,20 +270,11 @@ _CLEAN_RE = re.compile(
 )
 
 
-def _extract_bespoke(example: Dict[str, Any]) -> Tuple[str, str, str]:
-    """Extract (question, reasoning_chain, final_answer) from a Bespoke-Stratos row."""
-    question = ""
-    assistant_blob = ""
-    for turn in (example.get("conversations") or []):
-        role = str(turn.get("from", "")).lower().strip()
-        value = str(turn.get("value", "")).strip()
-        if role == "user" and not question:
-            question = value
-        elif role == "assistant" and not assistant_blob:
-            assistant_blob = value
-
-    if not question or not assistant_blob:
-        return "", "", ""
+def _parse_assistant_blob(assistant_blob: str) -> Tuple[str, str]:
+    """Parse assistant text into (reasoning, answer), preserving existing <think> traces when present."""
+    assistant_blob = str(assistant_blob or "").strip()
+    if not assistant_blob:
+        return "", ""
 
     think_match = _THINK_RE.search(assistant_blob)
     solution_match = _SOLUTION_RE.search(assistant_blob)
@@ -291,14 +282,100 @@ def _extract_bespoke(example: Dict[str, Any]) -> Tuple[str, str, str]:
     if think_match:
         reasoning = think_match.group(1).strip()
         answer = solution_match.group(1).strip() if solution_match else assistant_blob[think_match.end():].strip()
-    elif "<think>" in assistant_blob and "</think>" in assistant_blob:
+        return reasoning.strip(), answer.strip()
+
+    if "<think>" in assistant_blob and "</think>" in assistant_blob:
         parts = assistant_blob.split("</think>", 1)
         reasoning = parts[0].replace("<think>", "").strip()
         answer = parts[1].strip()
-    else:
-        reasoning = ""
-        answer = _CLEAN_RE.sub("", assistant_blob).strip()
+        return reasoning.strip(), answer.strip()
 
+    return "", _CLEAN_RE.sub("", assistant_blob).strip()
+
+
+def _extract_chat_pair(turns: Any) -> Tuple[str, str]:
+    """Extract the first user/human prompt and first assistant/gpt reply from a chat-style list."""
+    question = ""
+    assistant_blob = ""
+    for turn in (turns or []):
+        role = str(turn.get("role") or turn.get("from") or "").lower().strip()
+        value = str(turn.get("content") or turn.get("value") or "").strip()
+        if role in {"user", "human"} and value and not question:
+            question = value
+        elif role in {"assistant", "gpt"} and value and not assistant_blob:
+            assistant_blob = value
+    return question, assistant_blob
+
+
+def _pick_openr1_math_generation(example: Dict[str, Any]) -> str:
+    """Choose one high-quality OpenR1 math generation, preferring verified traces when available."""
+    generations = example.get("generations") or []
+    if not generations:
+        return ""
+
+    math_verify = list(example.get("correctness_math_verify") or [])
+    llama_verify = list(example.get("correctness_llama") or [])
+    for idx, generation in enumerate(generations):
+        is_math_ok = idx < len(math_verify) and bool(math_verify[idx])
+        is_llama_ok = idx < len(llama_verify) and bool(llama_verify[idx])
+        if is_math_ok or is_llama_ok:
+            return str(generation).strip()
+    return str(generations[0]).strip()
+
+
+def _extract_bespoke(example: Dict[str, Any]) -> Tuple[str, str, str]:
+    """Extract (question, reasoning_chain, final_answer) from a Bespoke-Stratos row."""
+    question, assistant_blob = _extract_chat_pair(example.get("conversations"))
+    if not question or not assistant_blob:
+        return "", "", ""
+    reasoning, answer = _parse_assistant_blob(assistant_blob)
+    return question.strip(), reasoning.strip(), answer.strip()
+
+
+def _extract_openr1_math(example: Dict[str, Any]) -> Tuple[str, str, str]:
+    """Extract (question, reasoning, answer) from OpenR1-Math-220k."""
+    question, assistant_blob = _extract_chat_pair(example.get("messages"))
+    if not question:
+        question = str(example.get("problem") or example.get("question") or "").strip()
+
+    generation = _pick_openr1_math_generation(example)
+    if generation:
+        assistant_blob = generation
+
+    reasoning = ""
+    answer = ""
+    if assistant_blob:
+        reasoning, answer = _parse_assistant_blob(assistant_blob)
+
+    if not reasoning and example.get("solution"):
+        reasoning = str(example.get("solution") or "").strip()
+    if not answer and example.get("answer"):
+        answer = str(example.get("answer") or "").strip()
+    elif not answer and not reasoning and example.get("solution"):
+        answer = str(example.get("solution") or "").strip()
+
+    return question.strip(), reasoning.strip(), answer.strip()
+
+
+def _extract_openr1_code(example: Dict[str, Any]) -> Tuple[str, str, str]:
+    """Extract (question, reasoning, answer) from OpenR1 code SFT data."""
+    question, assistant_blob = _extract_chat_pair(example.get("messages"))
+    if not question:
+        question = str(example.get("prompt") or "").strip()
+
+    if not question:
+        title = str(example.get("title") or "").strip()
+        description = str(example.get("description") or "").strip()
+        if title or description:
+            question = f"{title}\n\n{description}".strip()
+
+    if not assistant_blob:
+        assistant_blob = str(example.get("generation") or example.get("solution") or example.get("editorial") or "").strip()
+
+    if not question or not assistant_blob:
+        return "", "", ""
+
+    reasoning, answer = _parse_assistant_blob(assistant_blob)
     return question.strip(), reasoning.strip(), answer.strip()
 
 
@@ -327,16 +404,21 @@ def _build_sft_sample(
     answer: str,
     eos: str,
     max_seq_len: int,
-) -> Dict[str, Any]:
-    """Tokenize one SFT sample and record the prompt length for loss masking."""
+) -> Optional[Dict[str, Any]]:
+    """Tokenize one SFT sample, skipping rows that overflow max_seq_len or have no supervised target."""
     text = _format_training_text(question, reasoning, answer, eos)
     prefix_text = _build_prompt_prefix(question, reasoning)
     ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) < 4 or len(ids) > max_seq_len:
+        return None
+
     prompt_len = len(tokenizer.encode(prefix_text, add_special_tokens=False))
-    ids = ids[:max_seq_len]
+    if prompt_len >= len(ids):
+        return None
+
     return {
         "input_ids": torch.tensor(ids, dtype=torch.long),
-        "prompt_len": min(prompt_len, len(ids)),
+        "prompt_len": prompt_len,
     }
 
 
@@ -346,7 +428,7 @@ def load_and_tokenize(
     max_samples: Optional[int],
     max_seq_len: int,
 ) -> List[Dict[str, Any]]:
-    """Load one dataset, format rows, tokenize, and filter invalid samples."""
+    """Load one dataset, format rows, tokenize, and filter invalid or overlength samples."""
     print(f"Loading {dataset_name} ...")
     raw = load_dataset(dataset_name, split="train")
     if max_samples is not None:
@@ -354,21 +436,31 @@ def load_and_tokenize(
 
     eos = tokenizer.eos_token or "<|endoftext|>"
     samples: List[Dict[str, Any]] = []
-    skipped = 0
+    skipped_invalid = 0
+    skipped_too_long = 0
 
     for ex in tqdm(raw, desc="Formatting + tokenizing", leave=False):
         q, r, a = _extract_bespoke(ex)
         if not q or not a:
-            skipped += 1
+            skipped_invalid += 1
             continue
-        text = _format_training_text(q, r, a, eos)
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        if len(ids) < 4:
-            skipped += 1
-            continue
-        samples.append(_build_sft_sample(tokenizer, q, r, a, eos, max_seq_len))
 
-    print(f"  {len(samples)} samples kept, {skipped} skipped (missing fields / too short).")
+        sample = _build_sft_sample(tokenizer, q, r, a, eos, max_seq_len)
+        if sample is None:
+            text = _format_training_text(q, r, a, eos)
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if len(ids) > max_seq_len:
+                skipped_too_long += 1
+            else:
+                skipped_invalid += 1
+            continue
+
+        samples.append(sample)
+
+    print(
+        f"  {len(samples)} samples kept, {skipped_invalid} skipped (invalid), "
+        f"{skipped_too_long} skipped (> max_seq_len={max_seq_len})."
+    )
     return samples
 
 
@@ -393,26 +485,84 @@ def _extract_openhermes(example: Dict[str, Any]) -> Tuple[str, str, str]:
     return question, "", answer
 
 
+def _load_first_available_dataset(
+    candidates: List[Tuple[str, Optional[str]]],
+    split: str,
+) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+    """Load the first available dataset/config pair and report the resolved source label."""
+    for ds_name, config_name in candidates:
+        try:
+            if config_name:
+                dataset = load_dataset(ds_name, config_name, split=split)
+                label = f"{ds_name}[{config_name}]"
+            else:
+                dataset = load_dataset(ds_name, split=split)
+                label = ds_name
+            return dataset, ds_name, label
+        except Exception:
+            continue
+    return None, None, None
+
+
 def load_mixed_dataset(
     tokenizer,
     max_samples_per_source: Optional[int],
     max_seq_len: int,
 ) -> List[Dict[str, Any]]:
-    """Load a practical 40/30/30 Stratos/MetaMath/OpenHermes training mix."""
+    """Load the full Stage 2 mix with Stratos, MetaMath, OpenHermes, OpenR1-Math, and OpenR1-Code."""
     sources = [
-        ("bespokelabs/Bespoke-Stratos-17k", "train", _extract_bespoke, 0.40),
-        ("meta-math/MetaMathQA", "train", _extract_metamath, 0.30),
-        ("teknium/OpenHermes-2.5", "train", _extract_openhermes, 0.30),
+        {
+            "name": "bespokelabs/Bespoke-Stratos-17k",
+            "candidates": [("bespokelabs/Bespoke-Stratos-17k", None)],
+            "split": "train",
+            "extractor": _extract_bespoke,
+            "ratio": 0.30,
+        },
+        {
+            "name": "meta-math/MetaMathQA",
+            "candidates": [("meta-math/MetaMathQA", None)],
+            "split": "train",
+            "extractor": _extract_metamath,
+            "ratio": 0.20,
+        },
+        {
+            "name": "teknium/OpenHermes-2.5",
+            "candidates": [("teknium/OpenHermes-2.5", None)],
+            "split": "train",
+            "extractor": _extract_openhermes,
+            "ratio": 0.15,
+        },
+        {
+            "name": "open-r1/OpenR1-Math-220k",
+            "candidates": [
+                ("open-r1/OpenR1-Math-220k", "default"),
+                ("open-r1/OpenR1-Math-220k", None),
+            ],
+            "split": "train",
+            "extractor": _extract_openr1_math,
+            "ratio": 0.20,
+        },
+        {
+            "name": "open-r1/OpenR1-Code",
+            "candidates": [
+                ("open-r1/OpenR1-Code", None),
+                ("open-r1/codeforces-cots", "solutions_w_editorials_py"),
+                ("open-r1/codeforces-cots", "solutions_py"),
+                ("open-r1/codeforces-cots", "solutions"),
+            ],
+            "split": "train",
+            "extractor": _extract_openr1_code,
+            "ratio": 0.15,
+        },
     ]
     eos = tokenizer.eos_token or "<|endoftext|>"
     source_specs: List[Dict[str, Any]] = []
 
-    for ds_name, split, extractor, ratio in sources:
-        print(f"  Loading {ds_name} ...")
-        try:
-            raw = load_dataset(ds_name, split=split)
-        except Exception as exc:
-            print(f"  [warn] Could not load {ds_name}: {exc} - skipping.")
+    for source in sources:
+        print(f"  Loading {source['name']} ...")
+        raw, resolved_name, resolved_label = _load_first_available_dataset(source["candidates"], source["split"])
+        if raw is None or resolved_name is None or resolved_label is None:
+            print(f"  [warn] Could not load {source['name']} from any configured candidate - skipping.")
             continue
 
         available = len(raw)
@@ -420,12 +570,15 @@ def load_mixed_dataset(
             available = min(available, max_samples_per_source)
             raw = raw.select(range(available))
 
+        print(f"    resolved -> {resolved_label}")
         source_specs.append(
             {
-                "name": ds_name,
+                "name": source["name"],
+                "resolved_name": resolved_name,
+                "resolved_label": resolved_label,
                 "dataset": raw,
-                "extractor": extractor,
-                "ratio": ratio,
+                "extractor": source["extractor"],
+                "ratio": source["ratio"],
                 "available": available,
             }
         )
@@ -473,22 +626,37 @@ def load_mixed_dataset(
         extractor = spec["extractor"]
         target = target_counts[ds_name]
         kept = 0
-        for ex in tqdm(spec["dataset"], desc=f"  {ds_name.split('/')[-1]}", leave=False):
+        skipped_invalid = 0
+        skipped_too_long = 0
+
+        for ex in tqdm(spec["dataset"], desc=f"  {spec['resolved_label'].split('/')[-1]}", leave=False):
             q, r, a = extractor(ex)
             if not q or not a:
+                skipped_invalid += 1
                 continue
-            text = _format_training_text(q, r, a, eos)
-            ids = tokenizer.encode(text, add_special_tokens=False)
-            if len(ids) < 4:
-                continue
+
             sample = _build_sft_sample(tokenizer, q, r, a, eos, max_seq_len)
+            if sample is None:
+                text = _format_training_text(q, r, a, eos)
+                ids = tokenizer.encode(text, add_special_tokens=False)
+                if len(ids) > max_seq_len:
+                    skipped_too_long += 1
+                else:
+                    skipped_invalid += 1
+                continue
+
             sample["source"] = ds_name
+            sample["resolved_source"] = spec["resolved_label"]
             all_samples.append(sample)
             kept += 1
             if kept >= target:
                 break
+
         actual_counts[ds_name] = kept
-        print(f"    kept {kept} / target {target} samples.")
+        print(
+            f"    kept {kept} / target {target} samples "
+            f"(invalid={skipped_invalid}, too_long={skipped_too_long})."
+        )
 
     random.shuffle(all_samples)
     print(f"  Total mixed samples: {len(all_samples)}")
