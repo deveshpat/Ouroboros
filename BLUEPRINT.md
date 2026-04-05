@@ -10,9 +10,11 @@
 
 ### What this project is
 Novel hybrid Transformer-Mamba language model ("TRM-Mamba", 1:7 ratio) pre-trained
-from scratch on FineWeb-Edu, then fine-tuned for chain-of-thought reasoning. Target:
-a ~1B parameter model with test-time compute scaling via recursive inference (SERF).
-Zero budget — Kaggle Dual T4 + Google TRC application.
+from scratch on FineWeb-Edu, then fine-tuned for chain-of-thought reasoning using
+R1-distilled datasets. Target: prove the architecture outperforms comparably-sized
+models at nano scale (92.5M), then scale to medium/large on TRC. Test-time compute
+scaling via Coconut-Ouroboros recursive inference (SERF). Zero budget — Kaggle Dual
+T4 + Google TRC application.
 
 ### Root failure on record
 `checkpoint-950` (archived, do not use): randomly-initialized model trained directly
@@ -45,8 +47,10 @@ No change needed on resume.
 **Action 3 — Hard decision point: step 30000.**
 Val CE flat at 5.28–5.29 since step ~4500. Cosine LR does its primary work in the
 50–80% range (steps 30000–48000). Do not intervene before step 30000.
-Decision rule: *if val CE has not improved ≥ 0.05 nats from 5.28 by step 30000,
-reassess. Otherwise, let the schedule run to completion.*
+Decision rule: *if val CE is still declining at step 30000, extend token budget to
+4-6B tokens (increase `--token_budget`) rather than stopping at 2B. The empirical
+sweet spot for a 92.5M model is 4-6B high-quality tokens. Do not extend beyond 6B —
+diminishing returns dominate past that point at this model size.*
 
 ```bash
 # Stage 1 resume (next session) — shuffle_buffer already set, just resume:
@@ -56,12 +60,21 @@ python pretrain.py \
   --shuffle_buffer 20000 \
   --session_timeout_hours 12.0
 
+# Stage 1 extended budget (if val_ce still declining at step 30000):
+python pretrain.py \
+  --preset nano \
+  --resume_from runs/stage1 \
+  --token_budget 6_000_000_000 \
+  --shuffle_buffer 20000 \
+  --session_timeout_hours 12.0
+
 # Stage 2 launch (after Stage 1 banner: val_ce < 3.0 AND mean_uwr > 0.05):
 python train_sft.py \
   --preset nano \
   --resume_from runs/stage1/checkpoint-XXXXXXX \
+  --max_seq_len 1024 \
   --ema_decay 0.995 \
-  --dataset_mix stratos
+  --dataset_mix full
 
 # Stage 3 launch (after Stage 2 answer val_ce < 1.5):
 python recursive_finetune.py \
@@ -164,7 +177,14 @@ Two-pass to avoid double-initializing tied weights.
 | Tokenizer | Qwen2.5-0.5B; vocab_size=151_680 everywhere, no exceptions |
 | Mamba version | `mamba_ssm.Mamba` (original). Mamba2 deferred to Stage 3+ |
 | Stage 1 dataset | HuggingFaceFW/fineweb-edu sample-10BT, streamed |
-| Stage 2 dataset | Bespoke-Stratos-17k (40%) + MetaMathQA (30%) + OpenHermes-2.5 (30%) |
+| Stage 1 token budget | 4–6B tokens. Evaluate at step 30000: if val_ce still declining, extend. Hard cap at 6B (diminishing returns dominate past this for 92.5M params). Do NOT go to 10B at nano scale. |
+| Stage 2 dataset | Bespoke-Stratos-17k + MetaMathQA + OpenHermes-2.5 (existing mix) + OpenR1-Math-220k + OpenR1-Code (new additions). Filter/truncate at 1024 tokens — never train on mid-chain truncated samples. |
+| Stage 2 max_seq_len | **1024** tokens. Required for R1 reasoning traces (most are 2000–8000 tokens; 512 truncates mid-chain). Fits comfortably on Dual T4 at batch_size=2, grad_accum=8. |
+| Stage 2 epochs | 2–3 passes maximum over combined dataset. Beyond 3 epochs → memorization, not generalization. |
+| SFT vs pretrain tokens | Not interchangeable. Pretraining supervises every token position (dense signal). SFT supervises answer tokens only (sparse signal, structurally narrow). Cannot substitute 8B SFT tokens for 8B pretrain tokens — they teach fundamentally different things. |
+| Width scaling | Cannot increase d_model without abandoning checkpoints (every weight tensor shape changes). Net2Wider is too complex for hybrid architecture. Decision: prove architecture at nano, start medium/large from scratch on TRC. |
+| Architecture scaling path | Nano (92.5M) is the proof-of-concept. If architecture outperforms at this scale → start small (270M) or medium (760M) from scratch on TRC. Nano checkpoints are not transferable to wider configs. |
+| Depth stacking (DUS) | Viable in principle (see SOLAR 10.7B). Only meaningful after Stage 2 SFT, requires asymmetric initialization + residual re-scaling. Filed as Appendix C stretch goal — not on primary path. |
 | Hub repo | WeirdRunner/Ouroboros (private) |
 | Pre-training strategy | Train from scratch. Apply to Google TRC immediately (async) |
 | Recursion timing | Post-SFT only. Never train recursion from random init |
@@ -270,27 +290,31 @@ Do not duplicate any of these in per-script code.
 - Local (keep_last=3): checkpoint-0013000 pruned; checkpoint-0015000 saved and Hub-uploaded (commit=cc7891dc) ✅
 - Hub: checkpoint-0015000 confirmed
 
-**Key hyperparameters (nano, 2B tokens):**
+**Key hyperparameters (nano):**
 ```
 batch_size=8, grad_accum=4, chunk_size=1024 → 32,768 tokens/step
-total_steps = 61,036
 lr=6e-4, warmup=200 steps, cosine decay to 6e-5
 weight_decay=0.1, max_grad_norm=1.0, ema_decay=0.995
+shuffle_buffer=20000 (active since Session 6)
 save_every=1000, val_every=500, gen_every=500
-DDP throughput: ~5,800 tok/s. Full run ETA: ~9.4h
+DDP throughput: ~5,800 tok/s
 ```
 
+**Token budget (revised):**
+- Original plan: 2B tokens (61,036 steps). Now superseded.
+- Target: **4–6B tokens**. Modern over-training practice for small models (LLaMA 3.2 1B: 9T tokens; Chinchilla is a training-compute optimum, not inference-quality optimum).
+- Hard cap: **6B tokens** (~183,000 steps). Diminishing returns dominate past this at 92.5M params.
+- Decision at step 30000: if val_ce still declining → extend to 6B. If plateau is total → accept and proceed to Stage 2.
+
 **Live observations (step ~15900):**
-- Val CE: 5.289 (resume) → 5.2792 (step 15000) → 5.2799 (step 15500). **Essentially flat since step ~4500 (~147M tokens)**. Train CE continues declining (≈4.41 at step 9000 → ≈4.16 at step 15900). Widening generalization gap is expected at 26% of budget; likely to break through in later training. Monitor at step 20000.
-- VRAM flat at 2.035 GB throughout all sessions — no graph retention ✅
-- **Spike clusters recurring:** Session 6 spikes at steps 15030, 15215, 15767–15787 (3-step cluster), 15880. Increase `--shuffle_buffer 20000` on next resume.
-- UWR volatile: 0.220 @ step 15000 (decent), dropped to 0.129 @ step 15500 (code prompt degenerate again). Val CE is the primary signal.
-- Tokenizer length warning (133809 > 131072) — harmless, from streaming raw docs. Model inputs are always packed at chunk_size=1024.
+- Val CE: 5.289 (resume) → 5.2792 (step 15000) → 5.2799 (step 15500). Flat since step ~4500. Train CE declining steadily (≈4.11 at step 15900). Expected at 26% — cosine LR hasn't entered primary decay phase yet (steps 30000–48000).
+- VRAM flat at 2.035 GB — no graph retention ✅
+- Spike clusters recurring (15030, 15215, 15767–15787, 15880). shuffle_buffer 20000 now active.
+- Tokenizer length warning (133809 > 131072) — harmless, from streaming raw docs.
 
 **Success criteria:**
 - [ ] `val_ce < 3.0` AND `mean_uwr > 0.05` (script prints banner when met)
-- [ ] No loss spikes > smoothed+0.5 for > 5% of steps
-- [ ] Coherent text completions in gen callback
+- [ ] Val CE showing clear decline in steps 30000–48000 (cosine decay phase)
 
 **Loss curve summary (all sessions):**
 
@@ -340,6 +364,19 @@ checkpoints already exist in `output_dir`, they take priority over an external
 `load_mixed_dataset` — calls `_build_sft_sample` for all three sources (Stratos,
 MetaMathQA, OpenHermes). Bug 3 fix propagates automatically; no per-extractor patch needed.
 
+**Dataset mix (expanded):**
+
+| Source | Type | Approx size | Notes |
+|---|---|---|---|
+| Bespoke-Stratos-17k | Math + reasoning | ~25M tokens | Core dataset, already in `load_mixed_dataset` |
+| MetaMathQA | Math | ~400M tokens | Already in mix |
+| OpenHermes-2.5 | General instruction | ~1B tokens | Already in mix |
+| OpenR1-Math-220k | R1-distilled math traces | ~800M tokens | **New — add extractor** |
+| OpenR1-Code | R1-distilled code traces | ~300M tokens | **New — add extractor** |
+
+Filter rule: keep only samples where full sequence (question + think + answer) fits
+within 1024 tokens. Never train on mid-chain truncated reasoning traces.
+
 **Target format:**
 ```
 User: {question}
@@ -352,10 +389,17 @@ Assistant: <think>
 **Hyperparameters:**
 ```
 lr=1e-4 (default; use 3e-5 if loss spikes early)
-warmup=100 steps, cosine decay to 1e-5, num_epochs=3 max
+warmup=100 steps, cosine decay to 1e-5
+num_epochs=2–3 max (beyond 3 → memorization, not generalization)
 batch_size=2, grad_accum=8 → effective batch=16
-max_seq_len=512, ema_decay=0.995
+max_seq_len=1024  ← increased from 512; required for R1 trace compatibility
+ema_decay=0.995
 ```
+
+**Code changes needed before Stage 2 launch:**
+- Add extractors for `open-r1/OpenR1-Math-220k` and `open-r1/OpenR1-Code` in `train_sft.py::load_mixed_dataset`
+- Update mix ratios to accommodate new sources
+- Update `--max_seq_len` default or pass explicitly at launch
 
 **Success criteria:**
 - [ ] `val_ce < 1.5` (answer tokens only — guaranteed clean since Bug 3 fixed before first run)
@@ -477,13 +521,21 @@ will have clean answer-only val_ce from step 1. Close this bug.
 
 ## Part 8 — Compute Plan
 
+**Stage 1 token budget reference (Dual T4, ~5,800 tok/s):**
+
+| Token Budget | Steps | Sessions (12h) | Wall Time |
+|---|---|---|---|
+| 2B (original) | 61,036 | ~11 | ~5 days |
+| 4B | 122,072 | ~23 | ~11 days |
+| 6B (target cap) | 183,108 | ~34 | ~17 days |
+
 | Stage | Platform | Estimate | Notes |
 |---|---|---|---|
 | 0 | Colab free / local | ~15 min | ✅ Done |
-| 1 | Kaggle T4 | ~18.5h (nano, 2B tokens) | ~26% complete |
+| 1 | Kaggle T4 | ~17–34 sessions (4–6B tokens) | ~26% complete; budget decision at step 30000 |
 | TRC application | — | 5 min | sites.research.google/trc |
-| 2 | Kaggle T4 or TRC | ~2–4h | 3 epochs × ~50k samples |
-| 3 | TRC preferred | ~4–8h | Incremental, gated per n_loops |
+| 2 | Kaggle T4 or TRC | ~4–8h | 2–3 epochs over expanded R1 dataset mix |
+| 3 | TRC preferred | ~4–8h | Incremental, gated per n_latent |
 | 4 | TRC + unsloth | ~8–12h | GRPO G=4 rollouts |
 | 5 | Local / Jetson | ~2h | Post-training quantization |
 
@@ -497,10 +549,14 @@ will have clean answer-only val_ce from step 1. Close this bug.
 - **RoPE** (Su et al., 2021) — reference in LLaMA 2 codebase
 - **SwiGLU** (Shazeer, 2020) — `ceil((8/3 × d_model) / 64) × 64` hidden_dim
 - **GQA** (Ainslie et al., 2023) — grouped query attention
+- **Chinchilla** (Hoffmann et al., 2022) — compute-optimal scaling laws (training optimum, NOT inference optimum)
 - **FineWeb-Edu** (HuggingFaceTB, 2024) — https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
+- **Phi-1/Phi-2** (Microsoft, 2023) — synthetic "textbook quality" data at small scale
+- **SOLAR 10.7B** (Upstage, 2023) — Depth Up-Scaling (DUS) via pretrained weight stacking
+- **OpenR1 datasets** (open-r1 collection) — https://huggingface.co/collections/open-r1/reasoning-datasets
 - **Coconut** (Meta, arXiv:2412.06769) — latent thought injection, basis for Stage 3
 - **TRM** (Samsung, arXiv:2510.04871) — architecture inspiration only (encoder model)
-- **DeepSeek-R1** (2025) — GRPO reward functions
+- **DeepSeek-R1** (2025) — GRPO reward functions + R1-distilled datasets
 - **Quamba** (2024) — post-training quantization for Mamba models
 - **TRL GRPOTrainer** — https://huggingface.co/docs/trl
 
@@ -533,3 +589,64 @@ scratch-memory across K passes — a genuine advantage over pure Transformer-Coc
 - `forward_from_embeddings()` — forward pass starting from pre-computed embeddings
 
 See `stage3_agent_prompt.md` for complete implementation specification.
+
+---
+
+## Appendix C — Stretch Goals (post-Stage 3, no-TRC path)
+
+> These are explicitly NOT on the primary path. Document here so ideas are not lost.
+> Re-evaluate only after Stage 3 (Coconut-Ouroboros) is complete.
+
+### C.1 — Depth Up-Scaling (DUS) for a Deeper Nano
+
+**What:** Stack two Stage-2-fine-tuned nano checkpoints to get n_groups=2 at d_model=512
+(107M params, 18 residual layers). Based on SOLAR 10.7B technique.
+
+**When it makes sense:** No TRC access, Stage 3 complete, want to push capability
+ceiling before committing to a full medium-scale retraining run.
+
+**Requirements — do not attempt without all of these:**
+1. **Asymmetric initialization:** Group 1 from final Stage 2 checkpoint; Group 2 from
+   an earlier Stage 2 checkpoint (different step → different learned representations).
+   Never use identical weights for both groups — symmetric init collapses gradients.
+2. **Residual re-scaling:** After loading, multiply all residual writer weights
+   (`o_proj`, `mlp.down_proj`, `mamba.out_proj`) by `1/sqrt(2) ≈ 0.707` to correct
+   for the doubling of depth without re-scaling.
+3. **Healing run:** ~300–500M tokens of continued pretraining at lr=1e-4 to let both
+   groups learn to cooperate.
+4. **Re-SFT:** Full Stage 2 SFT pass on the stacked model after healing.
+
+**What you do NOT get:** wider representations (d_model stays 512), any parameter
+efficiency gain (15% more params for 2× compute), compatibility with existing nano
+checkpoints in later stages.
+
+### C.2 — Sparse MoE at MLP Layer
+
+**What:** Replace SwiGLU with top-2-of-N sparse MoE. Doubles MLP capacity at constant
+FLOPs per token.
+
+**Why not now:** Requires rewriting `SwiGLU` and `TRMBlock`, incompatible with all
+existing checkpoints, introduces load-balancing instability. This is a Stage 0
+architectural decision — cannot be retrofitted.
+
+**File for:** next full run if architecture proves out at nano scale.
+
+### C.3 — Synthetic Data Augmentation for SFT (Phi-style)
+
+**What:** Use a frontier model (DeepSeek-R1, Qwen2.5-72B via API) to generate
+reasoning traces targeting the nano's demonstrated weaknesses from Stage 2 generation
+callbacks. Keep traces short (< 1024 tokens) since longer chains are truncated.
+
+**Cost:** API credits, not GPU time. Low implementation risk.
+
+**When:** Before Stage 2 launch, as an additive data source alongside the open-r1
+collection. Highest ROI per dollar at small model scales (Phi-1 validated this).
+
+### C.4 — Architecture Scaling (if TRC never arrives)
+
+Primary path: nano proves architecture → medium/large from scratch on TRC.
+
+If TRC never arrives: nano + SERF K=16 is still a valid publishable result. A 92.5M
+model with 16 latent thought passes is doing 16× the inference compute of a single
+forward pass — competitive with much larger single-pass models on structured reasoning
+tasks where depth matters more than breadth.
