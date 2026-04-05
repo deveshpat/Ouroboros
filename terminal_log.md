@@ -11,6 +11,139 @@
 
 ---
 
+## Stage 1 — Pre-training, Kaggle Dual T4 (Session 6, resumed from checkpoint-0014902)
+**Script:** `pretrain.py`
+**Date:** 2026-04-05
+**Hardware:** Kaggle Dual T4 (2× T4 16 GB, DDP auto-launched, world_size=2)
+**Status:** 🟡 IN PROGRESS — log captured through step 15900 / 61,036 (26.1%)
+
+**Clean resume confirmed:**
+```
+  [resume] local   checkpoint-0014902  step=14902  epoch=0  tokens=488,308,736  val_ce=5.289637256266823
+```
+✅
+
+**Tokenizer warning (harmless):**
+```
+Token indices sequence length is longer than the specified maximum sequence length for
+this model (133809 > 131072). Running this sequence through the model will result in
+indexing errors
+```
+This is emitted by the HuggingFace tokenizer's own warning mechanism during dataset
+streaming — it refers to a raw document length, not a model input. Model inputs are
+packed at `chunk_size=1024` and are never oversized. No action required.
+
+**Startup:**
+```
+2026-04-05 02:40:55 
+2026-04-05 02:40:55 ========================================================================
+2026-04-05 02:40:55   Stage 1 Pre-training - Project Ouroboros
+2026-04-05 02:40:55 ========================================================================
+2026-04-05 02:40:55   dataset          : HuggingFaceFW/fineweb-edu / sample-10BT
+2026-04-05 02:40:55   tokenizer        : Qwen/Qwen2.5-0.5B  vocab=151,665
+2026-04-05 02:40:55   preset           : nano
+2026-04-05 02:40:55   model            : d_model=512  groups=1  heads=8/4
+2026-04-05 02:40:55   chunk_size       : 1024
+2026-04-05 02:40:55   batch x accum    : 8 global x 4
+2026-04-05 02:40:55   world_size       : 2  (DDP auto-enabled)
+2026-04-05 02:40:55   per_gpu_batch    : 4
+2026-04-05 02:40:55   tokens / step    : 32,768
+2026-04-05 02:40:55   token_budget     : 2,000,000,000
+2026-04-05 02:40:55   total_steps      : 61,036
+2026-04-05 02:40:55   dtype            : torch.bfloat16
+2026-04-05 02:40:55   device           : cuda:0
+2026-04-05 02:40:55   output_dir       : runs/stage1
+2026-04-05 02:40:55   push_to_hub      : True
+2026-04-05 02:40:55   timeout          : 12.0h  (buffer=15 min)
+2026-04-05 02:40:55 ========================================================================
+2026-04-05 02:40:57 
+2026-04-05 02:40:57 Model parameters : 92,477,440 (92.5 M)
+```
+
+**Val + generation callbacks:**
+```
+2026-04-05 03:26:57   [val] step=15000  val_ce=5.2792
+
+2026-04-05 03:26:57   -- Generation @ step 15000 (live weights) --
+2026-04-05 03:26:58   P: The capital of France is
+2026-04-05 03:26:58   C:  the town of L'O'Héon, the capital of the town of L'O'Héon, in the town of L'O'Héon. The town is the town of L'O'Héon, and the town of L'O'H'O'O'H'O'O'H'O'O'H'O
+2026-04-05 03:26:58      uwr=0.393
+2026-04-05 03:27:00   P: In mathematics, a prime number is
+2026-04-05 03:27:00   C:  a number of numbers that are written in a number of different ways. For example, a number is a number that is written in a number of ways. For example, a numbe
+2026-04-05 03:27:00      uwr=0.123
+2026-04-05 03:27:01   P: def factorial(n):
+2026-04-05 03:27:01     """Return n!."""
+2026-04-05 03:27:01     if n
+2026-04-05 03:27:01   C:  is a function that is not a function of the function, it is a function that is used to define the function of the function. For example, if the function is a f
+2026-04-05 03:27:01      uwr=0.168
+2026-04-05 03:27:03   P: Neural networks learn by
+2026-04-05 03:27:03   C:  the time they are born. This is a very important step in the development of the brain. It is a very important part of the brain's development. It is a very imp
+2026-04-05 03:27:03      uwr=0.292
+2026-04-05 03:27:04   P: The French Revolution began in
+2026-04-05 03:27:04   C:  1799, and the French Revolution was a period of great prosperity. The French Revolution was a period of great prosperity, and the French Revolution was a perio
+2026-04-05 03:27:04      uwr=0.124
+2026-04-05 03:27:04   Mean UWR: 0.220
+
+2026-04-05 04:17:32   [val] step=15500  val_ce=5.2799
+
+2026-04-05 04:17:32   -- Generation @ step 15500 (live weights) --
+2026-04-05 04:17:34   P: The capital of France is
+2026-04-05 04:17:34   C:  to build a new capital, the capital of the country, which is to be used as a capital. The capital is to be used as a capital, and the capital is to be used as
+2026-04-05 04:17:34      uwr=0.165
+2026-04-05 04:17:35   P: In mathematics, a prime number is
+2026-04-05 04:17:35   C:  a number of numbers that are in the same order as the number of numbers in the same number. For example, the number of digits in the number of digits in the nu
+2026-04-05 04:17:35      uwr=0.127
+2026-04-05 04:17:37   P: def factorial(n):
+2026-04-05 04:17:37     """Return n!."""
+2026-04-05 04:17:37     if n
+2026-04-05 04:17:37   C:  2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n
+2026-04-05 04:17:37      uwr=0.033
+2026-04-05 04:17:38   P: Neural networks learn by
+2026-04-05 04:17:38   C:  means of a series of different mechanisms that are used to create a single system. The first is the system of the system of the brain. The second is the system
+2026-04-05 04:17:38      uwr=0.185
+2026-04-05 04:17:40   P: The French Revolution began in
+2026-04-05 04:17:40   C:  1778, and the French revolution was a period of the revolution. The French revolution was a period of the revolution, and the revolution was the revolution of
+2026-04-05 04:17:40      uwr=0.133
+2026-04-05 04:17:40   Mean UWR: 0.129
+```
+
+**Training log (steps 14950–15900):**
+```
+2026-04-05 03:18:25   14950     4.1160          -     4.1650   0.4512   5.25e-04    2.035        706
+2026-04-05 03:23:06   15000     4.3443          -     4.1642   0.4648   5.25e-04    2.035       5816
+2026-04-05 03:29:47   [spike] step=15030  raw=4.8237  ema=4.1789
+2026-04-05 03:31:37   15050     4.2771     5.2792     4.1668   0.4141   5.24e-04    2.035       3209
+2026-04-05 03:36:18   15100     4.2057     5.2792     4.1648   0.3945   5.24e-04    2.035       5833
+2026-04-05 03:41:00   15150     4.2546     5.2792     4.1605   0.4375   5.23e-04    2.035       5803
+2026-04-05 03:45:43   15200     4.2229     5.2792     4.1516   0.4160   5.23e-04    2.035       5796
+2026-04-05 03:47:07   [spike] step=15215  raw=4.7100  ema=4.1549
+2026-04-05 03:50:26   15250     4.2361     5.2792     4.1536   0.4453   5.22e-04    2.035       5791
+2026-04-05 03:55:09   15300     4.1254     5.2792     4.1561   0.4043   5.22e-04    2.035       5792
+2026-04-05 03:59:52   15350     4.0473     5.2792     4.1481   0.3789   5.21e-04    2.035       5783
+2026-04-05 04:04:35   15400     4.1413     5.2792     4.1615   0.4160   5.21e-04    2.035       5791
+2026-04-05 04:09:17   15450     4.2836     5.2792     4.1639   0.4199   5.21e-04    2.035       5795
+2026-04-05 04:14:00   15500     4.1576     5.2792     4.1583   0.4922   5.20e-04    2.035       5790
+2026-04-05 04:22:13   15550     4.2562     5.2799     4.1567   0.4609   5.20e-04    2.035       3325
+2026-04-05 04:26:54   15600     4.2673     5.2799     4.1618   0.3926   5.19e-04    2.035       5837
+2026-04-05 04:31:36   15650     4.1992     5.2799     4.1574   0.4141   5.19e-04    2.035       5808
+2026-04-05 04:36:18   15700     4.0449     5.2799     4.1487   0.4023   5.18e-04    2.035       5810
+2026-04-05 04:41:00   15750     4.2621     5.2799     4.1494   0.5000   5.18e-04    2.035       5804
+2026-04-05 04:42:36   [spike] step=15767  raw=4.7158  ema=4.1564
+2026-04-05 04:44:24   [spike] step=15786  raw=4.6814  ema=4.1619
+2026-04-05 04:44:30   [spike] step=15787  raw=4.8845  ema=4.1691
+2026-04-05 04:45:43   15800     4.3277     5.2799     4.1686   0.7266   5.17e-04    2.035       5800
+2026-04-05 04:50:26   15850     4.1247     5.2799     4.1648   0.4570   5.17e-04    2.035       5794
+2026-04-05 04:53:15   [spike] step=15880  raw=4.7188  ema=4.1635
+2026-04-05 04:55:08   15900     4.1067     5.2799     4.1620   0.4395   5.16e-04    2.035       5798
+```
+*(Log ends here — session still running)*
+
+**Checkpoint status (end of captured log):**
+- Local (keep_last=3): checkpoint-0013000 pruned; checkpoint-0015000 saved and uploaded (commit=cc7891dc)
+- Hub: checkpoint-0015000 confirmed uploaded
+
+---
+
 ## Stage 1 — Pre-training, Kaggle Dual T4 (Session 5, resumed from checkpoint-0002000)
 **Script:** `pretrain.py`
 **Date:** 2026-04-03
@@ -56,7 +189,7 @@ Clean local resume from disk. ✅
 2026-04-03 08:28:07   epoch 0  offset=228  skipping=64000 chunks
 ```
 
-**Training log ( Latest gen @ / steps ):**
+**Training log (steps 8500–9000):**
 ```
 2026-04-03 19:35:45   -- Generation @ step 8500 (live weights) --
 2026-04-03 19:35:47   P: The capital of France is
@@ -70,14 +203,7 @@ Clean local resume from disk. ✅
 2026-04-03 19:35:50     if n
 2026-04-03 19:35:50   C: . 1
 2026-04-03 19:35:50 * 100% of the time
-2026-04-03 19:35:50 * 100% of the time
-2026-04-03 19:35:50 * 100% of the time
-2026-04-03 19:35:50 * 100% of the time
-2026-04-03 19:35:50 * 100% of the time
-2026-04-03 19:35:50 * 100% of the time
-2026-04-03 19:35:50 * 100% of the time
-2026-04-03 19:35:50 * 100% of the time
-2026-04-03 19:35:50 * 10
+...
 2026-04-03 19:35:50      uwr=0.119
 2026-04-03 19:35:51   P: Neural networks learn by
 2026-04-03 19:35:51   C:  means of the Internet. The Internet is a network of networks that connect to the Internet. The Internet is a network of networks that connect to the Internet.
@@ -105,122 +231,16 @@ Clean local resume from disk. ✅
 
 ---
 
-**Loss curve summary (steps 1–9000):**
-
-| Step | Train CE | Smoothed | Val CE | Tokens Seen | Notes |
-|---|---|---|---|---|---|
-| 1 | 11.98 | 11.98 | — | 32k | Random init |
-| 500 | 5.46 | 5.78 | 6.38 | 16.4M | Phrases forming |
-| 1000 | 4.97 | 5.14 | 5.85 | 32.8M | Real sentences |
-| 1500 | 4.89 | 4.91 | 5.68 | 49.2M | Coherent prose |
-| 2000 | — | — | 5.56 | 65.5M | Resumed (ckpt-2000) |
-| 2500 | 4.57 | 4.68 | 5.48 | 82.0M | Consistent drop |
-| 3000 | 4.48 | 4.60 | 5.42 | 98.3M | Hub sync working |
-| 3500 | 4.42 | 4.58 | 5.36 | 114.7M | Spike cluster ⚠ |
-| 4000 | 4.46 | 4.50 | 5.34 | 131.1M | Val drop slowing |
-| 4500 | 4.59 | 4.50 | 5.32 | 147.5M | |
-| 5000 | 4.47 | 4.45 | 5.30 | 163.8M | Val plateau begins ⚠ |
-| 5500 | 4.37 | 4.39 | 5.30 | 180.2M | Flat |
-| 6000 | 4.31 | 4.36 | 5.31 | 196.6M | Val ticked up slightly |
-| 6500 | 4.32 | 4.35 | 5.30 | 213.0M | |
-| 7000 | 4.45 | 4.34 | 5.31 | 229.4M | |
-| 7500 | 4.32 | 4.32 | 5.30 | 245.8M | |
-| 8000 | 4.92 | 4.31 | 5.29 | 262.1M | Spike cluster (7971/7987/8000) |
-| 8500 | 4.33 | 4.30 | 5.29 | 278.5M | Plateau continues |
-
-**Key observations (step 9000):**
-- Val CE improving very slowly from step 4500 onward (5.32 → 5.29, 4500 steps). Plateau-like but still marginally decreasing; primary signal is healthy.
-- Train CE continues to decline monotonically: 4.59 → 4.21. Gap between train and val CE slowly widening — expected at 14.7% of token budget.
-- VRAM perfectly flat at 2.035 GB throughout all sessions — zero graph retention. ✅
-- Spike rate: 44 spikes / 9000 steps = 0.49% — within acceptable 10% threshold. ✅
-- Multiple recurring 2–3 step spike clusters since step 3475. Increase `--shuffle_buffer 20000` on next session.
-- UWR chronically low (0.12–0.19) at most gen callbacks since step 5000; code prompt always degenerate (expected, FineWeb-Edu has no code).
-
----
-
 ## Stage 2 SFT — Patch Verification (Code Audit, no run)
 **Script:** `train_sft.py`
 **Date:** 2026-04-03
 **Method:** Static code audit of the submitted `train_sft.py` file.
 
 **Bug 1 — compute_val_ce live-weight restore:** ✅ FIXED
-```
-  live_backup: Dict[str, torch.Tensor] = {}
-  for name, param in model.named_parameters():
-      if name in ema.shadow:
-          live_backup[name] = param.data.clone()
-          param.data.copy_(ema.shadow[name].to(dtype=param.data.dtype))
-  ...
-  for name, param in model.named_parameters():
-      if name in live_backup:
-          param.data.copy_(live_backup[name])
-```
-Live weights are saved before EMA swap and restored after validation. ✅
-
 **Bug 2 — load_latest_checkpoint direct path handling:** ✅ FIXED
-```
-  # Handles: direct checkpoint path, parent dir scan, Hub fallback
-  # search_root + direct_candidates logic present and tested.
-```
-Function handles all three cases: direct checkpoint dir, parent dir glob, Hub download. ✅
-
-**Bug 3 — collate prompt masking:** 🔴 NOT FIXED
-```python
-  # In collate():
-  labels[idx, :length] = ids   ← ALL tokens supervised, including prompt
-  # No prompt_len field in load_and_tokenize samples.
-  # samples.append({"input_ids": torch.tensor(ids[:max_seq_len], dtype=torch.long)})
-  #   ↑ no "prompt_len" key added
-```
-User prompt tokens ("User: {question}\n\nAssistant: <think>\n") are still
-included in the CE loss. Must fix before Stage 3 — answer val_ce baseline
-is inflated by prompt supervision and cannot be used as a Stage 3 gate.
-
-**Fix required in `load_and_tokenize`:**
-```python
-prefix = f"User: {q}\n\nAssistant: <think>\n"  # or without <think> if no reasoning
-prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
-prompt_len = len(prefix_ids)
-full_ids   = tokenizer.encode(text, add_special_tokens=False)
-samples.append({
-    "input_ids":  torch.tensor(full_ids[:max_seq_len], dtype=torch.long),
-    "prompt_len": prompt_len,   ← ADD THIS
-})
-```
-
-**Fix required in `collate`:**
-```python
-for idx, sample in enumerate(samples):
-    ids = sample["input_ids"]
-    length = ids.size(0)
-    pl = min(sample.get("prompt_len", 0), length)
-    input_ids[idx, :length] = ids
-    labels[idx, pl:length]  = ids[pl:]   ← only supervise response tokens
-    mask[idx, :length] = True
-```
-
+**Bug 3 — collate prompt masking:** 🔴 NOT FIXED (must fix before Stage 2 run)
 **Issue 3 — Header string:** ✅ FIXED
-```
-  print("  Stage 2 SFT - Project Ouroboros")   ← confirmed in file
-```
-
 **Issue 4 — Multi-dataset mixing:** ✅ IMPLEMENTED
-```
-  load_mixed_dataset() present with:
-    - _extract_metamath()
-    - _extract_openhermes()
-    - 40/30/30 ratio logic with available-sample balancing
-    - --dataset_mix stratos|full CLI arg
-```
-
-**Summary of SFT patch status:**
-```
-  Bug 1  compute_val_ce weight restore    ✅ FIXED
-  Bug 2  load_latest_checkpoint paths     ✅ FIXED
-  Bug 3  collate prompt masking           🔴 NOT FIXED — must fix before Stage 2 run
-  Issue 3  header string                  ✅ FIXED
-  Issue 4  multi-dataset support          ✅ IMPLEMENTED
-```
 
 ---
 
@@ -233,8 +253,6 @@ for idx, sample in enumerate(samples):
 **⚠ No checkpoint saved (Bug 5):** Hub 401 at step 1000 caused `save_checkpoint` to
 abandon `.tmp` without renaming to final. Bug 5 was patched before Session 5.
 Session 5 started from scratch (step=0) since no local checkpoint existed from Session 4.
-
----
 
 **Smoke test output (runs automatically before main loop):**
 ```
@@ -261,26 +279,12 @@ Session 5 started from scratch (step=0) since no local checkpoint existed from S
       1    11.9824          -    11.9824   1.9766   6.00e-06    2.035       4222
      50     9.2922          -    11.4559   2.2656   1.53e-04    2.035       6040
     100     7.0954          -     9.9666   0.6797   3.03e-04    2.035       5859
-    150     7.0693          -     8.7018   1.0938   4.53e-04    2.035       5812
-    200     6.2197          -     7.7876   0.7617   6.00e-04    2.035       5794
-    250     6.1138          -     7.1607   0.6172   6.00e-04    2.035       5793
-    300     6.1652          -     6.7050   0.7773   6.00e-04    2.035       5794
-    350     5.7886          -     6.3685   1.0625   6.00e-04    2.035       5796
-    400     5.6378          -     6.1231   0.6211   6.00e-04    2.035       5783
-    450     5.6214          -     5.9260   0.7383   6.00e-04    2.035       5807
-    500     5.4631          -     5.7808   0.5664   6.00e-04    2.035       5805
-  [val] step=500  val_ce=6.3811
-  Mean UWR: 0.385
-    550     5.5842     6.3811     5.6558   0.5352   6.00e-04    2.035       3515
-    600     5.4063     6.3811     5.5648   0.5078   6.00e-04    2.035       5860
     ...
    1000     4.9713     6.3811     5.1369   0.4590   6.00e-04    2.035       5719
   [val] step=1000  val_ce=5.8478
-  Mean UWR: 0.421
   [hub] upload failed for checkpoint-0001000: Client error '401 Unauthorized' ← ⚠ Bug 5
    1500     4.8855     5.8478     4.9102   0.4805   5.99e-04    2.035       5702
   [val] step=1500  val_ce=5.6810
-  Mean UWR: 0.398
    1700     5.0407     5.6810     4.8453   0.4668   5.99e-04    2.035       5735
 ```
 *(Session 4 ended at step 1700 — no checkpoint saved due to Bug 5)*
@@ -291,11 +295,6 @@ Session 5 started from scratch (step=0) since no local checkpoint existed from S
 **Script:** `train_sft_phase2.py` (now: `train_sft.py`)
 **Date:** Session 3
 **Result:** Pipeline verified. EMA generation degenerate at step 100 (expected at decay=0.999). Corrected to `--ema_decay 0.995`.
-
-**⚠ Bugs identified post-run:**
-1. `compute_val_ce` — does not restore live weights after EMA eval (Bug 1) — ✅ FIXED
-2. `load_latest_checkpoint` — does not handle direct checkpoint paths (Bug 2) — ✅ FIXED
-3. `collate` — applies loss to all tokens including user prompt (Bug 3) — 🔴 STILL OPEN
 
 ```
   preset=nano  seq_len=512  batch×accum=2×4=8  lr=0.0002  warmup=100

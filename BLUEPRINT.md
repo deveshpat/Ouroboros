@@ -26,31 +26,30 @@ on SFT data. Output: comma-loops and "the the the". Three root causes:
 | Stage | Name | Status | Gate |
 |---|---|---|---|
 | 0 | Architecture & Viability | ✅ COMPLETE | All 4 gates passed |
-| 1 | Pre-training | 🟡 IN PROGRESS on Kaggle Dual T4 — step ~9000 / 61,036 (~14.7%) | val_ce < 3.0 + UWR > 0.05 |
-| 2 | SFT | 🔴 BLOCKED — Bug 3 (collate prompt masking) not fixed | Fix Bug 3, then run |
+| 1 | Pre-training | 🟡 IN PROGRESS — step ~15900 / 61,036 (~26.1%) | val_ce < 3.0 + UWR > 0.05 |
+| 2 | SFT | ✅ READY — blocked only on Stage 1 gate | Fix confirmed; see Stage 2 |
 | 3 | Recursive Inference (Coconut-Ouroboros) | ⬜ NOT STARTED | Stage 2 answer val_ce < 1.5 |
 | 4 | GRPO | ⬜ NOT STARTED | Stage 3 gate |
 | 5 | Quantization | ⬜ NOT STARTED | Stage 4 or 3 gate |
 
-### Immediate next action
+### Immediate next actions
 
 Stage 1 is running. While it runs:
- 
-**Action 1 — Fix Bug 3 in `train_sft.py`** (prompt masking in collate).
-See Part 7 → Bug 3 for the exact two-change fix.
-Without this, Stage 2 val_ce includes prompt supervision and cannot be
-used as a Stage 3 baseline.
- 
-**Action 2 — Increase `--shuffle_buffer` on next Kaggle session restart.**
-Multiple 2–3 step spike clusters have now appeared regularly (see Live Observations).
-Add `--shuffle_buffer 20000` to the resume command.
- 
-**Action 3 — Stage 3 architecture decisions are settled** (see Appendix B update).
-No code action needed yet. `recursive_finetune.py` to be written after Stage 2 completes.
-Use `stage3_agent_prompt.md` as the agent prompt.
- 
+
+**Action 1 — Stage 2 is ready.** No code changes needed. `train_sft.py` is fully
+verified. Launch immediately after Stage 1 gate is met.
+
+**Action 2 — shuffle_buffer 20000 already active** in current Session 6 run.
+No change needed on resume.
+
+**Action 3 — Hard decision point: step 30000.**
+Val CE flat at 5.28–5.29 since step ~4500. Cosine LR does its primary work in the
+50–80% range (steps 30000–48000). Do not intervene before step 30000.
+Decision rule: *if val CE has not improved ≥ 0.05 nats from 5.28 by step 30000,
+reassess. Otherwise, let the schedule run to completion.*
+
 ```bash
-# Stage 1 resume (next session) — add shuffle_buffer:
+# Stage 1 resume (next session) — shuffle_buffer already set, just resume:
 python pretrain.py \
   --preset nano \
   --resume_from runs/stage1 \
@@ -62,8 +61,8 @@ python train_sft.py \
   --preset nano \
   --resume_from runs/stage1/checkpoint-XXXXXXX \
   --ema_decay 0.995 \
-  --dataset_mix stratos   # upgrade to full after first successful run
- 
+  --dataset_mix stratos
+
 # Stage 3 launch (after Stage 2 answer val_ce < 1.5):
 python recursive_finetune.py \
   --preset nano \
@@ -182,10 +181,11 @@ Two-pass to avoid double-initializing tied weights.
 
 | File | Stage | Status | Notes |
 |---|---|---|---|
-| `baseline_trm_mamba.py` | 0 | ✅ COMPLETE | All smoke checks passed |
-| `viability_gate.py` | 0 | ✅ COMPLETE | All 4 gates passed |
-| `pretrain.py` | 1 | 🟡 SCRIPT VERIFIED, not run on Kaggle | See Stage 1 |
-| `train_sft.py` | 2 | 🔴 Bug 3 open — do not run | See Part 7 |
+| `baseline_trm_mamba.py` | 0 | ✅ COMPLETE | All smoke checks passed. No changes needed until Stage 3. |
+| `viability_gate.py` | 0 | ✅ COMPLETE | All 4 gates passed. Imports from training_utils. |
+| `training_utils.py` | All | ✅ COMPLETE | Shared infrastructure module. See Part 4a. |
+| `pretrain.py` | 1 | 🟡 RUNNING on Kaggle | Session 6, step ~15900. Imports from training_utils. |
+| `train_sft.py` | 2 | ✅ READY TO RUN | All bugs fixed. Blocked only on Stage 1 gate. |
 | `BLUEPRINT.md` | — | Living document | This file |
 | `terminal_log.md` | — | Verified terminal outputs | Append only |
 | `recursive_finetune.py` | 3 | ⬜ NOT CREATED | Use stage3_agent_prompt.md to generate |
@@ -208,6 +208,32 @@ Two-pass to avoid double-initializing tied weights.
 | `train_sft_deep_supervision.py` | Deep supervision on random init; obsolete |
 | `inference_trm_mamba.py` | Tied to old recursive model |
 | `architecture.py` | Superseded by `baseline_trm_mamba.py` |
+
+---
+
+## Part 4a — `training_utils.py` Module Reference
+
+Shared infrastructure imported by `pretrain.py`, `train_sft.py`, and `viability_gate.py`.
+Do not duplicate any of these in per-script code.
+
+| Export | Purpose | Notes |
+|---|---|---|
+| `ModelEMA` | EMA weight tracking | `load_state_dict` shape-checks before copying |
+| `ema_scope(model, ema)` | Context manager: swap EMA weights in, restore live weights on exit | Handles device/dtype transfer. Replaces the manual `live_backup` pattern from Bug 1. |
+| `autocast_context(device, dtype)` | Centralized `torch.autocast` | No-op on CPU |
+| `build_adamw_optimizer(model, ...)` | AdamW with decay/no-decay groups | Returns `(optimizer, fused_enabled)` |
+| `cosine_with_warmup(optimizer, ...)` | Linear warmup + cosine decay to `min_lr_ratio` | |
+| `checkpoint_step_from_name(name)` | Parse step integer from `checkpoint-NNNNNNN` | Returns -1 on failure |
+| `list_local_checkpoints(output_dir)` | Sorted list of finalized local checkpoint dirs | Newest first, excludes `.tmp` |
+| `try_load_state(path, device)` | Load `training_state.pt`, return `None` on corruption | |
+| `list_remote_checkpoint_names(repo_id, token)` | Hub checkpoint names, newest first | |
+| `download_checkpoint_from_hub(name, ...)` | Download one Hub checkpoint to disk | |
+| `sync_checkpoint_to_hub(dir, ...)` | Upload checkpoint dir with timeout, fire-and-forget | Bug 5 fix pattern |
+| `cleanup_temporary_checkpoints(output_dir)` | Remove stale `.tmp` dirs | Call at startup |
+| `set_seed(seed)` | Seed Python + PyTorch RNGs | |
+| `vram_gb(device)` | Current allocated VRAM in GiB | Returns 0.0 on CPU |
+| `resolve_hf_token(cli_value)` | HF token from CLI or env | Never reads from disk |
+| `pad_vocab_size(actual, multiple)` | Round vocab size up to multiple of 128 | |
 
 ---
 
@@ -238,20 +264,11 @@ Two-pass to avoid double-initializing tied weights.
 
 **Script:** `pretrain.py`
 **Hardware:** Kaggle Dual T4, DDP world_size=2
-**Status:** Running — step ~9000 / 61,036 (~14.7% complete). See terminal_log.md for full output.
+**Status:** Running — step ~15900 / 61,036 (~26.1% complete). See terminal_log.md for full output.
 
-**Bug 5 fix confirmed working:**
-- Session 5 resumed from `checkpoint-0002000` (step=2000, tokens=65.5M) — clean local load ✅
-- `checkpoint-0003000` saved locally first, then uploaded to Hub (commit=5e2ba2b8) ✅
-- Local-first + Hub fire-and-forget is now the live behaviour.
-
-**Dry-run checklist (completed):**
-- [x] No import errors; FakeMamba smoke test passes (epoch_offset=7, loss decreasing)
-- [x] Initial loss ≈ 11.93 (actual 11.98); decreases over 20 steps
-- [x] Checkpoint round-trip verified (step=20 restored correctly)
-- [x] `ema_backbone_state_dict` contains `lm_head.weight` alias
-- [x] Val buffer builds (2M tokens, 1,887 docs, document-disjoint from training)
-- [x] Epoch offset=228 (non-zero for epoch 0) ✓
+**Checkpoint status (Session 6):**
+- Local (keep_last=3): checkpoint-0013000 pruned; checkpoint-0015000 saved and Hub-uploaded (commit=cc7891dc) ✅
+- Hub: checkpoint-0015000 confirmed
 
 **Key hyperparameters (nano, 2B tokens):**
 ```
@@ -263,65 +280,65 @@ save_every=1000, val_every=500, gen_every=500
 DDP throughput: ~5,800 tok/s. Full run ETA: ~9.4h
 ```
 
-**Live observations (step 9000):**
-- Val CE declining but plateaued: 6.38 → 5.85 → 5.68 → 5.56 → 5.48 → 5.42 → 5.36 → 5.34 → 5.32 → 5.30 → 5.30 → 5.31 → 5.30 → 5.31 → 5.30 → 5.29 → 5.29 ✅ (still decreasing but very slowly)
-- **⚠ Val CE plateau:** Essentially flat 5.29–5.31 from step 4500–9000 (~147M–295M tokens, 4500 steps). Train CE continues declining (4.59→4.20), gap widening. Not alarming at 14.7% of token budget; expected to break through with more data. Monitor at step 10000.
-- VRAM flat at 2.035 GB throughout — no graph retention ✅
-- **⚠ UWR degradation:** Mean UWR chronically low since step 5000 (0.12–0.19 at most callbacks). "The capital of the city of the city" repetition loop recurring. Val CE is the primary signal and is healthy; UWR is a lagging indicator expected to recover as CE drops.
-- Spike rate: 44 spikes in 9000 steps = 0.49% — within 10% threshold ✅
-- **⚠ Spike clusters now regular:** (3570–3573), (6397–6400), (7971–7987–8000), (8060/8131), (8797/8847/8900). Multiple recurring clusters. Increase `--shuffle_buffer 20000` on next session resume.
-- Code prompt degenerate (digit/letter loops) — expected, FineWeb-Edu has no code.
-
-**Checkpoint status (as of step 9000):**
-- Local (keep_last=3): checkpoint-6000, checkpoint-7000, checkpoint-8000
-- Hub: checkpoint-3000 through checkpoint-8000
+**Live observations (step ~15900):**
+- Val CE: 5.289 (resume) → 5.2792 (step 15000) → 5.2799 (step 15500). **Essentially flat since step ~4500 (~147M tokens)**. Train CE continues declining (≈4.41 at step 9000 → ≈4.16 at step 15900). Widening generalization gap is expected at 26% of budget; likely to break through in later training. Monitor at step 20000.
+- VRAM flat at 2.035 GB throughout all sessions — no graph retention ✅
+- **Spike clusters recurring:** Session 6 spikes at steps 15030, 15215, 15767–15787 (3-step cluster), 15880. Increase `--shuffle_buffer 20000` on next resume.
+- UWR volatile: 0.220 @ step 15000 (decent), dropped to 0.129 @ step 15500 (code prompt degenerate again). Val CE is the primary signal.
+- Tokenizer length warning (133809 > 131072) — harmless, from streaming raw docs. Model inputs are always packed at chunk_size=1024.
 
 **Success criteria:**
 - [ ] `val_ce < 3.0` AND `mean_uwr > 0.05` (script prints banner when met)
 - [ ] No loss spikes > smoothed+0.5 for > 5% of steps
 - [ ] Coherent text completions in gen callback
 
-**Next action after Stage 1:**
-```bash
-python train_sft.py \
-  --preset nano \
-  --resume_from runs/stage1/checkpoint-XXXXXXX \
-  --ema_decay 0.995
-```
-Fix Bug 3 in `train_sft.py` first (see Part 7).
+**Loss curve summary (all sessions):**
 
-**Loss curve summary (full run to step 9000):**
-
-| Step | Train CE | Smoothed | Val CE | Tokens Seen | Notes |
-|---|---|---|---|---|---|
-| 1 | 11.98 | 11.98 | — | 32k | Random init |
-| 500 | 5.46 | 5.78 | 6.38 | 16.4M | Phrases forming |
-| 1000 | 4.97 | 5.14 | 5.85 | 32.8M | Real sentences |
-| 1500 | 4.89 | 4.91 | 5.68 | 49.2M | Coherent prose |
-| 2000 | — | — | 5.56 | 65.5M | Resumed (ckpt-2000) |
-| 2500 | 4.57 | 4.68 | 5.48 | 82.0M | Consistent drop |
-| 3000 | 4.48 | 4.60 | 5.42 | 98.3M | Hub sync working |
-| 3500 | 4.42 | 4.58 | 5.36 | 114.7M | Spike cluster ⚠ |
-| 4000 | 4.46 | 4.50 | 5.34 | 131.1M | Val drop slowing |
-| 4500 | 4.59 | 4.50 | 5.32 | 147.5M | |
-| 5000 | 4.47 | 4.45 | 5.30 | 163.8M | Val plateau begins ⚠ |
-| 5500 | 4.37 | 4.39 | 5.30 | 180.2M | Flat |
-| 6000 | 4.31 | 4.36 | 5.31 | 196.6M | Val ticked up slightly |
-| 6500 | 4.32 | 4.35 | 5.30 | 213.0M | |
-| 7000 | 4.45 | 4.34 | 5.31 | 229.4M | |
-| 7500 | 4.32 | 4.32 | 5.30 | 245.8M | |
-| 8000 | 4.92 | 4.31 | 5.29 | 262.1M | Spike cluster (7971/7987/8000) |
-| 8500 | 4.33 | 4.30 | 5.29 | 278.5M | Plateau continues |
+| Step | Train CE | Val CE | Tokens | Notes |
+|---|---|---|---|---|
+| 1 | 11.98 | — | 32k | Random init |
+| 500 | 5.46 | 6.38 | 16.4M | Phrases forming |
+| 1000 | 4.97 | 5.85 | 32.8M | Real sentences |
+| 2000 | — | 5.56 | 65.5M | Resumed (ckpt-2000) |
+| 3000 | 4.48 | 5.42 | 98.3M | Hub sync working |
+| 5000 | 4.47 | 5.30 | 163.8M | Val plateau begins ⚠ |
+| 8000 | 4.92 | 5.29 | 262.1M | Spike cluster (7971/7987/8000) |
+| 9000 | 4.19 | 5.29 | 295M | Plateau continues |
+| 14902 | — | 5.290 | 488.3M | Resumed (ckpt-14902) |
+| 15000 | 4.34 | 5.279 | 491.5M | Session 6 starts |
+| 15500 | 4.16 | 5.280 | 507.9M | Flat; spikes at 15767–15787 |
+| 15900 | 4.11 | 5.280 | 521M | Session 6 captured log end |
 
 ---
 
-### Stage 2 — SFT 🔴 BLOCKED
+### Stage 2 — SFT ✅ READY (blocked only on Stage 1 gate)
 
 **Gate:** Stage 1 `val_ce < 3.0` AND `mean_uwr > 0.05`
 
-**Script:** `train_sft.py` — Bug 3 open. See Part 7.
+**Script:** `train_sft.py` — all bugs fixed, all features live.
 
-**Agent prompt for fixing train_sft.py:** See Appendix A.
+**Key implementation details (verified in current codebase):**
+
+`_build_sft_sample` — central tokenization helper used by all dataset loaders. Computes
+`prompt_len` and clamps it to `min(prompt_len, len(ids))` so truncated samples are safe.
+
+`_format_training_text` / `_build_prompt_prefix` — enforce the canonical output format
+for all sources without duplication.
+
+`collate` — masks labels with `labels[idx, pl:length] = ids[pl:]`. Only response tokens
+are supervised. `prompt_len` defaults to 0 if missing (safe fallback).
+
+`compute_val_ce` + `run_generation_callback` — both use `ema_scope` from `training_utils`.
+Sequence: `model.eval()` → EMA swap → work → EMA restore → `model.train()`.
+
+`load_latest_checkpoint` — handles: direct `.pt` file, direct checkpoint dir, parent dir
+scan, Hub fallback. `_looks_like_pretrain_checkpoint` detects Stage 1 checkpoints and
+resets optimizer/scheduler while keeping model weights. Smart preference logic: if Stage 2
+checkpoints already exist in `output_dir`, they take priority over an external
+`--resume_from` path, preventing accidental Stage 1 re-load mid-Stage-2 run.
+
+`load_mixed_dataset` — calls `_build_sft_sample` for all three sources (Stratos,
+MetaMathQA, OpenHermes). Bug 3 fix propagates automatically; no per-extractor patch needed.
 
 **Target format:**
 ```
@@ -329,62 +346,40 @@ User: {question}
 Assistant: <think>
 {reasoning_chain}
 </think>
-{final_answer}
+{final_answer}{eos}
 ```
 
 **Hyperparameters:**
 ```
-lr=3e-5 to 1e-4 (10× lower than pre-training)
-warmup=100 steps, cosine decay, num_epochs=3 max
-batch_size=2, grad_accum=8, max_seq_len=512
-ema_decay=0.995
+lr=1e-4 (default; use 3e-5 if loss spikes early)
+warmup=100 steps, cosine decay to 1e-5, num_epochs=3 max
+batch_size=2, grad_accum=8 → effective batch=16
+max_seq_len=512, ema_decay=0.995
 ```
 
 **Success criteria:**
-- [ ] `val_ce < 1.5`
+- [ ] `val_ce < 1.5` (answer tokens only — guaranteed clean since Bug 3 fixed before first run)
 - [ ] Model generates `<think>` blocks before answering
 - [ ] Semantically coherent answers on GEN_PROMPTS
 
 ---
 
-### Stage 3 — Incremental Recursion ⬜ NOT STARTED
+### Stage 3 — Incremental Recursion (Coconut-Ouroboros) ⬜ NOT STARTED
 
 **Gate:** Stage 2 `val_ce < 1.5`
 
-**Strategy:** Fine-tune the Stage 2 checkpoint into recursion. NEVER train recursion
-from a randomly initialized model — this is what killed checkpoint-950.
+**Agent prompt:** `stage3_agent_prompt.md` (complete, ready to feed to coding agent).
+**Script to create:** `recursive_finetune.py`
 
-```
-Step 3.1: Fine-tune Stage 2 ckpt with n_loops=2
-          Gate: CE returns within 5% of Stage 2 baseline CE
-Step 3.2: n_loops=4. Same gate.
-Step 3.3: n_loops=8 if budget permits.
-```
+**Curriculum:**
 
-**Critical EMA warm-start (fixes the original bug):**
-```python
-# CORRECT — warm-start from current hidden state
-ema_state = base_hidden_state.detach().clone()
+| Sub-stage | K | Resume from | Output dir | Gate |
+|---|---|---|---|---|
+| 3.1 | 1 | Stage 2 final ckpt | runs/stage3_k1 | answer val_ce ≤ stage2 × 1.05 |
+| 3.2 | 4 | Stage 3.1 final ckpt | runs/stage3_k4 | answer val_ce ≤ stage2 × 1.05 |
+| 3.3 | 16 | Stage 3.2 final ckpt | runs/stage3_k16 | answer val_ce ≤ stage2 × 1.05 |
 
-# WRONG — caused checkpoint-950 divergence
-ema_state = torch.zeros_like(base_hidden_state)
-```
-
-**Recursive forward (inference-time wrapper, no architecture change):**
-```python
-@torch.no_grad()
-def recursive_generate(model, input_ids, n_loops=4, ema_decay=0.9):
-    logits, hidden = model(input_ids, return_hidden=True)
-    ema = hidden.detach().clone()                     # warm start
-    for step in range(1, n_loops):
-        correction = 1.0 - ema_decay ** step
-        loop_input = ema / correction                 # bias-corrected
-        logits, hidden = model(loop_input_as_embeddings, ...)
-        ema = ema_decay * ema + (1 - ema_decay) * hidden
-    return logits
-```
-
-**Agent prompt:** See Appendix B.
+Each sub-stage: `num_epochs=2`, `lr=1e-5`, `warmup_steps=50`.
 
 ---
 
@@ -392,17 +387,12 @@ def recursive_generate(model, input_ids, n_loops=4, ema_decay=0.9):
 
 **Gate:** Stage 3 quality does not degrade vs Stage 2 (CE within 5%).
 
-**Implementation:** TRL `GRPOTrainer` — DO NOT reimplement GRPO from scratch.
+**Implementation:** TRL `GRPOTrainer` — DO NOT reimplement from scratch.
 
-**Reward functions (implement in this order):**
+**Reward functions:**
 1. Format: +0.1 if `<think>...</think>` tags correctly open/close
 2. Correctness: +1.0 if answer verified (SymPy for math, E2B sandbox for code)
 3. Length penalty (optional): mild negative for traces > 2× median length
-
-**Compute (T4, 16GB):**
-- 1.5B model in 4-bit (bitsandbytes): ~3GB
-- G=4 GRPO rollouts: ~6GB additional
-- Use unsloth + gradient checkpointing. Drop to G=2 if OOM.
 
 ---
 
@@ -410,10 +400,7 @@ def recursive_generate(model, input_ids, n_loops=4, ema_decay=0.9):
 
 **Gate:** Stage 4 complete (or Stage 3 if skipping GRPO).
 
-**Method:** Quamba (Hadamard + DLS). Standard 4-bit breaks Mamba models due to
-activation outliers in the linear recurrence. Quamba (2024) resolves this.
-
-**Target:** INT4/INT8 artifact for Jetson or similar edge device.
+**Method:** Quamba (Hadamard + DLS). Standard 4-bit breaks Mamba models.
 
 ---
 
@@ -431,7 +418,7 @@ checkpoint-NNNNNNN/
 {
     "step":                    int,
     "epoch":                   int,
-    "chunks_in_epoch":         int,   # Stage 1 only — for data-position resume
+    "chunks_in_epoch":         int,   # Stage 1 only
     "tokens_processed":        int,   # Stage 1 only
     "model_state_dict":        dict,
     "ema_backbone_state_dict": dict,  # EMA shadow + lm_head.weight alias
@@ -439,86 +426,52 @@ checkpoint-NNNNNNN/
     "scheduler":               dict,
     "scaler":                  dict or None,
     "ema":                     dict,
-    "backbone_config":         dict,  # asdict(BaselineConfig)
+    "backbone_config":         dict,
     "val_ce":                  float or None,
 }
 ```
 
-**lm_head.weight alias rule:** When `tie_embeddings=True`, `named_parameters()` yields
-one tensor for both embedding and lm_head. `ema_backbone_state_dict` MUST explicitly
-contain `"lm_head.weight"` as an alias to `"token_embedding.weight"`. Verified in
-pretrain.py's `save_checkpoint`.
+**lm_head.weight alias rule:** When `tie_embeddings=True`, `ema_backbone_state_dict`
+MUST explicitly contain `"lm_head.weight"` as an alias to `"token_embedding.weight"`.
+Verified in pretrain.py's `save_checkpoint`.
 
-**Hub push protocol (corrected — see Bug 5):**
+**Hub push protocol:**
 1. Write fully to `checkpoint-NNNNNNN.tmp`
 2. Rename `.tmp` → `checkpoint-NNNNNNN` immediately (local finalize — always happens)
 3. Prune old local checkpoints
-4. Attempt Hub push from `checkpoint-NNNNNNN` — fire-and-forget, warn on failure, never block
+4. Attempt Hub push — fire-and-forget, warn on failure, never block
 
 ---
 
-## Part 7 — Known Bugs and Issues
+## Part 7 — Bug Tracker
 
-### Bug 3 — HIGH: `train_sft.py::collate` applies loss to all tokens including the prompt
- 
-**Status:** 🔴 NOT FIXED. Apply before any Stage 2 run.
- 
-**Why this also blocks Stage 3:**
-The Stage 3 gate check compares answer val_ce with the Stage 2 baseline.
-If the Stage 2 baseline was measured with prompt tokens in the loss, it is
-artificially inflated and the gate threshold is meaningless.
-Fix Bug 3 first, record a clean answer-only Stage 2 val_ce, then use that
-as `--stage2_val_ce` in `recursive_finetune.py`.
- 
-**Fix — two changes required:**
- 
-Change 1 — in `load_and_tokenize`, record prompt length:
-```python
-# Before (current — broken):
-samples.append({"input_ids": torch.tensor(ids[:max_seq_len], dtype=torch.long)})
- 
-# After (fixed):
-prefix_text = f"User: {q}\n\nAssistant: "
-if r:
-    prefix_text += f"<think>\n"
-prefix_ids  = tokenizer.encode(prefix_text, add_special_tokens=False)
-prompt_len  = len(prefix_ids)
-samples.append({
-    "input_ids":  torch.tensor(ids[:max_seq_len], dtype=torch.long),
-    "prompt_len": prompt_len,
-})
-```
- 
-Change 2 — in `collate`, mask prompt tokens in labels:
-```python
-# Before (current — broken):
-labels[idx, :length] = ids   # all tokens supervised
- 
-# After (fixed):
-pl = min(sample.get("prompt_len", 0), length)
-labels[idx, pl:length] = ids[pl:]   # only response tokens supervised
-```
- 
-Also apply the same fix in `load_mixed_dataset` for the MetaMathQA and
-OpenHermes extractors (each has its own prefix format).
+### Bug 1 — compute_val_ce did not restore live weights after EMA eval
+**Status:** ✅ FIXED — `compute_val_ce` and `run_generation_callback` in `train_sft.py`
+both use `ema_scope` from `training_utils.py`. The context manager handles weight swap,
+device/dtype transfer, and guaranteed restore on exit (including on exception). Also fixed
+identically in `pretrain.py::compute_val_ce`.
 
----
+### Bug 2 — load_latest_checkpoint did not handle direct checkpoint paths
+**Status:** ✅ FIXED — `load_latest_checkpoint` in `train_sft.py` handles: direct
+`training_state.pt` file, direct checkpoint directory, parent directory scan, Hub fallback.
+Additional smart logic: if Stage 2 checkpoints already exist in `output_dir`, they take
+priority over an external `--resume_from` to prevent accidental Stage 1 re-load.
 
-### Bug 6 — MEDIUM: Stage 2 val_ce measures full-sequence CE, not answer-only CE
- 
-**Symptom (potential):** If Bug 3 is fixed mid-training and val_ce is recorded
-both before and after, the values are not comparable. The pre-fix val_ce
-includes prompt supervision; the post-fix val_ce does not.
- 
-**Impact on Stage 3:** The `--stage2_val_ce` argument to `recursive_finetune.py`
-must be the answer-only val_ce from a Stage 2 run with Bug 3 fixed.
-Do NOT use val_ce from the Session 3 dry-run (which used the buggy collate).
- 
-**Fix:** Record Stage 2 final val_ce only after Bug 3 is confirmed fixed.
-Add a note in terminal_log.md at the start of each Stage 2 run indicating
-whether Bug 3 is fixed.
- 
-**Status:** 🟡 PENDING — becomes relevant when Stage 2 produces a checkpoint.
+### Bug 3 — collate applied loss to all tokens including prompt
+**Status:** ✅ FIXED — `_build_sft_sample` computes `prompt_len` (clamped to sequence
+length after truncation) for every sample. `collate` uses `labels[idx, pl:length] = ids[pl:]`.
+Fix propagates to all dataset sources via `_build_sft_sample` — no per-extractor patch needed.
+Bug 3 was fixed before any real Stage 2 run, so all Stage 2 val_ce values will be
+answer-only from step 1. No mixed baseline risk.
+
+### Bug 5 — Hub upload failure corrupted local checkpoint save
+**Status:** ✅ FIXED — `sync_checkpoint_to_hub` in `training_utils.py` uses
+`run_as_future=True` with timeout. Local finalization (`.tmp` → final rename) always
+happens first and is never blocked by Hub failures. Verified working in Session 5+.
+
+### Bug 6 — Stage 2 val_ce might mix prompt-supervised and answer-only measurements
+**Status:** ✅ MOOT — Bug 3 fixed before any real Stage 2 run. All Stage 2 checkpoints
+will have clean answer-only val_ce from step 1. Close this bug.
 
 ---
 
@@ -527,7 +480,7 @@ whether Bug 3 is fixed.
 | Stage | Platform | Estimate | Notes |
 |---|---|---|---|
 | 0 | Colab free / local | ~15 min | ✅ Done |
-| 1 | Kaggle T4 | ~18.5h (nano, 2B tokens) | Apply TRC immediately (async) |
+| 1 | Kaggle T4 | ~18.5h (nano, 2B tokens) | ~26% complete |
 | TRC application | — | 5 min | sites.research.google/trc |
 | 2 | Kaggle T4 or TRC | ~2–4h | 3 epochs × ~50k samples |
 | 3 | TRC preferred | ~4–8h | Incremental, gated per n_loops |
@@ -545,83 +498,38 @@ whether Bug 3 is fixed.
 - **SwiGLU** (Shazeer, 2020) — `ceil((8/3 × d_model) / 64) × 64` hidden_dim
 - **GQA** (Ainslie et al., 2023) — grouped query attention
 - **FineWeb-Edu** (HuggingFaceTB, 2024) — https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
-- **DeepSeek-R1** (2025) — GRPO reward functions and implementation (Appendix)
+- **Coconut** (Meta, arXiv:2412.06769) — latent thought injection, basis for Stage 3
+- **TRM** (Samsung, arXiv:2510.04871) — architecture inspiration only (encoder model)
+- **DeepSeek-R1** (2025) — GRPO reward functions
 - **Quamba** (2024) — post-training quantization for Mamba models
-- **build-nanoGPT** (Karpathy) — https://github.com/karpathy/build-nanogpt
 - **TRL GRPOTrainer** — https://huggingface.co/docs/trl
 
 ---
 
-## Appendix B — Stage 3 Agent Prompt
+## Appendix B — Stage 3: Coconut-Ouroboros
 
 > The original Appendix B (EMA hidden-state loop) is **superseded and incorrect**.
-> It is retained below as an archived note. The correct implementation is in
-> `stage3_agent_prompt.md` (a separate file created during the 2026-04-03 session).
- 
-### Why the original Appendix B approach was wrong
- 
-The Samsung TRM paper (arXiv:2510.04871) describes an **encoder** model for
-fixed-size grid tasks (ARC-AGI, Sudoku, Mazes). Its key properties:
- 
-- **Encoder architecture**: Bidirectional, processes the entire grid simultaneously.
-  Not an autoregressive decoder.
-- **Fixed-size I/O**: Input and output have the same shape. Recursion refines
-  the whole answer grid in-place.
-- **Ground-truth at every loop**: Deep supervision works because the correct
-  grid is known at every recursion step.
-- **EMA of model weights** (not hidden states): TRM uses weight EMA for
-  generalisation, not for the recursion mechanism itself.
- 
-Applying the "EMA-loop hidden states" approach to an autoregressive LLM:
-- Has no gradient signal — the model gets no feedback saying "use these loops".
-- Does not create new information — averaging hidden states across loops
-  is a linear operation on the same computation.
-- The deep supervision via gamma weights requires ground-truth at each step,
-  which text generation does not have.
- 
+> The correct implementation spec is in `stage3_agent_prompt.md`.
+
+### Why the original approach was wrong
+
+The Samsung TRM paper describes an **encoder** for fixed-size grids (ARC-AGI, Sudoku).
+Its EMA-loop recursion has ground-truth supervision at every step and is architecturally
+incompatible with an autoregressive decoder. Applying it to an LLM gives no gradient
+signal — the model learns to ignore the loop structure.
+
 ### Correct approach: Coconut-Ouroboros
- 
-Based on Meta's Coconut paper (arXiv:2412.06769), adapted for TRM-Mamba.
- 
-**Core mechanism**: Replace `<think>...</think>` reasoning tokens with K
-*latent thought positions* where the last hidden state is injected directly
+
+Based on Meta's Coconut paper (arXiv:2412.06769). Replace `<think>...</think>` reasoning
+tokens with K *latent thought positions* where the last hidden state is injected directly
 as the next position's input embedding (bypassing the token embedding table).
- 
-**Mamba SSM advantage**: During each latent pass, the Mamba SSM recurrent
-state propagates a compressed O(d_state) summary of all previous positions.
-Pure Transformer-Coconut only has attention at the latent position; our
-Mamba-Coconut accumulates a persistent scratch-memory in the SSM state
-across all K passes. This is a genuine architectural advantage.
- 
-**Curriculum (3 sub-stages)**:
- 
-| Sub-stage | K | Resume from | Output dir | Gate |
-|---|---|---|---|---|
-| 3.1 | 1 | Stage 2 final ckpt | runs/stage3_k1 | answer val_ce ≤ stage2 × 1.05 |
-| 3.2 | 4 | Stage 3.1 final ckpt | runs/stage3_k4 | answer val_ce ≤ stage2 × 1.05 |
-| 3.3 | 16 | Stage 3.2 final ckpt | runs/stage3_k16 | answer val_ce ≤ stage2 × 1.05 |
- 
-**Key implementation files**:
-- `stage3_agent_prompt.md` — complete coding agent prompt (created 2026-04-03)
-- `recursive_finetune.py` — to be generated by coding agent from above prompt
-- Requires two new methods in `baseline_trm_mamba.py`:
-  `forward_with_hidden()` and `forward_from_embeddings()`
- 
-**Success criterion**: answer val_ce at K=16 ≤ stage2 answer val_ce × 1.05,
-with coherent generation on GEN_PROMPTS_STAGE3. Print banner and record in terminal_log.md.
- 
-### Archived: Original Appendix B (for reference only — do not implement)
- 
-The original approach proposed:
-- `RecursiveSERF` wrapper with n_loops forward passes
-- EMA of hidden states: `ema = decay*ema + (1-decay)*hidden`
-- Deep supervision with gamma=0.8 weights across loops
-- Two new backbone methods: `forward_with_hidden` and `forward_from_embeddings`
- 
-The `forward_with_hidden` and `forward_from_embeddings` methods ARE still
-needed (for Coconut-Ouroboros), so those signatures are retained.
-The `RecursiveSERF` wrapper and EMA-loop mechanism are discarded.
 
----
+**Mamba SSM advantage:** During each latent pass, the Mamba SSM recurrent state propagates
+a compressed O(d_state) summary of all previous positions. This accumulates persistent
+scratch-memory across K passes — a genuine advantage over pure Transformer-Coconut.
 
-*End of Appendix B. Appendix C (Stage 4 GRPO) will be written when Stage 3 gate is passed.*
+**Required additions to `baseline_trm_mamba.py`** (two methods, do not rewrite file):
+- `forward_with_hidden()` — returns logits + final hidden states
+- `forward_from_embeddings()` — forward pass starting from pre-computed embeddings
+
+See `stage3_agent_prompt.md` for complete implementation specification.
