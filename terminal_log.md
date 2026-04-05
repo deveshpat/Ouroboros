@@ -15,7 +15,10 @@
 **Script:** `pretrain.py`
 **Date:** 2026-04-05
 **Hardware:** Kaggle Dual T4 (2× T4 16 GB, DDP auto-launched, world_size=2)
-**Status:** 🟡 IN PROGRESS — log captured through step 15900 / 61,036 (26.1%)
+**Status:** ✅ COMPLETE (graceful timeout exit) — steps 14902→21501, tokens 488M→705M
+
+**⚠ Val CE rose from 5.2767 (step 16000) to 5.3241 (step 21500) — +0.047 nats. Rising, not flat.**
+**⚠ Spike density tripled in steps 18000–21500 (~15+ events). shuffle_buffer=20000 insufficient for this data shard.**
 
 **Clean resume confirmed:**
 ```
@@ -23,124 +26,97 @@
 ```
 ✅
 
-**Tokenizer warning (harmless):**
+**Val CE + generation summary (complete):**
 ```
-Token indices sequence length is longer than the specified maximum sequence length for
-this model (133809 > 131072). Running this sequence through the model will result in
-indexing errors
-```
-This is emitted by the HuggingFace tokenizer's own warning mechanism during dataset
-streaming — it refers to a raw document length, not a model input. Model inputs are
-packed at `chunk_size=1024` and are never oversized. No action required.
-
-**Startup:**
-```
-2026-04-05 02:40:55 
-2026-04-05 02:40:55 ========================================================================
-2026-04-05 02:40:55   Stage 1 Pre-training - Project Ouroboros
-2026-04-05 02:40:55 ========================================================================
-2026-04-05 02:40:55   dataset          : HuggingFaceFW/fineweb-edu / sample-10BT
-2026-04-05 02:40:55   tokenizer        : Qwen/Qwen2.5-0.5B  vocab=151,665
-2026-04-05 02:40:55   preset           : nano
-2026-04-05 02:40:55   model            : d_model=512  groups=1  heads=8/4
-2026-04-05 02:40:55   chunk_size       : 1024
-2026-04-05 02:40:55   batch x accum    : 8 global x 4
-2026-04-05 02:40:55   world_size       : 2  (DDP auto-enabled)
-2026-04-05 02:40:55   per_gpu_batch    : 4
-2026-04-05 02:40:55   tokens / step    : 32,768
-2026-04-05 02:40:55   token_budget     : 2,000,000,000
-2026-04-05 02:40:55   total_steps      : 61,036
-2026-04-05 02:40:55   dtype            : torch.bfloat16
-2026-04-05 02:40:55   device           : cuda:0
-2026-04-05 02:40:55   output_dir       : runs/stage1
-2026-04-05 02:40:55   push_to_hub      : True
-2026-04-05 02:40:55   timeout          : 12.0h  (buffer=15 min)
-2026-04-05 02:40:55 ========================================================================
-2026-04-05 02:40:57 
-2026-04-05 02:40:57 Model parameters : 92,477,440 (92.5 M)
+step 15000  val_ce=5.2792  mean_uwr=0.220
+step 15500  val_ce=5.2799  mean_uwr=0.129
+step 16000  val_ce=5.2767  mean_uwr=0.163  ← only improvement this session
+step 16500  val_ce=5.2788  mean_uwr=0.307
+step 17000  val_ce=5.2883  mean_uwr=0.272  ← rising begins
+step 17500  val_ce=5.2925  mean_uwr=0.447
+step 18000  val_ce=5.3052  mean_uwr=0.161  ← dense spikes start
+step 18500  val_ce=5.3079  mean_uwr=0.280
+step 19000  val_ce=5.3105  mean_uwr=0.292
+step 19500  val_ce=5.3129  mean_uwr=0.134
+step 20000  val_ce=5.3135  mean_uwr=0.081
+step 20500  val_ce=5.3152  mean_uwr=0.344
+step 21000  val_ce=5.3190  mean_uwr=0.099
+step 21500  val_ce=5.3241  mean_uwr=0.266
 ```
 
-**Val + generation callbacks:**
-```
-2026-04-05 03:26:57   [val] step=15000  val_ce=5.2792
-
-2026-04-05 03:26:57   -- Generation @ step 15000 (live weights) --
-2026-04-05 03:26:58   P: The capital of France is
-2026-04-05 03:26:58   C:  the town of L'O'Héon, the capital of the town of L'O'Héon, in the town of L'O'Héon. The town is the town of L'O'Héon, and the town of L'O'H'O'O'H'O'O'H'O'O'H'O
-2026-04-05 03:26:58      uwr=0.393
-2026-04-05 03:27:00   P: In mathematics, a prime number is
-2026-04-05 03:27:00   C:  a number of numbers that are written in a number of different ways. For example, a number is a number that is written in a number of ways. For example, a numbe
-2026-04-05 03:27:00      uwr=0.123
-2026-04-05 03:27:01   P: def factorial(n):
-2026-04-05 03:27:01     """Return n!."""
-2026-04-05 03:27:01     if n
-2026-04-05 03:27:01   C:  is a function that is not a function of the function, it is a function that is used to define the function of the function. For example, if the function is a f
-2026-04-05 03:27:01      uwr=0.168
-2026-04-05 03:27:03   P: Neural networks learn by
-2026-04-05 03:27:03   C:  the time they are born. This is a very important step in the development of the brain. It is a very important part of the brain's development. It is a very imp
-2026-04-05 03:27:03      uwr=0.292
-2026-04-05 03:27:04   P: The French Revolution began in
-2026-04-05 03:27:04   C:  1799, and the French Revolution was a period of great prosperity. The French Revolution was a period of great prosperity, and the French Revolution was a perio
-2026-04-05 03:27:04      uwr=0.124
-2026-04-05 03:27:04   Mean UWR: 0.220
-
-2026-04-05 04:17:32   [val] step=15500  val_ce=5.2799
-
-2026-04-05 04:17:32   -- Generation @ step 15500 (live weights) --
-2026-04-05 04:17:34   P: The capital of France is
-2026-04-05 04:17:34   C:  to build a new capital, the capital of the country, which is to be used as a capital. The capital is to be used as a capital, and the capital is to be used as
-2026-04-05 04:17:34      uwr=0.165
-2026-04-05 04:17:35   P: In mathematics, a prime number is
-2026-04-05 04:17:35   C:  a number of numbers that are in the same order as the number of numbers in the same number. For example, the number of digits in the number of digits in the nu
-2026-04-05 04:17:35      uwr=0.127
-2026-04-05 04:17:37   P: def factorial(n):
-2026-04-05 04:17:37     """Return n!."""
-2026-04-05 04:17:37     if n
-2026-04-05 04:17:37   C:  2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n 2, n
-2026-04-05 04:17:37      uwr=0.033
-2026-04-05 04:17:38   P: Neural networks learn by
-2026-04-05 04:17:38   C:  means of a series of different mechanisms that are used to create a single system. The first is the system of the system of the brain. The second is the system
-2026-04-05 04:17:38      uwr=0.185
-2026-04-05 04:17:40   P: The French Revolution began in
-2026-04-05 04:17:40   C:  1778, and the French revolution was a period of the revolution. The French revolution was a period of the revolution, and the revolution was the revolution of
-2026-04-05 04:17:40      uwr=0.133
-2026-04-05 04:17:40   Mean UWR: 0.129
-```
-
-**Training log (steps 14950–15900):**
+**Selected training log with spikes annotated:**
 ```
 2026-04-05 03:18:25   14950     4.1160          -     4.1650   0.4512   5.25e-04    2.035        706
 2026-04-05 03:23:06   15000     4.3443          -     4.1642   0.4648   5.25e-04    2.035       5816
 2026-04-05 03:29:47   [spike] step=15030  raw=4.8237  ema=4.1789
-2026-04-05 03:31:37   15050     4.2771     5.2792     4.1668   0.4141   5.24e-04    2.035       3209
-2026-04-05 03:36:18   15100     4.2057     5.2792     4.1648   0.3945   5.24e-04    2.035       5833
-2026-04-05 03:41:00   15150     4.2546     5.2792     4.1605   0.4375   5.23e-04    2.035       5803
-2026-04-05 03:45:43   15200     4.2229     5.2792     4.1516   0.4160   5.23e-04    2.035       5796
 2026-04-05 03:47:07   [spike] step=15215  raw=4.7100  ema=4.1549
-2026-04-05 03:50:26   15250     4.2361     5.2792     4.1536   0.4453   5.22e-04    2.035       5791
-2026-04-05 03:55:09   15300     4.1254     5.2792     4.1561   0.4043   5.22e-04    2.035       5792
-2026-04-05 03:59:52   15350     4.0473     5.2792     4.1481   0.3789   5.21e-04    2.035       5783
-2026-04-05 04:04:35   15400     4.1413     5.2792     4.1615   0.4160   5.21e-04    2.035       5791
-2026-04-05 04:09:17   15450     4.2836     5.2792     4.1639   0.4199   5.21e-04    2.035       5795
 2026-04-05 04:14:00   15500     4.1576     5.2792     4.1583   0.4922   5.20e-04    2.035       5790
-2026-04-05 04:22:13   15550     4.2562     5.2799     4.1567   0.4609   5.20e-04    2.035       3325
-2026-04-05 04:26:54   15600     4.2673     5.2799     4.1618   0.3926   5.19e-04    2.035       5837
-2026-04-05 04:31:36   15650     4.1992     5.2799     4.1574   0.4141   5.19e-04    2.035       5808
-2026-04-05 04:36:18   15700     4.0449     5.2799     4.1487   0.4023   5.18e-04    2.035       5810
-2026-04-05 04:41:00   15750     4.2621     5.2799     4.1494   0.5000   5.18e-04    2.035       5804
 2026-04-05 04:42:36   [spike] step=15767  raw=4.7158  ema=4.1564
 2026-04-05 04:44:24   [spike] step=15786  raw=4.6814  ema=4.1619
 2026-04-05 04:44:30   [spike] step=15787  raw=4.8845  ema=4.1691
-2026-04-05 04:45:43   15800     4.3277     5.2799     4.1686   0.7266   5.17e-04    2.035       5800
-2026-04-05 04:50:26   15850     4.1247     5.2799     4.1648   0.4570   5.17e-04    2.035       5794
 2026-04-05 04:53:15   [spike] step=15880  raw=4.7188  ema=4.1635
-2026-04-05 04:55:08   15900     4.1067     5.2799     4.1620   0.4395   5.16e-04    2.035       5798
+2026-04-05 05:04:34   16000     4.1732     5.2799     4.1677   0.4141   5.15e-04    2.035       5795
+2026-04-05 05:14:47   [spike] step=16068  raw=4.7410  ema=4.1540
+2026-04-05 05:53:09   [spike] step=16475  raw=5.5527  ema=4.1674   ← large spike
+2026-04-05 05:55:31   16500     4.1851     5.2767     4.1577   0.4961   5.10e-04    2.035       5778
+2026-04-05 06:09:45   [spike] step=16614  raw=4.7115  ema=4.1560
+2026-04-05 06:46:13   17000     4.1732     5.2788     4.1289   0.5000   5.05e-04    2.035       5769
+2026-04-05 07:49:07   [spike] step=17590  raw=4.9689  ema=4.1164
+2026-04-05 08:13:01   [spike] step=17843  raw=4.8913  ema=4.1343   ← 3-step cluster start
+2026-04-05 08:13:06   [spike] step=17844  raw=4.7847  ema=4.1409
+2026-04-05 08:13:12   [spike] step=17845  raw=4.6801  ema=4.1462
+2026-04-05 08:27:51   18000     4.4503     5.2925     4.1206   0.4492   4.94e-04    2.035       5780
+2026-04-05 08:42:25   [spike] step=18115  raw=4.9637  ema=4.1359
+2026-04-05 08:46:11   [spike] step=18155  raw=4.6484  ema=4.1341
+2026-04-05 08:47:48   [spike] step=18172  raw=4.6760  ema=4.1363
+2026-04-05 08:55:56   [spike] step=18258  raw=4.6397  ema=4.1252
+2026-04-05 09:04:04   [spike] step=18344  raw=5.1457  ema=4.1429   ← large
+2026-04-05 09:09:50   [spike] step=18405  raw=5.1301  ema=4.1451   ← large
+2026-04-05 09:14:05   [spike] step=18450  raw=4.6893  ema=4.1426
+2026-04-05 09:23:17   [spike] step=18509  raw=4.8420  ema=4.1376
+2026-04-05 09:23:23   [spike] step=18510  raw=4.8002  ema=4.1442
+2026-04-05 09:29:06   [spike] step=18572  raw=5.0423  ema=4.1312   ← large
+2026-04-05 10:09:29   19000     4.1597     5.3052     4.0977   0.5117   4.82e-04    2.035       5771
+2026-04-05 10:58:47   [spike] step=19483  raw=5.1208  ema=4.1207   ← large
+2026-04-05 11:29:50   [spike] step=19775  raw=4.7476  ema=4.1051
+2026-04-05 11:45:01   [spike] step=19936  raw=5.2361  ema=4.0927   ← large
+2026-04-05 11:51:05   20000     4.0818     5.3129     4.0760   0.4043   4.71e-04    2.035       5773
+2026-04-05 12:16:09   [spike] step=20226  raw=4.6460  ema=4.0820
+2026-04-05 12:19:11   [spike] step=20258  raw=4.8589  ema=4.0897
+2026-04-05 12:23:33   [spike] step=20304  raw=4.5883  ema=4.0861
+2026-04-05 13:22:05   [spike] step=20886  raw=4.6380  ema=4.0712
+2026-04-05 13:32:41   [spike] step=20998  raw=4.6908  ema=4.0823
+2026-04-05 13:32:53   21000     4.3295     5.3152     4.0865   0.9219   4.59e-04    2.035       5769
+2026-04-05 13:53:59   [spike] step=21184  raw=4.6594  ema=4.0861
+2026-04-05 14:01:33   [spike] step=21264  raw=4.8866  ema=4.1154
+2026-04-05 14:13:28   [spike] step=21390  raw=4.9710  ema=4.1150
+2026-04-05 14:23:52   21500     4.0554     5.3190     4.0796   0.5703   4.52e-04    2.035       5784
 ```
-*(Log ends here — session still running)*
 
-**Checkpoint status (end of captured log):**
-- Local (keep_last=3): checkpoint-0013000 pruned; checkpoint-0015000 saved and uploaded (commit=cc7891dc)
-- Hub: checkpoint-0015000 confirmed uploaded
+**Graceful timeout exit:**
+```
+2026-04-05 14:27:36   [timeout] 11.77h elapsed — 13.7 min remaining (< 15 min buffer).
+2026-04-05 14:27:36   [timeout] Saving emergency checkpoint at step 21501 (local only) ...
+2026-04-05 14:27:38   [ckpt] saved  -> runs/stage1/checkpoint-0021501
+2026-04-05 14:27:38   [ckpt] pruned -> checkpoint-0019000
+2026-04-05 14:27:38   [timeout] Emergency checkpoint saved.
+2026-04-05 14:27:38 ========================================================================
+2026-04-05 14:27:38   [timeout] Session budget exhausted — graceful exit
+2026-04-05 14:27:38 ========================================================================
+2026-04-05 14:27:38   Wall time elapsed  : 11.77h / 12.0h
+2026-04-05 14:27:38   Steps completed    : 21,501 / 61,036
+2026-04-05 14:27:38   Tokens processed   : 704,544,768 / 2,000,000,000
+2026-04-05 14:27:38   Last val CE        : 5.324081295402125
+2026-04-05 14:27:38   Checkpoint saved   : runs/stage1/checkpoint-0021501  (local only)
+2026-04-05 14:27:38 ========================================================================
+```
+
+**Checkpoint status (end of session):**
+- Local: checkpoint-0021501 (local only — Hub push did not occur before timeout)
+- Hub: checkpoint-0021000 confirmed (commit=d70d2c49) ← safe resume point if local lost
+- Pruned: checkpoint-0019000
+
+---
 
 ---
 

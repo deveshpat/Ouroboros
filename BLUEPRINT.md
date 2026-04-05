@@ -28,47 +28,54 @@ on SFT data. Output: comma-loops and "the the the". Three root causes:
 | Stage | Name | Status | Gate |
 |---|---|---|---|
 | 0 | Architecture & Viability | ✅ COMPLETE | All 4 gates passed |
-| 1 | Pre-training | 🟡 IN PROGRESS — step ~15900 / 61,036 (~26.1%) | val_ce < 3.0 + UWR > 0.05 |
-| 2 | SFT | ✅ READY — blocked only on Stage 1 gate | Fix confirmed; see Stage 2 |
+| 1 | Pre-training | ⚠ NEEDS REVIEW — step 21501 / 61,036 (35%); val CE rising | val_ce < 3.0 + UWR > 0.05 |
+| 2 | SFT | ✅ READY — blocked only on Stage 1 gate (or step 30000 review) | Fix confirmed; see Stage 2 |
 | 3 | Recursive Inference (Coconut-Ouroboros) | ⬜ NOT STARTED | Stage 2 answer val_ce < 1.5 |
 | 4 | GRPO | ⬜ NOT STARTED | Stage 3 gate |
 | 5 | Quantization | ⬜ NOT STARTED | Stage 4 or 3 gate |
 
 ### Immediate next actions
 
-Stage 1 is running. While it runs:
+**⚠ REASSESSMENT REQUIRED before next session launch.**
 
-**Action 1 — Stage 2 is ready.** No code changes needed. `train_sft.py` is fully
-verified. Launch immediately after Stage 1 gate is met.
+Val CE is actively rising (+0.047 nats, steps 16000–21500) and spike density has tripled. The original "wait until step 30000" decision rule no longer applies — we have new information now.
 
-**Action 2 — shuffle_buffer 20000 already active** in current Session 6 run.
-No change needed on resume.
+**Before launching the next session, decide between these two options:**
 
-**Action 3 — Hard decision point: step 30000.**
-Val CE flat at 5.28–5.29 since step ~4500. Cosine LR does its primary work in the
-50–80% range (steps 30000–48000). Do not intervene before step 30000.
-Decision rule: *if val CE is still declining at step 30000, extend token budget to
-4-6B tokens (increase `--token_budget`) rather than stopping at 2B. The empirical
-sweet spot for a 92.5M model is 4-6B high-quality tokens. Do not extend beyond 6B —
-diminishing returns dominate past that point at this model size.*
+**Option A — Continue as-is, trust cosine decay (lower risk):**
+The rising val CE may be a transient effect driven by the spike cluster density in the current data shard. Cosine LR at step 21500 is still at ~4.59e-4 (76% of peak). The optimizer is still taking large steps. The rising val CE could stabilize or reverse once LR drops below 2e-4 (around step 40000). This is the do-nothing option.
+```bash
+python pretrain.py \
+  --preset nano \
+  --resume_from runs/stage1 \
+  --shuffle_buffer 20000 \
+  --session_timeout_hours 12.0
+```
+
+**Option B — Lower LR ceiling and resume (moderate intervention):**
+Add `--lr 3e-4` (half the current peak) on resume. The scheduler will restart its cosine from the current step with a lower peak, reducing the magnitude of gradient updates that caused the spike-driven val CE rise. This is a mid-run intervention that breaks strict comparability but may prevent further degradation.
+```bash
+python pretrain.py \
+  --preset nano \
+  --resume_from runs/stage1 \
+  --shuffle_buffer 20000 \
+  --lr 3e-4 \
+  --session_timeout_hours 12.0
+```
+
+**Recommendation: Option A for one more session.** The cosine schedule has not yet entered its primary decay phase. If val CE is still rising at step 30000 (i.e., above 5.35), then switch to Option B or accept the current checkpoint and proceed to SFT. Do not extend to 4–6B tokens unless val CE reverses.
+
+**Stage 2 is ready** — `train_sft.py` is fully verified. If Stage 1 val CE does not recover by step 30000, the ckpt-21000 Hub checkpoint is a viable SFT starting point even without the full pre-training gate being met. A 92.5M model at 5.32 val CE has learned substantial language structure — SFT can still succeed from here.
 
 ```bash
-# Stage 1 resume (next session) — shuffle_buffer already set, just resume:
+# Stage 1 resume (next session):
 python pretrain.py \
   --preset nano \
   --resume_from runs/stage1 \
   --shuffle_buffer 20000 \
   --session_timeout_hours 12.0
 
-# Stage 1 extended budget (if val_ce still declining at step 30000):
-python pretrain.py \
-  --preset nano \
-  --resume_from runs/stage1 \
-  --token_budget 6_000_000_000 \
-  --shuffle_buffer 20000 \
-  --session_timeout_hours 12.0
-
-# Stage 2 launch (after Stage 1 banner: val_ce < 3.0 AND mean_uwr > 0.05):
+# Stage 2 launch (after Stage 1 gate OR at step 30000if val CE not recovering):
 python train_sft.py \
   --preset nano \
   --resume_from runs/stage1/checkpoint-XXXXXXX \
@@ -306,15 +313,20 @@ DDP throughput: ~5,800 tok/s
 - Hard cap: **6B tokens** (~183,000 steps). Diminishing returns dominate past this at 92.5M params.
 - Decision at step 30000: if val_ce still declining → extend to 6B. If plateau is total → accept and proceed to Stage 2.
 
-**Live observations (step ~15900):**
-- Val CE: 5.289 (resume) → 5.2792 (step 15000) → 5.2799 (step 15500). Flat since step ~4500. Train CE declining steadily (≈4.11 at step 15900). Expected at 26% — cosine LR hasn't entered primary decay phase yet (steps 30000–48000).
-- VRAM flat at 2.035 GB — no graph retention ✅
-- Spike clusters recurring (15030, 15215, 15767–15787, 15880). shuffle_buffer 20000 now active.
-- Tokenizer length warning (133809 > 131072) — harmless, from streaming raw docs.
+**Live observations (step 21501, Session 6 complete):**
+- **Val CE is rising, not flat.** Went from 5.2767 (step 16000, only improvement) to 5.3241 (step 21500) — +0.047 nats over 5500 steps. This is a materially different situation from the earlier plateau. Train CE is still declining (~4.08–4.33 range), so the train/val gap is actively widening.
+- **Spike density has worsened severely.** Steps 18000–21500: ~15+ spike events (~1 per 230 steps, 3–4× earlier density). shuffle_buffer=20000 reduced early clustering but did not solve the root problem — the source is genuinely noisy/hard documents in this portion of FineWeb-Edu, not just ordering artifacts.
+- VRAM flat at 2.035 GB throughout — no graph retention ✅
+- Session ended gracefully at step 21501 via timeout mechanism (11.77h / 12.0h).
+- Emergency checkpoint: `checkpoint-0021501` saved locally only — Hub push did not occur before timeout. Last Hub checkpoint: `checkpoint-0021000` (commit=d70d2c49).
+- Tokens processed: **704,544,768** (~705M, 35% of 2B budget).
+
+**⚠ Decision point moved up from step 30000 to NOW.**
+Val CE is rising at step 21500, well before the planned step 30000 review. This requires reassessment on next session start before proceeding blindly. See Part 0 → Immediate next actions.
 
 **Success criteria:**
 - [ ] `val_ce < 3.0` AND `mean_uwr > 0.05` (script prints banner when met)
-- [ ] Val CE showing clear decline in steps 30000–48000 (cosine decay phase)
+- [ ] Val CE stops rising and resumes decline in cosine decay phase
 
 **Loss curve summary (all sessions):**
 
@@ -325,13 +337,18 @@ DDP throughput: ~5,800 tok/s
 | 1000 | 4.97 | 5.85 | 32.8M | Real sentences |
 | 2000 | — | 5.56 | 65.5M | Resumed (ckpt-2000) |
 | 3000 | 4.48 | 5.42 | 98.3M | Hub sync working |
-| 5000 | 4.47 | 5.30 | 163.8M | Val plateau begins ⚠ |
+| 5000 | 4.47 | 5.30 | 163.8M | Val plateau begins |
 | 8000 | 4.92 | 5.29 | 262.1M | Spike cluster (7971/7987/8000) |
 | 9000 | 4.19 | 5.29 | 295M | Plateau continues |
 | 14902 | — | 5.290 | 488.3M | Resumed (ckpt-14902) |
 | 15000 | 4.34 | 5.279 | 491.5M | Session 6 starts |
-| 15500 | 4.16 | 5.280 | 507.9M | Flat; spikes at 15767–15787 |
-| 15900 | 4.11 | 5.280 | 521M | Session 6 captured log end |
+| 16000 | 4.17 | 5.277 | 524M | Only val improvement in session |
+| 17000 | 4.17 | 5.288 | 557M | Val rising begins ⚠ |
+| 18000 | 4.45 | 5.305 | 590M | Val rising accelerates; dense spikes |
+| 19000 | 4.16 | 5.311 | 623M | Continued rise |
+| 20000 | 4.08 | 5.314 | 655M | 15+ spikes this interval |
+| 21000 | 4.33 | 5.319 | 688M | Hub ckpt-21000 (commit=d70d2c49) |
+| 21501 | — | 5.324 | 705M | ⚠ Session end; local-only ckpt |
 
 ---
 
