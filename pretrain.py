@@ -158,13 +158,13 @@ class PretrainConfig:
     log_every: int = 50
     val_tokens: int = 2_000_000
     val_every: int = 500
-    gen_every: int = 500
-    gen_max_tokens: int = 120
+    gen_every: int = 5000
+    gen_max_tokens: int = 80
     spike_threshold: float = 0.5
 
     # Graceful timeout
     session_timeout_hours: float = 12.0
-    graceful_exit_buffer_minutes: float = 15.0
+    graceful_exit_buffer_minutes: float = 7.0
 
     # Reproducibility
     seed: int = 42
