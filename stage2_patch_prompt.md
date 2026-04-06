@@ -380,6 +380,150 @@ existing = sorted(
 
 ---
 
+### Change 6 — Truncate reasoning instead of filtering long sequences
+
+This change replaces the "skip if too long" policy with a "truncate reasoning and keep" policy,
+ensuring that every training example contributes regardless of chain-of-thought length. This
+is the root fix for Stage 2 never learning the `<think>` format.
+
+**Truncation policy (applied per sample):**
+1. Tokenize question prefix, reasoning, and answer+eos separately.
+2. Compute how many reasoning tokens fit: `budget = max_seq_len - len(q_ids) - len(overhead_ids) - len(a_ids)`
+3. If `budget >= len(r_ids)`: no truncation needed, proceed normally.
+4. If `0 < budget < len(r_ids)`: randomly (50/50) keep either the **first** `budget` tokens of reasoning (start) or the **last** `budget` tokens (end). Reconstruct the reasoning string by decoding the truncated token slice.
+5. If `budget <= 0` (question + answer alone exceeds max_seq_len): **Option C** — drop reasoning entirely, use `User: Q\n\nAssistant: {answer}{eos}` format.
+6. If even Option C exceeds max_seq_len, skip the sample (this should be extremely rare at seq_len=2048).
+
+**`overhead_ids`** are the tokens for `"<think>\n"` and `"\n</think>\n"` combined. Pre-compute
+once per call using `tokenizer.encode("<think>\n", add_special_tokens=False)` +
+`tokenizer.encode("\n</think>\n", add_special_tokens=False)`.
+
+**Implementation:** Add one new standalone helper function `_build_sft_sample_truncated`, and
+replace every call to `_build_sft_sample` in both `load_and_tokenize` and `load_mixed_dataset`
+with `_build_sft_sample_truncated`. Do NOT modify `_build_sft_sample` itself — it is still
+used as a subroutine.
+
+```python
+def _build_sft_sample_truncated(
+    tokenizer,
+    question: str,
+    reasoning: str,
+    answer: str,
+    eos: str,
+    max_seq_len: int,
+) -> Optional[Dict[str, Any]]:
+    """Like _build_sft_sample but truncates reasoning instead of skipping long examples.
+
+    Truncation policy:
+      - If sequence fits: proceed normally (delegates to _build_sft_sample).
+      - If reasoning is too long: 50% chance keep reasoning start, 50% keep reasoning end.
+      - If question + answer alone exceeds max_seq_len: drop reasoning entirely (Option C).
+      - If even Option C exceeds max_seq_len: return None (skip).
+    """
+    if not reasoning:
+        # No reasoning — delegate directly, no truncation needed.
+        return _build_sft_sample(tokenizer, question, reasoning, answer, eos, max_seq_len)
+
+    # Tokenize components separately to compute budget.
+    prefix_text = f"User: {question}\n\nAssistant: "
+    answer_text = f"{answer}{eos}"
+    think_open_text = "<think>\n"
+    think_close_text = "\n</think>\n"
+
+    q_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+    a_ids = tokenizer.encode(answer_text, add_special_tokens=False)
+    open_ids = tokenizer.encode(think_open_text, add_special_tokens=False)
+    close_ids = tokenizer.encode(think_close_text, add_special_tokens=False)
+    r_ids = tokenizer.encode(reasoning, add_special_tokens=False)
+
+    overhead = len(open_ids) + len(close_ids)
+    base_len = len(q_ids) + len(a_ids)  # length without any reasoning
+
+    # Option C trigger: question + answer alone won't fit.
+    if base_len > max_seq_len:
+        return None  # truly unsalvageable; skip
+
+    budget = max_seq_len - base_len - overhead
+
+    if budget >= len(r_ids):
+        # Fits as-is — delegate to existing function (avoids double work).
+        return _build_sft_sample(tokenizer, question, reasoning, answer, eos, max_seq_len)
+
+    if budget <= 0:
+        # No room for reasoning at all — Option C (answer-only format).
+        return _build_sft_sample(tokenizer, question, "", answer, eos, max_seq_len)
+
+    # Truncate reasoning token slice, then decode back to string.
+    if random.random() < 0.5:
+        truncated_r_ids = r_ids[:budget]   # keep start of reasoning
+    else:
+        truncated_r_ids = r_ids[-budget:]  # keep end of reasoning
+
+    truncated_reasoning = tokenizer.decode(truncated_r_ids, skip_special_tokens=False)
+
+    return _build_sft_sample(tokenizer, question, truncated_reasoning, answer, eos, max_seq_len)
+```
+
+**In `load_and_tokenize`:** Replace the call:
+```python
+sample = _build_sft_sample(tokenizer, q, r, a, eos, max_seq_len)
+if sample is None:
+    text = _format_training_text(q, r, a, eos)
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) > max_seq_len:
+        skipped_too_long += 1
+    else:
+        skipped_invalid += 1
+    continue
+```
+with:
+```python
+sample = _build_sft_sample_truncated(tokenizer, q, r, a, eos, max_seq_len)
+if sample is None:
+    skipped_invalid += 1
+    continue
+```
+Also update the final print statement to remove the `skipped_too_long` reference and replace with
+a note that truncation is active:
+```python
+print(
+    f"  {len(samples)} samples kept ({skipped_invalid} skipped as invalid/too-short). "
+    f"Reasoning truncated where needed to fit max_seq_len={max_seq_len}."
+)
+```
+
+**In `load_mixed_dataset`:** Find the inner loop for each source that calls `_build_sft_sample`
+and apply the same substitution:
+```python
+# Before:
+sample = _build_sft_sample(tokenizer, q, r, a, eos, max_seq_len)
+if sample is None:
+    text = _format_training_text(q, r, a, eos)
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) > max_seq_len:
+        skipped_too_long += 1
+    else:
+        skipped_invalid += 1
+    continue
+
+# After:
+sample = _build_sft_sample_truncated(tokenizer, q, r, a, eos, max_seq_len)
+if sample is None:
+    skipped_invalid += 1
+    continue
+```
+Remove the local `skipped_too_long` variable and its reference in the per-source print:
+```python
+print(
+    f"    kept {kept} / target {target} samples "
+    f"(invalid={skipped_invalid}; reasoning truncated where needed)."
+)
+```
+
+**Important:** The `random` module is already imported in `train_sft.py`. No new imports needed.
+
+---
+
 ## Verification Checklist (dry-run before real training)
 
 ```bash
@@ -404,6 +548,9 @@ Confirm:
 - [ ] `runs/stage2_test/.hub_resume/` is deleted after load
 - [ ] Checkpoint saved to `runs/stage2_test/checkpoint-0000005`
 - [ ] Prune only deletes checkpoints inside `runs/stage2_test/`, not `.hub_resume`
+- [ ] Dataset load prints "Reasoning truncated where needed" — NOT "skipped (> max_seq_len)"
+- [ ] With `--max_samples 100 --dataset_mix full`, all 5 sources load without errors
+- [ ] OpenR1-Math and OpenR1-Code show significantly higher kept counts vs pre-patch
 
 ---
 
@@ -436,17 +583,17 @@ Expected behavior:
 - Resume finds no local Stage 2 checkpoints
 - Downloads checkpoint-0002979 from Hub to `.hub_resume/`
 - Detects data_changed (stratos → full), resets optimizer/scheduler/step
-- Trains 3 epochs × ceil(~20000/32) = ~1875 steps with lr=1e-4, warmup=100
-- At seq_len=2048: Stratos keeps ~60-70% samples, OpenR1-Math keeps ~30%, OpenR1-Code keeps ~15%
-- Generation should show `<think>` tags appearing by step 500-1000
+- Trains 3 epochs × ceil(~35000/32) ≈ ~3300 steps with lr=1e-4, warmup=100
+- At seq_len=2048 with truncation: ALL examples contribute; reasoning chains preserved
+- Generation should show `<think>` tags appearing by step 500–1000
 
-**Expected data counts at max_seq_len=2048 (approximate):**
-- Stratos: ~10000-12000 (60-70% of 16710)
-- MetaMathQA: ~11000
-- OpenHermes: ~8000
-- OpenR1-Math: ~3000-5000
-- OpenR1-Code: ~500-1500
-- Total: ~35000-38000 samples
+**Expected data counts at max_seq_len=2048 with truncation (approximate):**
+- Stratos: ~16000–16500 (nearly all 16710; only answer-only samples skipped as invalid)
+- MetaMathQA: ~11000 (all; these are short)
+- OpenHermes: ~8000 (all)
+- OpenR1-Math: ~10000–11000 (nearly all; reasoning truncated on long examples)
+- OpenR1-Code: ~8000–11000 (nearly all; reasoning truncated on long examples)
+- Total: ~53000–57000 samples; 3 epochs ≈ ~5000–5400 steps
 
 ---
 
@@ -458,4 +605,6 @@ Expected behavior:
 - The `shutil` import is already present in `train_sft.py`
 - `hub_resume_dir.mkdir(parents=True, exist_ok=True)` must be called before `download_checkpoint_from_hub`
 - The Hub download limit of 3 candidates prevents VRAM exhaustion; the newest Stage 2 checkpoint on Hub is checkpoint-0002979 which will be found as the 1st Hub candidate (it's the newest Stage 2 step)
-- After all changes: `mypy`-equivalent sanity — the return type of `load_latest_checkpoint` changes from `Tuple[int, int, int]` to `Tuple[int, int, int, bool]`. Update the type annotation in the function signature accordingly.
+- After all changes: the return type of `load_latest_checkpoint` changes from `Tuple[int, int, int]` to `Tuple[int, int, int, bool]`. Update the function signature type annotation accordingly.
+- `_build_sft_sample_truncated` calls `tokenizer.decode(..., skip_special_tokens=False)` to preserve any special tokens that may appear inside reasoning chains (e.g. `<|im_start|>` in some datasets). This is intentional.
+- The `random` module is already imported at the top of `train_sft.py` via `import random`. No new import needed for Change 6.
