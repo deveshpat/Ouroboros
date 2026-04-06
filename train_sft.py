@@ -44,6 +44,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import sys
 import time
 from dataclasses import asdict
@@ -52,7 +53,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import torch
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
     import torch.nn.functional as F
+    from torch.nn.parallel import DistributedDataParallel as DDP
     from torch.optim import AdamW
     from torch.optim.lr_scheduler import LambdaLR
 except ImportError:
@@ -109,7 +113,7 @@ except ImportError as exc:
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Stage 2 SFT trainer for BaselineTRMMamba",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -205,6 +209,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_every", type=int, default=250)
     parser.add_argument("--gen_every", type=int, default=250)
     parser.add_argument("--gen_max_tokens", type=int, default=120)
+    parser.add_argument("--spike_threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--session_timeout_hours",
+        type=float,
+        default=12.0,
+        help="Total wall-clock budget in hours. The trainer saves an emergency checkpoint before this expires.",
+    )
+    parser.add_argument(
+        "--graceful_exit_buffer_minutes",
+        type=float,
+        default=15.0,
+        help="Save checkpoint and exit this many minutes before session_timeout_hours.",
+    )
 
     # wandb
     parser.add_argument("--wandb_project", default="ouroboros-serf-phase2")
@@ -215,7 +232,7 @@ def parse_args() -> argparse.Namespace:
         default="online",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 PRESETS: Dict[str, Dict[str, Any]] = {
@@ -231,6 +248,101 @@ GEN_PROMPTS = [
     "Explain what a neural network is in simple terms.",
     "Solve for x: 3x + 6 = 21.",
 ]
+
+
+class SpikeMonitor:
+    """Track a smoothed training-loss EMA and warn on sudden spikes."""
+
+    def __init__(self, beta: float = 0.99, threshold: float = 0.5) -> None:
+        self.beta = beta
+        self.threshold = threshold
+        self._ema: Optional[float] = None
+        self.spikes: List[Tuple[int, float, float]] = []
+
+    def update(self, step: int, loss: float) -> bool:
+        if self._ema is None:
+            self._ema = loss
+            return False
+        self._ema = self.beta * self._ema + (1.0 - self.beta) * loss
+        bias_corrected = self._ema / (1.0 - self.beta ** (step + 1))
+        is_spike = (loss - bias_corrected) > self.threshold
+        if is_spike:
+            self.spikes.append((step, loss, bias_corrected))
+        return is_spike
+
+    @property
+    def smoothed(self) -> float:
+        return self._ema if self._ema is not None else float("nan")
+
+
+def dist_is_initialized() -> bool:
+    """Return True when torch.distributed collectives are ready to use."""
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def distributed_mean(value: float, device: torch.device) -> float:
+    if not dist_is_initialized():
+        return float(value)
+    tensor = torch.tensor([value], device=device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= dist.get_world_size()
+    return float(tensor.item())
+
+
+def distributed_sum_int(value: int, device: torch.device) -> int:
+    if not dist_is_initialized():
+        return int(value)
+    tensor = torch.tensor([value], device=device, dtype=torch.long)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return int(tensor.item())
+
+
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _distributed_worker(local_rank: int, world_size: int, master_port: int, argv: List[str]) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(local_rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    raise SystemExit(run_training(argv))
+
+
+def maybe_launch_multi_gpu(args: argparse.Namespace, argv: List[str]) -> bool:
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    world_size = torch.cuda.device_count()
+    if world_size < 2:
+        return False
+    if args.batch_size < world_size or (args.batch_size % world_size) != 0:
+        print(
+            f"[ddp] detected {world_size} CUDA devices, but batch_size={args.batch_size} "
+            "cannot be split evenly across ranks; using the original single-process path."
+        )
+        return False
+
+    per_gpu = args.batch_size // world_size
+    print(
+        f"[ddp] detected {world_size} CUDA devices; launching single-node DDP "
+        f"with global batch_size={args.batch_size} ({per_gpu} per GPU)."
+    )
+    mp.spawn(
+        _distributed_worker,
+        nprocs=world_size,
+        args=(world_size, find_free_port(), list(argv)),
+        join=True,
+    )
+    return True
 
 
 def pad_vocab(actual: int, multiple: int = 128) -> int:
@@ -259,6 +371,24 @@ def sanitize_args_for_serialization(args: argparse.Namespace) -> Dict[str, Any]:
     cfg = dict(vars(args))
     cfg.pop("hf_token", None)
     return cfg
+
+
+def build_data_fingerprint(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the subset of config fields that define the Stage 2 data stream."""
+    return {
+        "dataset_name": cfg.get("dataset_name"),
+        "dataset_mix": cfg.get("dataset_mix"),
+        "tokenizer_name": cfg.get("tokenizer_name"),
+        "max_samples": cfg.get("max_samples"),
+        "max_seq_len": cfg.get("max_seq_len"),
+        "val_fraction": cfg.get("val_fraction"),
+        "seed": cfg.get("seed"),
+    }
+
+
+def data_fingerprint_mismatch(saved_cfg: Dict[str, Any], current_cfg: Dict[str, Any]) -> bool:
+    """Return True when a resumed Stage 2 checkpoint targets a different dataset stream."""
+    return build_data_fingerprint(saved_cfg) != build_data_fingerprint(current_cfg)
 
 
 _THINK_RE = re.compile(r"<\|begin_of_thought\|>(.*?)<\|end_of_thought\|>", re.DOTALL)
@@ -390,11 +520,13 @@ def _format_training_text(question: str, reasoning: str, answer: str, eos: str) 
     return f"User: {question}\n\nAssistant: {answer}{eos}"
 
 def _build_prompt_prefix(question: str, reasoning: str) -> str:
-    """Build the exact non-supervised prompt prefix for one SFT sample."""
-    prefix = f"User: {question}\n\nAssistant: "
-    if reasoning:
-        prefix += "<think>\n"
-    return prefix
+    """Build the non-supervised prompt prefix for one SFT sample.
+
+    Stage 2 masks only the user prompt and the bare assistant header so the model
+    is explicitly trained to emit the opening <think> tag when reasoning is present.
+    """
+    _ = reasoning
+    return f"User: {question}\n\nAssistant: "
 
 
 def _build_sft_sample(
@@ -726,7 +858,7 @@ def run_generation_callback(
 
     with ema_scope(model, ema):
         for prompt in GEN_PROMPTS:
-            prefix = f"User: {prompt}\n\nAssistant: <think>\n"
+            prefix = f"User: {prompt}\n\nAssistant: "
             ids = torch.tensor(
                 tokenizer.encode(prefix, add_special_tokens=False),
                 dtype=torch.long,
@@ -860,6 +992,7 @@ def save_checkpoint(
         "ema": ema.state_dict(),
         "backbone_config": asdict(config),
         "sft_config": cfg_dict,
+        "data_fingerprint": build_data_fingerprint(cfg_dict),
     }
 
     try:
@@ -929,16 +1062,36 @@ def load_latest_checkpoint(
     hf_repo_id: str = "WeirdRunner/Ouroboros",
     hf_token: Optional[str] = None,
     verbose: bool = True,
+    current_sft_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, int, int]:
-    """Load the newest valid Stage 2 checkpoint or initialize from the newest Stage 1 checkpoint."""
+    """Load the newest valid Stage 2 checkpoint, falling back to Stage 1 only if no Stage 2 checkpoint exists anywhere."""
 
-    def _restore(state: Dict[str, Any], label: str) -> Optional[Tuple[int, int, int]]:
-        if "model_state_dict" not in state:
+    def _classify_state(state: Dict[str, Any]) -> str:
+        if _looks_like_pretrain_checkpoint(state) and "sft_config" not in state:
+            return "stage1"
+        if "sft_config" in state:
+            return "stage2"
+        return "unknown"
+
+    def _restore_stage1(state: Dict[str, Any], label: str) -> Tuple[int, int, int]:
+        model.load_state_dict(state["model_state_dict"])
+        if state.get("ema"):
+            ema.load_state_dict(state["ema"])
+        elif state.get("ema_backbone_state_dict"):
+            _load_ema_shadow_from_alias(ema, state["ema_backbone_state_dict"])
+        if verbose:
+            print(
+                f"  [init]   {label}  loaded Stage 1 weights; "
+                "resetting optimizer/scheduler for Stage 2."
+            )
+        return 0, 0, 0
+
+    def _restore_stage2(state: Dict[str, Any], label: str) -> Optional[Tuple[int, int, int]]:
+        if any(key not in state for key in ("model_state_dict", "optimizer", "scheduler")):
             if verbose:
-                print(f"  [resume] incomplete checkpoint {label} - skipping")
+                print(f"  [resume] incomplete Stage 2 checkpoint {label} - skipping")
             return None
 
-        pretrain_init = _looks_like_pretrain_checkpoint(state) and "sft_config" not in state
         epoch = int(state.get("epoch", 0))
         samples_seen = int(state.get("samples_seen", 0))
         model.load_state_dict(state["model_state_dict"])
@@ -946,26 +1099,27 @@ def load_latest_checkpoint(
             ema.load_state_dict(state["ema"])
         elif state.get("ema_backbone_state_dict"):
             _load_ema_shadow_from_alias(ema, state["ema_backbone_state_dict"])
-
-        if pretrain_init:
-            if verbose:
-                print(
-                    f"  [init]   {label}  loaded Stage 1 weights; "
-                    "resetting optimizer/scheduler for Stage 2."
-                )
-            return 0, 0, 0
-
-        if any(key not in state for key in ("optimizer", "scheduler")):
-            if verbose:
-                print(f"  [resume] incomplete Stage 2 checkpoint {label} - skipping")
-            return None
-
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
         if scaler and state.get("scaler"):
             scaler.load_state_dict(state["scaler"])
         step = int(state.get("step", 0))
-        if verbose:
+
+        saved_cfg = dict(state.get("sft_config") or {})
+        saved_fingerprint = dict(state.get("data_fingerprint") or build_data_fingerprint(saved_cfg))
+        current_fingerprint = build_data_fingerprint(current_sft_config or {})
+        data_changed = bool(current_sft_config) and (saved_fingerprint != current_fingerprint)
+        if data_changed:
+            if verbose:
+                print(
+                    f"  [resume] {label}  restored optimizer/model state at step={step}, "
+                    "but dataset-defining args changed; resetting epoch/sample cursor for the new data stream."
+                )
+                print(f"  [resume] saved_data={saved_fingerprint}")
+                print(f"  [resume] new_data  ={current_fingerprint}")
+            epoch = 0
+            samples_seen = -1
+        elif verbose:
             print(
                 f"  [resume] {label}  step={step}  epoch={epoch}  "
                 f"samples_seen={samples_seen}  val_ce={state.get('val_ce')}"
@@ -1007,6 +1161,7 @@ def load_latest_checkpoint(
                 "priority": 1,
                 "label": candidate.name,
                 "state": state,
+                "kind": _classify_state(state),
             }
         )
 
@@ -1019,17 +1174,21 @@ def load_latest_checkpoint(
                     "source": "hub",
                     "priority": 0,
                     "label": ckpt_name,
+                    "kind": "unknown",
                 }
             )
 
     if verbose:
-        local_latest = local_records[0]["step"] if local_records else None
+        local_stage2_latest = max((r["step"] for r in local_records if r.get("kind") == "stage2"), default=None)
+        local_stage1_latest = max((r["step"] for r in local_records if r.get("kind") == "stage1"), default=None)
         hub_latest = remote_records[0]["step"] if remote_records else None
         print(
             "  [resume] candidate summary: "
-            f"local_latest={local_latest if local_latest is not None else 'none'}  "
+            f"local_stage2_latest={local_stage2_latest if local_stage2_latest is not None else 'none'}  "
+            f"local_stage1_latest={local_stage1_latest if local_stage1_latest is not None else 'none'}  "
             f"hub_latest={hub_latest if hub_latest is not None else 'none'}"
         )
+        print("  [resume] policy: prefer newest Stage 2 checkpoint across local + Hub; use Stage 1 only if no Stage 2 checkpoint exists.")
 
     candidates = sorted(
         local_records + remote_records,
@@ -1037,24 +1196,47 @@ def load_latest_checkpoint(
         reverse=True,
     )
 
+    stage1_fallback_state: Optional[Dict[str, Any]] = None
+    stage1_fallback_label: Optional[str] = None
+
     for record in candidates:
-        if record["source"] == "local":
-            restored = _restore(record["state"], record["label"])
+        state = record.get("state")
+        if record["source"] == "hub":
+            if verbose:
+                print(f"  [hub]  downloading {record['label']} ...")
+            downloaded = download_checkpoint_from_hub(record["label"], local_root, hf_repo_id, hf_token)
+            if downloaded is None:
+                continue
+            state = try_load_state(downloaded, device)
+            if state is None:
+                continue
+            record["state"] = state
+            record["kind"] = _classify_state(state)
+
+        if state is None or "model_state_dict" not in state:
+            if verbose:
+                print(f"  [resume] incomplete checkpoint {record['label']} - skipping")
+            continue
+
+        if record.get("kind") == "stage2":
+            restored = _restore_stage2(state, record["label"])
             if restored is not None:
                 return restored
             continue
 
+        if record.get("kind") == "stage1":
+            if stage1_fallback_state is None:
+                stage1_fallback_state = state
+                stage1_fallback_label = record["label"]
+            continue
+
         if verbose:
-            print(f"  [hub]  downloading {record['label']} ...")
-        downloaded = download_checkpoint_from_hub(record["label"], local_root, hf_repo_id, hf_token)
-        if downloaded is None:
-            continue
-        state = try_load_state(downloaded, device)
-        if state is None:
-            continue
-        restored = _restore(state, record["label"])
-        if restored is not None:
-            return restored
+            print(f"  [resume] could not classify {record['label']} as Stage 1 or Stage 2 - skipping")
+
+    if stage1_fallback_state is not None:
+        if verbose:
+            print(f"  [resume] no Stage 2 checkpoint found; using Stage 1 fallback from {stage1_fallback_label}.")
+        return _restore_stage1(stage1_fallback_state, stage1_fallback_label or "stage1")
 
     if verbose:
         print("  [resume] No checkpoint found - starting from scratch.")
@@ -1062,27 +1244,60 @@ def load_latest_checkpoint(
 
 
 
-def main() -> None:
-    args = parse_args()
-    set_seed(args.seed)
-
+def run_training(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
     hf_token = resolve_hf_token(args.hf_token)
     if args.push_to_hub and not hf_token:
         sys.exit("--push_to_hub requires --hf_token or HF_TOKEN/HUGGINGFACE_HUB_TOKEN")
 
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    distributed = world_size > 1
+    process_group_owner = False
+
+    if distributed and (args.batch_size < world_size or (args.batch_size % world_size) != 0):
+        raise SystemExit(
+            f"For DDP, batch_size must be divisible by world_size. "
+            f"Got batch_size={args.batch_size}, world_size={world_size}."
+        )
+
+    if distributed and not dist_is_initialized():
+        if not torch.cuda.is_available():
+            raise SystemExit("DDP auto-launch expects CUDA GPUs, but CUDA is not available.")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+            device_id=torch.device(f"cuda:{local_rank}"),
+        )
+        process_group_owner = True
+
+    set_seed(args.seed)
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    cleanup_temporary_checkpoints(output_dir)
+    if distributed:
+        if is_main_process(rank):
+            cleanup_temporary_checkpoints(output_dir)
+        dist.barrier()
+    else:
+        cleanup_temporary_checkpoints(output_dir)
 
-    device = torch.device("cuda")
+    if distributed:
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cuda")
+
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.cuda.reset_peak_memory_stats(device)
 
     wandb_run = None
-    if args.wandb_mode != "disabled":
+    if is_main_process(rank) and args.wandb_mode != "disabled":
         try:
             import wandb
 
@@ -1095,329 +1310,504 @@ def main() -> None:
         except ImportError:
             print("[warn] wandb not installed - logging to stdout only.")
 
-    print()
-    print("=" * 64)
-    print("  Stage 2 SFT - Project Ouroboros")
-    print("=" * 64)
-    print(f"  preset        : {args.preset}")
-    print(f"  seq_len       : {args.max_seq_len}")
-    print(f"  batch x accum : {args.batch_size} x {args.grad_accum} = {args.batch_size * args.grad_accum}")
-    print(f"  lr            : {args.lr}  warmup={args.warmup_steps}")
-    print(f"  dtype         : {dtype}")
-    print(f"  output_dir    : {output_dir}")
-    print(f"  dataset_mix   : {args.dataset_mix}")
-    print(f"  answer_only_ce: True")
-    print(f"  token_acc     : True  (answer tokens only)")
-    print(f"  push_to_hub   : {args.push_to_hub}")
-    print("=" * 64)
-    print()
+    try:
+        if is_main_process(rank):
+            print()
+            print("=" * 64)
+            print("  Stage 2 SFT - Project Ouroboros")
+            print("=" * 64)
+            print(f"  preset        : {args.preset}")
+            print(f"  seq_len       : {args.max_seq_len}")
+            print(f"  batch x accum : {args.batch_size} x {args.grad_accum} = {args.batch_size * args.grad_accum}")
+            if distributed:
+                print(f"  world_size    : {world_size}  (DDP auto-enabled)")
+                print(f"  per_gpu_batch : {args.batch_size // world_size}")
+            print(f"  lr            : {args.lr}  warmup={args.warmup_steps}")
+            print(f"  dtype         : {dtype}")
+            print(f"  output_dir    : {output_dir}")
+            print(f"  dataset_mix   : {args.dataset_mix}")
+            print(f"  answer_only_ce: True")
+            print(f"  token_acc     : True  (answer tokens only)")
+            print(f"  push_to_hub   : {args.push_to_hub}")
+            print(f"  timeout       : {args.session_timeout_hours}h  (buffer={args.graceful_exit_buffer_minutes:.0f} min)")
+            print("=" * 64)
+            print()
 
-    print(f"Loading tokenizer: {args.tokenizer_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-    print(f"  vocab: {len(tokenizer):,}  pad_token: '{tokenizer.pad_token}'")
-    print()
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+        if is_main_process(rank):
+            print(f"Loading tokenizer: {args.tokenizer_name}")
+            print(f"  vocab: {len(tokenizer):,}  pad_token: '{tokenizer.pad_token}'")
+            print()
 
-    if args.dataset_mix == "full":
-        all_samples = load_mixed_dataset(tokenizer, args.max_samples, args.max_seq_len)
-    else:
-        all_samples = load_and_tokenize(args.dataset_name, tokenizer, args.max_samples, args.max_seq_len)
-    if not all_samples:
-        sys.exit("No samples loaded. Check dataset connectivity and --max_samples.")
+        if args.dataset_mix == "full":
+            all_samples = load_mixed_dataset(tokenizer, args.max_samples, args.max_seq_len)
+        else:
+            all_samples = load_and_tokenize(args.dataset_name, tokenizer, args.max_samples, args.max_seq_len)
+        if not all_samples:
+            sys.exit("No samples loaded. Check dataset connectivity and --max_samples.")
 
-    train_samples, val_samples = split_train_val_samples(
-        all_samples=all_samples,
-        seed=args.seed,
-        val_fraction=args.val_fraction,
-    )
-    pad_id = tokenizer.pad_token_id or 0
+        train_samples, val_samples = split_train_val_samples(
+            all_samples=all_samples,
+            seed=args.seed,
+            val_fraction=args.val_fraction,
+        )
+        pad_id = tokenizer.pad_token_id or 0
 
-    print(f"  train: {len(train_samples)}  val: {len(val_samples)}")
-    print()
+        if is_main_process(rank):
+            print(f"  train: {len(train_samples)}  val: {len(val_samples)}")
+            print()
 
-    preset_kwargs = PRESETS[args.preset]
-    padded_vocab = pad_vocab_size(len(tokenizer), 128)
-    config = BaselineConfig(vocab_size=padded_vocab, max_seq_len=args.max_seq_len, dropout=0.0, **preset_kwargs)
-    model = BaselineTRMMamba(config).to(device=device, dtype=dtype)
-    model.train()
+        preset_kwargs = PRESETS[args.preset]
+        padded_vocab = pad_vocab_size(len(tokenizer), 128)
+        config = BaselineConfig(vocab_size=padded_vocab, max_seq_len=args.max_seq_len, dropout=0.0, **preset_kwargs)
+        raw_model = BaselineTRMMamba(config).to(device=device, dtype=dtype)
+        raw_model.train()
 
-    n_params = count_parameters(model)
-    print(f"Model  : {n_params / 1e6:.1f}M parameters  (preset={args.preset})")
-    print(
-        f"Config : d_model={config.d_model}  n_groups={config.n_groups} "
-        f" heads={config.n_heads}/{config.n_kv_heads}  mlp_hidden={config.mlp_hidden}"
-    )
-    print(f"Vocab  : {padded_vocab:,} (padded from {len(tokenizer):,})")
-    print()
-
-    optimizer, fused_enabled = build_adamw_optimizer(
-        model=model,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        prefer_fused=True,
-    )
-    print(f"Optimizer : AdamW ({'fused CUDA kernel' if fused_enabled else 'standard'})")
-
-    steps_per_epoch = math.ceil(len(train_samples) / (args.batch_size * args.grad_accum))
-    total_steps = args.max_steps if args.max_steps > 0 else steps_per_epoch * args.num_epochs
-    scheduler = cosine_with_warmup(optimizer, args.warmup_steps, total_steps, args.min_lr_ratio)
-    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
-    ema = ModelEMA(model, decay=args.ema_decay)
-
-    print(
-        f"Schedule  : cosine warmup={args.warmup_steps} total={total_steps} "
-        f" ({args.num_epochs} epochs x {steps_per_epoch} steps/epoch)"
-    )
-    print()
-
-    resume_search = Path(args.resume_from) if args.resume_from else output_dir
-    if args.resume_from and list_local_checkpoints(output_dir):
-        resume_path = Path(args.resume_from).resolve()
-        output_root = output_dir.resolve()
-        resume_inside_output = (resume_path == output_root) or (output_root in resume_path.parents)
-        if not resume_inside_output:
-            print("  [resume] found local Stage 2 checkpoints in output_dir; preferring them over external --resume_from")
-            resume_search = output_dir
-    if resume_search.is_dir():
-        cleanup_temporary_checkpoints(resume_search)
-
-    start_step, start_epoch, samples_seen = load_latest_checkpoint(
-        resume_search,
-        model,
-        ema,
-        optimizer,
-        scheduler,
-        scaler,
-        device,
-        push_to_hub=args.push_to_hub,
-        hf_repo_id=args.hf_repo_id,
-        hf_token=hf_token,
-        verbose=True,
-    )
-
-    torch.manual_seed(args.seed)
-    if train_samples:
-        samples_per_step = args.batch_size * args.grad_accum
-        derived_samples_seen = start_step * samples_per_step
-        if samples_seen <= 0:
-            samples_seen = derived_samples_seen
-        elif samples_seen != derived_samples_seen:
+        n_params = count_parameters(raw_model)
+        if is_main_process(rank):
+            print(f"Model  : {n_params / 1e6:.1f}M parameters  (preset={args.preset})")
             print(
-                f"  [resume] warning: checkpoint samples_seen={samples_seen} differs from "
-                f"derived value {derived_samples_seen}; trusting checkpoint."
+                f"Config : d_model={config.d_model}  n_groups={config.n_groups} "
+                f" heads={config.n_heads}/{config.n_kv_heads}  mlp_hidden={config.mlp_hidden}"
             )
-        completed_epochs = samples_seen // len(train_samples)
-        sample_idx = samples_seen % len(train_samples)
-        perm_train = []
-        for _ in range(completed_epochs + 1):
-            perm_train = torch.randperm(len(train_samples)).tolist()
-        if start_epoch <= 0:
-            start_epoch = completed_epochs
-    else:
-        sample_idx = 0
-        perm_train = []
+            print(f"Vocab  : {padded_vocab:,} (padded from {len(tokenizer):,})")
+            print()
 
-    col_hdr = (
-        f"{'Step':>7}  {'Train CE':>9}  {'Train Acc':>10}  {'Val CE':>9}  {'Val Acc':>8}  "
-        f"{'GNorm':>7}  {'LR':>9}  {'VRAM':>7}  {'Tok/s':>7}"
-    )
-    print(col_hdr)
-    print("-" * len(col_hdr))
+        optimizer, fused_enabled = build_adamw_optimizer(
+            model=raw_model,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            prefer_fused=True,
+        )
+        if is_main_process(rank):
+            print(f"Optimizer : AdamW ({'fused CUDA kernel' if fused_enabled else 'standard'})")
 
-    pbar = tqdm(total=total_steps, initial=start_step, desc="Training", dynamic_ncols=True)
-    step = start_step
-    micro_step = 0
-    accum_loss = 0.0
-    accum_correct = 0
-    accum_tokens = 0
-    last_val_ce: Optional[float] = None
-    last_val_acc: Optional[float] = None
-    t0 = time.perf_counter()
-    tokens_seen = 0
+        steps_per_epoch = max(1, math.ceil(len(train_samples) / max(args.batch_size * args.grad_accum, 1)))
+        total_steps = args.max_steps if args.max_steps > 0 else steps_per_epoch * args.num_epochs
+        scheduler = cosine_with_warmup(optimizer, args.warmup_steps, total_steps, args.min_lr_ratio)
+        scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
+        ema = ModelEMA(raw_model, decay=args.ema_decay)
+        spike_monitor = SpikeMonitor(threshold=args.spike_threshold)
 
-    optimizer.zero_grad(set_to_none=True)
-
-    logical_epoch = start_epoch
-
-    while step < total_steps:
-        micro_batch: List[Dict[str, Any]] = []
-        for _ in range(args.batch_size):
-            if sample_idx >= len(train_samples):
-                sample_idx = 0
-                logical_epoch += 1
-                perm_train = torch.randperm(len(train_samples)).tolist()
-            micro_batch.append(train_samples[perm_train[sample_idx]])
-            sample_idx += 1
-
-        batch = collate(micro_batch, pad_id)
-        input_ids = batch["input_ids"].to(device)
-        attn_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-        tokens_seen += int(attn_mask.sum().item())
-        samples_seen += len(micro_batch)
-
-        with torch.autocast(device_type="cuda", dtype=dtype):
-            logits = model(input_ids, attention_mask=attn_mask)
-
-        shift_logits = logits[:, :-1, :].contiguous().view(-1, config.vocab_size).float()
-        shift_labels = labels[:, 1:].contiguous().view(-1)
-        loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
-        n_correct, n_valid = masked_token_accuracy(shift_logits, shift_labels)
-
-        if dtype == torch.float16:
-            scaler.scale(loss / args.grad_accum).backward()
-        else:
-            (loss / args.grad_accum).backward()
-
-        accum_loss += loss.detach().item()
-        accum_correct += n_correct
-        accum_tokens += n_valid
-        micro_step += 1
-        if micro_step % args.grad_accum != 0:
-            continue
-
-        if dtype == torch.float16:
-            scaler.unscale_(optimizer)
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm))
-
-        if dtype == torch.float16:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-
-        scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
-        ema.update(model)
-
-        step += 1
-        mean_ce = accum_loss / args.grad_accum
-        mean_acc = accum_correct / max(accum_tokens, 1)
-        accum_loss = 0.0
-        accum_correct = 0
-        accum_tokens = 0
-
-        pbar.update(1)
-        pbar.set_postfix(ce=f"{mean_ce:.3f}", acc=f"{mean_acc:.3f}", gn=f"{grad_norm:.3f}")
-
-        if step % args.log_every == 0 or step == 1:
-            elapsed = max(time.perf_counter() - t0, 1e-6)
-            tok_s = tokens_seen / elapsed
-            cur_lr = scheduler.get_last_lr()[0]
-            vram = vram_gb(device)
-            val_ce_str = f"{last_val_ce:.4f}" if last_val_ce is not None else "        -"
-            val_acc_str = f"{last_val_acc:.4f}" if last_val_acc is not None else "       -"
-
-            tqdm.write(
-                f"{step:>7}  {mean_ce:>9.4f}  {mean_acc:>10.4f}  {val_ce_str:>9}  {val_acc_str:>8}  "
-                f"{grad_norm:>7.4f}  {cur_lr:>9.2e}  {vram:>7.3f}  {tok_s:>7.0f}"
+        if is_main_process(rank):
+            print(
+                f"Schedule  : cosine warmup={args.warmup_steps} total={total_steps} "
+                f"({args.num_epochs} epochs x {steps_per_epoch} steps/epoch)"
             )
+            print()
 
-            if wandb_run is not None:
-                import wandb
+        resume_search = Path(args.resume_from) if args.resume_from else output_dir
+        if args.resume_from and list_local_checkpoints(output_dir):
+            resume_path = Path(args.resume_from).resolve()
+            output_root = output_dir.resolve()
+            resume_inside_output = (resume_path == output_root) or (output_root in resume_path.parents)
+            if not resume_inside_output and is_main_process(rank):
+                print("  [resume] found local Stage 2 checkpoints in output_dir; preferring them over external --resume_from")
+                resume_search = output_dir
+        if resume_search.is_dir():
+            if distributed:
+                if is_main_process(rank):
+                    cleanup_temporary_checkpoints(resume_search)
+                dist.barrier()
+            else:
+                cleanup_temporary_checkpoints(resume_search)
 
-                wandb.log(
-                    {
-                        "train/ce": mean_ce,
-                        "train/accuracy": mean_acc,
-                        "train/grad_norm": grad_norm,
-                        "train/lr": cur_lr,
-                        "train/tok_s": tok_s,
-                        "train/vram_gb": vram,
-                    },
-                    step=step,
+        if distributed:
+            if is_main_process(rank):
+                start_step, start_epoch, samples_seen = load_latest_checkpoint(
+                    resume_search,
+                    raw_model,
+                    ema,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    device,
+                    push_to_hub=args.push_to_hub,
+                    hf_repo_id=args.hf_repo_id,
+                    hf_token=hf_token,
+                    verbose=True,
+                    current_sft_config=sanitize_args_for_serialization(args),
                 )
-
-        if step % args.val_every == 0 or step == total_steps:
-            last_val_ce, last_val_acc = compute_val_metrics(
-                model,
-                ema,
-                val_samples,
-                pad_id,
-                device,
-                dtype,
-                args.batch_size,
-                config.vocab_size,
-            )
-            tqdm.write(
-                f"  [val] step={step}  val_ce={last_val_ce:.4f}  val_acc={last_val_acc:.4f}"
-            )
-
-            if wandb_run is not None:
-                import wandb
-
-                wandb.log({"val/ce": last_val_ce, "val/accuracy": last_val_acc}, step=step)
-
-            if last_val_ce < 1.5:
-                tqdm.write(
-                    "  * val_ce < 1.5 - Stage 2 success criterion met. "
-                    "Consider proceeding to Phase 3."
+                dist.barrier()
+            else:
+                dist.barrier()
+                start_step, start_epoch, samples_seen = load_latest_checkpoint(
+                    resume_search,
+                    raw_model,
+                    ema,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    device,
+                    push_to_hub=args.push_to_hub,
+                    hf_repo_id=args.hf_repo_id,
+                    hf_token=hf_token,
+                    verbose=False,
+                    current_sft_config=sanitize_args_for_serialization(args),
                 )
-
-        if step % args.gen_every == 0 or step == total_steps:
-            run_generation_callback(
-                model,
+        else:
+            start_step, start_epoch, samples_seen = load_latest_checkpoint(
+                resume_search,
+                raw_model,
                 ema,
-                tokenizer,
+                optimizer,
+                scheduler,
+                scaler,
                 device,
-                dtype,
-                step=step,
-                max_new_tokens=args.gen_max_tokens,
-                max_seq_len=args.max_seq_len,
-                wandb_run=wandb_run,
-            )
-
-        if step % args.save_every == 0 or step == total_steps:
-            save_checkpoint(
-                output_dir=output_dir,
-                step=step,
-                model=model,
-                ema=ema,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler if dtype == torch.float16 else None,
-                config=config,
-                val_ce=last_val_ce,
-                keep_last=args.keep_last,
-                epoch=logical_epoch,
-                samples_seen=samples_seen,
-                sft_config=sanitize_args_for_serialization(args),
                 push_to_hub=args.push_to_hub,
                 hf_repo_id=args.hf_repo_id,
                 hf_token=hf_token,
+                verbose=True,
+                current_sft_config=sanitize_args_for_serialization(args),
             )
 
-    pbar.close()
+        train_model = raw_model
+        if distributed:
+            train_model = DDP(
+                raw_model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                broadcast_buffers=False,
+            )
 
-    total_time = time.perf_counter() - t0
-    peak_vram_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+        local_batch_size = args.batch_size // world_size if distributed else args.batch_size
+        if samples_seen < 0:
+            if is_main_process(rank):
+                print("  [resume] data stream changed - restarting sample cursor from the beginning of the new dataset.")
+            samples_seen = 0
+        elif samples_seen == 0 and start_step > 0:
+            samples_seen = start_step * args.batch_size * args.grad_accum
 
-    print()
-    print("=" * 64)
-    print("  Stage 2 Training Complete")
-    print("=" * 64)
-    print(f"  Total steps  : {step}")
-    print(f"  Total time   : {total_time / 60:.1f} min")
-    print(f"  Peak VRAM    : {peak_vram_gb:.2f} GB")
-    if last_val_ce is not None:
-        print(f"  Final val CE : {last_val_ce:.4f}  (answer tokens only)")
-        if last_val_acc is not None:
-            print(f"  Final val acc: {last_val_acc:.4f}  (answer-token accuracy)")
-        if last_val_ce < 1.5:
-            print("  Status       : SUCCESS - proceed to Phase 3 (incremental recursion)")
-        else:
-            print("  Status       : val_ce >= 1.5 - extend training or check data quality")
-    print("=" * 64)
+        perm_cache: Dict[int, List[int]] = {}
 
-    if wandb_run is not None:
-        import wandb
+        def epoch_permutation(epoch: int) -> List[int]:
+            if epoch not in perm_cache:
+                generator = torch.Generator().manual_seed(args.seed + epoch)
+                perm_cache[epoch] = torch.randperm(len(train_samples), generator=generator).tolist()
+            return perm_cache[epoch]
 
-        wandb.finish()
+        def fetch_micro_batch(global_sample_start: int) -> List[Dict[str, Any]]:
+            batch: List[Dict[str, Any]] = []
+            rank_start = global_sample_start + (rank * local_batch_size)
+            for pos in range(rank_start, rank_start + local_batch_size):
+                epoch = pos // len(train_samples)
+                offset = pos % len(train_samples)
+                perm = epoch_permutation(epoch)
+                batch.append(train_samples[perm[offset]])
+            return batch
+
+        col_hdr = (
+            f"{'Step':>7}  {'Train CE':>9}  {'Train Acc':>10}  {'Val CE':>9}  {'Val Acc':>8}  "
+            f"{'GNorm':>7}  {'LR':>9}  {'VRAM':>7}  {'Tok/s':>7}"
+        )
+        if is_main_process(rank):
+            print(col_hdr)
+            print("-" * len(col_hdr))
+
+        pbar = tqdm(total=total_steps, initial=start_step, desc="Training", dynamic_ncols=True) if is_main_process(rank) else None
+        step = start_step
+        last_saved_step = start_step
+        last_val_ce: Optional[float] = None
+        last_val_acc: Optional[float] = None
+        tokens_since_log = 0
+        t0 = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+
+        session_start = time.perf_counter()
+        timeout_limit_s = args.session_timeout_hours * 3600.0
+        timeout_buffer_s = args.graceful_exit_buffer_minutes * 60.0
+        timeout_triggered = False
+
+        def check_timeout() -> bool:
+            nonlocal timeout_triggered
+            if timeout_triggered or not is_main_process(rank):
+                return timeout_triggered
+            elapsed = time.perf_counter() - session_start
+            if elapsed + timeout_buffer_s >= timeout_limit_s:
+                remaining_min = (timeout_limit_s - elapsed) / 60.0
+                print(
+                    f"\n  [timeout] {elapsed / 3600:.2f}h elapsed — "
+                    f"{remaining_min:.1f} min remaining (< {args.graceful_exit_buffer_minutes:.0f} min buffer)."
+                )
+                timeout_triggered = True
+            return timeout_triggered
+
+        def broadcast_timeout() -> bool:
+            nonlocal timeout_triggered
+            if not distributed:
+                return timeout_triggered
+            tensor = torch.tensor([int(timeout_triggered)], device=device, dtype=torch.int32)
+            dist.broadcast(tensor, src=0)
+            timeout_triggered = bool(tensor.item())
+            return timeout_triggered
+
+        while step < total_steps:
+            accum_loss = 0.0
+            accum_correct = 0
+            accum_tokens = 0
+
+            for _ in range(args.grad_accum):
+                micro_batch = fetch_micro_batch(samples_seen)
+                batch = collate(micro_batch, pad_id)
+                input_ids = batch["input_ids"].to(device)
+                attn_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+                tokens_since_log += int(attn_mask.sum().item())
+                samples_seen += args.batch_size
+
+                with autocast_context(device, dtype):
+                    logits = train_model(input_ids, attention_mask=attn_mask)
+
+                shift_logits = logits[:, :-1, :].contiguous().view(-1, config.vocab_size).float()
+                shift_labels = labels[:, 1:].contiguous().view(-1)
+                loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+                n_correct, n_valid = masked_token_accuracy(shift_logits, shift_labels)
+
+                if dtype == torch.float16:
+                    scaler.scale(loss / args.grad_accum).backward()
+                else:
+                    (loss / args.grad_accum).backward()
+
+                accum_loss += loss.detach().item()
+                accum_correct += n_correct
+                accum_tokens += n_valid
+
+            if dtype == torch.float16:
+                scaler.unscale_(optimizer)
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm))
+
+            if dtype == torch.float16:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            ema.update(raw_model)
+
+            step += 1
+            mean_ce = distributed_mean(accum_loss / args.grad_accum, device)
+            global_correct = distributed_sum_int(accum_correct, device)
+            global_valid = distributed_sum_int(accum_tokens, device)
+            mean_acc = global_correct / max(global_valid, 1)
+            grad_norm_log = distributed_mean(grad_norm, device)
+
+            if is_main_process(rank) and spike_monitor.update(step, mean_ce):
+                tqdm.write(f"  [spike] step={step}  raw={mean_ce:.4f}  ema={spike_monitor.smoothed:.4f}")
+
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix(ce=f"{mean_ce:.3f}", acc=f"{mean_acc:.3f}", gn=f"{grad_norm_log:.3f}")
+
+            if step % args.log_every == 0 or step == 1:
+                global_tokens_since_log = distributed_sum_int(tokens_since_log, device)
+                cur_lr = scheduler.get_last_lr()[0]
+                if is_main_process(rank):
+                    elapsed = max(time.perf_counter() - t0, 1e-6)
+                    tok_s = global_tokens_since_log / elapsed
+                    vram = vram_gb(device)
+                    val_ce_str = f"{last_val_ce:.4f}" if last_val_ce is not None else "        -"
+                    val_acc_str = f"{last_val_acc:.4f}" if last_val_acc is not None else "       -"
+                    tqdm.write(
+                        f"{step:>7}  {mean_ce:>9.4f}  {mean_acc:>10.4f}  {val_ce_str:>9}  {val_acc_str:>8}  "
+                        f"{grad_norm_log:>7.4f}  {cur_lr:>9.2e}  {vram:>7.3f}  {tok_s:>7.0f}"
+                    )
+
+                    if wandb_run is not None:
+                        import wandb
+
+                        wandb.log(
+                            {
+                                "train/ce": mean_ce,
+                                "train/ce_smooth": spike_monitor.smoothed,
+                                "train/accuracy": mean_acc,
+                                "train/grad_norm": grad_norm_log,
+                                "train/lr": cur_lr,
+                                "train/tok_s": tok_s,
+                                "train/vram_gb": vram,
+                                "train/world_size": world_size,
+                            },
+                            step=step,
+                        )
+                t0 = time.perf_counter()
+                tokens_since_log = 0
+
+            check_timeout()
+            if broadcast_timeout():
+                current_epoch = samples_seen // max(len(train_samples), 1)
+                if is_main_process(rank):
+                    print(f"  [timeout] Saving emergency checkpoint at step {step} ...")
+                    save_checkpoint(
+                        output_dir=output_dir,
+                        step=step,
+                        model=raw_model,
+                        ema=ema,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler if dtype == torch.float16 else None,
+                        config=config,
+                        val_ce=last_val_ce,
+                        keep_last=args.keep_last,
+                        epoch=current_epoch,
+                        samples_seen=samples_seen,
+                        sft_config=sanitize_args_for_serialization(args),
+                        push_to_hub=args.push_to_hub,
+                        hf_repo_id=args.hf_repo_id,
+                        hf_token=hf_token,
+                    )
+                    last_saved_step = step
+                if distributed:
+                    dist.barrier()
+                break
+
+            if step % args.val_every == 0 or step == total_steps:
+                if is_main_process(rank):
+                    last_val_ce, last_val_acc = compute_val_metrics(
+                        raw_model,
+                        ema,
+                        val_samples,
+                        pad_id,
+                        device,
+                        dtype,
+                        args.batch_size,
+                        config.vocab_size,
+                    )
+                    tqdm.write(
+                        f"  [val] step={step}  val_ce={last_val_ce:.4f}  val_acc={last_val_acc:.4f}"
+                    )
+
+                    if wandb_run is not None:
+                        import wandb
+
+                        wandb.log({"val/ce": last_val_ce, "val/accuracy": last_val_acc}, step=step)
+
+                    if last_val_ce < 1.5:
+                        tqdm.write(
+                            "  * val_ce < 1.5 - Stage 2 success criterion met. "
+                            "Consider proceeding to Phase 3."
+                        )
+                if distributed:
+                    dist.barrier()
+
+            if step % args.gen_every == 0 or step == total_steps:
+                if is_main_process(rank):
+                    run_generation_callback(
+                        raw_model,
+                        ema,
+                        tokenizer,
+                        device,
+                        dtype,
+                        step=step,
+                        max_new_tokens=args.gen_max_tokens,
+                        max_seq_len=args.max_seq_len,
+                        wandb_run=wandb_run,
+                    )
+                if distributed:
+                    dist.barrier()
+
+            if step % args.save_every == 0 or step == total_steps:
+                current_epoch = samples_seen // max(len(train_samples), 1)
+                if is_main_process(rank):
+                    save_checkpoint(
+                        output_dir=output_dir,
+                        step=step,
+                        model=raw_model,
+                        ema=ema,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler if dtype == torch.float16 else None,
+                        config=config,
+                        val_ce=last_val_ce,
+                        keep_last=args.keep_last,
+                        epoch=current_epoch,
+                        samples_seen=samples_seen,
+                        sft_config=sanitize_args_for_serialization(args),
+                        push_to_hub=args.push_to_hub,
+                        hf_repo_id=args.hf_repo_id,
+                        hf_token=hf_token,
+                    )
+                    last_saved_step = step
+                if distributed:
+                    dist.barrier()
+
+        if pbar is not None:
+            pbar.close()
+
+        if not timeout_triggered and step != last_saved_step:
+            current_epoch = samples_seen // max(len(train_samples), 1)
+            if is_main_process(rank):
+                save_checkpoint(
+                    output_dir=output_dir,
+                    step=step,
+                    model=raw_model,
+                    ema=ema,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler if dtype == torch.float16 else None,
+                    config=config,
+                    val_ce=last_val_ce,
+                    keep_last=args.keep_last,
+                    epoch=current_epoch,
+                    samples_seen=samples_seen,
+                    sft_config=sanitize_args_for_serialization(args),
+                    push_to_hub=args.push_to_hub,
+                    hf_repo_id=args.hf_repo_id,
+                    hf_token=hf_token,
+                )
+                last_saved_step = step
+            if distributed:
+                dist.barrier()
+
+        if is_main_process(rank):
+            total_time = time.perf_counter() - session_start
+            peak_vram_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+            print()
+            print("=" * 64)
+            print("  Stage 2 Training Complete")
+            print("=" * 64)
+            print(f"  Total steps  : {step}")
+            print(f"  Total time   : {total_time / 60:.1f} min")
+            print(f"  Peak VRAM    : {peak_vram_gb:.2f} GB")
+            if distributed:
+                print(f"  World size   : {world_size}")
+            print(f"  Spike count  : {len(spike_monitor.spikes)}")
+            if last_val_ce is not None:
+                print(f"  Final val CE : {last_val_ce:.4f}  (answer tokens only)")
+                if last_val_acc is not None:
+                    print(f"  Final val acc: {last_val_acc:.4f}  (answer-token accuracy)")
+                if last_val_ce < 1.5:
+                    print("  Status       : SUCCESS - proceed to Phase 3 (incremental recursion)")
+                else:
+                    print("  Status       : val_ce >= 1.5 - extend training or check data quality")
+            if timeout_triggered:
+                print(f"  Status       : TIMEOUT - checkpoint saved at step {step}")
+            print("=" * 64)
+
+        if wandb_run is not None:
+            import wandb
+
+            wandb.finish()
+        if distributed:
+            dist.barrier()
+        return 0
+    finally:
+        if process_group_owner and dist_is_initialized():
+            dist.destroy_process_group()
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    args = parse_args(argv_list)
+    if maybe_launch_multi_gpu(args, argv_list):
+        return 0
+    return run_training(argv_list)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
