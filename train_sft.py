@@ -203,6 +203,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="HF token for Hub sync. Falls back to HF_TOKEN/HUGGINGFACE_HUB_TOKEN.",
     )
+    parser.add_argument(
+        "--hf_stage_subdir",
+        default="runs/stage2",
+        help="Remote subdirectory inside the HF repo used for Stage 2 checkpoints.",
+    )
 
     # Monitoring
     parser.add_argument("--log_every", type=int, default=20)
@@ -313,7 +318,9 @@ def _distributed_worker(local_rank: int, world_size: int, master_port: int, argv
     os.environ["RANK"] = str(local_rank)
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    raise SystemExit(run_training(argv))
+    exit_code = run_training(argv)
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 def maybe_launch_multi_gpu(args: argparse.Namespace, argv: List[str]) -> bool:
@@ -389,6 +396,136 @@ def build_data_fingerprint(cfg: Dict[str, Any]) -> Dict[str, Any]:
 def data_fingerprint_mismatch(saved_cfg: Dict[str, Any], current_cfg: Dict[str, Any]) -> bool:
     """Return True when a resumed Stage 2 checkpoint targets a different dataset stream."""
     return build_data_fingerprint(saved_cfg) != build_data_fingerprint(current_cfg)
+
+
+def _normalize_repo_subdir(path: Optional[str]) -> str:
+    return str(path or "").strip().strip("/")
+
+
+def _join_repo_path(prefix: Optional[str], *parts: str) -> str:
+    cleaned: List[str] = []
+    prefix_clean = _normalize_repo_subdir(prefix)
+    if prefix_clean:
+        cleaned.append(prefix_clean)
+    for part in parts:
+        part_clean = str(part or "").strip().strip("/")
+        if part_clean:
+            cleaned.append(part_clean)
+    return "/".join(cleaned)
+
+
+def _legacy_root_checkpoint_sort_key(name: str) -> Tuple[int, int]:
+    """Prefer irregular checkpoint steps first when a mixed legacy repo is unavoidable."""
+    step = checkpoint_step_from_name(name)
+    return (1 if step % 500 == 0 else 0, -step)
+
+
+def list_remote_checkpoint_names(
+    hf_repo_id: str,
+    hf_token: Optional[str],
+    remote_prefix: Optional[str] = None,
+    prefer_irregular_steps: bool = False,
+) -> List[str]:
+    """List remote checkpoint directories inside one Hub path."""
+    if not hf_token:
+        return []
+    try:
+        from huggingface_hub import HfFileSystem
+    except ImportError:
+        return []
+
+    hffs = HfFileSystem(token=hf_token)
+    repo_path = _join_repo_path(None, hf_repo_id, _normalize_repo_subdir(remote_prefix))
+    try:
+        entries = hffs.ls(repo_path, detail=False, refresh=True)
+    except Exception:
+        return []
+
+    names = []
+    for entry in entries:
+        name = str(entry).rstrip("/").split("/")[-1]
+        if checkpoint_step_from_name(name) >= 0:
+            names.append(name)
+
+    names = list(dict.fromkeys(names))
+    if prefer_irregular_steps:
+        names.sort(key=_legacy_root_checkpoint_sort_key)
+    else:
+        names.sort(key=checkpoint_step_from_name, reverse=True)
+    return names
+
+
+def download_checkpoint_from_hub(
+    ckpt_name: str,
+    local_root: Path,
+    hf_repo_id: str,
+    hf_token: Optional[str],
+    remote_prefix: Optional[str] = None,
+) -> Optional[Path]:
+    """Download one checkpoint directory from the Hub into a local staging folder."""
+    if not hf_token:
+        return None
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return None
+
+    remote_dir = _join_repo_path(remote_prefix, ckpt_name)
+    allow_patterns = [f"{remote_dir}/*"]
+    local_root = Path(local_root)
+    local_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        snapshot_download(
+            repo_id=hf_repo_id,
+            repo_type="model",
+            token=hf_token,
+            allow_patterns=allow_patterns,
+            local_dir=str(local_root),
+        )
+    except Exception as exc:
+        print(f"  [hub]  warn: failed to download {remote_dir} from {hf_repo_id}: {exc}")
+        return None
+
+    target_dir = local_root / remote_dir
+    return target_dir if (target_dir / "training_state.pt").exists() else None
+
+
+def sync_checkpoint_to_hub(
+    checkpoint_dir: Path,
+    hf_repo_id: str,
+    hf_token: Optional[str],
+    remote_prefix: Optional[str] = None,
+) -> bool:
+    """Upload one checkpoint directory to a stage-specific Hub subdirectory.
+
+    This path is blocking on purpose so the trainer does not keep running after the
+    training loop simply because a background Hub upload is still active.
+    """
+    if not hf_token:
+        return False
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        print("  [hub]  warn: huggingface_hub not installed; skipping Hub upload.")
+        return False
+
+    checkpoint_dir = Path(checkpoint_dir)
+    remote_dir = _join_repo_path(remote_prefix, checkpoint_dir.name)
+    try:
+        api = HfApi(token=hf_token)
+        api.upload_folder(
+            repo_id=hf_repo_id,
+            repo_type="model",
+            folder_path=str(checkpoint_dir),
+            path_in_repo=remote_dir,
+            commit_message=f"Upload Stage 2 {checkpoint_dir.name}",
+        )
+        print(f"  [hub]  uploaded -> {hf_repo_id}/{remote_dir}")
+        return True
+    except Exception as exc:
+        print(f"  [hub]  warn: failed to upload {checkpoint_dir.name} to {hf_repo_id}/{remote_dir}: {exc}")
+        return False
 
 
 _THINK_RE = re.compile(r"<\|begin_of_thought\|>(.*?)<\|end_of_thought\|>", re.DOTALL)
@@ -565,10 +702,10 @@ def _build_sft_sample_truncated(
     """Like _build_sft_sample but truncates reasoning instead of skipping long examples.
 
     Truncation policy:
-      - If sequence fits: proceed normally (delegates to _build_sft_sample).
+      - If sequence fits: proceed normally.
       - If reasoning is too long: 50% chance keep reasoning start, 50% keep reasoning end.
-      - If question + answer alone exceeds max_seq_len: drop reasoning entirely (Option C).
-      - If even Option C exceeds max_seq_len: return None (skip).
+      - If question + answer alone fits but reasoning does not: drop or trim reasoning.
+      - If even question + answer alone exceed max_seq_len: skip.
     """
     if not reasoning:
         return _build_sft_sample(tokenizer, question, reasoning, answer, eos, max_seq_len)
@@ -586,15 +723,12 @@ def _build_sft_sample_truncated(
 
     overhead = len(open_ids) + len(close_ids)
     base_len = len(q_ids) + len(a_ids)
-
     if base_len > max_seq_len:
         return None
 
     budget = max_seq_len - base_len - overhead
-
     if budget >= len(r_ids):
         return _build_sft_sample(tokenizer, question, reasoning, answer, eos, max_seq_len)
-
     if budget <= 0:
         return _build_sft_sample(tokenizer, question, "", answer, eos, max_seq_len)
 
@@ -602,9 +736,7 @@ def _build_sft_sample_truncated(
         truncated_r_ids = r_ids[:budget]
     else:
         truncated_r_ids = r_ids[-budget:]
-
     truncated_reasoning = tokenizer.decode(truncated_r_ids, skip_special_tokens=False)
-
     return _build_sft_sample(tokenizer, question, truncated_reasoning, answer, eos, max_seq_len)
 
 
@@ -614,7 +746,10 @@ def load_and_tokenize(
     max_samples: Optional[int],
     max_seq_len: int,
 ) -> List[Dict[str, Any]]:
-    """Load one dataset, format rows, tokenize, and filter invalid or overlength samples."""
+    """Load one dataset, format rows, tokenize, and filter invalid samples.
+
+    Long reasoning traces are truncated to fit max_seq_len instead of being discarded.
+    """
     print(f"Loading {dataset_name} ...")
     raw = load_dataset(dataset_name, split="train")
     if max_samples is not None:
@@ -1003,8 +1138,9 @@ def save_checkpoint(
     push_to_hub: bool = False,
     hf_repo_id: str = "WeirdRunner/Ouroboros",
     hf_token: Optional[str] = None,
+    hf_stage_subdir: Optional[str] = None,
 ) -> Optional[Path]:
-    """Write a Stage 2 checkpoint locally first, then try a Hub push."""
+    """Write a Stage 2 checkpoint locally first, then try a stage-scoped Hub push."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ckpt_name = f"checkpoint-{step:07d}"
@@ -1069,7 +1205,12 @@ def save_checkpoint(
         print(f"  [ckpt] pruned -> {old.name}")
 
     if push_to_hub and hf_token:
-        uploaded = sync_checkpoint_to_hub(final_dir, hf_repo_id, hf_token)
+        uploaded = sync_checkpoint_to_hub(
+            final_dir,
+            hf_repo_id,
+            hf_token,
+            remote_prefix=hf_stage_subdir,
+        )
         if not uploaded:
             print(
                 f"  [hub]  warn: step {step} Hub sync failed; "
@@ -1106,11 +1247,12 @@ def load_latest_checkpoint(
     hf_token: Optional[str] = None,
     verbose: bool = True,
     current_sft_config: Optional[Dict[str, Any]] = None,
+    hf_stage_subdir: Optional[str] = None,
 ) -> Tuple[int, int, int, bool]:
     """Load the newest valid Stage 2 checkpoint.
 
     Returns (step, epoch, samples_seen, reset_optimizer).
-    reset_optimizer=True when data stream changed or Stage 1 was loaded.
+    reset_optimizer=True when the data stream changed or only Stage 1 weights were found.
     """
 
     def _classify_state(state: Dict[str, Any]) -> str:
@@ -1161,18 +1303,18 @@ def load_latest_checkpoint(
                 print(f"  [resume] saved_data={saved_fingerprint}")
                 print(f"  [resume] new_data  ={current_fingerprint}")
             return 0, 0, 0, True
-        else:
-            optimizer.load_state_dict(state["optimizer"])
-            scheduler.load_state_dict(state["scheduler"])
-            if scaler and state.get("scaler"):
-                scaler.load_state_dict(state["scaler"])
-            step = int(state.get("step", 0))
-            if verbose:
-                print(
-                    f"  [resume] {label}  step={step}  epoch={epoch}  "
-                    f"samples_seen={samples_seen}  val_ce={state.get('val_ce')}"
-                )
-            return step, epoch, samples_seen, False
+
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        if scaler and state.get("scaler"):
+            scaler.load_state_dict(state["scaler"])
+        step = int(state.get("step", 0))
+        if verbose:
+            print(
+                f"  [resume] {label}  step={step}  epoch={epoch}  "
+                f"samples_seen={samples_seen}  val_ce={state.get('val_ce')}"
+            )
+        return step, epoch, samples_seen, False
 
     search_root = Path(output_dir)
     direct_candidates: List[Path] = []
@@ -1188,6 +1330,9 @@ def load_latest_checkpoint(
         search_root = search_root.parent
 
     local_root = search_root if search_root.exists() else search_root.parent
+    hub_resume_dir = local_root / ".hub_resume"
+    if hub_resume_dir.exists():
+        direct_candidates.extend(list_local_checkpoints(hub_resume_dir))
 
     local_stage2: List[Dict[str, Any]] = []
     local_stage1_fallback: Optional[Dict[str, Any]] = None
@@ -1210,7 +1355,7 @@ def load_latest_checkpoint(
             local_stage1_fallback = state
             local_stage1_label = candidate.name
 
-    local_stage2.sort(key=lambda r: r["step"], reverse=True)
+    local_stage2.sort(key=lambda record: record["step"], reverse=True)
 
     if verbose:
         local_s2 = local_stage2[0]["step"] if local_stage2 else None
@@ -1221,50 +1366,70 @@ def load_latest_checkpoint(
 
     for record in local_stage2:
         try:
-            result = _restore_stage2(record["state"], record["label"])
-            if result is not None:
-                return result
+            restored = _restore_stage2(record["state"], record["label"])
+            if restored is not None:
+                return restored
         except Exception as exc:
             if verbose:
                 print(f"  [resume] failed to restore local {record['label']}: {exc} - skipping")
 
-    hub_resume_dir = local_root / ".hub_resume"
     if hf_token:
         if verbose:
             print("  [resume] no local Stage 2 found; checking Hub for Stage 2 checkpoints...")
-        remote_names = list_remote_checkpoint_names(hf_repo_id, hf_token)
-        candidates_tried = 0
-        for ckpt_name in remote_names:
-            if candidates_tried >= 3:
-                if verbose:
-                    print("  [resume] reached Hub download limit (3); stopping Hub search.")
-                break
-            if verbose:
-                print(f"  [hub]  checking {ckpt_name} ...")
-            hub_resume_dir.mkdir(parents=True, exist_ok=True)
-            downloaded = download_checkpoint_from_hub(ckpt_name, hub_resume_dir, hf_repo_id, hf_token)
-            if downloaded is None:
-                continue
-            candidates_tried += 1
-            state = try_load_state(downloaded, device)
-            if state is None or "model_state_dict" not in state:
-                continue
-            kind = _classify_state(state)
-            if kind == "stage2":
-                try:
-                    result = _restore_stage2(state, ckpt_name)
-                    if result is not None:
-                        shutil.rmtree(hub_resume_dir, ignore_errors=True)
-                        return result
-                except Exception as exc:
-                    if verbose:
-                        print(f"  [resume] failed to restore Hub {ckpt_name}: {exc} - skipping")
-            elif kind == "stage1" and local_stage1_fallback is None:
-                local_stage1_fallback = state
-                local_stage1_label = ckpt_name
 
-    if hub_resume_dir.exists():
-        shutil.rmtree(hub_resume_dir, ignore_errors=True)
+        remote_queries: List[Tuple[Optional[str], bool, Optional[int]]] = []
+        stage_prefix = _normalize_repo_subdir(hf_stage_subdir)
+        if stage_prefix:
+            remote_queries.append((stage_prefix, False, None))
+        remote_queries.append((None, True, 3))
+
+        for remote_prefix, prefer_irregular, limit in remote_queries:
+            location = remote_prefix or "<repo-root>"
+            remote_names = list_remote_checkpoint_names(
+                hf_repo_id,
+                hf_token,
+                remote_prefix=remote_prefix,
+                prefer_irregular_steps=prefer_irregular,
+            )
+            if not remote_names:
+                continue
+            if verbose:
+                print(f"  [resume] checking Hub path {location} ({len(remote_names)} candidates)...")
+
+            candidates_tried = 0
+            for ckpt_name in remote_names:
+                if limit is not None and candidates_tried >= limit:
+                    if verbose:
+                        print(f"  [resume] reached Hub download limit ({limit}) for {location}; stopping search there.")
+                    break
+                if verbose:
+                    print(f"  [hub]  downloading {location}/{ckpt_name} ...")
+                downloaded = download_checkpoint_from_hub(
+                    ckpt_name,
+                    hub_resume_dir,
+                    hf_repo_id,
+                    hf_token,
+                    remote_prefix=remote_prefix,
+                )
+                if downloaded is None:
+                    continue
+                candidates_tried += 1
+                state = try_load_state(downloaded, device)
+                if state is None or "model_state_dict" not in state:
+                    continue
+                kind = _classify_state(state)
+                label = _join_repo_path(remote_prefix, ckpt_name) or ckpt_name
+                if kind == "stage2":
+                    try:
+                        restored = _restore_stage2(state, label)
+                        if restored is not None:
+                            return restored
+                    except Exception as exc:
+                        if verbose:
+                            print(f"  [resume] failed to restore Hub {label}: {exc} - skipping")
+                elif kind == "stage1" and local_stage1_fallback is None:
+                    local_stage1_fallback = state
+                    local_stage1_label = label
 
     if local_stage1_fallback is not None:
         if verbose:
@@ -1273,7 +1438,7 @@ def load_latest_checkpoint(
 
     if verbose:
         print("  [resume] No checkpoint found - starting from scratch.")
-    return 0, 0, 0, True
+    return 0, 0, 0, False
 
 
 
@@ -1363,6 +1528,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
             print(f"  answer_only_ce: True")
             print(f"  token_acc     : True  (answer tokens only)")
             print(f"  push_to_hub   : {args.push_to_hub}")
+            print(f"  hf_stage_dir  : {args.hf_stage_subdir}")
             print(f"  timeout       : {args.session_timeout_hours}h  (buffer={args.graceful_exit_buffer_minutes:.0f} min)")
             print("=" * 64)
             print()
@@ -1466,25 +1632,12 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                     hf_token=hf_token,
                     verbose=True,
                     current_sft_config=sanitize_args_for_serialization(args),
+                    hf_stage_subdir=args.hf_stage_subdir,
                 )
-
-                if need_opt_reset:
-                    optimizer, fused_enabled = build_adamw_optimizer(
-                        model=raw_model,
-                        lr=args.lr,
-                        weight_decay=args.weight_decay,
-                        betas=(0.9, 0.95),
-                        eps=1e-8,
-                        prefer_fused=True,
-                    )
-                    scheduler = cosine_with_warmup(optimizer, args.warmup_steps, total_steps, args.min_lr_ratio)
-                    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
-                    if is_main_process(rank):
-                        print(f"  [resume] optimizer/scheduler reset; training starts fresh from step 0.")
                 dist.barrier()
             else:
                 dist.barrier()
-                start_step, start_epoch, samples_seen, _ = load_latest_checkpoint(
+                start_step, start_epoch, samples_seen, need_opt_reset = load_latest_checkpoint(
                     resume_search,
                     raw_model,
                     ema,
@@ -1494,9 +1647,10 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                     device,
                     push_to_hub=args.push_to_hub,
                     hf_repo_id=args.hf_repo_id,
-                    hf_token=hf_token,
+                    hf_token=None,
                     verbose=False,
                     current_sft_config=sanitize_args_for_serialization(args),
+                    hf_stage_subdir=args.hf_stage_subdir,
                 )
         else:
             start_step, start_epoch, samples_seen, need_opt_reset = load_latest_checkpoint(
@@ -1512,21 +1666,32 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                 hf_token=hf_token,
                 verbose=True,
                 current_sft_config=sanitize_args_for_serialization(args),
+                hf_stage_subdir=args.hf_stage_subdir,
             )
 
-            if need_opt_reset:
-                optimizer, fused_enabled = build_adamw_optimizer(
-                    model=raw_model,
-                    lr=args.lr,
-                    weight_decay=args.weight_decay,
-                    betas=(0.9, 0.95),
-                    eps=1e-8,
-                    prefer_fused=True,
-                )
-                scheduler = cosine_with_warmup(optimizer, args.warmup_steps, total_steps, args.min_lr_ratio)
-                scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
-                if is_main_process(rank):
-                    print(f"  [resume] optimizer/scheduler reset; training starts fresh from step 0.")
+        if need_opt_reset:
+            optimizer, fused_enabled = build_adamw_optimizer(
+                model=raw_model,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+                prefer_fused=True,
+            )
+            scheduler = cosine_with_warmup(optimizer, args.warmup_steps, total_steps, args.min_lr_ratio)
+            scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
+            if is_main_process(rank):
+                print("  [resume] optimizer/scheduler reset; training starts fresh from step 0.")
+                print(f"Optimizer : AdamW ({'fused CUDA kernel' if fused_enabled else 'standard'})")
+
+        hub_resume_dir = (resume_search if Path(resume_search).is_dir() else Path(resume_search).parent) / ".hub_resume"
+        if distributed:
+            dist.barrier()
+            if is_main_process(rank) and hub_resume_dir.exists():
+                shutil.rmtree(hub_resume_dir, ignore_errors=True)
+            dist.barrier()
+        elif hub_resume_dir.exists():
+            shutil.rmtree(hub_resume_dir, ignore_errors=True)
 
         train_model = raw_model
         if distributed:
@@ -1538,11 +1703,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
             )
 
         local_batch_size = args.batch_size // world_size if distributed else args.batch_size
-        if samples_seen < 0:
-            if is_main_process(rank):
-                print("  [resume] data stream changed - restarting sample cursor from the beginning of the new dataset.")
-            samples_seen = 0
-        elif samples_seen == 0 and start_step > 0:
+        if samples_seen == 0 and start_step > 0:
             samples_seen = start_step * args.batch_size * args.grad_accum
 
         perm_cache: Dict[int, List[int]] = {}
@@ -1722,6 +1883,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                         push_to_hub=args.push_to_hub,
                         hf_repo_id=args.hf_repo_id,
                         hf_token=hf_token,
+                        hf_stage_subdir=args.hf_stage_subdir,
                     )
                     last_saved_step = step
                 if distributed:
@@ -1793,6 +1955,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                         push_to_hub=args.push_to_hub,
                         hf_repo_id=args.hf_repo_id,
                         hf_token=hf_token,
+                        hf_stage_subdir=args.hf_stage_subdir,
                     )
                     last_saved_step = step
                 if distributed:
@@ -1821,6 +1984,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                     push_to_hub=args.push_to_hub,
                     hf_repo_id=args.hf_repo_id,
                     hf_token=hf_token,
+                    hf_stage_subdir=args.hf_stage_subdir,
                 )
                 last_saved_step = step
             if distributed:
@@ -1854,13 +2018,18 @@ def run_training(argv: Optional[List[str]] = None) -> int:
         if wandb_run is not None:
             import wandb
 
-            wandb.finish()
-        if distributed:
-            dist.barrier()
+            try:
+                wandb.finish()
+            except Exception as exc:
+                print(f"[warn] wandb.finish() failed during shutdown: {exc}")
         return 0
     finally:
         if process_group_owner and dist_is_initialized():
-            dist.destroy_process_group()
+            try:
+                dist.destroy_process_group()
+            except Exception as exc:
+                if is_main_process(rank):
+                    print(f"[warn] dist.destroy_process_group() failed: {exc}")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
