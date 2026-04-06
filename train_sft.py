@@ -126,7 +126,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="nano",
         help="Model size preset. nano=92M, small=270M, medium=760M.",
     )
-    parser.add_argument("--max_seq_len", type=int, default=1024)
+    parser.add_argument("--max_seq_len", type=int, default=2048)
 
     # Dataset
     parser.add_argument("--dataset_name", default="bespokelabs/Bespoke-Stratos-17k")
@@ -554,6 +554,60 @@ def _build_sft_sample(
     }
 
 
+def _build_sft_sample_truncated(
+    tokenizer,
+    question: str,
+    reasoning: str,
+    answer: str,
+    eos: str,
+    max_seq_len: int,
+) -> Optional[Dict[str, Any]]:
+    """Like _build_sft_sample but truncates reasoning instead of skipping long examples.
+
+    Truncation policy:
+      - If sequence fits: proceed normally (delegates to _build_sft_sample).
+      - If reasoning is too long: 50% chance keep reasoning start, 50% keep reasoning end.
+      - If question + answer alone exceeds max_seq_len: drop reasoning entirely (Option C).
+      - If even Option C exceeds max_seq_len: return None (skip).
+    """
+    if not reasoning:
+        return _build_sft_sample(tokenizer, question, reasoning, answer, eos, max_seq_len)
+
+    prefix_text = f"User: {question}\n\nAssistant: "
+    answer_text = f"{answer}{eos}"
+    think_open_text = "<think>\n"
+    think_close_text = "\n</think>\n"
+
+    q_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+    a_ids = tokenizer.encode(answer_text, add_special_tokens=False)
+    open_ids = tokenizer.encode(think_open_text, add_special_tokens=False)
+    close_ids = tokenizer.encode(think_close_text, add_special_tokens=False)
+    r_ids = tokenizer.encode(reasoning, add_special_tokens=False)
+
+    overhead = len(open_ids) + len(close_ids)
+    base_len = len(q_ids) + len(a_ids)
+
+    if base_len > max_seq_len:
+        return None
+
+    budget = max_seq_len - base_len - overhead
+
+    if budget >= len(r_ids):
+        return _build_sft_sample(tokenizer, question, reasoning, answer, eos, max_seq_len)
+
+    if budget <= 0:
+        return _build_sft_sample(tokenizer, question, "", answer, eos, max_seq_len)
+
+    if random.random() < 0.5:
+        truncated_r_ids = r_ids[:budget]
+    else:
+        truncated_r_ids = r_ids[-budget:]
+
+    truncated_reasoning = tokenizer.decode(truncated_r_ids, skip_special_tokens=False)
+
+    return _build_sft_sample(tokenizer, question, truncated_reasoning, answer, eos, max_seq_len)
+
+
 def load_and_tokenize(
     dataset_name: str,
     tokenizer,
@@ -569,7 +623,6 @@ def load_and_tokenize(
     eos = tokenizer.eos_token or "<|endoftext|>"
     samples: List[Dict[str, Any]] = []
     skipped_invalid = 0
-    skipped_too_long = 0
 
     for ex in tqdm(raw, desc="Formatting + tokenizing", leave=False):
         q, r, a = _extract_bespoke(ex)
@@ -577,21 +630,16 @@ def load_and_tokenize(
             skipped_invalid += 1
             continue
 
-        sample = _build_sft_sample(tokenizer, q, r, a, eos, max_seq_len)
+        sample = _build_sft_sample_truncated(tokenizer, q, r, a, eos, max_seq_len)
         if sample is None:
-            text = _format_training_text(q, r, a, eos)
-            ids = tokenizer.encode(text, add_special_tokens=False)
-            if len(ids) > max_seq_len:
-                skipped_too_long += 1
-            else:
-                skipped_invalid += 1
+            skipped_invalid += 1
             continue
 
         samples.append(sample)
 
     print(
-        f"  {len(samples)} samples kept, {skipped_invalid} skipped (invalid), "
-        f"{skipped_too_long} skipped (> max_seq_len={max_seq_len})."
+        f"  {len(samples)} samples kept ({skipped_invalid} skipped as invalid/too-short). "
+        f"Reasoning truncated where needed to fit max_seq_len={max_seq_len}."
     )
     return samples
 
@@ -759,7 +807,6 @@ def load_mixed_dataset(
         target = target_counts[ds_name]
         kept = 0
         skipped_invalid = 0
-        skipped_too_long = 0
 
         for ex in tqdm(spec["dataset"], desc=f"  {spec['resolved_label'].split('/')[-1]}", leave=False):
             q, r, a = extractor(ex)
@@ -767,14 +814,9 @@ def load_mixed_dataset(
                 skipped_invalid += 1
                 continue
 
-            sample = _build_sft_sample(tokenizer, q, r, a, eos, max_seq_len)
+            sample = _build_sft_sample_truncated(tokenizer, q, r, a, eos, max_seq_len)
             if sample is None:
-                text = _format_training_text(q, r, a, eos)
-                ids = tokenizer.encode(text, add_special_tokens=False)
-                if len(ids) > max_seq_len:
-                    skipped_too_long += 1
-                else:
-                    skipped_invalid += 1
+                skipped_invalid += 1
                 continue
 
             sample["source"] = ds_name
@@ -787,7 +829,7 @@ def load_mixed_dataset(
         actual_counts[ds_name] = kept
         print(
             f"    kept {kept} / target {target} samples "
-            f"(invalid={skipped_invalid}, too_long={skipped_too_long})."
+            f"(invalid={skipped_invalid}; reasoning truncated where needed)."
         )
 
     random.shuffle(all_samples)
@@ -1017,6 +1059,7 @@ def save_checkpoint(
             if entry.is_dir()
             and entry.name.startswith("checkpoint-")
             and not entry.name.endswith(".tmp")
+            and not entry.name.startswith(".hub_")
             and checkpoint_step_from_name(entry.name) >= 0
         ],
         key=lambda entry: checkpoint_step_from_name(entry.name),
@@ -1063,8 +1106,12 @@ def load_latest_checkpoint(
     hf_token: Optional[str] = None,
     verbose: bool = True,
     current_sft_config: Optional[Dict[str, Any]] = None,
-) -> Tuple[int, int, int]:
-    """Load the newest valid Stage 2 checkpoint, falling back to Stage 1 only if no Stage 2 checkpoint exists anywhere."""
+) -> Tuple[int, int, int, bool]:
+    """Load the newest valid Stage 2 checkpoint.
+
+    Returns (step, epoch, samples_seen, reset_optimizer).
+    reset_optimizer=True when data stream changed or Stage 1 was loaded.
+    """
 
     def _classify_state(state: Dict[str, Any]) -> str:
         if _looks_like_pretrain_checkpoint(state) and "sft_config" not in state:
@@ -1073,7 +1120,7 @@ def load_latest_checkpoint(
             return "stage2"
         return "unknown"
 
-    def _restore_stage1(state: Dict[str, Any], label: str) -> Tuple[int, int, int]:
+    def _restore_stage1(state: Dict[str, Any], label: str) -> Tuple[int, int, int, bool]:
         model.load_state_dict(state["model_state_dict"])
         if state.get("ema"):
             ema.load_state_dict(state["ema"])
@@ -1084,9 +1131,9 @@ def load_latest_checkpoint(
                 f"  [init]   {label}  loaded Stage 1 weights; "
                 "resetting optimizer/scheduler for Stage 2."
             )
-        return 0, 0, 0
+        return 0, 0, 0, True
 
-    def _restore_stage2(state: Dict[str, Any], label: str) -> Optional[Tuple[int, int, int]]:
+    def _restore_stage2(state: Dict[str, Any], label: str) -> Optional[Tuple[int, int, int, bool]]:
         if any(key not in state for key in ("model_state_dict", "optimizer", "scheduler")):
             if verbose:
                 print(f"  [resume] incomplete Stage 2 checkpoint {label} - skipping")
@@ -1099,42 +1146,40 @@ def load_latest_checkpoint(
             ema.load_state_dict(state["ema"])
         elif state.get("ema_backbone_state_dict"):
             _load_ema_shadow_from_alias(ema, state["ema_backbone_state_dict"])
-        optimizer.load_state_dict(state["optimizer"])
-        scheduler.load_state_dict(state["scheduler"])
-        if scaler and state.get("scaler"):
-            scaler.load_state_dict(state["scaler"])
-        step = int(state.get("step", 0))
 
         saved_cfg = dict(state.get("sft_config") or {})
         saved_fingerprint = dict(state.get("data_fingerprint") or build_data_fingerprint(saved_cfg))
         current_fingerprint = build_data_fingerprint(current_sft_config or {})
         data_changed = bool(current_sft_config) and (saved_fingerprint != current_fingerprint)
+
         if data_changed:
             if verbose:
                 print(
-                    f"  [resume] {label}  restored optimizer/model state at step={step}, "
-                    "but dataset-defining args changed; resetting epoch/sample cursor for the new data stream."
+                    f"  [resume] {label}  loaded model weights (step={state.get('step', 0)}), "
+                    "but data stream changed — resetting step/optimizer/scheduler for new data."
                 )
                 print(f"  [resume] saved_data={saved_fingerprint}")
                 print(f"  [resume] new_data  ={current_fingerprint}")
-            epoch = 0
-            samples_seen = -1
-        elif verbose:
-            print(
-                f"  [resume] {label}  step={step}  epoch={epoch}  "
-                f"samples_seen={samples_seen}  val_ce={state.get('val_ce')}"
-            )
-        return step, epoch, samples_seen
+            return 0, 0, 0, True
+        else:
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            if scaler and state.get("scaler"):
+                scaler.load_state_dict(state["scaler"])
+            step = int(state.get("step", 0))
+            if verbose:
+                print(
+                    f"  [resume] {label}  step={step}  epoch={epoch}  "
+                    f"samples_seen={samples_seen}  val_ce={state.get('val_ce')}"
+                )
+            return step, epoch, samples_seen, False
 
     search_root = Path(output_dir)
     direct_candidates: List[Path] = []
 
     if search_root.is_file() and search_root.name == "training_state.pt":
         direct_candidates.append(search_root.parent)
-        if search_root.parent.name.startswith("checkpoint-"):
-            search_root = search_root.parent.parent
-        else:
-            search_root = search_root.parent
+        search_root = search_root.parent.parent if search_root.parent.name.startswith("checkpoint-") else search_root.parent
     elif (search_root / "training_state.pt").exists():
         direct_candidates.append(search_root)
         if search_root.name.startswith("checkpoint-"):
@@ -1143,7 +1188,10 @@ def load_latest_checkpoint(
         search_root = search_root.parent
 
     local_root = search_root if search_root.exists() else search_root.parent
-    local_records: List[Dict[str, Any]] = []
+
+    local_stage2: List[Dict[str, Any]] = []
+    local_stage1_fallback: Optional[Dict[str, Any]] = None
+    local_stage1_label: Optional[str] = None
     seen_paths: set[str] = set()
 
     for candidate in direct_candidates + list_local_checkpoints(local_root):
@@ -1152,100 +1200,86 @@ def load_latest_checkpoint(
             continue
         seen_paths.add(candidate_str)
         state = try_load_state(candidate, device)
-        if state is None:
+        if state is None or "model_state_dict" not in state:
             continue
-        local_records.append(
-            {
-                "step": int(state.get("step", checkpoint_step_from_name(candidate.name))),
-                "source": "local",
-                "priority": 1,
-                "label": candidate.name,
-                "state": state,
-                "kind": _classify_state(state),
-            }
-        )
+        kind = _classify_state(state)
+        step = int(state.get("step", checkpoint_step_from_name(candidate.name)))
+        if kind == "stage2":
+            local_stage2.append({"step": step, "label": candidate.name, "state": state})
+        elif kind == "stage1" and local_stage1_fallback is None:
+            local_stage1_fallback = state
+            local_stage1_label = candidate.name
 
-    remote_records: List[Dict[str, Any]] = []
-    if hf_token:
-        for ckpt_name in list_remote_checkpoint_names(hf_repo_id, hf_token):
-            remote_records.append(
-                {
-                    "step": checkpoint_step_from_name(ckpt_name),
-                    "source": "hub",
-                    "priority": 0,
-                    "label": ckpt_name,
-                    "kind": "unknown",
-                }
-            )
+    local_stage2.sort(key=lambda r: r["step"], reverse=True)
 
     if verbose:
-        local_stage2_latest = max((r["step"] for r in local_records if r.get("kind") == "stage2"), default=None)
-        local_stage1_latest = max((r["step"] for r in local_records if r.get("kind") == "stage1"), default=None)
-        hub_latest = remote_records[0]["step"] if remote_records else None
+        local_s2 = local_stage2[0]["step"] if local_stage2 else None
         print(
-            "  [resume] candidate summary: "
-            f"local_stage2_latest={local_stage2_latest if local_stage2_latest is not None else 'none'}  "
-            f"local_stage1_latest={local_stage1_latest if local_stage1_latest is not None else 'none'}  "
-            f"hub_latest={hub_latest if hub_latest is not None else 'none'}"
+            f"  [resume] local Stage 2 candidates: {len(local_stage2)} "
+            f"(newest step={local_s2 if local_s2 is not None else 'none'})"
         )
-        print("  [resume] policy: prefer newest Stage 2 checkpoint across local + Hub; use Stage 1 only if no Stage 2 checkpoint exists.")
 
-    candidates = sorted(
-        local_records + remote_records,
-        key=lambda record: (int(record.get("step", -1)), int(record.get("priority", 0))),
-        reverse=True,
-    )
-
-    stage1_fallback_state: Optional[Dict[str, Any]] = None
-    stage1_fallback_label: Optional[str] = None
-
-    for record in candidates:
-        state = record.get("state")
-        if record["source"] == "hub":
+    for record in local_stage2:
+        try:
+            result = _restore_stage2(record["state"], record["label"])
+            if result is not None:
+                return result
+        except Exception as exc:
             if verbose:
-                print(f"  [hub]  downloading {record['label']} ...")
-            downloaded = download_checkpoint_from_hub(record["label"], local_root, hf_repo_id, hf_token)
+                print(f"  [resume] failed to restore local {record['label']}: {exc} - skipping")
+
+    hub_resume_dir = local_root / ".hub_resume"
+    if hf_token:
+        if verbose:
+            print("  [resume] no local Stage 2 found; checking Hub for Stage 2 checkpoints...")
+        remote_names = list_remote_checkpoint_names(hf_repo_id, hf_token)
+        candidates_tried = 0
+        for ckpt_name in remote_names:
+            if candidates_tried >= 3:
+                if verbose:
+                    print("  [resume] reached Hub download limit (3); stopping Hub search.")
+                break
+            if verbose:
+                print(f"  [hub]  checking {ckpt_name} ...")
+            hub_resume_dir.mkdir(parents=True, exist_ok=True)
+            downloaded = download_checkpoint_from_hub(ckpt_name, hub_resume_dir, hf_repo_id, hf_token)
             if downloaded is None:
                 continue
+            candidates_tried += 1
             state = try_load_state(downloaded, device)
-            if state is None:
+            if state is None or "model_state_dict" not in state:
                 continue
-            record["state"] = state
-            record["kind"] = _classify_state(state)
+            kind = _classify_state(state)
+            if kind == "stage2":
+                try:
+                    result = _restore_stage2(state, ckpt_name)
+                    if result is not None:
+                        shutil.rmtree(hub_resume_dir, ignore_errors=True)
+                        return result
+                except Exception as exc:
+                    if verbose:
+                        print(f"  [resume] failed to restore Hub {ckpt_name}: {exc} - skipping")
+            elif kind == "stage1" and local_stage1_fallback is None:
+                local_stage1_fallback = state
+                local_stage1_label = ckpt_name
 
-        if state is None or "model_state_dict" not in state:
-            if verbose:
-                print(f"  [resume] incomplete checkpoint {record['label']} - skipping")
-            continue
+    if hub_resume_dir.exists():
+        shutil.rmtree(hub_resume_dir, ignore_errors=True)
 
-        if record.get("kind") == "stage2":
-            restored = _restore_stage2(state, record["label"])
-            if restored is not None:
-                return restored
-            continue
-
-        if record.get("kind") == "stage1":
-            if stage1_fallback_state is None:
-                stage1_fallback_state = state
-                stage1_fallback_label = record["label"]
-            continue
-
+    if local_stage1_fallback is not None:
         if verbose:
-            print(f"  [resume] could not classify {record['label']} as Stage 1 or Stage 2 - skipping")
-
-    if stage1_fallback_state is not None:
-        if verbose:
-            print(f"  [resume] no Stage 2 checkpoint found; using Stage 1 fallback from {stage1_fallback_label}.")
-        return _restore_stage1(stage1_fallback_state, stage1_fallback_label or "stage1")
+            print(f"  [resume] no Stage 2 checkpoint found; using Stage 1 fallback from {local_stage1_label}.")
+        return _restore_stage1(local_stage1_fallback, local_stage1_label or "stage1")
 
     if verbose:
         print("  [resume] No checkpoint found - starting from scratch.")
-    return 0, 0, 0
+    return 0, 0, 0, True
 
 
 
 def run_training(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     hf_token = resolve_hf_token(args.hf_token)
     if args.push_to_hub and not hf_token:
         sys.exit("--push_to_hub requires --hf_token or HF_TOKEN/HUGGINGFACE_HUB_TOKEN")
@@ -1419,7 +1453,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
 
         if distributed:
             if is_main_process(rank):
-                start_step, start_epoch, samples_seen = load_latest_checkpoint(
+                start_step, start_epoch, samples_seen, need_opt_reset = load_latest_checkpoint(
                     resume_search,
                     raw_model,
                     ema,
@@ -1433,10 +1467,24 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                     verbose=True,
                     current_sft_config=sanitize_args_for_serialization(args),
                 )
+
+                if need_opt_reset:
+                    optimizer, fused_enabled = build_adamw_optimizer(
+                        model=raw_model,
+                        lr=args.lr,
+                        weight_decay=args.weight_decay,
+                        betas=(0.9, 0.95),
+                        eps=1e-8,
+                        prefer_fused=True,
+                    )
+                    scheduler = cosine_with_warmup(optimizer, args.warmup_steps, total_steps, args.min_lr_ratio)
+                    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
+                    if is_main_process(rank):
+                        print(f"  [resume] optimizer/scheduler reset; training starts fresh from step 0.")
                 dist.barrier()
             else:
                 dist.barrier()
-                start_step, start_epoch, samples_seen = load_latest_checkpoint(
+                start_step, start_epoch, samples_seen, _ = load_latest_checkpoint(
                     resume_search,
                     raw_model,
                     ema,
@@ -1451,7 +1499,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                     current_sft_config=sanitize_args_for_serialization(args),
                 )
         else:
-            start_step, start_epoch, samples_seen = load_latest_checkpoint(
+            start_step, start_epoch, samples_seen, need_opt_reset = load_latest_checkpoint(
                 resume_search,
                 raw_model,
                 ema,
@@ -1465,6 +1513,20 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                 verbose=True,
                 current_sft_config=sanitize_args_for_serialization(args),
             )
+
+            if need_opt_reset:
+                optimizer, fused_enabled = build_adamw_optimizer(
+                    model=raw_model,
+                    lr=args.lr,
+                    weight_decay=args.weight_decay,
+                    betas=(0.9, 0.95),
+                    eps=1e-8,
+                    prefer_fused=True,
+                )
+                scheduler = cosine_with_warmup(optimizer, args.warmup_steps, total_steps, args.min_lr_ratio)
+                scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
+                if is_main_process(rank):
+                    print(f"  [resume] optimizer/scheduler reset; training starts fresh from step 0.")
 
         train_model = raw_model
         if distributed:
