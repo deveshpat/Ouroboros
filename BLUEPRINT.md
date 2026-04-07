@@ -15,31 +15,41 @@ Novel hybrid Transformer-Mamba language model ("TRM-Mamba", 1:7 ratio) pre-train
 |---|---|---|---|
 | 0 | Architecture & Viability | ✅ COMPLETE | All 4 gates passed |
 | 1 | Pre-training | ✅ BYPASSED — SFT from ckpt-0021000 | val_ce < 3.0 + UWR > 0.05 |
-| 2 | SFT | 🟡 IN PROGRESS — Session 5, step ~1520/4920 | answer val_ce < 1.5 |
+| 2 | SFT | 🔴 NEEDS FIX — S5 timed out, val_ce plateau at ~5.62 | answer val_ce < 1.5 |
 | 3 | Recursive Inference (Coconut-Ouroboros) | ⬜ NOT STARTED | Stage 2 gate |
 | 4 | GRPO | ⬜ NOT STARTED | Stage 3 gate |
 | 5 | Quantization | ⬜ NOT STARTED | Stage 4/3 gate |
 
 ### Immediate next actions
 
-**Stage 2 — currently running.** Session 5 at step ~1520/4920. Expected to complete in ~8h total.
+**Stage 2 Session 6 — fix the EMA lag + consider LR change.** Resume from the highest-step Hub checkpoint from S5 (expected ~step 3900).
 
-Post-session checklist:
-- [ ] Confirm Hub has checkpoint(s) from this session (500, 1000, 1500 confirmed ✅)
-- [ ] Check val_ce at step 2500 — must be below 5.0 for on-track signal
-- [ ] Check generation at step 2000+ for first `<think>` tag emergence
-- [ ] If val_ce > 5.0 at step 2500: consider restarting with `--ema_decay 0.99`
-- [ ] If val_ce < 1.5 at end: proceed to Stage 3
-
-**Stage 3 (after Stage 2 gate):**
+**Session 6 run command:**
 ```bash
-python recursive_finetune.py \
+python train_sft.py \
   --preset nano \
-  --resume_from runs/stage2/checkpoint-XXXXXXX \
-  --n_latent 1 \
-  --stage2_val_ce <record_here> \
-  --output_dir runs/stage3_k1
+  --max_seq_len 2048 \
+  --dataset_mix full \
+  --num_epochs 3 \
+  --batch_size 2 \
+  --grad_accum 16 \
+  --lr 1e-4 \
+  --warmup_steps 0 \
+  --ema_decay 0.99 \
+  --output_dir runs/stage2 \
+  --push_to_hub \
+  --hf_token $HF_TOKEN \
+  --wandb_project ouroboros-stage2 \
+  --save_every 500 \
+  --val_every 250 \
+  --gen_every 250 \
+  --session_timeout_hours 11.5 \
+  --graceful_exit_buffer_minutes 7
 ```
+
+Key changes vs S5: `--ema_decay 0.99` (was 0.995), `--warmup_steps 0` (resuming mid-run; no warmup needed).
+
+**If val_ce still plateaued after 500 more steps:** Consider `--lr 3e-4` for a short burst (100 steps), then back to 1e-4.
 
 ---
 
@@ -50,7 +60,8 @@ python recursive_finetune.py \
 | No pre-training | Comma-loops from random init | Pre-train first |
 | Stage 2 S1: max_seq_len=1024 | Filtered all reasoning; no `<think>` learning | Raised to 2048 + truncation |
 | Stage 2 S2: resume bug cascade | Hub downloads in output_dir; prune deleted all Stage 2 ckpts; optimizer not reset | Bugs 6–10 fixed |
-| Stage 2 S5: EMA lag | EMA@0.995 slow to reflect trained weights; generation still degenerate at step 1500 | Monitor; reduce to 0.99 if val_ce > 5.0 at step 2500 |
+| Stage 2 S5: EMA decay=0.995 | EMA lags ~200 steps behind live weights; val CE barely moves despite train CE improving | Reduce to 0.99 in S6 |
+| Stage 2 S5: Number loop prior | Strong FineWeb-Edu number bias never broken; generation frozen through step 2250 | Needs more training; EMA fix should help |
 
 ---
 
@@ -91,6 +102,7 @@ mamba_expand=2, max_seq_len=2048, dropout=0.0, rms_norm_eps=1e-5, tie_embeddings
 | Stage 2 DDP | Works correctly on Dual T4. SIGABRT is benign post-training teardown race (Bug 11). |
 | Stage 3 recursion | Coconut-Ouroboros, K=1→4→16. NOT TRM EMA-loop. |
 | Hub repo | WeirdRunner/Ouroboros (private) |
+| EMA decay S5→S6 | Reducing 0.995 → 0.99 to close the EMA lag that stalled val_ce |
 
 ---
 
@@ -111,18 +123,15 @@ mamba_expand=2, max_seq_len=2048, dropout=0.0, rms_norm_eps=1e-5, tie_embeddings
 
 ## Part 5 — Stage Definitions
 
-### Stage 2 — SFT 🟡 IN PROGRESS
+### Stage 2 — SFT 🔴 SESSION 6 NEEDED
 
 **Sessions:**
 - S1 (✅): stratos-only, max_seq_len=1024, val_ce=4.9153, no `<think>` learning. Hub: ckpt-0002979.
 - S2 (❌): full-mix DDP, Bugs 6–10, val_ce=5.7135. All local Stage 2 ckpts deleted.
-- S3 (✅ training): dry-run max_steps=10, patches verified.
-- S4 (✅ training): dry-run confirmed S3 diagnosis. Full-scale launched.
-- S5 (🟡): full-scale, DDP, from step 0 (data_changed reset). At step ~1520/4920.
-  - val_ce: 5.7453 → 5.6372 (slow but consistent decline)
-  - train CE: 4.54 → 3.06 (model learning from training data)
-  - Generation still degenerate at step 1500 — EMA lag expected; monitor step 2000+
-  - Hub: ckpt-0000500 ✅, ckpt-0001000 ✅, ckpt-0001500 ✅
+- S3 (✅): dry-run max_steps=10, patches verified.
+- S4 (✅): dry-run confirmed S3 diagnosis. Full-scale launched.
+- S5 (🔴): full-scale DDP, timed out ~step 3900. val_ce plateaued at 5.62. EMA lag identified as root cause. Hub: ckpt-0000500/1000/1500/2000 + timeout ckpt.
+- S6 (⬜): **NEXT** — resume from S5 timeout ckpt, `ema_decay=0.99`, `warmup_steps=0`.
 
 **All patches applied to `train_sft.py`:**
 - [x] Local Stage 2 checkpoints tried first; Hub downloads to `.hub_resume/` temp dir
@@ -132,16 +141,24 @@ mamba_expand=2, max_seq_len=2048, dropout=0.0, rms_norm_eps=1e-5, tie_embeddings
 - [x] Prune skips `.hub_*` subdirs
 - [x] `_build_sft_sample_truncated` — truncate reasoning instead of skipping
 
-**Hyperparameters (active run):**
+**Hyperparameters (S5 active / S6 planned):**
 ```
-lr=1e-4, warmup=100, cosine to 1e-5
+S5: lr=1e-4, warmup=100, cosine to 1e-5, ema_decay=0.995  ← EMA lag issue
+S6: lr=1e-4, warmup=0,   cosine (continued), ema_decay=0.99  ← fix
 batch_size=2, grad_accum=16 → effective batch=32 (global, DDP)
-max_seq_len=2048, ema_decay=0.995
-dataset_mix=full, num_epochs=3, total_steps=4920
+max_seq_len=2048, dataset_mix=full, num_epochs=3, total_steps=4920
 ```
 
 **Data counts at max_seq_len=2048 (with truncation):**
 55,230 total | train: 52,469 | val: 2,761
+
+**S5 val_ce analysis:**
+```
+Steps 250–2250: 5.7453 → 5.6251  (Δ = 0.12 over 2000 steps)
+Projected steps to reach < 1.5 at this rate: ~34,000 — NOT viable
+EMA@0.995 effective lookback at step 2000: ~200 steps  ← too slow
+EMA@0.99 effective lookback at step 2000:  ~100 steps  ← 2× more responsive
+```
 
 **Success criteria:**
 - val_ce < 1.5 (answer tokens only)
@@ -191,6 +208,7 @@ Full spec: `stage3_agent_prompt.md`. Required additions to `baseline_trm_mamba.p
 ### Bug 9 — Optimizer not reset on data stream change ✅ FIXED
 ### Bug 10 — max_seq_len=1024 filtered 97% of reasoning datasets ✅ FIXED
 ### Bug 11 — NCCL teardown race: post-training SIGABRT on Dual T4 ✅ BENIGN (no fix needed)
+### Bug 12 — EMA decay=0.995 causes severe lag; val_ce plateau 🔴 FIX IN S6 (reduce to 0.99)
 
 ---
 
@@ -199,7 +217,7 @@ Full spec: `stage3_agent_prompt.md`. Required additions to `baseline_trm_mamba.p
 | Stage | Platform | Estimate | Notes |
 |---|---|---|---|
 | 1 | Kaggle Dual T4 | ✅ Done (705M tokens) | |
-| 2 | Kaggle Dual T4 | ~8–11h per session | Session 5 in progress |
+| 2 | Kaggle Dual T4 | ~2–3 more sessions | S6 with ema_decay=0.99 |
 | 3 | TRC preferred | ~4–8h | Per K sub-stage |
 | 4 | TRC + unsloth | ~8–12h | GRPO G=4 rollouts |
 | 5 | Local / Jetson | ~2h | Post-training quantization |
