@@ -145,7 +145,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--dataset_mix",
-        default="stratos",
+        default="full",
         choices=["stratos", "full"],
         help="'stratos' = Bespoke-Stratos-17k only. 'full' = Stratos + MetaMathQA + OpenHermes-2.5 + OpenR1-Math-220k + OpenR1-Code.",
     )
@@ -167,20 +167,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--grad_accum",
         type=int,
-        default=8,
+        default=16,
         help="Gradient accumulation steps. Effective batch = batch_size * grad_accum.",
     )
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument(
         "--min_lr_ratio",
         type=float,
         default=0.1,
         help="LR at end of cosine decay = lr * min_lr_ratio.",
     )
-    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--warmup_steps", type=int, default=50)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--ema_decay", type=float, default=0.995)
+    parser.add_argument("--ema_decay", type=float, default=0.99)
     parser.add_argument("--seed", type=int, default=42)
 
     # I/O
@@ -212,13 +212,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # Monitoring
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--val_every", type=int, default=250)
-    parser.add_argument("--gen_every", type=int, default=250)
+    parser.add_argument("--gen_every", type=int, default=500)
     parser.add_argument("--gen_max_tokens", type=int, default=120)
     parser.add_argument("--spike_threshold", type=float, default=0.5)
     parser.add_argument(
         "--session_timeout_hours",
         type=float,
-        default=12.0,
+        default=11.5,
         help="Total wall-clock budget in hours. The trainer saves an emergency checkpoint before this expires.",
     )
     parser.add_argument(
@@ -229,7 +229,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
 
     # wandb
-    parser.add_argument("--wandb_project", default="ouroboros-serf-phase2")
+    parser.add_argument("--wandb_project", default="ouroboros-stage2")
     parser.add_argument("--wandb_run_name", default=None)
     parser.add_argument(
         "--wandb_mode",
@@ -352,8 +352,8 @@ def maybe_launch_multi_gpu(args: argparse.Namespace, argv: List[str]) -> bool:
     return True
 
 
-def pad_vocab(actual: int, multiple: int = 128) -> int:
-    return math.ceil(actual / multiple) * multiple
+
+
 
 
 def unique_word_ratio(text: str) -> float:
@@ -414,118 +414,8 @@ def _join_repo_path(prefix: Optional[str], *parts: str) -> str:
     return "/".join(cleaned)
 
 
-def _legacy_root_checkpoint_sort_key(name: str) -> Tuple[int, int]:
-    """Prefer irregular checkpoint steps first when a mixed legacy repo is unavoidable."""
-    step = checkpoint_step_from_name(name)
-    return (1 if step % 500 == 0 else 0, -step)
 
 
-def list_remote_checkpoint_names(
-    hf_repo_id: str,
-    hf_token: Optional[str],
-    remote_prefix: Optional[str] = None,
-    prefer_irregular_steps: bool = False,
-) -> List[str]:
-    """List remote checkpoint directories inside one Hub path."""
-    if not hf_token:
-        return []
-    try:
-        from huggingface_hub import HfFileSystem
-    except ImportError:
-        return []
-
-    hffs = HfFileSystem(token=hf_token)
-    repo_path = _join_repo_path(None, hf_repo_id, _normalize_repo_subdir(remote_prefix))
-    try:
-        entries = hffs.ls(repo_path, detail=False, refresh=True)
-    except Exception:
-        return []
-
-    names = []
-    for entry in entries:
-        name = str(entry).rstrip("/").split("/")[-1]
-        if checkpoint_step_from_name(name) >= 0:
-            names.append(name)
-
-    names = list(dict.fromkeys(names))
-    if prefer_irregular_steps:
-        names.sort(key=_legacy_root_checkpoint_sort_key)
-    else:
-        names.sort(key=checkpoint_step_from_name, reverse=True)
-    return names
-
-
-def download_checkpoint_from_hub(
-    ckpt_name: str,
-    local_root: Path,
-    hf_repo_id: str,
-    hf_token: Optional[str],
-    remote_prefix: Optional[str] = None,
-) -> Optional[Path]:
-    """Download one checkpoint directory from the Hub into a local staging folder."""
-    if not hf_token:
-        return None
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        return None
-
-    remote_dir = _join_repo_path(remote_prefix, ckpt_name)
-    allow_patterns = [f"{remote_dir}/*"]
-    local_root = Path(local_root)
-    local_root.mkdir(parents=True, exist_ok=True)
-
-    try:
-        snapshot_download(
-            repo_id=hf_repo_id,
-            repo_type="model",
-            token=hf_token,
-            allow_patterns=allow_patterns,
-            local_dir=str(local_root),
-        )
-    except Exception as exc:
-        print(f"  [hub]  warn: failed to download {remote_dir} from {hf_repo_id}: {exc}")
-        return None
-
-    target_dir = local_root / remote_dir
-    return target_dir if (target_dir / "training_state.pt").exists() else None
-
-
-def sync_checkpoint_to_hub(
-    checkpoint_dir: Path,
-    hf_repo_id: str,
-    hf_token: Optional[str],
-    remote_prefix: Optional[str] = None,
-) -> bool:
-    """Upload one checkpoint directory to a stage-specific Hub subdirectory.
-
-    This path is blocking on purpose so the trainer does not keep running after the
-    training loop simply because a background Hub upload is still active.
-    """
-    if not hf_token:
-        return False
-    try:
-        from huggingface_hub import HfApi
-    except ImportError:
-        print("  [hub]  warn: huggingface_hub not installed; skipping Hub upload.")
-        return False
-
-    checkpoint_dir = Path(checkpoint_dir)
-    remote_dir = _join_repo_path(remote_prefix, checkpoint_dir.name)
-    try:
-        api = HfApi(token=hf_token)
-        api.upload_folder(
-            repo_id=hf_repo_id,
-            repo_type="model",
-            folder_path=str(checkpoint_dir),
-            path_in_repo=remote_dir,
-            commit_message=f"Upload Stage 2 {checkpoint_dir.name}",
-        )
-        print(f"  [hub]  uploaded -> {hf_repo_id}/{remote_dir}")
-        return True
-    except Exception as exc:
-        print(f"  [hub]  warn: failed to upload {checkpoint_dir.name} to {hf_repo_id}/{remote_dir}: {exc}")
-        return False
 
 
 _THINK_RE = re.compile(r"<\|begin_of_thought\|>(.*?)<\|end_of_thought\|>", re.DOTALL)
@@ -666,6 +556,16 @@ def _build_prompt_prefix(question: str, reasoning: str) -> str:
     return f"User: {question}\n\nAssistant: "
 
 
+def _build_answer_prefix(question: str, reasoning: str) -> str:
+    """Build the prefix that ends exactly where answer-token supervision starts."""
+    if reasoning:
+        return (
+            f"User: {question}\n\n"
+            f"Assistant: <think>\n{reasoning}\n</think>\n"
+        )
+    return _build_prompt_prefix(question, reasoning)
+
+
 def _build_sft_sample(
     tokenizer,
     question: str,
@@ -674,21 +574,26 @@ def _build_sft_sample(
     eos: str,
     max_seq_len: int,
 ) -> Optional[Dict[str, Any]]:
-    """Tokenize one SFT sample, skipping rows that overflow max_seq_len or have no supervised target."""
+    """Tokenize one SFT sample and record both training and answer-only mask boundaries."""
     text = _format_training_text(question, reasoning, answer, eos)
-    prefix_text = _build_prompt_prefix(question, reasoning)
+    prompt_text = _build_prompt_prefix(question, reasoning)
+    answer_prefix_text = _build_answer_prefix(question, reasoning)
     ids = tokenizer.encode(text, add_special_tokens=False)
     if len(ids) < 4 or len(ids) > max_seq_len:
         return None
 
-    prompt_len = len(tokenizer.encode(prefix_text, add_special_tokens=False))
-    if prompt_len >= len(ids):
+    prompt_len = len(tokenizer.encode(prompt_text, add_special_tokens=False))
+    answer_start = len(tokenizer.encode(answer_prefix_text, add_special_tokens=False))
+    if prompt_len >= len(ids) or answer_start > len(ids):
         return None
 
     return {
         "input_ids": torch.tensor(ids, dtype=torch.long),
         "prompt_len": prompt_len,
+        "answer_start": answer_start,
     }
+
+
 
 
 def _build_sft_sample_truncated(
@@ -995,8 +900,12 @@ def split_train_val_samples(
     return train_samples, val_samples
 
 
-def collate(samples: List[Dict[str, Any]], pad_id: int) -> Dict[str, torch.Tensor]:
-    """Pad a micro-batch to the longest example and mask padding in labels."""
+def collate(
+    samples: List[Dict[str, Any]],
+    pad_id: int,
+    label_start_key: str = "prompt_len",
+) -> Dict[str, torch.Tensor]:
+    """Pad a micro-batch and build labels from one configurable supervision boundary."""
     max_len = max(sample["input_ids"].size(0) for sample in samples)
     batch_size = len(samples)
 
@@ -1008,11 +917,14 @@ def collate(samples: List[Dict[str, Any]], pad_id: int) -> Dict[str, torch.Tenso
         ids = sample["input_ids"]
         length = ids.size(0)
         input_ids[idx, :length] = ids
-        pl = min(sample.get("prompt_len", 0), length)
-        labels[idx, pl:length] = ids[pl:]
+        label_start = int(sample.get(label_start_key, sample.get("prompt_len", 0)))
+        label_start = min(max(label_start, 0), length)
+        labels[idx, label_start:length] = ids[label_start:length]
         mask[idx, :length] = True
 
     return {"input_ids": input_ids, "attention_mask": mask, "labels": labels}
+
+
 
 
 @torch.no_grad()
@@ -1096,7 +1008,7 @@ def compute_val_metrics(
     with ema_scope(model, ema):
         for start in range(0, len(val_samples), batch_size):
             batch_samples = val_samples[start : start + batch_size]
-            batch = collate(batch_samples, pad_id)
+            batch = collate(batch_samples, pad_id, label_start_key="answer_start")
             input_ids = batch["input_ids"].to(device)
             attn_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
@@ -1776,7 +1688,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
 
             for _ in range(args.grad_accum):
                 micro_batch = fetch_micro_batch(samples_seen)
-                batch = collate(micro_batch, pad_id)
+                batch = collate(micro_batch, pad_id, label_start_key="prompt_len")
                 input_ids = batch["input_ids"].to(device)
                 attn_mask = batch["attention_mask"].to(device)
                 labels = batch["labels"].to(device)
@@ -1880,7 +1792,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                         epoch=current_epoch,
                         samples_seen=samples_seen,
                         sft_config=sanitize_args_for_serialization(args),
-                        push_to_hub=args.push_to_hub,
+                        push_to_hub=False,
                         hf_repo_id=args.hf_repo_id,
                         hf_token=hf_token,
                         hf_stage_subdir=args.hf_stage_subdir,
@@ -1889,6 +1801,32 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                 if distributed:
                     dist.barrier()
                 break
+
+            if step % args.save_every == 0 or step == total_steps:
+                current_epoch = samples_seen // max(len(train_samples), 1)
+                if is_main_process(rank):
+                    save_checkpoint(
+                        output_dir=output_dir,
+                        step=step,
+                        model=raw_model,
+                        ema=ema,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler if dtype == torch.float16 else None,
+                        config=config,
+                        val_ce=last_val_ce,
+                        keep_last=args.keep_last,
+                        epoch=current_epoch,
+                        samples_seen=samples_seen,
+                        sft_config=sanitize_args_for_serialization(args),
+                        push_to_hub=args.push_to_hub,
+                        hf_repo_id=args.hf_repo_id,
+                        hf_token=hf_token,
+                        hf_stage_subdir=args.hf_stage_subdir,
+                    )
+                    last_saved_step = step
+                if distributed:
+                    dist.barrier()
 
             if step % args.val_every == 0 or step == total_steps:
                 if is_main_process(rank):
@@ -1932,32 +1870,6 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                         max_seq_len=args.max_seq_len,
                         wandb_run=wandb_run,
                     )
-                if distributed:
-                    dist.barrier()
-
-            if step % args.save_every == 0 or step == total_steps:
-                current_epoch = samples_seen // max(len(train_samples), 1)
-                if is_main_process(rank):
-                    save_checkpoint(
-                        output_dir=output_dir,
-                        step=step,
-                        model=raw_model,
-                        ema=ema,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        scaler=scaler if dtype == torch.float16 else None,
-                        config=config,
-                        val_ce=last_val_ce,
-                        keep_last=args.keep_last,
-                        epoch=current_epoch,
-                        samples_seen=samples_seen,
-                        sft_config=sanitize_args_for_serialization(args),
-                        push_to_hub=args.push_to_hub,
-                        hf_repo_id=args.hf_repo_id,
-                        hf_token=hf_token,
-                        hf_stage_subdir=args.hf_stage_subdir,
-                    )
-                    last_saved_step = step
                 if distributed:
                     dist.barrier()
 

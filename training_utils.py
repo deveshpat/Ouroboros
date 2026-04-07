@@ -7,7 +7,7 @@ import shutil
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 from torch.optim import AdamW
@@ -57,6 +57,30 @@ def checkpoint_step_from_name(name: str) -> int:
         else:
             break
     return int("".join(digits)) if digits else -1
+
+
+def _normalize_repo_subdir(path: Optional[str]) -> str:
+    """Return a clean Hub subdirectory path without leading or trailing slashes."""
+    return str(path or "").strip().strip("/")
+
+
+def _join_repo_path(prefix: Optional[str], *parts: str) -> str:
+    """Join an optional Hub subdirectory prefix with one or more path parts."""
+    cleaned: List[str] = []
+    prefix_clean = _normalize_repo_subdir(prefix)
+    if prefix_clean:
+        cleaned.append(prefix_clean)
+    for part in parts:
+        part_clean = str(part or "").strip().strip("/")
+        if part_clean:
+            cleaned.append(part_clean)
+    return "/".join(cleaned)
+
+
+def _legacy_root_checkpoint_sort_key(name: str) -> Tuple[int, int]:
+    """Prefer irregular-root checkpoints first when scanning mixed legacy repos."""
+    step = checkpoint_step_from_name(name)
+    return (1 if step % 500 == 0 else 0, -step)
 
 
 def cosine_with_warmup(
@@ -141,17 +165,21 @@ def cleanup_temporary_checkpoints(output_dir: Path) -> None:
 def sync_checkpoint_to_hub(
     checkpoint_dir: Path,
     repo_id: str,
-    token: str,
+    token: Optional[str],
     timeout_seconds: float = HF_UPLOAD_TIMEOUT_SECONDS,
+    remote_prefix: Optional[str] = None,
 ) -> bool:
     """Upload one checkpoint directory to the Hugging Face Hub without raising."""
+    if not token:
+        return False
     try:
         from huggingface_hub import HfApi
     except ImportError:
         print("[hub] huggingface_hub not installed - skipping Hub sync.")
         return False
 
-    remote_name = checkpoint_dir.name[:-4] if checkpoint_dir.name.endswith(".tmp") else checkpoint_dir.name
+    local_name = checkpoint_dir.name[:-4] if checkpoint_dir.name.endswith(".tmp") else checkpoint_dir.name
+    remote_name = _join_repo_path(remote_prefix, local_name)
     try:
         api = HfApi(token=token)
         api.create_repo(repo_id=repo_id, token=token, private=True, exist_ok=True)
@@ -202,8 +230,15 @@ def try_load_state(path: Path, device: torch.device) -> Optional[Dict[str, Any]]
         return None
 
 
-def list_remote_checkpoint_names(repo_id: str, token: str) -> List[str]:
-    """Return Hub checkpoint directory names sorted newest-first."""
+def list_remote_checkpoint_names(
+    repo_id: str,
+    token: Optional[str],
+    remote_prefix: Optional[str] = None,
+    prefer_irregular_steps: bool = False,
+) -> List[str]:
+    """Return Hub checkpoint directory names sorted newest-first within one repo path."""
+    if not token:
+        return []
     try:
         from huggingface_hub import HfApi
     except ImportError:
@@ -215,28 +250,46 @@ def list_remote_checkpoint_names(repo_id: str, token: str) -> List[str]:
     except Exception:
         return []
 
+    prefix_parts = tuple(Path(_normalize_repo_subdir(remote_prefix)).parts)
     names = set()
     for file_name in repo_files:
         parts = Path(file_name).parts
-        top = parts[0] if parts else ""
+        if prefix_parts:
+            if len(parts) <= len(prefix_parts) or tuple(parts[: len(prefix_parts)]) != prefix_parts:
+                continue
+            top = parts[len(prefix_parts)]
+        else:
+            top = parts[0] if parts else ""
         if checkpoint_step_from_name(top) >= 0:
             names.add(top)
-    return sorted(names, key=checkpoint_step_from_name, reverse=True)
+
+    ordered = list(names)
+    if prefer_irregular_steps:
+        ordered.sort(key=_legacy_root_checkpoint_sort_key)
+    else:
+        ordered.sort(key=checkpoint_step_from_name, reverse=True)
+    return ordered
 
 
 def download_checkpoint_from_hub(
     checkpoint_name: str,
     output_dir: Path,
     repo_id: str,
-    token: str,
+    token: Optional[str],
+    remote_prefix: Optional[str] = None,
 ) -> Optional[Path]:
     """Download a single checkpoint directory from the Hub into output_dir."""
+    if not token:
+        return None
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
         return None
 
-    local_dir = output_dir / checkpoint_name
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    remote_dir = _join_repo_path(remote_prefix, checkpoint_name)
+    local_dir = output_dir / remote_dir
     if local_dir.exists():
         shutil.rmtree(local_dir, ignore_errors=True)
 
@@ -246,10 +299,10 @@ def download_checkpoint_from_hub(
             local_dir=str(output_dir),
             token=token,
             force_download=True,
-            allow_patterns=[f"{checkpoint_name}/*"],
+            allow_patterns=[f"{remote_dir}/*"],
         )
     except Exception as exc:
-        print(f"  [hub]  download failed for {checkpoint_name}: {exc}")
+        print(f"  [hub]  download failed for {remote_dir}: {exc}")
         return None
 
     return local_dir if local_dir.exists() else None
