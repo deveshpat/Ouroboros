@@ -7,22 +7,31 @@
 
 ---
 
-## Stage 2 SFT — Session 5 (full-scale, DDP, TIMED OUT ~step 3900)
-**Script:** `train_sft.py`
-**Date:** 2026-04-06 → 2026-04-07
-**Hardware:** Kaggle Dual T4 (world_size=2, DDP)
-**Status:** 🔴 TIMED OUT — val_ce plateau, gate NOT met
+## Stage 2 SFT — Session 5 (full-scale, DDP, HARD TIMEOUT at 43200.6s)
+**Script:** `train_sft.py`  **Date:** 2026-04-06 → 2026-04-07  **Hardware:** Kaggle Dual T4 (world_size=2)  
+**Status:** 🔴 HARD TIMEOUT (exit code 137, SIGKILL) — val_ce plateau confirmed, gate NOT met  
+**Kaggle output:** 2.23 GB (confirms ≥3 checkpoints saved locally before kill)
 
 **Dataset counts (with truncation at max_seq_len=2048):**
 ```
 Bespoke-Stratos-17k=16594, MetaMathQA=11140, OpenHermes-2.5=8355,
 OpenR1-Math-220k=11140, OpenR1-Code=8001
-Total: 55,230  |  train: 52,469  val: 2,761
+Total: 55,230  |  train: 52,469  |  val: 2,761
 ```
 
-**Resume:** Hub `checkpoint-0002979` → data_changed detected → optimizer/scheduler reset (step=0).
+**Resume:**
+```
+[resume] local Stage 2 candidates: 0 (newest step=none)
+[resume] no local Stage 2 found; checking Hub for Stage 2 checkpoints...
+[hub]  downloading runs/stage2/checkpoint-0002979 ...
+[resume] runs/stage2/checkpoint-0002979  loaded model weights (step=2979),
+         but data stream changed — resetting step/optimizer/scheduler for new data.
+[resume] saved_data={'dataset_mix': 'stratos', 'max_seq_len': 1024, ...}
+[resume] new_data  ={'dataset_mix': 'full',    'max_seq_len': 2048, ...}
+[resume] optimizer/scheduler reset; training starts fresh from step 0.
+```
 
-**Val CE trajectory (answer-only):**
+**Val CE trajectory (answer-only, EMA weights):**
 ```
 Step    Val CE    Val Acc    Note
   250   5.7453    0.2170
@@ -34,83 +43,115 @@ Step    Val CE    Val Acc    Note
  1750   5.6306    0.2209
  2000   5.6288    0.2208     ckpt saved + Hub uploaded; ckpt-0000500 pruned
  2250   5.6251    0.2207
+ 2500   5.6245    0.2206     ckpt saved + Hub uploaded; ckpt-0001000 pruned
+ 2750   5.6245    0.2205
+ 3000   5.6248    0.2203     ckpt saved + Hub uploaded; ckpt-0001500 pruned
+ 3250   5.6254    0.2203
+ 3500   5.6257    0.2203     ckpt saved + Hub uploaded; ckpt-0002000 pruned
+ ~3700  ~5.625    ~0.220     timeout emergency checkpoint (Hub uploaded)
 ```
-Δval_ce over 2000 steps = **0.12** — catastrophically slow. Projected to reach <1.5: ~34,000 more steps.
+Δval_ce over 3500 steps = **0.12** → effectively zero progress. val_ce REVERSED after step 2500.
 
-**Train CE trajectory (selected steps):**
+**Train CE (selected):**
 ```
-    1   4.5404      980   3.2757    1900   3.7181
-   20   3.8257     1000   3.3384    1940   3.3890
-  240   3.3992     1100   3.2742    2000   3.1677
-  500   3.5602     1200   3.4535    2100   3.4084
-  740   3.2355     1400   3.3492    2200   3.5414
-  900   3.7585     1500   3.0564    2380   2.9425
+    1   4.5404      980   3.2757    2000   3.1677    3000   3.3297
+  240   3.3992     1500   3.0564    2380   2.9425    3380   2.6127
+  500   3.5602     1280   3.3913*   2500   3.4573    3500   2.9457
+                   (* gn=8.1875, largest observed)
+```
+Train/val gap at step 3500: train_ce ≈ 3.0, val_ce ≈ 5.63 → **Δ = 2.63**
+
+**Spike count:** 20 spikes over steps 1–2500 (threshold=0.5)
+
+**Generation (completely frozen steps 250–3500, representative sample):**
+```
+Step 250 / 1000 / 2000 / 3000:
+  Q: What is 15 + 27?
+  A: 1000 - 1000 - 100 - 100 - 100 ... [or pure 100000000...]  uwr≈0.064
+  Q: Write a Python function...
+  A: 100000000000000000000000000000...   uwr=1.000
+  Q: What is the capital of Japan?
+  A: 100000000000000000000000000000...   uwr=1.000   [occasionally: "2000 The first two years..."]
+  Q: Explain what a neural network is...
+  A: 100000000000000000000000000000...   uwr=1.000
+  Q: Solve for x: 3x + 6 = 21.
+  A: 2012 = 2012 = 2012 = ...            uwr≈0.125
+  Mean UWR: ~0.45–0.49 (inflated by uwr=1.0 on single-token number loops)
+```
+No `<think>` tags observed at any step.
+
+**WandB charts confirm (wandb.ai/devesh-patel0922-weirdrunner, run cardassian-frontier-2):**
+- val/ce: plateau between 5.62–5.63 from step 1000 onward
+- val/accuracy: peaks at 0.221, then gently decays to 0.218
+- gen/mean_uwr: high at step 250 (0.87, due to all-ones UWR on number loops), drops to 0.45 and stays flat
+- train/ce_smooth: clear downward trend 4.4 → 3.4
+- train/grad_norm: mostly 1–3, occasional spikes to 8–9
+- train/lr: cosine decay from 1e-4 to ~3e-5 by step 3500
+
+**Hub checkpoints from Session 5 (all retained on Hub):**
+```
+WeirdRunner/Ouroboros/runs/stage2/checkpoint-0000500  (pruned locally at step 2000)
+WeirdRunner/Ouroboros/runs/stage2/checkpoint-0001000  (pruned locally at step 2500)
+WeirdRunner/Ouroboros/runs/stage2/checkpoint-0001500  (pruned locally at step 3000)
+WeirdRunner/Ouroboros/runs/stage2/checkpoint-0002000  (pruned locally at step 3500)
+WeirdRunner/Ouroboros/runs/stage2/checkpoint-0002500  (local: retained, keep_last=3)
+WeirdRunner/Ouroboros/runs/stage2/checkpoint-0003000  (local: retained)
+WeirdRunner/Ouroboros/runs/stage2/checkpoint-0003500  (local: retained)
+WeirdRunner/Ouroboros/runs/stage2/checkpoint-~003700  (timeout emergency save)
 ```
 
-**Spike count (steps 1–2380):** 20 spikes (threshold=0.5)
-Notable spike at step 1280: `gn=8.1875` — largest observed gradient norm.
-
-**Generation (frozen across all checkpoints 250–2250):**
+**Root cause analysis:**
 ```
-Q: What is 15 + 27?
-A: 1000 - 1000 - 100 - 100 - ...      uwr=0.064  ⚠ DEGENERATE
-Q: Write a Python function...
-A: 100000000000000000000000000000...   uwr=1.000  ⚠ number loop
-Q: What is the capital of Japan?
-A: 2000 The first two years of...      uwr=0.107  ⚠ DEGENERATE
-Q: Explain what a neural network is...
-A: 100000000000000000000000000000...   uwr=1.000  ⚠ number loop
-Q: Solve for x: 3x + 6 = 21.
-A: 2012 = 2012 = 2012 = 1012 = ...    uwr=0.125  ⚠ DEGENERATE
-Mean UWR: ~0.46–0.49 (deceptively high due to UWR=1.0 on number loops)
+Primary:  The model is stuck in a number-loop attractor inherited from Stage 1
+          FineWeb-Edu pre-training. Answer tokens in the full mix are dominated
+          by integers (MetaMathQA, OpenR1-Math), which reinforces this prior
+          instead of breaking it. The model learns to minimize CE on
+          numeric answer tokens while never learning sentence-level structure.
+
+Secondary: EMA@0.995 is not the root cause (by step 3500, EMA^3500 ≈ 0,
+           initial weights fully forgotten). The val/train gap of 2.63 is
+           genuine overfitting to numeric patterns, not EMA lag.
+
+Third:     LR decayed from 1e-4 to ~3e-5 by step 3500 (cosine over 4920 steps).
+           The model may need a higher-LR burst to escape the number attractor.
 ```
-No `<think>` tags observed. Generation pattern completely unchanged from step 250 to step 2250.
 
-**Hub checkpoints from Session 5:**
-- `WeirdRunner/Ouroboros/runs/stage2/checkpoint-0000500` (pruned locally, Hub copy retained)
-- `WeirdRunner/Ouroboros/runs/stage2/checkpoint-0001000`
-- `WeirdRunner/Ouroboros/runs/stage2/checkpoint-0001500`
-- `WeirdRunner/Ouroboros/runs/stage2/checkpoint-0002000`
-- `WeirdRunner/Ouroboros/runs/stage2/checkpoint-~0003900` (timeout emergency save, step TBD)
-
-**Diagnosis — why val_ce is plateauing:**
-- EMA@0.995 at step 2000 reflects a ~200-step-old model snapshot. Live train CE (3.0–3.2) has improved meaningfully but EMA validation barely tracks it.
-- The model inherited a strong "number loop" prior from Stage 1 FineWeb-Edu pre-training. Answer tokens in the SFT mix are dominated by math answers (numbers), reinforcing this pattern.
-- Val acc completely flat at 0.2207–0.2211 — model has not learned to predict the next answer token correctly despite 2000 steps.
-- Root cause: **EMA decay too high (0.995)** → EMA lags too far behind live weights at this step count and learning rate.
+**Kaggle session terminated:** 43200.6s (hard limit), exit code 137 (SIGKILL). The Python graceful exit (code 0 path) did not complete. Most likely cause: DDP dist.barrier() deadlock after emergency save + Hub push consumed the 7-minute buffer, and rank 1 was already in a different state when rank 0 tried to synchronize.
 
 ---
 
-## Stage 2 SFT — Session 4 (dry-run, DDP, training succeeded / teardown crash)
-**Date:** 2026-04-07 | **Status:** ✅ TRAINING COMPLETE — SIGABRT is cosmetic post-training NCCL teardown only
+## Stage 2 SFT — Session 4 (dry-run, DDP, training succeeded / teardown SIGABRT)
+**Date:** 2026-04-07 | **Status:** ✅ TRAINING COMPLETE — SIGABRT is cosmetic post-training NCCL teardown only (Bug 11, benign)
 
 ---
 
-## Stage 2 SFT — Session 3 (dry-run, DDP SIGABRT — benign post-training teardown)
+## Stage 2 SFT — Session 3 (dry-run, DDP, SIGABRT — mis-diagnosed initially)
 **Date:** 2026-04-07 | **Status:** ✅ TRAINING COMPLETE (see Session 4 for corrected diagnosis)
 
 ---
 
-## Stage 2 SFT — Session 2 (full dataset mix, DDP, FAILED)
-**Date:** 2026-04-06 | **Status:** ❌ FAILED — Bugs 6–10 cascading
-
-Critical failures: Hub downloads contaminated output_dir → prune deleted all Stage 2 checkpoints → optimizer not reset on data change → 75 spikes → val_ce=5.7135. Hub: `checkpoint-0002979` (only valid Stage 2 checkpoint).
+## Stage 2 SFT — Session 2 (full dataset mix, DDP, FAILED — Bugs 6–10 cascade)
+**Date:** 2026-04-06 | **Status:** ❌ FAILED
+```
+val_ce=5.7135 at timeout. All local Stage 2 checkpoints deleted by prune bug.
+75 loss spikes in 717 steps. Generation degraded to pure number loops.
+Hub: checkpoint-0002979 (only valid Stage 2 checkpoint, kept from Session 1).
+```
 
 ---
 
 ## Stage 2 SFT — Session 1 (stratos-only, single GPU)
 **Date:** 2026-04-05 | **Status:** ✅ COMPLETE — step 2979, val_ce=4.9153, gate NOT met
-
-⚠ No `<think>` tags ever appeared — max_seq_len=1024 filtered all reasoning chains.
 ```
 step 2979  val_ce=4.9153  ← plateau
 Total time: 290.2 min   Peak VRAM: 6.59 GB
 [hub] uploaded  checkpoint-0002979 (commit=8981b950)
+⚠ No <think> tags ever appeared — max_seq_len=1024 filtered all reasoning chains.
 ```
 
 ---
 
-## Stage 1 — Pre-training, Session 6 (Kaggle Dual T4)
+## Stage 1 Pre-training — Session 6 (Kaggle Dual T4)
 **Status:** ✅ COMPLETE (graceful timeout) — steps 14902→21501, tokens 488M→705M
 ```
 Tokens processed: 704,544,768   Last val CE: 5.324081295402125
