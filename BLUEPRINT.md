@@ -15,20 +15,21 @@ Novel hybrid Transformer-Mamba language model ("TRM-Mamba", 1:7 ratio) pre-train
 |---|---|---|---|
 | 0 | Architecture & Viability | ✅ COMPLETE | All 4 gates passed |
 | 1 | Pre-training | ✅ BYPASSED — SFT from ckpt-0021000 | val_ce < 3.0 + UWR > 0.05 |
-| 2 | SFT | 🟡 IN PROGRESS — full-scale run launched | answer val_ce < 1.5 |
+| 2 | SFT | 🟡 IN PROGRESS — Session 5, step ~1520/4920 | answer val_ce < 1.5 |
 | 3 | Recursive Inference (Coconut-Ouroboros) | ⬜ NOT STARTED | Stage 2 gate |
 | 4 | GRPO | ⬜ NOT STARTED | Stage 3 gate |
 | 5 | Quantization | ⬜ NOT STARTED | Stage 4/3 gate |
 
 ### Immediate next actions
 
-**Stage 2 — currently running.** Expected: ~8–11h on Dual T4 DDP.
+**Stage 2 — currently running.** Session 5 at step ~1520/4920. Expected to complete in ~8h total.
 
-Post-run checklist:
-- [ ] Confirm Hub has checkpoint(s) from this session
-- [ ] Check val_ce trajectory for `<think>` tag emergence (expect by step 500–1000)
-- [ ] If val_ce < 1.5: proceed to Stage 3
-- [ ] If val_ce plateaus above 1.5: consider additional epochs or LR adjustment
+Post-session checklist:
+- [ ] Confirm Hub has checkpoint(s) from this session (500, 1000, 1500 confirmed ✅)
+- [ ] Check val_ce at step 2500 — must be below 5.0 for on-track signal
+- [ ] Check generation at step 2000+ for first `<think>` tag emergence
+- [ ] If val_ce > 5.0 at step 2500: consider restarting with `--ema_decay 0.99`
+- [ ] If val_ce < 1.5 at end: proceed to Stage 3
 
 **Stage 3 (after Stage 2 gate):**
 ```bash
@@ -49,6 +50,7 @@ python recursive_finetune.py \
 | No pre-training | Comma-loops from random init | Pre-train first |
 | Stage 2 S1: max_seq_len=1024 | Filtered all reasoning; no `<think>` learning | Raised to 2048 + truncation |
 | Stage 2 S2: resume bug cascade | Hub downloads in output_dir; prune deleted all Stage 2 ckpts; optimizer not reset | Bugs 6–10 fixed |
+| Stage 2 S5: EMA lag | EMA@0.995 slow to reflect trained weights; generation still degenerate at step 1500 | Monitor; reduce to 0.99 if val_ce > 5.0 at step 2500 |
 
 ---
 
@@ -83,9 +85,9 @@ mamba_expand=2, max_seq_len=2048, dropout=0.0, rms_norm_eps=1e-5, tie_embeddings
 | Tokenizer | Qwen2.5-0.5B; vocab_size=151_680 |
 | Stage 1 outcome | Bypassed gate (val_ce 5.32 at step 21501); SFT from ckpt-0021000 |
 | Stage 2 max_seq_len | 2048 — 1024 filtered 97% of Stratos reasoning |
-| Stage 2 dataset | Full mix: Stratos + MetaMathQA + OpenHermes + OpenR1-Math + OpenR1-Code |
+| Stage 2 dataset | Full mix: Stratos + MetaMathQA + OpenHermes + OpenR1-Math + OpenR1-Code (~55k samples) |
 | Stage 2 target format | `User: {q}\n\nAssistant: <think>\n{reasoning}\n</think>\n{answer}{eos}` |
-| Stage 2 starting checkpoint | Hub ckpt-0002979 (commit=8981b950) |
+| Stage 2 starting checkpoint | Hub ckpt-0002979 (stratos-only weights; optimizer reset due to data change) |
 | Stage 2 DDP | Works correctly on Dual T4. SIGABRT is benign post-training teardown race (Bug 11). |
 | Stage 3 recursion | Coconut-Ouroboros, K=1→4→16. NOT TRM EMA-loop. |
 | Hub repo | WeirdRunner/Ouroboros (private) |
@@ -114,8 +116,13 @@ mamba_expand=2, max_seq_len=2048, dropout=0.0, rms_norm_eps=1e-5, tie_embeddings
 **Sessions:**
 - S1 (✅): stratos-only, max_seq_len=1024, val_ce=4.9153, no `<think>` learning. Hub: ckpt-0002979.
 - S2 (❌): full-mix DDP, Bugs 6–10, val_ce=5.7135. All local Stage 2 ckpts deleted.
-- S3 (✅ training, teardown crash): dry-run max_steps=10, patches verified.
-- S4 (✅ training, teardown crash): dry-run confirmed S3 diagnosis. Full-scale launched.
+- S3 (✅ training): dry-run max_steps=10, patches verified.
+- S4 (✅ training): dry-run confirmed S3 diagnosis. Full-scale launched.
+- S5 (🟡): full-scale, DDP, from step 0 (data_changed reset). At step ~1520/4920.
+  - val_ce: 5.7453 → 5.6372 (slow but consistent decline)
+  - train CE: 4.54 → 3.06 (model learning from training data)
+  - Generation still degenerate at step 1500 — EMA lag expected; monitor step 2000+
+  - Hub: ckpt-0000500 ✅, ckpt-0001000 ✅, ckpt-0001500 ✅
 
 **All patches applied to `train_sft.py`:**
 - [x] Local Stage 2 checkpoints tried first; Hub downloads to `.hub_resume/` temp dir
@@ -130,11 +137,11 @@ mamba_expand=2, max_seq_len=2048, dropout=0.0, rms_norm_eps=1e-5, tie_embeddings
 lr=1e-4, warmup=100, cosine to 1e-5
 batch_size=2, grad_accum=16 → effective batch=32 (global, DDP)
 max_seq_len=2048, ema_decay=0.995
-dataset_mix=full, num_epochs=3
+dataset_mix=full, num_epochs=3, total_steps=4920
 ```
 
-**Expected data counts (at max_seq_len=2048 with truncation):**
-~35000–38000 total samples; 3 epochs ≈ ~3300–3600 steps.
+**Data counts at max_seq_len=2048 (with truncation):**
+55,230 total | train: 52,469 | val: 2,761
 
 **Success criteria:**
 - val_ce < 1.5 (answer tokens only)
@@ -183,19 +190,7 @@ Full spec: `stage3_agent_prompt.md`. Required additions to `baseline_trm_mamba.p
 ### Bug 8 — Prune deleted all Stage 2 checkpoints ✅ FIXED
 ### Bug 9 — Optimizer not reset on data stream change ✅ FIXED
 ### Bug 10 — max_seq_len=1024 filtered 97% of reasoning datasets ✅ FIXED
-
 ### Bug 11 — NCCL teardown race: post-training SIGABRT on Dual T4 ✅ BENIGN (no fix needed)
-**Symptom:** `process 1 terminated with signal SIGABRT` after training completes.
-**Root cause:** After the training loop exits, rank 0 and rank 1 reach teardown at slightly
-different times. One rank enters a final scalar ALLREDUCE (e.g. `distributed_mean` or
-`dist.barrier()`) while the other has already moved past it. After the 600s NCCL watchdog
-timeout, the lagging rank is killed with SIGABRT.
-**Impact:** Zero. All checkpoints, Hub uploads, and EMA weights are written inside the training
-loop before this point. The crash is pure cleanup noise.
-**Prior incorrect diagnosis:** "mamba_ssm CUDA kernels fail in mp.spawn subprocess" — WRONG.
-DDP + mamba_ssm works correctly on Kaggle Dual T4. The crash is timing-only, not architectural.
-**Optional future fix:** Add a final `dist.barrier()` inside `run_training` before
-`dist.destroy_process_group()` to synchronize both ranks cleanly. Low priority.
 
 ---
 
@@ -204,7 +199,7 @@ DDP + mamba_ssm works correctly on Kaggle Dual T4. The crash is timing-only, not
 | Stage | Platform | Estimate | Notes |
 |---|---|---|---|
 | 1 | Kaggle Dual T4 | ✅ Done (705M tokens) | |
-| 2 | Kaggle Dual T4 | ~8–11h per session | DDP works; teardown crash is benign |
+| 2 | Kaggle Dual T4 | ~8–11h per session | Session 5 in progress |
 | 3 | TRC preferred | ~4–8h | Per K sub-stage |
 | 4 | TRC + unsloth | ~8–12h | GRPO G=4 rollouts |
 | 5 | Local / Jetson | ~2h | Post-training quantization |

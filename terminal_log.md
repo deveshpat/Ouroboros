@@ -7,65 +7,90 @@
 
 ---
 
-## Stage 2 SFT — Session 4 (dry-run, DDP, training succeeded / teardown crash)
+## Stage 2 SFT — Session 5 (full-scale, DDP, IN PROGRESS)
 **Script:** `train_sft.py`
-**Date:** 2026-04-07
-**Hardware:** Kaggle Dual T4 (world_size=2, DDP auto-triggered)
-**Status:** ✅ TRAINING COMPLETE — SIGABRT is cosmetic post-training NCCL teardown only
+**Date:** 2026-04-06 → 2026-04-07
+**Hardware:** Kaggle Dual T4 (world_size=2, DDP)
+**Status:** 🟡 IN PROGRESS — log captured to step 1520 / 4920
 
-**What actually happened:**
-Training ran successfully for all intended steps. The SIGABRT occurred AFTER training completed,
-during NCCL process group teardown. The failing collective was a single-scalar ALLREDUCE
-(`NumelIn=1, NumelOut=1`) — one rank began teardown while the other was still at a final
-collective. The NCCL watchdog (600s timeout) killed the hung rank, producing the SIGABRT.
-
-**Key NCCL log (verbatim):**
+**Dataset counts (with truncation at max_seq_len=2048):**
 ```
-1066.6s [rank1]: failure detected by watchdog at work sequence id: 306
-1066.6s [rank1]: last enqueued work: 306, last completed work: 305
-1066.6s [rank1]: Watchdog caught collective operation timeout:
-          WorkNCCL(SeqNum=306, OpType=ALLREDUCE, NumelIn=1, NumelOut=1,
-          Timeout(ms)=600000) ran for 600032 milliseconds before timing out.
-1126.7s [rank1]: To avoid data inconsistency, we are taking the entire process down.
-1127.3s torch.multiprocessing.spawn.ProcessExitedException: process 1 terminated with signal SIGABRT
+Bespoke-Stratos-17k=16594, MetaMathQA=11140, OpenHermes-2.5=8355,
+OpenR1-Math-220k=11140, OpenR1-Code=8001
+Total: 55,230  |  train: 52,469  val: 2,761
 ```
 
-**Impact on full-scale run:** None. Checkpoints are written inside the training loop at
-`save_every` intervals and Hub uploads complete immediately after each save. The teardown
-crash only occurs after all useful work is done. Full-scale run proceeds as planned.
+**Resume:** Hub `checkpoint-0002979` → data_changed detected → optimizer/scheduler reset (step=0).
 
-**Corrected diagnosis of Session 3:** Same teardown crash pattern — training DID complete
-max_steps=10 before the SIGABRT. Prior diagnosis ("mamba_ssm incompatible with mp.spawn")
-was wrong. DDP + mamba_ssm on Kaggle Dual T4 works correctly during training.
+**Training trajectory:**
+```
+Step     Train CE   Val CE (answer-only)   Val Acc
+   1     4.5404     —
+ 250     3.3992     5.7453                 0.2170
+ 500     3.5602     5.7019                 0.2191   [ckpt saved + Hub uploaded]
+ 750     3.2355     5.6747                 0.2203
+1000     3.3384     5.6532                 0.2207   [ckpt saved + Hub uploaded]
+1250     3.2777     5.6447                 0.2209
+1500     3.0564     5.6372                 0.2211   [ckpt saved + Hub uploaded]
+1520     3.2845     5.6372                 0.2211   (last captured)
+```
+
+**Spike count (steps 1–1520):** 13 spikes (threshold=0.5)
+
+**Generation @ step 1500 (EMA weights):**
+```
+Q: What is 15 + 27?
+A: 1000 - 1000 - 100 - 100 - 100 - ...   uwr=0.064  ⚠ DEGENERATE
+
+Q: Write a Python function that returns the factorial of n.
+A: 100000000000000000000000000000000...   uwr=1.000  ⚠ number loop
+
+Q: What is the capital of Japan?
+A: 2000 The first two years of the year...  uwr=0.107  ⚠ DEGENERATE
+
+Q: Explain what a neural network is in simple terms.
+A: 100000000000000000000000000000000...   uwr=1.000  ⚠ number loop
+
+Q: Solve for x: 3x + 6 = 21.
+A: 2012 = 2012 = 2012 = 2012 = 1012...   uwr=0.295  ⚠ DEGENERATE
+
+Mean UWR: 0.493
+```
+
+**⚠ Diagnosis — generation still degenerate at step 1500:**
+- Train CE has dropped meaningfully (4.54 → 3.06) — the model IS learning from training data.
+- Val CE (answer-only) drops slowly: 5.74 → 5.64 over 1500 steps (Δ = 0.10).
+- EMA lags live weights at decay=0.995; at step 1500 the EMA model is approximately a 300-step-old snapshot.
+- Generation patterns suggest the EMA model inherited the "number loop" bias from S1 (stratos-only, no `<think>` learned).
+- Expected: generation should improve noticeably between steps 1500–3000 as EMA catches up.
+- If val_ce is not below 5.0 by step 2500, consider reducing ema_decay to 0.99 in the next session.
+
+**Hub checkpoints confirmed:**
+- `WeirdRunner/Ouroboros/runs/stage2/checkpoint-0000500`
+- `WeirdRunner/Ouroboros/runs/stage2/checkpoint-0001000`
+- `WeirdRunner/Ouroboros/runs/stage2/checkpoint-0001500`
 
 ---
 
-## Stage 2 SFT — Session 3 (dry-run, DDP SIGABRT — now known to be post-training teardown)
-**Date:** 2026-04-07 | **Status:** ✅ TRAINING COMPLETE (teardown crash — benign, see Session 4)
+## Stage 2 SFT — Session 4 (dry-run, DDP, training succeeded / teardown crash)
+**Date:** 2026-04-07 | **Status:** ✅ TRAINING COMPLETE — SIGABRT is cosmetic post-training NCCL teardown only
 
-Training completed max_steps=10. Patches verified working. SIGABRT is same teardown race as Session 4.
+Training ran successfully for all intended steps. The SIGABRT occurred AFTER training completed,
+during NCCL process group teardown (single-scalar ALLREDUCE race, NCCL 600s watchdog).
+
+**Impact on full-scale run:** None. All patches verified working with DDP.
+
+---
+
+## Stage 2 SFT — Session 3 (dry-run, DDP SIGABRT — benign post-training teardown)
+**Date:** 2026-04-07 | **Status:** ✅ TRAINING COMPLETE (see Session 4 for corrected diagnosis)
 
 ---
 
 ## Stage 2 SFT — Session 2 (full dataset mix, DDP, FAILED)
-**Script:** `train_sft.py` | **Date:** 2026-04-06 | **Hardware:** Kaggle Dual T4
-**Status:** ❌ FAILED — cascading bugs (Bugs 6–10); all Stage 2 local checkpoints deleted
+**Date:** 2026-04-06 | **Status:** ❌ FAILED — Bugs 6–10 cascading
 
-**Critical failures:**
-1. Resume downloaded 18 Stage 1 Hub checkpoints into output_dir before finding local Stage 2 ckpt
-2. Hub downloads contaminated output_dir → prune deleted ALL Stage 2 checkpoints
-3. Optimizer not reset on data change → near-zero LR (1.89e-05) → 75 spikes in 717 steps
-4. max_seq_len=1024 filtered 97% Stratos, 92% OpenR1-Math, 99.9% OpenR1-Code
-
-**Generation — catastrophic:**
-```
-  Q: What is 15 + 27?
-  A: 100000000000000000000000000000000000000000000000000000000000000000000000000000
-```
-```
-  Total time: 20.5 min   Peak VRAM: 14.30 GB   Spike count: 75   Final val CE: 5.7135
-```
-**Checkpoint status:** Hub: checkpoint-0002979 (commit=8981b950) ← only valid Stage 2 checkpoint
+Critical failures: Hub downloads contaminated output_dir → prune deleted all Stage 2 checkpoints → optimizer not reset on data change → 75 spikes → val_ce=5.7135. Hub: `checkpoint-0002979` (only valid Stage 2 checkpoint).
 
 ---
 
@@ -75,10 +100,9 @@ Training completed max_steps=10. Patches verified working. SIGABRT is same teard
 ⚠ No `<think>` tags ever appeared — max_seq_len=1024 filtered all reasoning chains.
 
 ```
-step  250  val_ce=5.2199     step 1000  val_ce=4.9480
-step 2000  val_ce=4.9172     step 2979  val_ce=4.9153  ← plateau
-2026-04-05 21:52:38   Total time: 290.2 min   Peak VRAM: 6.59 GB
-2026-04-05 21:52:38   [hub] uploaded  checkpoint-0002979 (commit=8981b950)
+step 2979  val_ce=4.9153  ← plateau
+Total time: 290.2 min   Peak VRAM: 6.59 GB
+[hub] uploaded  checkpoint-0002979 (commit=8981b950)
 ```
 
 ---
@@ -86,7 +110,7 @@ step 2000  val_ce=4.9172     step 2979  val_ce=4.9153  ← plateau
 ## Stage 1 — Pre-training, Session 6 (Kaggle Dual T4)
 **Status:** ✅ COMPLETE (graceful timeout) — steps 14902→21501, tokens 488M→705M
 ```
-2026-04-05 14:27:38   Tokens processed: 704,544,768   Last val CE: 5.324081295402125
+Tokens processed: 704,544,768   Last val CE: 5.324081295402125
 ```
 Hub: checkpoint-0021000 (commit=d70d2c49) ← SFT starting point.
 
@@ -94,11 +118,11 @@ Hub: checkpoint-0021000 (commit=d70d2c49) ← SFT starting point.
 
 ## Stage 0 — Viability Gate  ✅ ALL GATES PASSED
 ```
-  G1 CE < 3.5        final CE = 2.0034   PASS ✓
-  G2 UWR > 0.1       mean UWR = 0.573    PASS ✓
-  G3 gnorm < 10.0    max = 4.0312        PASS ✓
-  G4 VRAM Δ < 1.0GB  Δ = 0.000 GB       PASS ✓
-  Total time: 3.4 min   Peak VRAM: 2.07 GB
+G1 CE < 3.5        final CE = 2.0034   PASS ✓
+G2 UWR > 0.1       mean UWR = 0.573    PASS ✓
+G3 gnorm < 10.0    max = 4.0312        PASS ✓
+G4 VRAM Δ < 1.0GB  Δ = 0.000 GB       PASS ✓
+Total time: 3.4 min   Peak VRAM: 2.07 GB
 ```
 
 ## Stage 0 — Baseline Smoke Test  ✅ PASSED
