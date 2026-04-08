@@ -1,36 +1,28 @@
-#!/usr/bin/env python3
-"""
-prepare_sft_dataset.py — One-time dataset builder for Project Ouroboros Stage 2
-================================================================================
-Processes all 5 source datasets (same logic as train_sft.py load_mixed_dataset),
-saves the result as a HuggingFace dataset, and uploads it to the Hub.
+# ==============================================================================
+# Colab-Friendly Dataset Builder for Project Ouroboros Stage 2
+# ==============================================================================
 
-Run ONCE on any machine with internet access (Kaggle, Colab, local).
-After this, train_sft.py --dataset_mix=cached skips the 25-45 min processing step
-and loads the pre-built dataset directly.
-
-Usage:
-    python prepare_sft_dataset.py --hf_token $HF_TOKEN
-
-Output:
-    WeirdRunner/Ouroboros (dataset repo, config="sft-mix-v1", split="train")
-    Columns: input_ids (list[int]), prompt_len (int), source (str)
-
-Install:
-    pip install transformers datasets huggingface_hub tqdm
-    (mamba-ssm NOT required — this script has no model dependencies)
-"""
-
-from __future__ import annotations
-
-import argparse
 import json
 import os
 import random
 import re
 import sys
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# --- Colab Configuration ---
+# The script will try to fetch your token from Colab Secrets.
+# If you don't use Secrets, just paste your token inside the quotes below.
+try:
+    from google.colab import userdata
+    HF_TOKEN = userdata.get('HF_TOKEN')
+except Exception:
+    HF_TOKEN = "PASTE_YOUR_HF_TOKEN_HERE"
+
+# Local backup path on your Google Drive
+BACKUP_PATH = "/content/drive/MyDrive/Ouroboros/sft_dataset_backup"
+# ---------------------------
 
 try:
     import torch
@@ -48,11 +40,11 @@ except ImportError:
     sys.exit("datasets required: pip install datasets")
 
 try:
-    from tqdm import tqdm
+    from tqdm.notebook import tqdm  # Using notebook version for cleaner Colab output
 except ImportError:
-    sys.exit("tqdm required: pip install tqdm")
+    from tqdm import tqdm
 
-# ── Constants (must match train_sft.py exactly) ───────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 TOKENIZER_NAME = "Qwen/Qwen2.5-0.5B"
 HF_REPO_ID     = "WeirdRunner/Ouroboros"
@@ -100,7 +92,7 @@ SOURCE_SPECS = [
     },
 ]
 
-# ── Parsing helpers (copied verbatim from train_sft.py) ──────────────────────
+# ── Parsing helpers ──────────────────────────────────────────────────────────
 
 _THINK_RE   = re.compile(r"<\|begin_of_thought\|>(.*?)<\|end_of_thought\|>", re.DOTALL)
 _SOLUTION_RE= re.compile(r"<\|begin_of_solution\|>(.*?)<\|end_of_solution\|>", re.DOTALL)
@@ -227,7 +219,6 @@ def _format_text(q: str, r: str, a: str, eos: str) -> str:
 
 
 def _build_sample(tokenizer, q: str, r: str, a: str, eos: str) -> Optional[Dict]:
-    """Build and tokenize one sample, with truncation of reasoning if needed."""
     if not r:
         text = _format_text(q, "", a, eos)
         prefix = f"User: {q}\n\nAssistant: "
@@ -239,12 +230,10 @@ def _build_sample(tokenizer, q: str, r: str, a: str, eos: str) -> Optional[Dict]
             return None
         return {"input_ids": ids, "prompt_len": pl}
 
-    # Attempt with full reasoning
     sample = _try_build(tokenizer, q, r, a, eos)
     if sample:
         return sample
 
-    # Truncate reasoning
     q_ids   = tokenizer.encode(f"User: {q}\n\nAssistant: ", add_special_tokens=False)
     a_ids   = tokenizer.encode(f"{a}{eos}", add_special_tokens=False)
     open_ids= tokenizer.encode("<think>\n", add_special_tokens=False)
@@ -274,8 +263,6 @@ def _try_build(tokenizer, q: str, r: str, a: str, eos: str) -> Optional[Dict]:
 
 # ── Dataset loading ───────────────────────────────────────────────────────────
 
-import math
-
 def _load_first(candidates, split):
     for ds_name, cfg_name in candidates:
         try:
@@ -299,7 +286,7 @@ def build_mixed_samples(tokenizer) -> List[Dict]:
         source_specs.append({**spec, "dataset": ds, "resolved": resolved, "label": label})
 
     if not source_specs:
-        sys.exit("No source datasets could be loaded.")
+        raise ValueError("No source datasets could be loaded.")
 
     weight_sum = sum(s["ratio"] for s in source_specs)
     for s in source_specs:
@@ -340,11 +327,9 @@ def build_mixed_samples(tokenizer) -> List[Dict]:
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 def upload_to_hub(samples: List[Dict], hf_token: str) -> None:
-    from datasets import Dataset, DatasetDict
     from huggingface_hub import HfApi
 
     api = HfApi(token=hf_token)
-    # Create as dataset repo (not model repo)
     api.create_repo(
         repo_id=HF_REPO_ID,
         repo_type="dataset",
@@ -361,6 +346,11 @@ def upload_to_hub(samples: List[Dict], hf_token: str) -> None:
     }
     ds = Dataset.from_dict(hf_dict)
 
+    print(f"  Saving dataset locally to {BACKUP_PATH} to prevent data loss on 504 errors...")
+    # Ensuring directory exists before saving
+    Path(BACKUP_PATH).parent.mkdir(parents=True, exist_ok=True)
+    ds.save_to_disk(BACKUP_PATH)
+
     print(f"  Pushing {len(ds):,} samples to {HF_REPO_ID} (config={DATASET_CONFIG}) ...")
     ds.push_to_hub(
         repo_id=HF_REPO_ID,
@@ -375,16 +365,9 @@ def upload_to_hub(samples: List[Dict], hf_token: str) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(description="Build and upload Stage 2 SFT dataset.")
-    parser.add_argument("--hf_token", default=None, help="HF write token (or set HF_TOKEN env var).")
-    parser.add_argument("--dry_run", action="store_true", help="Process but do not upload.")
-    parser.add_argument("--save_local", default=None, help="Save processed samples locally as JSON (path).")
-    args = parser.parse_args()
-
-    hf_token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-    if not args.dry_run and not hf_token:
-        sys.exit("--hf_token or HF_TOKEN env var required (unless --dry_run).")
+if __name__ == "__main__":
+    if not HF_TOKEN or HF_TOKEN == "PASTE_YOUR_HF_TOKEN_HERE":
+         raise ValueError("Wait! Please provide your Hugging Face token in the 'HF_TOKEN' variable at the top of the cell.")
 
     random.seed(SEED)
 
@@ -397,22 +380,6 @@ def main():
     print("\nBuilding dataset mix ...")
     samples = build_mixed_samples(tokenizer)
 
-    if args.save_local:
-        p = Path(args.save_local)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        # Save as JSON for inspection; strip tensors
-        serializable = [{"input_ids": s["input_ids"], "prompt_len": s["prompt_len"], "source": s.get("source","")} for s in samples]
-        p.write_text(json.dumps(serializable[:100], indent=2))  # save first 100 for inspection
-        print(f"  Saved first 100 samples to {p} for inspection.")
-
-    if args.dry_run:
-        print(f"\n[dry_run] Would upload {len(samples):,} samples. Exiting.")
-        return
-
     print("\nUploading to HuggingFace Hub ...")
-    upload_to_hub(samples, hf_token)
-    print("\nAll done. Future train_sft.py runs can use --dataset_mix=cached.")
-
-
-if __name__ == "__main__":
-    main()
+    upload_to_hub(samples, HF_TOKEN)
+    print("\nAll done. Future runs can load from cache!")
