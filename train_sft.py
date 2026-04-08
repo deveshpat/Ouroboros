@@ -144,6 +144,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Fraction of data held out for validation CE.",
     )
     parser.add_argument(
+        "--val_max_samples",
+        type=int,
+        default=500,
+        help=(
+            "Cap validation set to this many samples for speed. "
+            "500 samples at val_batch_size=16 approx 10s on T4. "
+            "Set to -1 to use the full val set (slow under DDP)."
+        ),
+    )
+    parser.add_argument(
+        "--val_batch_size",
+        type=int,
+        default=16,
+        help="Micro-batch size for validation forward passes (no gradients; can be larger than --batch_size).",
+    )
+    parser.add_argument(
         "--dataset_mix",
         default="stratos",
         choices=["stratos", "full"],
@@ -170,17 +186,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=8,
         help="Gradient accumulation steps. Effective batch = batch_size * grad_accum.",
     )
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument(
         "--min_lr_ratio",
         type=float,
         default=0.1,
         help="LR at end of cosine decay = lr * min_lr_ratio.",
     )
-    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--warmup_steps", type=int, default=50)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--ema_decay", type=float, default=0.995)
+    parser.add_argument("--ema_decay", type=float, default=0.99)
     parser.add_argument("--seed", type=int, default=42)
 
     # I/O
@@ -212,7 +228,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # Monitoring
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--val_every", type=int, default=250)
-    parser.add_argument("--gen_every", type=int, default=250)
+    parser.add_argument("--gen_every", type=int, default=500)
     parser.add_argument("--gen_max_tokens", type=int, default=120)
     parser.add_argument("--spike_threshold", type=float, default=0.5)
     parser.add_argument(
@@ -440,114 +456,6 @@ def _legacy_root_checkpoint_sort_key(name: str) -> Tuple[int, int]:
     """Prefer irregular checkpoint steps first when a mixed legacy repo is unavoidable."""
     step = checkpoint_step_from_name(name)
     return (1 if step % 500 == 0 else 0, -step)
-
-
-def list_remote_checkpoint_names(
-    hf_repo_id: str,
-    hf_token: Optional[str],
-    remote_prefix: Optional[str] = None,
-    prefer_irregular_steps: bool = False,
-) -> List[str]:
-    """List remote checkpoint directories inside one Hub path."""
-    if not hf_token:
-        return []
-    try:
-        from huggingface_hub import HfFileSystem
-    except ImportError:
-        return []
-
-    hffs = HfFileSystem(token=hf_token)
-    repo_path = _join_repo_path(None, hf_repo_id, _normalize_repo_subdir(remote_prefix))
-    try:
-        entries = hffs.ls(repo_path, detail=False, refresh=True)
-    except Exception:
-        return []
-
-    names = []
-    for entry in entries:
-        name = str(entry).rstrip("/").split("/")[-1]
-        if checkpoint_step_from_name(name) >= 0:
-            names.append(name)
-
-    names = list(dict.fromkeys(names))
-    if prefer_irregular_steps:
-        names.sort(key=_legacy_root_checkpoint_sort_key)
-    else:
-        names.sort(key=checkpoint_step_from_name, reverse=True)
-    return names
-
-
-def download_checkpoint_from_hub(
-    ckpt_name: str,
-    local_root: Path,
-    hf_repo_id: str,
-    hf_token: Optional[str],
-    remote_prefix: Optional[str] = None,
-) -> Optional[Path]:
-    """Download one checkpoint directory from the Hub into a local staging folder."""
-    if not hf_token:
-        return None
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        return None
-
-    remote_dir = _join_repo_path(remote_prefix, ckpt_name)
-    allow_patterns = [f"{remote_dir}/*"]
-    local_root = Path(local_root)
-    local_root.mkdir(parents=True, exist_ok=True)
-
-    try:
-        snapshot_download(
-            repo_id=hf_repo_id,
-            repo_type="model",
-            token=hf_token,
-            allow_patterns=allow_patterns,
-            local_dir=str(local_root),
-        )
-    except Exception as exc:
-        print(f"  [hub]  warn: failed to download {remote_dir} from {hf_repo_id}: {exc}")
-        return None
-
-    target_dir = local_root / remote_dir
-    return target_dir if (target_dir / "training_state.pt").exists() else None
-
-
-def sync_checkpoint_to_hub(
-    checkpoint_dir: Path,
-    hf_repo_id: str,
-    hf_token: Optional[str],
-    remote_prefix: Optional[str] = None,
-) -> bool:
-    """Upload one checkpoint directory to a stage-specific Hub subdirectory.
-
-    This path is blocking on purpose so the trainer does not keep running after the
-    training loop simply because a background Hub upload is still active.
-    """
-    if not hf_token:
-        return False
-    try:
-        from huggingface_hub import HfApi
-    except ImportError:
-        print("  [hub]  warn: huggingface_hub not installed; skipping Hub upload.")
-        return False
-
-    checkpoint_dir = Path(checkpoint_dir)
-    remote_dir = _join_repo_path(remote_prefix, checkpoint_dir.name)
-    try:
-        api = HfApi(token=hf_token)
-        api.upload_folder(
-            repo_id=hf_repo_id,
-            repo_type="model",
-            folder_path=str(checkpoint_dir),
-            path_in_repo=remote_dir,
-            commit_message=f"Upload Stage 2 {checkpoint_dir.name}",
-        )
-        print(f"  [hub]  uploaded -> {hf_repo_id}/{remote_dir}")
-        return True
-    except Exception as exc:
-        print(f"  [hub]  warn: failed to upload {checkpoint_dir.name} to {hf_repo_id}/{remote_dir}: {exc}")
-        return False
 
 
 _THINK_RE = re.compile(r"<\|begin_of_thought\|>(.*?)<\|end_of_thought\|>", re.DOTALL)
@@ -1487,6 +1395,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
         if not torch.cuda.is_available():
             raise SystemExit("DDP auto-launch expects CUDA GPUs, but CUDA is not available.")
         torch.cuda.set_device(local_rank)
+        os.environ.setdefault("NCCL_TIMEOUT", "1800")  # 30 min; kills genuine hangs fast
         dist.init_process_group(
             backend="nccl",
             init_method="env://",
@@ -1564,18 +1473,36 @@ def run_training(argv: Optional[List[str]] = None) -> int:
             print(f"  vocab: {len(tokenizer):,}  pad_token: '{tokenizer.pad_token}'")
             print()
 
-        if args.dataset_mix == "full":
-            all_samples = load_mixed_dataset(tokenizer, args.max_samples, args.max_seq_len)
+        # -- Data loading: rank 0 only, then broadcast --------------------------------
+        if is_main_process(rank):
+            if args.dataset_mix == "full":
+                all_samples = load_mixed_dataset(tokenizer, args.max_samples, args.max_seq_len)
+            else:
+                all_samples = load_and_tokenize(args.dataset_name, tokenizer, args.max_samples, args.max_seq_len)
+            if not all_samples:
+                sys.exit("No samples loaded. Check dataset connectivity and --max_samples.")
         else:
-            all_samples = load_and_tokenize(args.dataset_name, tokenizer, args.max_samples, args.max_seq_len)
-        if not all_samples:
-            sys.exit("No samples loaded. Check dataset connectivity and --max_samples.")
+            all_samples = None
+
+        if distributed:
+            # broadcast_object_list handles arbitrary Python objects (list of dicts with Tensors)
+            # via pickle. For 55k samples at avg 512 tokens each approx 225 MB - well within T4 RAM.
+            objects = [all_samples]
+            dist.broadcast_object_list(objects, src=0)
+            all_samples = objects[0]
+        elif all_samples is None:
+            sys.exit("No samples loaded.")
 
         train_samples, val_samples = split_train_val_samples(
             all_samples=all_samples,
             seed=args.seed,
             val_fraction=args.val_fraction,
         )
+        if args.val_max_samples > 0 and len(val_samples) > args.val_max_samples:
+            # Deterministic subsample: always take the first N after the split permutation.
+            val_samples = val_samples[:args.val_max_samples]
+            if is_main_process(rank):
+                print(f"  val capped to {len(val_samples)} samples (--val_max_samples={args.val_max_samples})")
         pad_id = tokenizer.pad_token_id or 0
 
         if is_main_process(rank):
@@ -1984,7 +1911,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                         pad_id,
                         device,
                         dtype,
-                        args.batch_size,
+                        args.val_batch_size,
                         config.vocab_size,
                     )
                     tqdm.write(

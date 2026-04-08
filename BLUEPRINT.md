@@ -15,16 +15,16 @@ Novel hybrid Transformer-Mamba language model ("TRM-Mamba", 1:7 ratio) pre-train
 |---|---|---|---|
 | 0 | Architecture & Viability | ✅ COMPLETE | All 4 gates passed |
 | 1 | Pre-training | ✅ BYPASSED — SFT from ckpt-0021000 | val_ce < 3.0 + UWR > 0.05 |
-| 2 | SFT | 🔴 NEEDS FIX — S5 hard timeout (43200.6s), val_ce frozen at 5.62 | answer val_ce < 1.5 |
+| 2 | SFT | 🔴 NEEDS REWRITE — S5/S6 both killed by NCCL watchdog (val+gen > 600s under DDP) | answer val_ce < 1.5 |
 | 3 | Recursive Inference (Coconut-Ouroboros) | ⬜ NOT STARTED | Stage 2 gate |
 | 4 | GRPO | ⬜ NOT STARTED | Stage 3 gate |
 | 5 | Quantization | ⬜ NOT STARTED | Stage 4/3 gate |
 
 ### Immediate next actions
 
-**Before re-running Stage 2:** Rewrite `train_sft.py` (see Part 6 — File Audits). The current implementation has multiple confirmed bugs causing the plateau and the hard-kill timeout. Do NOT re-run S6 on the current `train_sft.py`.
+**Apply the `stage2_rewrite_prompt.md` patch to `train_sft.py`**, then run the DDP dry-run check before launching S7.
 
-**After rewrite, S6 run command:**
+**S7 run command (after patch applied and dry-run passes):**
 ```bash
 python train_sft.py \
   --preset nano \
@@ -36,6 +36,8 @@ python train_sft.py \
   --lr 3e-4 \
   --warmup_steps 50 \
   --ema_decay 0.99 \
+  --val_max_samples 500 \
+  --val_batch_size 16 \
   --output_dir runs/stage2 \
   --push_to_hub \
   --hf_token $HF_TOKEN \
@@ -46,7 +48,6 @@ python train_sft.py \
   --session_timeout_hours 11.5 \
   --graceful_exit_buffer_minutes 15
 ```
-Key changes vs S5: `--lr 3e-4` (burst to escape number-loop attractor), `--warmup_steps 50`, `--ema_decay 0.99`, `--gen_every 500` (reduce EMA-swap overhead), `--graceful_exit_buffer_minutes 15` (larger buffer given Hub push + DDP barrier latency).
 
 ---
 
@@ -57,7 +58,8 @@ Key changes vs S5: `--lr 3e-4` (burst to escape number-loop attractor), `--warmu
 | Pre-S1 | No pre-training | Comma-loops from random init | ✅ Fixed: pretrain first |
 | S1 | max_seq_len=1024 | Filtered all reasoning; no `<think>` | ✅ Fixed: 2048 + truncation |
 | S2 | Bugs 6–10 cascade | Hub downloads in output_dir; prune deleted all Stage 2 ckpts; no optimizer reset | ✅ Fixed |
-| S5 | Number-loop attractor + save ordering + DDP barrier | val_ce frozen 5.62; SIGKILL before clean exit | 🔴 Needs train_sft.py rewrite |
+| S5 | Bugs 13–19 cascade | val+gen exceeded NCCL 600s watchdog; SIGABRT; val_ce frozen at 5.62 | 🔴 Needs stage2_rewrite_prompt.md applied |
+| S6 | Same as S5 (rewrite not yet applied) | Same NCCL crash at step 3750 | 🔴 Confirmed same bug |
 
 ---
 
@@ -95,6 +97,9 @@ FinalRMSNorm → LM Head (weight-tied)
 | Stage 2 target format | `User: {q}\n\nAssistant: <think>\n{reasoning}\n</think>\n{answer}{eos}` |
 | Stage 2 starting checkpoint | Hub ckpt-0002979 (stratos-only weights; optimizer reset due to data change) |
 | Stage 2 DDP | Works correctly on Dual T4. Post-training SIGABRT is benign NCCL teardown race. |
+| Stage 2 data loading | Rank 0 loads + tokenizes; `broadcast_object_list` to rank 1. Eliminates double disk I/O. |
+| Stage 2 val speed | 500 samples capped, batch_size=16 → ~10s per val run (was 2761 ÷ 2 = 557s) |
+| Stage 2 NCCL timeout | `NCCL_TIMEOUT=1800` (30 min). Kills genuine hangs; 18× headroom vs 100s worst-case wait. |
 | Stage 3 recursion | Coconut-Ouroboros, K=1→4→16. NOT TRM EMA-loop. See stage3_agent_prompt.md. |
 | Hub repo | WeirdRunner/Ouroboros (private) |
 
@@ -106,10 +111,10 @@ FinalRMSNorm → LM Head (weight-tied)
 |---|---|---|---|
 | `baseline_trm_mamba.py` | 0 | ✅ COMPLETE | Stage 3 needs `forward_with_hidden` + `forward_from_embeddings` (surgical, see stage3_agent_prompt.md) |
 | `viability_gate.py` | 0 | ✅ COMPLETE | |
-| `training_utils.py` | All | ✅ COMPLETE | Core utilities; do not duplicate in training scripts |
-| `pretrain.py` | 1 | ✅ COMPLETE | Last Hub ckpt: ckpt-0021000. See Part 6 for plateau analysis. |
-| `train_sft.py` | 2 | 🔴 NEEDS REWRITE | See Part 6 for full audit and required changes |
-| `stage2_patch_prompt.md` | 2 | ✅ APPLIED | All 6 changes in current `train_sft.py` |
+| `training_utils.py` | All | ✅ COMPLETE | Canonical Hub/checkpoint utilities. Do not duplicate. |
+| `pretrain.py` | 1 | ✅ COMPLETE | Last Hub ckpt: ckpt-0021000 |
+| `train_sft.py` | 2 | 🔴 NEEDS PATCH | Apply `stage2_rewrite_prompt.md` (8 changes) |
+| `stage2_rewrite_prompt.md` | 2 | ✅ COMPLETE | Feed to coding agent; fixes Bugs 13–19 |
 | `stage3_agent_prompt.md` | 3 | ✅ COMPLETE | Feed to coding agent after Stage 2 gate |
 | `recursive_finetune.py` | 3 | ⬜ NOT CREATED | Generate from `stage3_agent_prompt.md` |
 
@@ -117,14 +122,32 @@ FinalRMSNorm → LM Head (weight-tied)
 
 ## Part 5 — Stage Definitions
 
-### Stage 2 — SFT 🔴 NEEDS REWRITE BEFORE S6
+### Stage 2 — SFT 🔴 NEEDS PATCH BEFORE S7
 
 **Sessions:**
 - S1 (✅): stratos-only, max_seq_len=1024, val_ce=4.9153, no `<think>` learning. Hub: ckpt-0002979.
 - S2 (❌): full-mix DDP, Bugs 6–10, val_ce=5.7135. All local Stage 2 ckpts deleted.
-- S3–S4 (✅): dry-runs; all patches verified.
-- S5 (🔴): full-scale DDP, hard-killed at 43200.6s (~step 3700). val_ce plateaued at 5.62 from step 2500 onward. Generation frozen (number loops) throughout. Exit code 137 (SIGKILL). Root cause: number-loop attractor + save ordering bug + DDP barrier deadlock on timeout. Hub: ckpts 500–3700.
-- S6 (⬜): **NEXT** — after rewriting train_sft.py. See Part 6.
+- S3–S4 (✅): dry-runs; all patches from stage2_patch_prompt.md verified.
+- S5 (🔴): full-scale DDP, hard-killed at 43200.6s (~step 3700). val_ce plateaued at 5.62. Generation frozen (number loops). Exit code 137 (SIGKILL). Root cause: val+gen > NCCL 600s watchdog under DDP. Hub: ckpts 500–3700.
+- S6 (🔴): Same crash at step 3750. NCCL watchdog confirmed. `WorkNCCL(ALLREDUCE, NumelIn=1, Timeout=600000ms)` ran for 600003ms → SIGABRT. Confirmed val took 557s + gen 90s = 647s > 600s.
+- S7 (⬜): **NEXT** — after applying `stage2_rewrite_prompt.md`.
+
+**Root cause of S5/S6 NCCL crash (confirmed from log):**
+```
+Step 3750 hits val_every=250 AND gen_every=250 simultaneously.
+Rank 0: compute_val_metrics(2761 samples, batch_size=2) = 1380 passes ≈ 557s
+        + run_generation_callback() ≈ 90s
+        = 647s total on rank 0 while rank 1 waits at dist.barrier()
+NCCL watchdog fires at 600s → SIGABRT
+Fix: val capped to 500 samples at batch_size=16 (≈10s), gen_every=500,
+     NCCL_TIMEOUT=1800s.
+```
+
+**Note on "streaming dataset" hypothesis:** Investigated and ruled out. Dataset
+download does not cause NCCL desync — NCCL's watchdog only activates on pending
+collectives, which are not called during data loading. The 55k-sample dataset
+fits in ~225 MB RAM and is cached by HuggingFace after first download. Streaming
+would break deterministic epoch_permutation sampling with no training-time benefit.
 
 **All patches applied to current `train_sft.py` (from stage2_patch_prompt.md):**
 - [x] Local Stage 2 checkpoints tried first; Hub downloads to `.hub_resume/` temp dir
@@ -134,24 +157,24 @@ FinalRMSNorm → LM Head (weight-tied)
 - [x] Prune skips `.hub_*` subdirs
 - [x] `_build_sft_sample_truncated` — truncate reasoning instead of skipping
 
-**Hyperparameters (S5 / S6 planned):**
+**Pending patches (from stage2_rewrite_prompt.md):**
+- [ ] Bug 13: Save order `save→val→gen`
+- [ ] Bug 14: Emergency save `push_to_hub=False`
+- [ ] Bug 15: Remove `dist.barrier()` from timeout break path
+- [ ] Bug 16: Default `lr=3e-4`, `warmup_steps=50`, `ema_decay=0.99`
+- [ ] Bug 17: Delete 3 locally re-implemented Hub utility functions
+- [ ] Bug 18: Default `gen_every=500`
+- [ ] Bug 19A: `NCCL_TIMEOUT=1800` before `init_process_group`
+- [ ] Bug 19B: Val capped to 500 samples at `val_batch_size=16`; new CLI args
+- [ ] Data broadcast: Rank 0 loads, `broadcast_object_list` to rank 1
+
+**Hyperparameters (S5–S6 / S7 planned):**
 ```
-S5: lr=1e-4, warmup=100, cosine to 1e-5, ema_decay=0.995, gen_every=250  ← plateau, SIGKILL
-S6: lr=3e-4, warmup=50, cosine,           ema_decay=0.99,  gen_every=500  ← after rewrite
+S5/S6: lr=1e-4, warmup=100, ema_decay=0.995, gen_every=250  ← NCCL crash
+S7:    lr=3e-4, warmup=50,  ema_decay=0.99,  gen_every=500  ← after rewrite
 batch_size=2, grad_accum=16 → effective batch=32 (global, DDP)
 max_seq_len=2048, dataset_mix=full, num_epochs=3, total_steps=4920
-```
-
-**Data counts at max_seq_len=2048 (with truncation):**
-55,230 total | train: 52,469 | val: 2,761
-
-**S5 val_ce analysis:**
-```
-Steps 250–2500: 5.7453 → 5.6245  (improvement)
-Steps 2500–3500: 5.6245 → 5.6257 (REVERSAL — model is diverging or overfitting)
-Train/val gap at step 3500: ~2.63 CE units — not EMA lag, genuine distribution mismatch
-Root cause: model memorizes integer-answer patterns from MetaMathQA/OpenR1-Math
-            but does not generalize to sentence-level structure
+val_max_samples=500, val_batch_size=16
 ```
 
 **Success criteria:**
@@ -179,101 +202,71 @@ Full spec: `stage3_agent_prompt.md`. Required additions to `baseline_trm_mamba.p
 
 ## Part 6 — File Audits & Engineering Principles
 
-This section captures every design insight that took trial-and-error to discover. It is the authoritative reference for writing, debugging, or reviewing any training script in this project.
-
----
-
 ### 6.1 train_sft.py — Full Audit
 
-**CONFIRMED BUGS (must fix before S6):**
+**CONFIRMED BUGS — all addressed in `stage2_rewrite_prompt.md`:**
 
-**Bug 13 — Save order is wrong (CRITICAL)**  
-Current order per optimizer step: `val_every → gen_every → save_every`. Generation with EMA weights requires swapping ~740MB of parameters twice and running greedy decode on 5 prompts — takes ~90 seconds total. When a Kaggle session timeout fires during generation, the checkpoint for that step is **never saved**. This is why the S5 emergency save may have fired at step ~3700 rather than at a regular save_every boundary.  
-Fix: reorder to `save_every → val_every → gen_every`. Checkpoint is written before any slow callbacks. This is the exact order used in `pretrain.py` which has never lost a checkpoint to timeout.
+**Bug 13 — Save order is wrong (CRITICAL)**
+Current order per optimizer step: `val_every → gen_every → save_every`. A timeout during generation loses the checkpoint for that step.
+Fix: reorder to `save_every → val_every → gen_every`.
 
-**Bug 14 — Emergency save includes Hub push (CRITICAL)**  
-The timeout handler calls `save_checkpoint(..., push_to_hub=args.push_to_hub)`. With `push_to_hub=True`, a 740MB Hub upload runs inside the 7-minute graceful-exit buffer. The upload is nominally fast (~10s) but Hub API latency varies. If it hangs, the buffer is exhausted and Kaggle SIGKILL fires before `dist.barrier()` completes. In S5 this caused exit code 137.  
-Fix: pass `push_to_hub=False` in the emergency save call. The local checkpoint is safe; Hub sync can happen on the next regular save.
+**Bug 14 — Emergency save includes Hub push (CRITICAL)**
+The timeout handler calls `save_checkpoint(..., push_to_hub=args.push_to_hub)`. Hub upload inside the graceful-exit buffer risks SIGKILL before clean exit.
+Fix: pass `push_to_hub=False` in the emergency save call.
 
-**Bug 15 — DDP barrier placement on graceful exit (CRITICAL)**  
-After the emergency save, the code does `dist.barrier()` before breaking. If rank 0 is mid-Hub-push and rank 1 already advanced to the next micro-step, the barrier deadlocks until Kaggle SIGKILL fires. The `broadcast_timeout()` function is only called once per optimizer step, so rank 1 may be several seconds ahead.  
-Fix: increase `graceful_exit_buffer_minutes` to at least 15 to absorb this slack, AND skip Hub push in emergency saves (Bug 14 fix). Optionally, replace the final `dist.barrier()` in the timeout path with a `dist.barrier(timeout=timedelta(minutes=2))` call to fail gracefully instead of deadlocking.
+**Bug 15 — DDP barrier deadlock on graceful exit (CRITICAL)**
+After the emergency save, `dist.barrier()` is called before breaking. Rank 0 may be mid-save while rank 1 is already at the next micro-step. The `broadcast_timeout()` flag handles rank synchronization; the explicit barrier here is redundant and dangerous.
+Fix: delete `dist.barrier()` from the timeout break path entirely.
 
-**Bug 16 — Number-loop attractor not broken by lr=1e-4 (FUNCTIONAL)**  
-The model inherited a strong FineWeb-Edu number prior from Stage 1. After 3500 SFT steps at lr=1e-4 on a mix where answer tokens are dominated by integers, val_ce reversed and generation remained frozen. lr=1e-4 is too conservative to overcome the attractor in the first epoch.  
-Fix: start with lr=3e-4 (3× higher) for the first 50 warmup steps, then cosine decay. The higher learning rate is justified because we're trying to overwrite an existing prior, not learn from scratch. If spikes become excessive (>30% of steps), reduce to 2e-4.
+**Bug 16 — Number-loop attractor not broken by lr=1e-4 (FUNCTIONAL)**
+The model inherited a strong FineWeb-Edu number prior. lr=1e-4 is too conservative to overwrite it within the first epoch.
+Fix: `lr=3e-4`, `warmup_steps=50`.
 
-**Bug 17 — DRY violation: utility functions redefined (MEDIUM)**  
-`list_remote_checkpoint_names`, `download_checkpoint_from_hub`, and `sync_checkpoint_to_hub` are all re-implemented inside `train_sft.py` with modified signatures. This shadows the versions in `training_utils.py` and creates drift. Any future fix to the Hub logic must be applied in both files.  
-Fix: delete the local re-definitions and import the canonical versions from `training_utils.py`. Adjust call sites to match the imported signatures.
+**Bug 17 — DRY violation: utility functions redefined (MEDIUM)**
+`list_remote_checkpoint_names`, `download_checkpoint_from_hub`, and `sync_checkpoint_to_hub` are all re-implemented inside `train_sft.py`. Any Hub fix must be applied in two places.
+Fix: delete local re-definitions; use canonical imports from `training_utils.py`.
 
-**Bug 18 — gen_every=250 causes excessive EMA-swap overhead (MINOR)**  
-At 9.5s/step and gen_every=250, generation runs every ~40 minutes. Each generation call takes ~90s (EMA swap + 5 prompts × 120 tokens greedy decode). This represents ~225s/2500s = ~9% overhead per gen window. More importantly, it adds 90s of non-checkpointed time to every val window.  
-Fix: set gen_every=500. Generation is for human monitoring only; running half as often is sufficient.
+**Bug 18 — gen_every=250 excessive overhead (MINOR)**
+Generation takes ~90s. At gen_every=250 and 9.5s/step, that is 90s of non-checkpointed time every ~40 min.
+Fix: `gen_every=500`.
 
-**DESIGN PRINCIPLES proven by trial-and-error (preserve in all future scripts):**
+**Bug 19 — NCCL watchdog killed by combined val+gen (CRITICAL — new)**
+At step 3750 (divisible by both val_every=250 and gen_every=250), rank 0 spends 647s (557s val + 90s gen) while rank 1 waits at `dist.barrier()`. NCCL's default 600s watchdog fires.
+Three sub-fixes: (A) `NCCL_TIMEOUT=1800`; (B) cap val to 500 samples at batch_size=16 (≈10s); (C) reorder callbacks (Bug 13 fix).
 
-- **Checkpoint before callbacks.** The save must happen before val CE computation and generation. Callbacks are slow and can be interrupted. The checkpoint is the only thing that must survive.
-- **Emergency saves never push to Hub.** Hub push is a network call with unpredictable latency. Emergency saves exist to protect against hard session limits; their only goal is writing a valid file to local disk.
-- **Optimizer/scheduler reset on data stream change.** When the dataset fingerprint changes on resume (different mix, different max_seq_len, different seed), reset step=0, optimizer, scheduler, and scaler. Keep model weights and EMA. The code detects this via `build_data_fingerprint()` comparison.
-- **Local Stage 2 checkpoints always take priority over Hub.** Never download a Hub checkpoint when a valid local Stage 2 checkpoint exists in output_dir. Hub downloads go to `.hub_resume/` (a temp directory), never into output_dir itself, to prevent contaminating the prune logic.
-- **Prune logic must filter non-training directories.** The prune loop must skip `.hub_*`, `.tmp`, and any directory that doesn't pass `checkpoint_step_from_name()`. Without this filter, Hub-downloaded checkpoints get pruned into as regular training checkpoints and delete legitimate saves.
-- **EMA decay governs val/gen responsiveness.** With decay=0.995 and <5000 steps, the EMA is a heavily smoothed average of the full training trajectory. val_ce using EMA weights will appear higher than the live model and move slowly. Use decay=0.99 for Stage 2 (half-life ~69 steps vs ~139 at 0.995). For Stage 1 pretrain with 62,500 total steps, 0.995 is appropriate.
-- **DDP world_size=2 requires every synchronization point to be symmetric.** Both ranks must call `dist.barrier()` the same number of times. Any conditional that skips a barrier on rank 0 (e.g., inside `if is_main_process(rank)`) must have a matching unconditional barrier or a paired dummy barrier on rank 1.
-- **The generation uses EMA weights via `ema_scope`.** This context manager swaps live weights for EMA shadow, runs generation, then restores. It requires two full-model copies in memory (~1.5GB for nano). This is acceptable but means generation cannot be concurrent with forward passes.
-- **Spike monitor bias correction matters early.** Without bias correction, the EMA-based spike detector will flag nearly every step in the first 100 steps (EMA starts near 0 or the first loss value). The SpikeMonitor in train_sft.py correctly applies bias correction (matches pretrain.py behavior).
-- **The cosine schedule total_steps is computed from scratch on optimizer reset.** When resuming with a new dataset (need_opt_reset=True), total_steps = steps_per_epoch * num_epochs is recalculated using the new dataset's size. This is correct because we're training fresh from step 0.
+**DESIGN PRINCIPLES (proven by trial-and-error):**
 
----
-
-### 6.2 pretrain.py — Plateau Analysis
-
-**Observed:** val_ce plateaued at ~5.32 at step 21,501 (705M tokens, nano 92M).
-
-**Is it a code bug?** No. The pretrain.py code has been carefully reviewed and is architecturally sound. The optimizer, data pipeline, scheduler, and checkpoint handling all function correctly. The plateau is a data/compute limitation.
-
-**Explanation:**
-- Chinchilla scaling laws suggest compute-optimal training of 92M params requires ~1.85B tokens. We trained on 705M = 38% of compute-optimal.
-- The LR schedule was designed for a 2B token budget (~62,500 steps). Session timeout at step 21,501 means the LR had decayed to ~3.1e-4 (still not too low, not the cause).
-- A 92M model should reach ~3.5–4.0 val CE on educational web text with sufficient compute. 5.32 reflects primarily insufficient training, not architecture failure.
-- The number-bias in FineWeb-Edu (financial articles, STEM content) creates a strong integer-sequence prior that 705M tokens wasn't enough to balance with richer language structure.
-
-**Implications for future pre-training (TRC hardware):**
-- Use `token_budget=5_000_000_000` (5B tokens) for compute-optimal nano training.
-- Use `chunk_size=2048` instead of 1024 to leverage Mamba SSM's long-context advantage. The SSM recurrent state accumulates O(d_state) = O(16) compressed history per token; longer chunks give more context for each supervision signal.
-- Consider including instruction-formatted text (10–20% of budget) to pre-load the QA response format, reducing the SFT sample efficiency problem.
+- **Checkpoint before callbacks.** save → val → gen. Callbacks are interruptible; the checkpoint is not.
+- **Emergency saves never push to Hub.** Hub push has unpredictable latency. Emergency saves write to local disk only.
+- **Remove `dist.barrier()` from graceful exit.** `broadcast_timeout()` already propagates the flag. A barrier here risks NCCL deadlock when rank 0 is mid-save.
+- **Val batch size is independent of train batch size.** No gradients needed; use `val_batch_size=16` regardless of training `batch_size=2`.
+- **Rank 0 loads data; rank 1 receives via `broadcast_object_list`.** Eliminates double dataset download/tokenization. ~225 MB broadcast for 55k samples is fast and well within T4 RAM.
+- **NCCL watchdog must be set tighter than the slowest barrier wait, but looser than expected worst case.** At 10s (val) + 90s (gen) = 100s max, 1800s is 18× headroom while still catching genuine hangs.
+- **Optimizer/scheduler reset on data stream change.** Detected via `build_data_fingerprint()` comparison on resume. Keep model weights and EMA; reset everything else.
+- **EMA decay governs val/gen responsiveness.** decay=0.99 at ~5000 steps gives half-life ~69 steps. Use 0.99 for Stage 2, 0.995 for Stage 1 (62,500 steps).
+- **Local Stage 2 checkpoints always take priority over Hub.** Hub downloads go to `.hub_resume/` (temp), never into `output_dir`.
+- **Prune logic must filter non-training directories.** Skip `.hub_*`, `.tmp`, and anything failing `checkpoint_step_from_name()`.
+- **The cosine schedule total_steps is recomputed on optimizer reset.** After data-stream change resume (step=0), total_steps = steps_per_epoch × num_epochs using the new dataset size.
 
 ---
 
-### 6.3 baseline_trm_mamba.py — Investigation Notes
+### 6.2 pretrain.py — Notes
+*(unchanged from previous BLUEPRINT version)*
 
-**Architecture is sound.** No bugs found. The following are observations for future reference:
+Architecture is sound. Plateau at val_ce=5.32 is a data/compute limitation (705M of ~1.85B compute-optimal tokens). No bugs found.
 
-**BF16 on T4:** `torch.cuda.is_bf16_supported()` returns True on T4 (Turing, sm_75) due to PyTorch software emulation. Hardware BF16 requires Ampere (sm_80+). In practice, BF16 on T4 runs at approximately the same speed as FP16 because neither has native BF16 tensor cores. The `dtype=bfloat16` path in training is not wrong, but on T4 `float16` would be equally fast and has better-characterized numerics. On A100/H100 (TRC), BF16 is preferable.
+---
 
-**No gradient checkpointing:** For sequences >2048 or model sizes >nano, activation memory grows linearly with sequence length × number of layers. The `TRMMambaGroup.forward()` method is the natural insertion point for `torch.utils.checkpoint.checkpoint()`. Not needed for nano at seq_len=2048 (VRAM ~6.6GB measured), but will be necessary for medium preset.
+### 6.3 baseline_trm_mamba.py — Notes
+*(unchanged from previous BLUEPRINT version)*
 
-**Mamba masking overhead:** `MambaLayer.forward()` applies `h * mask` before and after the Mamba call when `attention_mask is not None`. This is correct behavior (SSM processes padded zeros rather than garbage) but adds two elementwise ops per Mamba layer per forward pass. Not a bottleneck at current scale.
-
-**Tied embeddings and EMA shadow:** The EMA shadow dict must include `lm_head.weight` as an alias for `token_embedding.weight` when `tie_embeddings=True`. The checkpoint save code in both pretrain.py and train_sft.py correctly adds this alias. Any new training script must replicate this behavior or the checkpoint will fail to load into an EMA-swapped inference context.
-
-**Stage 3 additions (surgical only):** Two methods must be added to `BaselineTRMMamba` immediately after the existing `forward` method: `forward_with_hidden()` and `forward_from_embeddings()`. See stage3_agent_prompt.md for the exact code. These are additive only; nothing in the existing forward path changes.
+Architecture is sound. Stage 3 additions (`forward_with_hidden`, `forward_from_embeddings`) are additive-only — no existing code changes.
 
 ---
 
 ### 6.4 training_utils.py — Notes
 
-Functions in this module are the canonical implementations. Training scripts must import from here rather than re-implementing:
-- `ModelEMA` — EMA tracking and state dict I/O
-- `ema_scope` — context manager for EMA-weight swap during val/gen
-- `cosine_with_warmup` — LR schedule
-- `build_adamw_optimizer` — parameter grouping (decay/no-decay)
-- `list_local_checkpoints`, `try_load_state`, `checkpoint_step_from_name` — checkpoint discovery
-- `list_remote_checkpoint_names`, `download_checkpoint_from_hub`, `sync_checkpoint_to_hub` — Hub I/O
-- `cleanup_temporary_checkpoints` — removes `.tmp` dirs on startup
-- `vram_gb`, `set_seed`, `pad_vocab_size` — utilities
-
-**Do not re-implement any of these in training scripts.** The DRY violations in `train_sft.py` are Bug 17 and must be cleaned up.
+Canonical implementations for all Hub/checkpoint/EMA utilities. **Do not re-implement in training scripts.** Bug 17 documents the consequences of doing so.
 
 ---
 
@@ -305,7 +298,7 @@ Functions in this module are the canonical implementations. Training scripts mus
 }
 ```
 
-**Classification logic:** `"sft_config" in state` → Stage 2. `"pretrain_config" in state` (or `"tokens_processed"` without `"sft_config"`) → Stage 1. Stage 2 loader must handle Stage 1 checkpoints as cold-start (load weights + EMA, reset optimizer/scheduler, return step=0, reset_optimizer=True).
+**Classification:** `"sft_config" in state` → Stage 2. `"pretrain_config" in state` (without `"sft_config"`) → Stage 1. Stage 2 loader handles Stage 1 checkpoints as cold-start (load weights + EMA, reset optimizer/scheduler, return step=0, reset_optimizer=True).
 
 ---
 
@@ -320,13 +313,14 @@ Functions in this module are the canonical implementations. Training scripts mus
 | 9 | Optimizer not reset on data stream change | ✅ FIXED |
 | 10 | max_seq_len=1024 filtered 97% of reasoning datasets | ✅ FIXED |
 | 11 | NCCL teardown race: post-training SIGABRT on Dual T4 | ✅ BENIGN |
-| 12 | EMA decay=0.995 causes severe lag | ✅ MITIGATED (reduce to 0.99 in S6) |
-| 13 | Save order wrong: val→gen→save instead of save→val→gen | 🔴 OPEN — train_sft.py rewrite |
-| 14 | Emergency save includes Hub push | 🔴 OPEN — train_sft.py rewrite |
-| 15 | DDP barrier deadlock on graceful timeout exit | 🔴 OPEN — train_sft.py rewrite |
-| 16 | lr=1e-4 insufficient to break number-loop attractor | 🔴 OPEN — use 3e-4 in S6 |
-| 17 | DRY: utility functions re-implemented in train_sft.py | 🔴 OPEN — train_sft.py rewrite |
-| 18 | gen_every=250 adds ~9% overhead per gen window | 🟡 MINOR — set gen_every=500 |
+| 12 | EMA decay=0.995 causes severe lag | ✅ MITIGATED (reduce to 0.99 in S7) |
+| 13 | Save order wrong: val→gen→save instead of save→val→gen | 🔴 OPEN — stage2_rewrite_prompt.md |
+| 14 | Emergency save includes Hub push | 🔴 OPEN — stage2_rewrite_prompt.md |
+| 15 | DDP barrier deadlock on graceful timeout exit | 🔴 OPEN — stage2_rewrite_prompt.md |
+| 16 | lr=1e-4 insufficient to break number-loop attractor | 🔴 OPEN — stage2_rewrite_prompt.md |
+| 17 | DRY: utility functions re-implemented in train_sft.py | 🔴 OPEN — stage2_rewrite_prompt.md |
+| 18 | gen_every=250 adds ~9% overhead per gen window | 🔴 OPEN — stage2_rewrite_prompt.md |
+| 19 | NCCL watchdog (600s) killed by val(557s)+gen(90s)=647s under DDP | 🔴 OPEN — stage2_rewrite_prompt.md |
 
 ---
 
@@ -334,13 +328,13 @@ Functions in this module are the canonical implementations. Training scripts mus
 
 | Stage | Platform | Estimate | Notes |
 |---|---|---|---|
-| 1 | Kaggle Dual T4 | ✅ Done (705M tokens) | Would benefit from 5B tokens on TRC for future runs |
-| 2 | Kaggle Dual T4 | 2–3 more sessions after rewrite | S6 with lr=3e-4, ema=0.99, fixed save order |
+| 1 | Kaggle Dual T4 | ✅ Done (705M tokens) | Would benefit from 5B tokens on TRC |
+| 2 | Kaggle Dual T4 | 1–2 sessions after rewrite | S7 with all Bug 13–19 fixes applied |
 | 3 | TRC preferred | ~4–8h per K sub-stage | Coconut K=1→4→16 |
 | 4 | TRC + unsloth | ~8–12h | GRPO G=4 rollouts |
 | 5 | Local / Jetson | ~2h | Post-training quantization |
 
-**TRC note:** Application submitted 2026-04-07. Awaiting email. TRC provides free TPU/GPU compute via Google. Expected allocation: v4-8 TPU or A100 GPU. When confirmed, re-evaluate whether Stage 2 should be re-run on TRC (A100 BF16 would be 3–4× faster).
+**TRC note:** Application submitted 2026-04-07. Awaiting email.
 
 ---
 
@@ -348,7 +342,7 @@ Functions in this module are the canonical implementations. Training scripts mus
 
 - **Mamba** (Gu & Dao, 2023); **Jamba** (AI21 Labs, 2024); **Coconut** (Meta, arXiv:2412.06769)
 - **TRM** (Samsung, arXiv:2510.04871); **DeepSeek-R1** (2025); **Quamba** (2024)
-- **GPT-2** residual scaling; **RoPE** (Su et al., 2021); **SwiGLU** (Shazeer, 2020); **GQA** (Ainslie et al., 2023)
+- **GPT-2** residual scaling; **RoPE** (Su et al., 2021); **SwiGLU** (Shazeer, 2020); **GQA** (Ainslie et al, 2023)
 - **Chinchilla scaling laws** (Hoffmann et al., 2022) — compute-optimal: ~20 tokens per param
 - **TRL GRPOTrainer** — https://huggingface.co/docs/trl
 - **OpenR1 datasets** — https://huggingface.co/collections/open-r1/reasoning-datasets
