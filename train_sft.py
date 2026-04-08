@@ -30,6 +30,9 @@ Install:
 Run:
   python train_sft.py --preset small --output_dir ./runs/stage2_small
 
+DDP (recommended launch):
+  torchrun --standalone --nproc_per_node=2 train_sft_ddp_v2.py --preset small --output_dir ./runs/stage2_small
+
 Dry-run style sanity check:
   python train_sft.py --preset nano --max_samples 300 --max_steps 100 \
     --val_every 50 --gen_every 50 --wandb_mode disabled
@@ -44,17 +47,17 @@ import os
 import random
 import re
 import shutil
-import socket
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import torch
     import torch.distributed as dist
-    import torch.multiprocessing as mp
     import torch.nn.functional as F
     from torch.nn.parallel import DistributedDataParallel as DDP
     from torch.optim import AdamW
@@ -82,11 +85,6 @@ from training_utils import (
     vram_gb,
 )
 
-if not torch.cuda.is_available():
-    sys.exit(
-        "No CUDA GPU found. mamba-ssm requires CUDA kernels.\n"
-        "Run on Kaggle (T4/Dual-T4) or Google Colab."
-    )
 
 try:
     from transformers import AutoTokenizer
@@ -150,7 +148,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help=(
             "Cap validation set to this many samples for speed. "
             "500 samples at val_batch_size=16 approx 10s on T4. "
-            "Set to -1 to use the full val set (slow under DDP)."
+            "Set to -1 to use the full val set (slow)."
         ),
     )
     parser.add_argument(
@@ -161,9 +159,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--dataset_mix",
-        default="stratos",
-        choices=["stratos", "full"],
-        help="'stratos' = Bespoke-Stratos-17k only. 'full' = Stratos + MetaMathQA + OpenHermes-2.5 + OpenR1-Math-220k + OpenR1-Code.",
+        default="cached",
+        choices=["stratos", "full", "cached"],
+        help=(
+            "'cached' = load pre-processed dataset from HF Hub (fast, recommended). "
+            "'stratos' = Bespoke-Stratos-17k only (slow). "
+            "'full' = all 5 sources processed from scratch (very slow, ~30-45 min)."
+        ),
+    )
+    parser.add_argument(
+        "--cached_dataset_name",
+        default="WeirdRunner/Ouroboros",
+        help="HF dataset repo to load when --dataset_mix=cached.",
+    )
+    parser.add_argument(
+        "--cached_dataset_config",
+        default="sft-mix-v1",
+        help="HF dataset config name (the 'name' argument to load_dataset).",
     )
 
     # Training
@@ -305,13 +317,18 @@ def is_main_process(rank: int) -> bool:
     return rank == 0
 
 
-def distributed_mean(value: float, device: torch.device) -> float:
+def distributed_sum_float(value: float, device: torch.device) -> float:
     if not dist_is_initialized():
         return float(value)
     tensor = torch.tensor([value], device=device, dtype=torch.float64)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    tensor /= dist.get_world_size()
     return float(tensor.item())
+
+
+def distributed_mean_float(value: float, device: torch.device) -> float:
+    if not dist_is_initialized():
+        return float(value)
+    return distributed_sum_float(value, device) / dist.get_world_size()
 
 
 def distributed_sum_int(value: int, device: torch.device) -> int:
@@ -322,50 +339,43 @@ def distributed_sum_int(value: int, device: torch.device) -> int:
     return int(tensor.item())
 
 
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+def broadcast_bool(flag: bool, device: torch.device, src: int = 0) -> bool:
+    if not dist_is_initialized():
+        return bool(flag)
+    tensor = torch.tensor([int(flag)], device=device, dtype=torch.int32)
+    dist.broadcast(tensor, src=src)
+    return bool(tensor.item())
 
 
-def _distributed_worker(local_rank: int, world_size: int, master_port: int, argv: List[str]) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(master_port)
-    os.environ["RANK"] = str(local_rank)
-    os.environ["LOCAL_RANK"] = str(local_rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    exit_code = run_training(argv)
-    if exit_code:
-        raise SystemExit(exit_code)
+def verify_distributed_resume_meta(
+    step: int,
+    epoch: int,
+    samples_seen: int,
+    need_opt_reset: bool,
+    device: torch.device,
+) -> Tuple[int, int, int, bool]:
+    """Ensure every rank restored the same checkpoint metadata."""
+    if not dist_is_initialized():
+        return step, epoch, samples_seen, need_opt_reset
 
-
-def maybe_launch_multi_gpu(args: argparse.Namespace, argv: List[str]) -> bool:
-    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        return False
-    if not torch.cuda.is_available():
-        return False
-    world_size = torch.cuda.device_count()
-    if world_size < 2:
-        return False
-    if args.batch_size < world_size or (args.batch_size % world_size) != 0:
-        print(
-            f"[ddp] detected {world_size} CUDA devices, but batch_size={args.batch_size} "
-            "cannot be split evenly across ranks; using the original single-process path."
+    local = torch.tensor(
+        [int(step), int(epoch), int(samples_seen), int(bool(need_opt_reset))],
+        device=device,
+        dtype=torch.long,
+    )
+    gathered = [torch.zeros_like(local) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local)
+    ref = gathered[0]
+    if any(not torch.equal(meta, ref) for meta in gathered[1:]):
+        mismatch_summary = ", ".join(
+            f"rank{idx}={meta.tolist()}" for idx, meta in enumerate(gathered)
         )
-        return False
-
-    per_gpu = args.batch_size // world_size
-    print(
-        f"[ddp] detected {world_size} CUDA devices; launching single-node DDP "
-        f"with global batch_size={args.batch_size} ({per_gpu} per GPU)."
-    )
-    mp.spawn(
-        _distributed_worker,
-        nprocs=world_size,
-        args=(world_size, find_free_port(), list(argv)),
-        join=True,
-    )
-    return True
+        raise RuntimeError(
+            "DDP resume state mismatch across ranks. "
+            "Each rank must restore the same checkpoint metadata. "
+            f"Details: {mismatch_summary}"
+        )
+    return int(ref[0].item()), int(ref[1].item()), int(ref[2].item()), bool(ref[3].item())
 
 
 def pad_vocab(actual: int, multiple: int = 128) -> int:
@@ -401,6 +411,8 @@ def build_data_fingerprint(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "dataset_name": cfg.get("dataset_name"),
         "dataset_mix": cfg.get("dataset_mix"),
+        "cached_dataset_name": cfg.get("cached_dataset_name"),
+        "cached_dataset_config": cfg.get("cached_dataset_config"),
         "tokenizer_name": cfg.get("tokenizer_name"),
         "max_samples": cfg.get("max_samples"),
         "max_seq_len": cfg.get("max_seq_len"),
@@ -668,6 +680,58 @@ def _build_sft_sample_truncated(
         truncated_r_ids = r_ids[-budget:]
     truncated_reasoning = tokenizer.decode(truncated_r_ids, skip_special_tokens=False)
     return _build_sft_sample(tokenizer, question, truncated_reasoning, answer, eos, max_seq_len)
+
+
+def load_cached_dataset(
+    dataset_name: str,
+    dataset_config: str,
+    tokenizer_name: str,
+    max_samples: Optional[int],
+    max_seq_len: int,
+) -> List[Dict[str, Any]]:
+    """Load the pre-processed Stage 2 SFT dataset from the HF Hub.
+
+    The cached dataset has columns: input_ids (list[int]), prompt_len (int).
+    This avoids the 25-45 min download + tokenization step on every cold run.
+    """
+    from datasets import load_dataset as hf_load_dataset
+
+    print(f"Loading cached SFT dataset from {dataset_name}[{dataset_config}] ...")
+    try:
+        raw = hf_load_dataset(dataset_name, dataset_config, split="train", token=True)
+    except Exception as exc:
+        print(f"  [warn] Could not load cached dataset: {exc}")
+        print("  Falling back to full dataset processing (slow).")
+        # lazy import tokenizer for fallback
+        from transformers import AutoTokenizer as _AutoTokenizer
+
+        _tok = _AutoTokenizer.from_pretrained(
+            tokenizer_name, use_fast=True, trust_remote_code=True
+        )
+        if _tok.pad_token is None:
+            _tok.pad_token = _tok.eos_token
+        return load_mixed_dataset(_tok, max_samples, max_seq_len)
+
+    if max_samples is not None:
+        raw = raw.select(range(min(max_samples, len(raw))))
+
+    samples: List[Dict[str, Any]] = []
+    skipped = 0
+    for row in raw:
+        ids = row["input_ids"]
+        prompt_len = int(row["prompt_len"])
+        if len(ids) < 4 or len(ids) > max_seq_len:
+            skipped += 1
+            continue
+        samples.append(
+            {
+                "input_ids": torch.tensor(ids, dtype=torch.long),
+                "prompt_len": prompt_len,
+            }
+        )
+
+    print(f"  {len(samples)} samples loaded ({skipped} skipped for length).")
+    return samples
 
 
 def load_and_tokenize(
@@ -1051,6 +1115,75 @@ def compute_val_metrics(
     return val_ce, val_acc
 
 
+
+@torch.no_grad()
+def compute_val_metrics_distributed(
+    model: BaselineTRMMamba,
+    ema: ModelEMA,
+    val_samples: List[Dict[str, Any]],
+    pad_id: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+    vocab_size: int,
+    rank: int,
+    world_size: int,
+) -> Tuple[float, float]:
+    """Compute validation CE/accuracy across all ranks without a rank-0-only barrier."""
+    if world_size <= 1:
+        return compute_val_metrics(
+            model,
+            ema,
+            val_samples,
+            pad_id,
+            device,
+            dtype,
+            batch_size,
+            vocab_size,
+        )
+
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    total_correct = 0
+    global_stride = batch_size * world_size
+
+    with ema_scope(model, ema):
+        for start in range(rank * batch_size, len(val_samples), global_stride):
+            batch_samples = val_samples[start : start + batch_size]
+            if not batch_samples:
+                continue
+            batch = collate(batch_samples, pad_id)
+            input_ids = batch["input_ids"].to(device)
+            attn_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            with autocast_context(device, dtype):
+                logits = model(input_ids, attention_mask=attn_mask)
+
+            shift_logits = logits[:, :-1, :].contiguous().view(-1, vocab_size).float()
+            shift_labels = labels[:, 1:].contiguous().view(-1)
+            valid = shift_labels != -100
+            if valid.any():
+                total_loss += F.cross_entropy(
+                    shift_logits[valid], shift_labels[valid], reduction="sum"
+                ).item()
+                correct, count = masked_token_accuracy(shift_logits, shift_labels)
+                total_correct += correct
+                total_tokens += count
+
+    loss_tensor = torch.tensor([total_loss], device=device, dtype=torch.float64)
+    count_tensor = torch.tensor([total_tokens, total_correct], device=device, dtype=torch.long)
+    dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+    model.train()
+
+    global_tokens = int(count_tensor[0].item())
+    global_correct = int(count_tensor[1].item())
+    val_ce = float(loss_tensor.item()) / max(global_tokens, 1)
+    val_acc = global_correct / max(global_tokens, 1)
+    return val_ce, val_acc
+
 def save_checkpoint(
     output_dir: Path,
     step: int,
@@ -1375,9 +1508,16 @@ def load_latest_checkpoint(
 def run_training(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
     hf_token = resolve_hf_token(args.hf_token)
     if args.push_to_hub and not hf_token:
         sys.exit("--push_to_hub requires --hf_token or HF_TOKEN/HUGGINGFACE_HUB_TOKEN")
+
+    if not torch.cuda.is_available():
+        sys.exit(
+            "No CUDA GPU found. mamba-ssm requires CUDA kernels.\n"
+            "Run on Kaggle (T4/Dual-T4) or Google Colab."
+        )
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1392,34 +1532,25 @@ def run_training(argv: Optional[List[str]] = None) -> int:
         )
 
     if distributed and not dist_is_initialized():
-        if not torch.cuda.is_available():
-            raise SystemExit("DDP auto-launch expects CUDA GPUs, but CUDA is not available.")
         torch.cuda.set_device(local_rank)
-        os.environ.setdefault("NCCL_TIMEOUT", "1800")  # 30 min; kills genuine hangs fast
         dist.init_process_group(
             backend="nccl",
             init_method="env://",
             rank=rank,
             world_size=world_size,
-            device_id=torch.device(f"cuda:{local_rank}"),
+            timeout=timedelta(minutes=30),
         )
         process_group_owner = True
 
     set_seed(args.seed)
 
+    device = torch.device("cuda", local_rank) if distributed else torch.device("cuda")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if distributed:
-        if is_main_process(rank):
-            cleanup_temporary_checkpoints(output_dir)
-        dist.barrier()
-    else:
+    if is_main_process(rank):
         cleanup_temporary_checkpoints(output_dir)
-
     if distributed:
-        device = torch.device("cuda", local_rank)
-    else:
-        device = torch.device("cuda")
+        dist.barrier()
 
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -1444,18 +1575,20 @@ def run_training(argv: Optional[List[str]] = None) -> int:
         if is_main_process(rank):
             print()
             print("=" * 64)
-            print("  Stage 2 SFT - Project Ouroboros")
+            print("  Stage 2 SFT - Project Ouroboros (DDP v2)")
             print("=" * 64)
             print(f"  preset        : {args.preset}")
             print(f"  seq_len       : {args.max_seq_len}")
             print(f"  batch x accum : {args.batch_size} x {args.grad_accum} = {args.batch_size * args.grad_accum}")
             if distributed:
-                print(f"  world_size    : {world_size}  (DDP auto-enabled)")
+                print(f"  world_size    : {world_size}")
                 print(f"  per_gpu_batch : {args.batch_size // world_size}")
             print(f"  lr            : {args.lr}  warmup={args.warmup_steps}")
             print(f"  dtype         : {dtype}")
             print(f"  output_dir    : {output_dir}")
             print(f"  dataset_mix   : {args.dataset_mix}")
+            if args.dataset_mix == "cached":
+                print(f"  cached_ds     : {args.cached_dataset_name}[{args.cached_dataset_config}]")
             print(f"  answer_only_ce: True")
             print(f"  token_acc     : True  (answer tokens only)")
             print(f"  push_to_hub   : {args.push_to_hub}")
@@ -1473,25 +1606,25 @@ def run_training(argv: Optional[List[str]] = None) -> int:
             print(f"  vocab: {len(tokenizer):,}  pad_token: '{tokenizer.pad_token}'")
             print()
 
-        # -- Data loading: rank 0 only, then broadcast --------------------------------
-        if is_main_process(rank):
-            if args.dataset_mix == "full":
-                all_samples = load_mixed_dataset(tokenizer, args.max_samples, args.max_seq_len)
-            else:
-                all_samples = load_and_tokenize(args.dataset_name, tokenizer, args.max_samples, args.max_seq_len)
-            if not all_samples:
-                sys.exit("No samples loaded. Check dataset connectivity and --max_samples.")
+        # Each rank loads the same dataset locally. This avoids large Python-object broadcasts
+        # and makes the fast cached dataset path the recommended DDP mode.
+        if args.dataset_mix == "cached":
+            all_samples = load_cached_dataset(
+                args.cached_dataset_name,
+                args.cached_dataset_config,
+                args.tokenizer_name,
+                args.max_samples,
+                args.max_seq_len,
+            )
+        elif args.dataset_mix == "full":
+            all_samples = load_mixed_dataset(tokenizer, args.max_samples, args.max_seq_len)
         else:
-            all_samples = None
+            all_samples = load_and_tokenize(
+                args.dataset_name, tokenizer, args.max_samples, args.max_seq_len
+            )
 
-        if distributed:
-            # broadcast_object_list handles arbitrary Python objects (list of dicts with Tensors)
-            # via pickle. For 55k samples at avg 512 tokens each approx 225 MB - well within T4 RAM.
-            objects = [all_samples]
-            dist.broadcast_object_list(objects, src=0)
-            all_samples = objects[0]
-        elif all_samples is None:
-            sys.exit("No samples loaded.")
+        if not all_samples:
+            sys.exit("No samples loaded. Check dataset connectivity and --max_samples.")
 
         train_samples, val_samples = split_train_val_samples(
             all_samples=all_samples,
@@ -1499,7 +1632,6 @@ def run_training(argv: Optional[List[str]] = None) -> int:
             val_fraction=args.val_fraction,
         )
         if args.val_max_samples > 0 and len(val_samples) > args.val_max_samples:
-            # Deterministic subsample: always take the first N after the split permutation.
             val_samples = val_samples[:args.val_max_samples]
             if is_main_process(rank):
                 print(f"  val capped to {len(val_samples)} samples (--val_max_samples={args.val_max_samples})")
@@ -1511,7 +1643,12 @@ def run_training(argv: Optional[List[str]] = None) -> int:
 
         preset_kwargs = PRESETS[args.preset]
         padded_vocab = pad_vocab_size(len(tokenizer), 128)
-        config = BaselineConfig(vocab_size=padded_vocab, max_seq_len=args.max_seq_len, dropout=0.0, **preset_kwargs)
+        config = BaselineConfig(
+            vocab_size=padded_vocab,
+            max_seq_len=args.max_seq_len,
+            dropout=0.0,
+            **preset_kwargs,
+        )
         raw_model = BaselineTRMMamba(config).to(device=device, dtype=dtype)
         raw_model.train()
 
@@ -1556,15 +1693,16 @@ def run_training(argv: Optional[List[str]] = None) -> int:
             output_root = output_dir.resolve()
             resume_inside_output = (resume_path == output_root) or (output_root in resume_path.parents)
             if not resume_inside_output and is_main_process(rank):
-                print("  [resume] found local Stage 2 checkpoints in output_dir; preferring them over external --resume_from")
+                print(
+                    "  [resume] found local Stage 2 checkpoints in output_dir; "
+                    "preferring them over external --resume_from"
+                )
                 resume_search = output_dir
         if resume_search.is_dir():
-            if distributed:
-                if is_main_process(rank):
-                    cleanup_temporary_checkpoints(resume_search)
-                dist.barrier()
-            else:
+            if is_main_process(rank):
                 cleanup_temporary_checkpoints(resume_search)
+            if distributed:
+                dist.barrier()
 
         if distributed:
             if is_main_process(rank):
@@ -1586,11 +1724,8 @@ def run_training(argv: Optional[List[str]] = None) -> int:
             else:
                 start_step, start_epoch, samples_seen, need_opt_reset = 0, 0, 0, False
 
-            # Rank 0 may have downloaded a stage-scoped Hub checkpoint into
-            # .hub_resume/<hf_stage_subdir>/checkpoint-XXXXXXX. All other ranks must
-            # wait for that download to complete before restoring from the same local
-            # checkpoint, otherwise ranks can resume from different steps and enter
-            # different collectives on the very next iteration.
+            # Rank 0 handles any Hub download first, then every other rank restores locally
+            # from the same downloaded checkpoint path.
             dist.barrier()
 
             if not is_main_process(rank):
@@ -1610,33 +1745,13 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                     hf_stage_subdir=args.hf_stage_subdir,
                 )
 
-            local_resume_meta = [
-                int(start_step),
-                int(start_epoch),
-                int(samples_seen),
-                bool(need_opt_reset),
-            ]
-            gathered_resume_meta: List[Optional[List[Any]]] = [None for _ in range(world_size)]
-            dist.all_gather_object(gathered_resume_meta, local_resume_meta)
-            ref_resume_meta = gathered_resume_meta[0]
-            if ref_resume_meta is None:
-                raise RuntimeError("Rank 0 failed to produce resume metadata.")
-            if any(meta != ref_resume_meta for meta in gathered_resume_meta):
-                mismatch_summary = ", ".join(
-                    f"rank{idx}={meta}" for idx, meta in enumerate(gathered_resume_meta)
-                )
-                raise RuntimeError(
-                    "DDP resume state mismatch across ranks. "
-                    "This usually means a non-main rank did not restore the same checkpoint. "
-                    f"Details: {mismatch_summary}"
-                )
-            start_step, start_epoch, samples_seen, need_opt_reset = (
-                int(ref_resume_meta[0]),
-                int(ref_resume_meta[1]),
-                int(ref_resume_meta[2]),
-                bool(ref_resume_meta[3]),
+            start_step, start_epoch, samples_seen, need_opt_reset = verify_distributed_resume_meta(
+                start_step,
+                start_epoch,
+                samples_seen,
+                need_opt_reset,
+                device,
             )
-            dist.barrier()
         else:
             start_step, start_epoch, samples_seen, need_opt_reset = load_latest_checkpoint(
                 resume_search,
@@ -1745,21 +1860,12 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                 timeout_triggered = True
             return timeout_triggered
 
-        def broadcast_timeout() -> bool:
-            nonlocal timeout_triggered
-            if not distributed:
-                return timeout_triggered
-            tensor = torch.tensor([int(timeout_triggered)], device=device, dtype=torch.int32)
-            dist.broadcast(tensor, src=0)
-            timeout_triggered = bool(tensor.item())
-            return timeout_triggered
-
         while step < total_steps:
-            accum_loss = 0.0
+            accum_loss_numer = 0.0
             accum_correct = 0
             accum_tokens = 0
 
-            for _ in range(args.grad_accum):
+            for micro_idx in range(args.grad_accum):
                 micro_batch = fetch_micro_batch(samples_seen)
                 batch = collate(micro_batch, pad_id)
                 input_ids = batch["input_ids"].to(device)
@@ -1768,20 +1874,26 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                 tokens_since_log += int(attn_mask.sum().item())
                 samples_seen += args.batch_size
 
-                with autocast_context(device, dtype):
-                    logits = train_model(input_ids, attention_mask=attn_mask)
+                sync_context = (
+                    train_model.no_sync()
+                    if distributed and micro_idx < (args.grad_accum - 1)
+                    else nullcontext()
+                )
+                with sync_context:
+                    with autocast_context(device, dtype):
+                        logits = train_model(input_ids, attention_mask=attn_mask)
 
-                shift_logits = logits[:, :-1, :].contiguous().view(-1, config.vocab_size).float()
-                shift_labels = labels[:, 1:].contiguous().view(-1)
-                loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
-                n_correct, n_valid = masked_token_accuracy(shift_logits, shift_labels)
+                    shift_logits = logits[:, :-1, :].contiguous().view(-1, config.vocab_size).float()
+                    shift_labels = labels[:, 1:].contiguous().view(-1)
+                    loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+                    n_correct, n_valid = masked_token_accuracy(shift_logits, shift_labels)
 
-                if dtype == torch.float16:
-                    scaler.scale(loss / args.grad_accum).backward()
-                else:
-                    (loss / args.grad_accum).backward()
+                    if dtype == torch.float16:
+                        scaler.scale(loss / args.grad_accum).backward()
+                    else:
+                        (loss / args.grad_accum).backward()
 
-                accum_loss += loss.detach().item()
+                accum_loss_numer += loss.detach().item() * n_valid
                 accum_correct += n_correct
                 accum_tokens += n_valid
 
@@ -1800,11 +1912,12 @@ def run_training(argv: Optional[List[str]] = None) -> int:
             ema.update(raw_model)
 
             step += 1
-            mean_ce = distributed_mean(accum_loss / args.grad_accum, device)
+            global_loss_numer = distributed_sum_float(accum_loss_numer, device)
             global_correct = distributed_sum_int(accum_correct, device)
             global_valid = distributed_sum_int(accum_tokens, device)
+            mean_ce = global_loss_numer / max(global_valid, 1)
             mean_acc = global_correct / max(global_valid, 1)
-            grad_norm_log = distributed_mean(grad_norm, device)
+            grad_norm_log = distributed_mean_float(grad_norm, device)
 
             if is_main_process(rank) and spike_monitor.update(step, mean_ce):
                 tqdm.write(f"  [spike] step={step}  raw={mean_ce:.4f}  ema={spike_monitor.smoothed:.4f}")
@@ -1846,8 +1959,8 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                 t0 = time.perf_counter()
                 tokens_since_log = 0
 
-            check_timeout()
-            if broadcast_timeout():
+            timeout_triggered = broadcast_bool(check_timeout() if is_main_process(rank) else False, device)
+            if timeout_triggered:
                 current_epoch = samples_seen // max(len(train_samples), 1)
                 if is_main_process(rank):
                     print(f"  [timeout] Saving emergency checkpoint at step {step} ...")
@@ -1871,9 +1984,6 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                         hf_stage_subdir=args.hf_stage_subdir,
                     )
                     last_saved_step = step
-                # No barrier here: the timeout flag has already been broadcast for this
-                # step, and blocking rank 1 behind rank 0's slow emergency save can hang
-                # long enough to trip the NCCL watchdog near the session limit.
                 break
 
             if step % args.save_every == 0 or step == total_steps:
@@ -1899,11 +2009,22 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                         hf_stage_subdir=args.hf_stage_subdir,
                     )
                     last_saved_step = step
-                if distributed:
-                    dist.barrier()
 
             if step % args.val_every == 0 or step == total_steps:
-                if is_main_process(rank):
+                if distributed:
+                    last_val_ce, last_val_acc = compute_val_metrics_distributed(
+                        raw_model,
+                        ema,
+                        val_samples,
+                        pad_id,
+                        device,
+                        dtype,
+                        args.val_batch_size,
+                        config.vocab_size,
+                        rank,
+                        world_size,
+                    )
+                else:
                     last_val_ce, last_val_acc = compute_val_metrics(
                         raw_model,
                         ema,
@@ -1914,6 +2035,8 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                         args.val_batch_size,
                         config.vocab_size,
                     )
+
+                if is_main_process(rank):
                     tqdm.write(
                         f"  [val] step={step}  val_ce={last_val_ce:.4f}  val_acc={last_val_acc:.4f}"
                     )
@@ -1928,8 +2051,6 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                             "  * val_ce < 1.5 - Stage 2 success criterion met. "
                             "Consider proceeding to Phase 3."
                         )
-                if distributed:
-                    dist.barrier()
 
             if step % args.gen_every == 0 or step == total_steps:
                 if is_main_process(rank):
@@ -1944,8 +2065,6 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                         max_seq_len=args.max_seq_len,
                         wandb_run=wandb_run,
                     )
-                if distributed:
-                    dist.barrier()
 
         if pbar is not None:
             pbar.close()
@@ -1973,8 +2092,6 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                     hf_stage_subdir=args.hf_stage_subdir,
                 )
                 last_saved_step = step
-            if distributed:
-                dist.barrier()
 
         if is_main_process(rank):
             total_time = time.perf_counter() - session_start
@@ -2001,15 +2118,16 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                 print(f"  Status       : TIMEOUT - checkpoint saved at step {step}")
             print("=" * 64)
 
+        return 0
+    finally:
         if wandb_run is not None:
             import wandb
 
             try:
                 wandb.finish()
             except Exception as exc:
-                print(f"[warn] wandb.finish() failed during shutdown: {exc}")
-        return 0
-    finally:
+                if is_main_process(rank):
+                    print(f"[warn] wandb.finish() failed during shutdown: {exc}")
         if process_group_owner and dist_is_initialized():
             try:
                 dist.destroy_process_group()
@@ -2017,12 +2135,8 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                 if is_main_process(rank):
                     print(f"[warn] dist.destroy_process_group() failed: {exc}")
 
-
 def main(argv: Optional[List[str]] = None) -> int:
     argv_list = list(sys.argv[1:] if argv is None else argv)
-    args = parse_args(argv_list)
-    if maybe_launch_multi_gpu(args, argv_list):
-        return 0
     return run_training(argv_list)
 
 
