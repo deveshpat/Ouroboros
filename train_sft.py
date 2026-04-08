@@ -154,8 +154,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--val_batch_size",
         type=int,
-        default=16,
-        help="Micro-batch size for validation forward passes (no gradients; can be larger than --batch_size).",
+        default=2,
+        help=(
+            "Micro-batch size for validation forward passes (no gradients). "
+            "Default 2 is safe for DDP on dual T4 at max_seq_len=2048 "
+            "(logit tensor ~1.16 GiB float32). Increase only if VRAM permits."
+        ),
     )
     parser.add_argument(
         "--dataset_mix",
@@ -1397,7 +1401,8 @@ def load_latest_checkpoint(
     if hub_resume_dir.exists():
         direct_candidates.extend(list_local_checkpoints_recursive(hub_resume_dir))
 
-    local_stage2: List[Dict[str, Any]] = []
+    local_stage2_match: List[Dict[str, Any]] = []     # same data fingerprint
+    local_stage2_fallback: List[Dict[str, Any]] = []  # mismatched fingerprint (weights-only)
     local_stage1_fallback: Optional[Dict[str, Any]] = None
     local_stage1_label: Optional[str] = None
     seen_paths: set[str] = set()
@@ -1411,20 +1416,32 @@ def load_latest_checkpoint(
         if state is None or "model_state_dict" not in state:
             continue
         kind = _classify_state(state)
-        step = int(state.get("step", checkpoint_step_from_name(candidate.name)))
+        step_val = int(state.get("step", checkpoint_step_from_name(candidate.name)))
         if kind == "stage2":
-            local_stage2.append({"step": step, "label": candidate.name, "state": state})
+            saved_fp = dict(
+                state.get("data_fingerprint")
+                or build_data_fingerprint(dict(state.get("sft_config") or {}))
+            )
+            current_fp = build_data_fingerprint(current_sft_config or {})
+            is_match = not current_sft_config or saved_fp == current_fp
+            bucket = local_stage2_match if is_match else local_stage2_fallback
+            bucket.append({"step": step_val, "label": candidate.name, "state": state})
         elif kind == "stage1" and local_stage1_fallback is None:
             local_stage1_fallback = state
             local_stage1_label = candidate.name
 
-    local_stage2.sort(key=lambda record: record["step"], reverse=True)
+    local_stage2_match.sort(key=lambda r: r["step"], reverse=True)
+    local_stage2_fallback.sort(key=lambda r: r["step"], reverse=True)
+    local_stage2 = local_stage2_match + local_stage2_fallback  # matching first, always
 
     if verbose:
-        local_s2 = local_stage2[0]["step"] if local_stage2 else None
+        match_count = len(local_stage2_match)
+        fallback_count = len(local_stage2_fallback)
+        newest_match = local_stage2_match[0]["step"] if local_stage2_match else "none"
         print(
             f"  [resume] local Stage 2 candidates: {len(local_stage2)} "
-            f"(newest step={local_s2 if local_s2 is not None else 'none'})"
+            f"({match_count} fingerprint-match, {fallback_count} fallback; "
+            f"newest match step={newest_match})"
         )
 
     for record in local_stage2:
@@ -1459,11 +1476,14 @@ def load_latest_checkpoint(
             if verbose:
                 print(f"  [resume] checking Hub path {location} ({len(remote_names)} candidates)...")
 
+            hub_stage2_match: List[Dict[str, Any]] = []
+            hub_stage2_fallback: List[Dict[str, Any]] = []
             candidates_tried = 0
+
             for ckpt_name in remote_names:
                 if limit is not None and candidates_tried >= limit:
                     if verbose:
-                        print(f"  [resume] reached Hub download limit ({limit}) for {location}; stopping search there.")
+                        print(f"  [resume] reached Hub download limit ({limit}) for {location}; stopping.")
                     break
                 if verbose:
                     print(f"  [hub]  downloading {location}/{ckpt_name} ...")
@@ -1483,16 +1503,36 @@ def load_latest_checkpoint(
                 kind = _classify_state(state)
                 label = _join_repo_path(remote_prefix, ckpt_name) or ckpt_name
                 if kind == "stage2":
-                    try:
-                        restored = _restore_stage2(state, label)
-                        if restored is not None:
-                            return restored
-                    except Exception as exc:
-                        if verbose:
-                            print(f"  [resume] failed to restore Hub {label}: {exc} - skipping")
+                    saved_fp = dict(
+                        state.get("data_fingerprint")
+                        or build_data_fingerprint(dict(state.get("sft_config") or {}))
+                    )
+                    current_fp = build_data_fingerprint(current_sft_config or {})
+                    is_match = not current_sft_config or saved_fp == current_fp
+                    record = {
+                        "step": int(state.get("step", checkpoint_step_from_name(ckpt_name))),
+                        "label": label,
+                        "state": state,
+                    }
+                    if is_match:
+                        hub_stage2_match.append(record)
+                    else:
+                        hub_stage2_fallback.append(record)
                 elif kind == "stage1" and local_stage1_fallback is None:
                     local_stage1_fallback = state
                     local_stage1_label = label
+
+            # Always try matching fingerprint first, then fallbacks
+            hub_stage2_match.sort(key=lambda r: r["step"], reverse=True)
+            hub_stage2_fallback.sort(key=lambda r: r["step"], reverse=True)
+            for record in (hub_stage2_match + hub_stage2_fallback):
+                try:
+                    restored = _restore_stage2(record["state"], record["label"])
+                    if restored is not None:
+                        return restored
+                except Exception as exc:
+                    if verbose:
+                        print(f"  [resume] failed to restore Hub {record['label']}: {exc} - skipping")
 
     if local_stage1_fallback is not None:
         if verbose:
@@ -1508,7 +1548,7 @@ def load_latest_checkpoint(
 def run_training(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     hf_token = resolve_hf_token(args.hf_token)
     if args.push_to_hub and not hf_token:
         sys.exit("--push_to_hub requires --hf_token or HF_TOKEN/HUGGINGFACE_HUB_TOKEN")
@@ -2011,6 +2051,7 @@ def run_training(argv: Optional[List[str]] = None) -> int:
                     last_saved_step = step
 
             if step % args.val_every == 0 or step == total_steps:
+                torch.cuda.empty_cache()  # flush fragmented training activations
                 if distributed:
                     last_val_ce, last_val_acc = compute_val_metrics_distributed(
                         raw_model,

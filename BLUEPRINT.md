@@ -14,19 +14,18 @@ Novel hybrid Transformer-Mamba language model ("TRM-Mamba", 1:7 ratio) pre-train
 | Stage | Name | Status | Gate |
 |---|---|---|---|
 | 0 | Architecture & Viability | ✅ COMPLETE | All 4 gates passed |
-| 1 | Pre-training | ✅ COMPLETE (bypassed gate) | val_ce=5.32 @ step 21501, Hub: ckpt-0021000 |
-| 2 | SFT | 🔴 NEEDS REWRITE — DDP killed every session; removing DDP entirely | answer val_ce < 1.5 |
+| 1 | Pre-training | ✅ COMPLETE | val_ce=5.32 @ step 21501; Hub: ckpt-0021000 |
+| 2 | SFT | 🟡 IN PROGRESS — S8 ran 250 steps, OOM at val; S9 pending after `train_sft_fixes_prompt.md` applied | answer val_ce < 1.5 |
 | 3 | Recursive Inference (Coconut-Ouroboros) | ⬜ NOT STARTED | Stage 2 gate |
 | 4 | GRPO | ⬜ NOT STARTED | Stage 3 gate |
 | 5 | Quantization | ⬜ NOT STARTED | Stage 4 gate |
 
 ### Immediate next actions
 
-1. **Apply `train_sft_simplify_prompt.md`** to `train_sft.py` — strips DDP, adds `--dataset_mix=cached`.
-2. **Run `prepare_sft_dataset.py`** once (Kaggle or Colab) to process + upload the ~55k sample dataset to `WeirdRunner/Ouroboros` (dataset repo, config `sft-mix-v1`). This is a one-time operation.
-3. **Run S7** with the simplified single-GPU script.
+1. **Apply `train_sft_fixes_prompt.md`** to `train_sft.py` — lowers `val_batch_size` default to 2, flushes CUDA cache before val, fixes `NCCL_ASYNC_ERROR_HANDLING` deprecation, and adds fingerprint-aware resume bucketing.
+2. **Run S9** with the patched script (command in the prompt's verification checklist).
 
-**S7 run command (after both steps above):**
+**S9 run command:**
 ```bash
 python train_sft.py \
   --preset nano \
@@ -39,7 +38,7 @@ python train_sft.py \
   --warmup_steps 50 \
   --ema_decay 0.99 \
   --val_max_samples 500 \
-  --val_batch_size 16 \
+  --val_batch_size 2 \
   --output_dir runs/stage2 \
   --push_to_hub \
   --hf_token $HF_TOKEN \
@@ -77,15 +76,14 @@ FinalRMSNorm → LM Head (weight-tied)
 
 | Decision | Resolution |
 |---|---|
-| Tokenizer | Qwen2.5-0.5B; vocab_size=151_680 |
-| Stage 1 | Bypassed gate (val_ce 5.32 at step 21501). SFT starts from Hub ckpt-0021000. |
+| Tokenizer | Qwen2.5-0.5B; vocab_size=151,680 |
+| Stage 1 | Bypassed gate (val_ce=5.32 at step 21501). SFT starts from Hub ckpt-0021000. |
 | Stage 2 max_seq_len | 2048 — 1024 filtered 97% of reasoning chains |
 | Stage 2 dataset | Full mix: Stratos + MetaMathQA + OpenHermes + OpenR1-Math + OpenR1-Code (~55k samples). Pre-processed and cached at `WeirdRunner/Ouroboros` (dataset repo, config `sft-mix-v1`). |
 | Stage 2 target format | `User: {q}\n\nAssistant: <think>\n{reasoning}\n</think>\n{answer}{eos}` |
-| Stage 2 starting checkpoint | Hub ckpt-0002979 (stratos-only weights; optimizer reset on data change) |
-| Stage 2 DDP | **REMOVED.** 3 consecutive NCCL watchdog kills (steps 3522, 3750, ~3700). Single GPU only. |
-| Stage 2 data loading | Pre-processed cached HF dataset — load in <60s vs 25-45min from scratch |
-| Stage 2 val speed | 500 samples capped, batch_size=16 → ~10s per val run |
+| Stage 2 starting weights | Hub ckpt-0003500 (old full-mix; weights loaded, optimizer reset on fingerprint change) |
+| Stage 2 DDP | **Kept.** DDP worked for 250 steps in S8 before OOM. NCCL issues resolved. |
+| Stage 2 val_batch_size | **2** (not 16). At seq=2048, vocab=151680, batch=16 → 9.25 GiB logit tensor → OOM. |
 | Stage 3 recursion | Coconut-Ouroboros, K=1→4→16. See `stage3_agent_prompt.md`. |
 | Hub repo | WeirdRunner/Ouroboros (private model repo + dataset repo) |
 
@@ -95,50 +93,45 @@ FinalRMSNorm → LM Head (weight-tied)
 
 | File | Stage | Status | Notes |
 |---|---|---|---|
-| `baseline_trm_mamba.py` | 0 | ✅ COMPLETE | Stage 3 needs `forward_with_hidden` + `forward_from_embeddings` (surgical, see `stage3_agent_prompt.md`) |
+| `baseline_trm_mamba.py` | 0 | ✅ COMPLETE | Stage 3 needs `forward_with_hidden` + `forward_from_embeddings` (see `stage3_agent_prompt.md`) |
 | `viability_gate.py` | 0 | ✅ COMPLETE | |
 | `training_utils.py` | All | ✅ COMPLETE | Canonical Hub/checkpoint/EMA utilities. Do not duplicate. |
 | `pretrain.py` | 1 | ✅ COMPLETE | Last Hub ckpt: ckpt-0021000 |
-| `prepare_sft_dataset.py` | 2 | ✅ READY — run once | Builds + uploads cached SFT dataset to HF |
-| `train_sft.py` | 2 | 🔴 NEEDS PATCH | Apply `train_sft_simplify_prompt.md` (strip DDP, add cached mode) |
-| `train_sft_simplify_prompt.md` | 2 | ✅ COMPLETE | Feed to coding agent |
-| `stage3_agent_prompt.md` | 3 | ✅ COMPLETE | Feed to coding agent after Stage 2 gate |
+| `prepare_sft_dataset.py` | 2 | ✅ DONE | Dataset uploaded to HF as `sft-mix-v1` (55,230 samples) |
+| `train_sft.py` | 2 | 🟡 NEEDS PATCH | Apply `train_sft_fixes_prompt.md` |
+| `train_sft_single_gpu.py` | 2 | 🗄️ ARCHIVED | Superseded by `train_sft.py` (DDP v2) |
+| `train_sft_fixes_prompt.md` | 2 | ✅ READY | Feed to coding agent before S9 |
+| `stage3_agent_prompt.md` | 3 | ✅ READY | Feed to coding agent after Stage 2 gate |
 | `recursive_finetune.py` | 3 | ⬜ NOT CREATED | Generate from `stage3_agent_prompt.md` |
 
 ---
 
-## Part 4 — Stage 2 History & Root Cause
+## Part 4 — Stage 2 Session History
 
-| Session | Root Cause | Outcome |
+| Session | Outcome | Root Cause |
 |---|---|---|
-| S1 | max_seq_len=1024 filtered 97% of reasoning; no `<think>` learning | val_ce=4.92 plateau. Hub: ckpt-0002979. |
-| S2 | Bugs 6–10 cascade (Hub downloads in output_dir, prune deleted all local ckpts) | val_ce=5.71. All local Stage 2 ckpts deleted. |
-| S3–S4 | Dry-runs | Patches from `stage2_patch_prompt.md` verified. |
-| S5 | NCCL watchdog: val(557s)+gen(90s)=647s > 600s timeout at step ~3700 | val_ce plateau 5.62. Exit code 137 (SIGKILL). |
-| S6 | Same as S5 (rewrite not yet applied) | NCCL crash at step 3750. SIGABRT confirmed. |
-| S7 (this run) | **Same NCCL crash at step 3522** — `stage2_rewrite_prompt.md` was NOT applied before run | val_ce still plateau ~3.5 (only saw 3 steps). DDP removed permanently. |
-| S8 | ⬜ NEXT — after `train_sft_simplify_prompt.md` applied and cached dataset uploaded | — |
+| S1 | val_ce=4.92 plateau. Hub: ckpt-0002979. | max_seq_len=1024 filtered 97% of reasoning chains. |
+| S2 | val_ce=5.71. All local ckpts deleted. | Bugs 6–10 cascade; prune bug wiped local checkpoints. |
+| S3–S4 | Dry-runs only. | Patches from `stage2_patch_prompt.md` verified. |
+| S5 | SIGKILL (exit 137) at step ~3700. | val(557s)+gen(90s) combined > NCCL 600s timeout. |
+| S6 | SIGABRT at step 3750. | Same NCCL watchdog. `stage2_rewrite_prompt.md` not applied. |
+| S7 | SIGABRT at step 3522. | Same NCCL. Rewrite still not applied. |
+| S8 | 250 steps clean, OOM at first val. Hub: ckpt-0000250. | `val_batch_size=16` → 9.25 GiB logit tensor at seq=2048. |
+| S9 | ⬜ NEXT — after `train_sft_fixes_prompt.md` applied | — |
 
-**Why DDP was removed (not just patched):** Every patch attempt introduced new failure modes (barrier deadlocks, checkpoint broadcast races, val timing overruns). The throughput gain (~1.8×) does not justify the engineering cost for a 92M-parameter model on a ~55k sample dataset where a single T4 can complete 3 epochs in ~14 hours.
-
-**S7 training snippet (from log):**
-```
-step 3520  ce=3.2366  acc=0.4122  — training was running, then NCCL watchdog at step 3522
-[rank1]: Terminating the process after attempting to dump debug info, due to ProcessGroupNCCL watchdog hang.
-process 1 terminated with signal SIGABRT
-```
+**Why val OOM'd:** `logits[:, :-1, :].contiguous().view(-1, vocab_size).float()` with batch=16, seq=2048, vocab=151680 allocates `16 × 2047 × 151680 × 4 = 9.25 GiB`. Fix: default val_batch_size=2 (1.16 GiB) + `torch.cuda.empty_cache()` before val.
 
 ---
 
-## Part 5 — Stage 2 Hyperparameters (S8 target)
+## Part 5 — Stage 2 Hyperparameters (S9 target)
 
 ```
-batch_size=4, grad_accum=8  → effective batch=32
+batch_size=4, grad_accum=8  → effective batch=32 (4 per GPU × 2 GPUs × 8 accum steps)
 max_seq_len=2048, lr=3e-4, warmup_steps=50, ema_decay=0.99
-val_max_samples=500, val_batch_size=16
-dataset_mix=cached (load from WeirdRunner/Ouroboros, sft-mix-v1)
-num_epochs=3, total_steps≈4920 (depends on dataset size after split)
-~9-10s/step on single T4 → ~14h for full 3 epochs
+val_max_samples=500, val_batch_size=2
+dataset_mix=cached (WeirdRunner/Ouroboros, sft-mix-v1, 55,230 samples)
+num_epochs=3, total_steps≈4920 (52,469 train samples ÷ 32 eff batch)
+~10s/step on dual T4 → ~14h for 3 epochs
 ```
 
 ---
@@ -151,7 +144,7 @@ num_epochs=3, total_steps≈4920 (depends on dataset size after split)
 | 3.2 | 4 | Stage 3.1 final | runs/stage3_k4 |
 | 3.3 | 16 | Stage 3.2 final | runs/stage3_k16 |
 
-Full spec: `stage3_agent_prompt.md`. Required additions to `baseline_trm_mamba.py`: `forward_with_hidden()` and `forward_from_embeddings()`. Gate: answer val_ce ≤ stage2_val_ce × 1.05.
+Full spec: `stage3_agent_prompt.md`. Requires two additions to `baseline_trm_mamba.py`: `forward_with_hidden()` and `forward_from_embeddings()`. Gate: answer val_ce ≤ stage2_val_ce × 1.05.
 
 ---
 
@@ -169,7 +162,7 @@ Full spec: `stage3_agent_prompt.md`. Required additions to `baseline_trm_mamba.p
 # Stage 3 adds: "stage": "coconut", "n_latent", "lat_token_id", "vocab_size"
 ```
 
-Stage 2 loader handles Stage 1 checkpoints as cold-start (load weights + EMA, reset optimizer, return step=0).
+Stage 2 loader handles Stage 1 checkpoints as cold-start (load weights + EMA, reset optimizer, return step=0). Fingerprint mismatch also triggers reset with weights loaded.
 
 ---
 
@@ -177,7 +170,7 @@ Stage 2 loader handles Stage 1 checkpoints as cold-start (load weights + EMA, re
 
 | Stage | Platform | Estimate |
 |---|---|---|
-| 2 | Kaggle single T4 | ~14h/session for 3 epochs. 1–2 sessions. |
+| 2 | Kaggle Dual T4 | ~14h/session for 3 epochs. 1–2 sessions. |
 | 3 | TRC preferred | ~4–8h per K sub-stage |
 | 4 | TRC + unsloth | ~8–12h |
 | 5 | Local / Jetson | ~2h |

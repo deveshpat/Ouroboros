@@ -3,59 +3,56 @@
 
 ---
 
-## Stage 2 SFT — Session 7 (single GPU attempt, DDP still active, NCCL crash step 3522)
-**Script:** `train_sft.py`  **Date:** 2026-04-08  **Hardware:** Kaggle Dual T4  
-**Status:** 🔴 NCCL WATCHDOG KILL — `stage2_rewrite_prompt.md` was NOT applied before this run
+## Stage 2 SFT — Session 8 (DDP, OOM at step 250)
+**Script:** `train_sft.py` (DDP v2)  **Date:** 2026-04-08  **Hardware:** Kaggle Dual T4  
+**Status:** 🔴 OOM at first val step — `train_sft_fixes_prompt.md` pending
 
-**Root cause:** `maybe_launch_multi_gpu()` still in script → DDP auto-launched → same NCCL hang.
+**What worked:** DDP training ran cleanly. Checkpoint resume detected fingerprint mismatch (full→cached), correctly loaded weights from Hub ckpt-0003500, reset optimizer, started from step 0. Loss descended 3.68→2.57 over 250 steps.
 
-**Last training step visible before crash:**
+**Training snippet (S8):**
 ```
-step 3520  ce=3.2366  acc=0.4122  gn=1.5312  lr=2.71e-05  vram=1.499  tok/s=4594
+      1     3.6784      0.3993          -         -   1.2656   1.20e-05    1.527     4599
+     20     3.3819      0.4156          -         -   1.2969   1.26e-04    4.131     4577
+    100     3.1499      0.4089          -         -   1.4531   3.00e-04    4.345     4362
+    200     2.6602      0.4589          -         -   0.9648   2.99e-04    4.345     4236
+    240     2.6970      0.4450          -         -   1.0547   2.99e-04    1.546     4165
 ```
 
 **Crash (verbatim):**
 ```
-[rank1]: Terminating the process after attempting to dump debug info,
-         due to ProcessGroupNCCL watchdog hang.
-W0408 12:01:02.579000  torch/multiprocessing/spawn.py:165
-  Terminating process 96 via signal SIGTERM
-torch.multiprocessing.spawn.ProcessExitedException:
-  process 1 terminated with signal SIGABRT
+[rank1]: File "train_sft.py", line 1164, in compute_val_metrics_distributed
+[rank1]:   shift_logits = logits[:, :-1, :].contiguous().view(-1, vocab_size).float()
+[rank1]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 9.25 GiB.
+         GPU 1: 14.56 GiB total, 433.81 MiB free, 13.77 GiB allocated by PyTorch
+[rank0]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 9.25 GiB.
+         GPU 0: 14.56 GiB total, 3.63 GiB free, 10.62 GiB allocated by PyTorch
 ```
 
-**Resolution:** DDP removed entirely via `train_sft_simplify_prompt.md`. Single GPU only for all future Stage 2 runs.
+**Root cause:** `val_batch_size=16`, `max_seq_len=2048`, `vocab=151,680` → logit tensor `16 × 2047 × 151680 × 4 bytes = 9.25 GiB`. Fix: `val_batch_size=2` default + `torch.cuda.empty_cache()` before val.
+
+**Resume fingerprint log (correct behaviour):**
+```
+[resume] runs/stage2/checkpoint-0003500  loaded model weights (step=3500), 
+         but data stream changed — resetting step/optimizer/scheduler for new data.
+[resume] saved_data={'dataset_mix': 'full', ...}
+[resume] new_data  ={'dataset_mix': 'cached', ...}
+[resume] optimizer/scheduler reset; training starts fresh from step 0.
+```
+
+Hub checkpoint saved: `checkpoint-0000250` (partial, from graceful exit at OOM).
 
 ---
 
-## Stage 2 SFT — Session 6 (full-scale, DDP, NCCL watchdog crash at step 3750)
-**Date:** 2026-04-07  **Hardware:** Kaggle Dual T4  **Status:** 🔴 Same NCCL crash
+## Stage 2 SFT — Sessions 5–7 (DDP, NCCL watchdog kills)
+**Status:** 🔴 All killed by NCCL watchdog — root cause: combined val+gen time exceeded 600s
 
-**Crash (verbatim):**
-```
-WorkNCCL(SeqNum=13274, OpType=ALLREDUCE, NumelIn=1, NumelOut=1,
-  Timeout(ms)=600000) ran for 600003 milliseconds before timing out.
-[Rank 1] Watchdog caught collective operation timeout
-process 1 terminated with signal SIGABRT
-```
-Val CE at crash: `step=3750  val_ce=5.6254  val_acc=0.2203`
+| Session | Crash point | Last val_ce | Root cause |
+|---|---|---|---|
+| S5 | step ~3700, SIGKILL (exit 137) | 5.62 | val(557s)+gen(90s) > 600s NCCL timeout |
+| S6 | step 3750, SIGABRT | 5.63 | Same |
+| S7 | step 3522, SIGABRT | ~3.24 | Rewrite not applied before run |
 
----
-
-## Stage 2 SFT — Session 5 (full-scale, DDP, HARD TIMEOUT at 43200.6s)
-**Date:** 2026-04-06→07  **Hardware:** Kaggle Dual T4  **Status:** 🔴 SIGKILL (exit 137)
-
-**Val CE trajectory:**
-```
-Step    Val CE    Val Acc
-  250   5.7453    0.2170
- 1000   5.6532    0.2207
- 2500   5.6245    0.2206
- 3500   5.6257    0.2203   ← plateau, effectively no progress after step 2500
-```
-Generation: number loops throughout. No `<think>` tags ever appeared.
-
-Hub checkpoints retained: `checkpoint-0000500` through `checkpoint-~003700`
+**Fix applied:** `stage2_rewrite_prompt.md` → val capped to 500 samples (batch=16, ~10s), `gen_every=500`, NCCL timeout raised to 1800s.
 
 ---
 
@@ -63,9 +60,9 @@ Hub checkpoints retained: `checkpoint-0000500` through `checkpoint-~003700`
 
 | Session | Outcome |
 |---|---|
-| S1 | stratos-only, max_seq_len=1024, val_ce=4.92 plateau. No `<think>` (1024 filtered all reasoning). Hub: ckpt-0002979. |
-| S2 | full-mix DDP, Bugs 6–10, val_ce=5.71. All local Stage 2 ckpts deleted by prune bug. |
-| S3–S4 | Dry-runs only. Patches from `stage2_patch_prompt.md` verified. |
+| S1 | max_seq_len=1024, val_ce=4.92 plateau. Hub: ckpt-0002979. |
+| S2 | Bugs 6–10, val_ce=5.71. All local Stage 2 ckpts deleted by prune bug. |
+| S3–S4 | Dry-runs only. Patches verified. |
 
 ---
 
