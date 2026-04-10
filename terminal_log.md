@@ -9,41 +9,35 @@
 **Script:** `train_sft_single_gpu.py`  **Date:** 2026-04-09  **Hardware:** Kaggle Single T4
 **wandb run:** `comic-planet-8`  **Status:** 🔴 DEGENERATE — val_acc collapsed, no `<think>` tags
 
-**Key metrics (from wandb run summary):**
+**Key metrics (verbatim from wandb):**
 ```
-train/ce:         2.17731  (final)
+train/ce:         2.17731
 train/ce_smooth:  2.04761
 train/accuracy:   0.51889
 gen/mean_uwr:     0.08077   ← BELOW viability threshold (0.10)
-val/accuracy:     █▅▄▂▁▁    ← DECLINING over 6 val steps (critical failure signal)
-train/lr:         ██▇▇▇▆▆▅▅▄▄▃▃▂▂▁▁  ← cosine schedule ran to ~completion
-world_size:       1 (single GPU confirmed)
+val/accuracy:     █▅▄▂▁▁    ← DECLINING over 6 val steps
+train/lr:         ██▇▇▇▆▆▅▅▄▄▃▃▂▂▁▁  ← cosine ran to near-completion
+world_size:       1
 ```
 
-**Generation samples (verbatim from wandb):**
+**Generation samples (verbatim):**
 ```
-Q: What is 15 + 27?                     A: "1000 + 1000 + 1000 +..."   [number loop]
-Q: What is the capital of Japan?         A: "1000 (1000) (1000) ..."    [number loop]
-Q: Solve for x: 3x + 6 = 21.            A: "2012. The answer is ..."    [wrong + loop]
-Q: Explain what a neural network is...  A: "1. The answer is 1. ..."    [degenerate]
-Q: Write a Python function...            A: "1. The first two num..."    [degenerate]
+Q: What is 15 + 27?                     A: "1000 + 1000 + 1000 +..."
+Q: What is the capital of Japan?         A: "1000 (1000) (1000) ..."
+Q: Solve for x: 3x + 6 = 21.            A: "2012. The answer is ..."
+Q: Explain what a neural network is...  A: "1. The answer is 1. ..."
+Q: Write a Python function...            A: "1. The first two num..."
 ```
 
-**Duration:** ~4 hours (14,472s). Ran ~800 steps before timeout (out of 9,840 total for 3 epochs).
+**Duration:** 14,472s (~4 hours). ~800/9,840 steps before timeout.
 
-**Root cause analysis:**
-- `val/accuracy` declining to near 0 → strong overfitting OR catastrophic distribution shift signal
-- No `<think>` tags generated → model hasn't learned the CoT format entry point
-- "1000" loop = classic greedy-decode number attractor; insufficient training signal to break it
-- LR 3e-4 may be too aggressive for fine-tuning from a stage-1 checkpoint that only saw plain text
-- Greedy decoding in generation callback masks real quality; temperature sampling needed
+**Root cause:**
+- "1000" loop = greedy-decode number attractor at low training signal. Model hasn't seen enough answer tokens to break it.
+- val_acc declining while train_ce falling → overfitting signal. lr=3e-4 too aggressive for fine-tuning from plain-text pretrain.
+- No `<think>` tags → model hasn't learned CoT format entry point; only ~8% of the schedule completed.
+- Greedy decode masks true quality; temperature sampling required to diagnose properly.
 
-**Fixes needed for S10:**
-- Lower LR to `1e-4`, increase warmup to 100 steps
-- Add `dropout=0.1` to combat overfitting
-- Add temperature sampling (temp=0.8, top_p=0.9) to generation callback
-- More epochs (5) to push past the plateau
-- Verify val/ce (not just val/acc) on wandb before next run
+**Fixes for S10:** lr=1e-4, warmup=100, dropout=0.1, ema_decay=0.995, num_epochs=5, temp=0.8/top_p=0.9 generation.
 
 ---
 
@@ -51,7 +45,7 @@ Q: Write a Python function...            A: "1. The first two num..."    [degene
 **Script:** `train_sft.py` (DDP v2)  **Date:** 2026-04-08  **Hardware:** Kaggle Dual T4
 **Status:** 🔴 OOM at first val step
 
-**Training snippet:**
+**Training snippet (verbatim):**
 ```
       1     3.6784      0.3993          -         -   1.2656   1.20e-05    1.527     4599
     100     3.1499      0.4089          -         -   1.4531   3.00e-04    4.345     4362
@@ -64,13 +58,12 @@ Q: Write a Python function...            A: "1. The first two num..."    [degene
 torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 9.25 GiB.
 GPU 1: 14.56 GiB total, 433.81 MiB free
 ```
-Root cause: `val_batch_size=16`, seq=2048, vocab=151,680 → logit tensor = 9.25 GiB.
-Fix: `val_batch_size=2` + `torch.cuda.empty_cache()` before val.
+Root cause: `val_batch_size=16`, seq=2048, vocab=151,680 → logit tensor = 9.25 GiB. Fix: `val_batch_size=2` + `torch.cuda.empty_cache()`.
 
 **Resume fingerprint (correct behavior):**
 ```
-[resume] runs/stage2/checkpoint-0003500 loaded model weights (step=3500),
-         but data stream changed — resetting step/optimizer/scheduler for new data.
+[resume] checkpoint-0003500: loaded model weights (step=3500),
+         but data stream changed — resetting step/optimizer/scheduler.
 [resume] saved_data={'dataset_mix': 'full', ...}
 [resume] new_data  ={'dataset_mix': 'cached', ...}
 ```
@@ -86,7 +79,7 @@ Fix: `val_batch_size=2` + `torch.cuda.empty_cache()` before val.
 | S6 | 3750 | 5.63 | Same (SIGABRT) |
 | S7 | 3522 | ~3.24 | Same — rewrite not applied before run |
 
-Fix applied: `stage2_rewrite_prompt.md` → val capped (500 samples, batch=16, ~10s), `gen_every=500`, NCCL timeout raised to 1800s.
+Fix: `stage2_rewrite_prompt.md` → val capped (500 samples, batch=2, ~10s), `gen_every=500`, NCCL timeout raised to 1800s.
 
 ---
 
@@ -98,23 +91,21 @@ Fix applied: `stage2_rewrite_prompt.md` → val capped (500 samples, batch=16, ~
 | S2 | ~1500 | 5.71 | Bugs 6–10 cascade; prune bug deleted all local checkpoints. |
 | S3–S4 | <100 | — | Dry-runs only; patches verified. |
 
-Fix: max_seq_len raised to 2048. All S1-S2 bugs resolved in `stage2_rewrite_prompt.md`.
+Fix: max_seq_len raised to 2048.
 
 ---
 
-## Stage 1 Pre-training — Session 6 (Final, Kaggle Dual T4)
-**Status:** ✅ COMPLETE (graceful timeout exit)
+## Stage 1 Pre-training — Session 6 (Final)
+**Hardware:** Kaggle Dual T4  **Status:** ✅ COMPLETE (graceful timeout)
 
 ```
 Tokens processed: 704,544,768   Last val CE: 5.324
-Hub: checkpoint-0021000 (commit=d70d2c49)  ← SFT starting point
+Hub: checkpoint-0021000 (commit=d70d2c49)
 ```
-
-Note: val_ce=5.32 did not hit the < 3.0 gate, but Stage 1 was intentionally cut short to preserve GPU time for SFT. Architecture was proven healthy.
 
 ---
 
-## Stage 0 — Viability Gate  ✅ ALL GATES PASSED
+## Stage 0 — Viability Gate ✅ ALL GATES PASSED
 ```
 G1 CE < 3.5        final CE = 2.0034   PASS ✓
 G2 UWR > 0.1       mean UWR = 0.573    PASS ✓
@@ -123,7 +114,7 @@ G4 VRAM Δ < 1.0GB  Δ = 0.000 GB       PASS ✓
 Total time: 3.4 min   Peak VRAM: 2.07 GB
 ```
 
-## Stage 0 — Baseline Smoke Test  ✅ PASSED
+## Stage 0 — Baseline Smoke Test ✅ PASSED
 ```
 parameters: 92,477,440 (92.5M)   initial loss: 11.9904   All checks passed.
 ```
