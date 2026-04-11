@@ -20,10 +20,10 @@ References:
   Jamba Reasoning 3B (AI21, ai21labs/AI21-Jamba-Reasoning-3B, Oct 2025)
 
 Install:
-  !pip install -q "transformers>=4.54.0" peft datasets tqdm wandb bitsandbytes accelerate
-  !pip install -q flash-attn --no-build-isolation   # optional but recommended
-  !pip install -q https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl
-  !pip install -q https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl
+  !pip install -q "transformers>=4.54.0" peft datasets tqdm wandb bitsandbytes accelerate \
+   https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/flash_attn-2.8.3+cu128torch2.10cxx11abiFALSE-cp312-cp312-linux_x86_64.whl \
+   https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl \
+   https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl
 Run (smoke test, Colab T4):
   !python jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
@@ -375,6 +375,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session_timeout_hours", type=float, default=11.0)
     parser.add_argument("--graceful_exit_buffer_minutes", type=float, default=20.0)
 
+    # ── Hub checkpoint sync ───────────────────────────────────────────────────
+    parser.add_argument("--push_to_hub", action="store_true",
+        help="Push checkpoints to HF Hub after each epoch save.")
+    parser.add_argument("--hf_token", default=None,
+        help="HF write token. Falls back to HF_TOKEN env var.")
+    parser.add_argument("--hf_repo_id", default="WeirdRunner/Ouroboros",
+        help="HF model repo to sync checkpoints to.")
+    parser.add_argument("--hf_stage_subdir", default="runs/stage3",
+        help="Remote subdirectory inside the HF repo for Stage 3 checkpoints.")
+  
     # I/O
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--output_dir", default="runs/stage3")
@@ -567,19 +577,118 @@ def load_model_and_tokenizer(
     return model, tokenizer, d_model, lat_token_id
 
 
+def _download_dataset_from_hub(
+    data_dir: Path,
+    hf_repo_id: str = "WeirdRunner/Ouroboros",
+    hf_config: str = "coconut-v1",
+) -> None:
+    """
+    Download coconut-v1 from HF Hub and write local train.jsonl / val.jsonl / stats.json.
+    Called automatically when local files are missing.
+    """
+    try:
+        from datasets import load_dataset as hf_load_dataset
+    except ImportError:
+        raise ImportError("pip install datasets")
+
+    is_main = _is_main_process()
+    if is_main:
+        print(f"  [data] Local files missing. Downloading {hf_repo_id}[{hf_config}] from Hub...")
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    def _write_split(split_name: str, hf_split: str, out_path: Path) -> List[Dict[str, Any]]:
+        try:
+            ds = hf_load_dataset(hf_repo_id, hf_config, split=hf_split, token=True)
+        except Exception as exc:
+            if is_main:
+                print(f"  [data] Could not load split '{hf_split}': {exc}")
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        with out_path.open("w", encoding="utf-8") as fh:
+            for row in ds:
+                # 'steps' is JSON-encoded string on Hub; decode it
+                steps = row.get("steps", [])
+                if isinstance(steps, str):
+                    try:
+                        steps = json.loads(steps)
+                    except json.JSONDecodeError:
+                        steps = [steps]
+                sample = {
+                    "id":          row.get("id", ""),
+                    "source":      row.get("source", ""),
+                    "question":    row.get("question", ""),
+                    "steps":       steps,
+                    "answer_full": row.get("answer_full", ""),
+                    "answer_norm": row.get("answer_norm", ""),
+                    "n_steps":     int(row.get("n_steps", len(steps))),
+                }
+                fh.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                rows.append(sample)
+
+        if is_main:
+            print(f"  [data] {split_name}: {len(rows)} samples -> {out_path}")
+        return rows
+
+    train_rows = _write_split("train", "train",      data_dir / "train.jsonl")
+    val_rows   = _write_split("val",   "validation", data_dir / "val.jsonl")
+
+    # Regenerate stats.json from downloaded data
+    def _quick_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not rows:
+            return {}
+        n_steps = [r["n_steps"] for r in rows]
+        by_source: Dict[str, int] = {}
+        for r in rows:
+            by_source[r["source"]] = by_source.get(r["source"], 0) + 1
+        sorted_steps = sorted(n_steps)
+        return {
+            "n_samples":      len(rows),
+            "n_steps_mean":   round(sum(n_steps) / len(n_steps), 2),
+            "n_steps_min":    min(n_steps),
+            "n_steps_max":    max(n_steps),
+            "n_steps_median": sorted_steps[len(sorted_steps) // 2],
+            "by_source":      by_source,
+        }
+
+    stats = {"train": _quick_stats(train_rows), "val": _quick_stats(val_rows)}
+    with (data_dir / "stats.json").open("w", encoding="utf-8") as fh:
+        json.dump(stats, fh, indent=2)
+
+    if is_main:
+        t = stats.get("train", {})
+        print(f"  [data] stats.json written. "
+              f"median_steps={t.get('n_steps_median')}  "
+              f"recommended --max_stage={t.get('n_steps_median')}")
+
+
 def load_canonical_dataset(
     data_dir: Path,
     max_samples: Optional[int],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Load train.jsonl, val.jsonl, and stats.json from prepare_coconut_dataset.py output.
-    Each sample: {id, source, question, steps, answer_full, answer_norm, n_steps}
+    Load train.jsonl, val.jsonl, and stats.json.
+    If local files are missing, auto-downloads from HF Hub (WeirdRunner/Ouroboros, coconut-v1).
     """
+    train_path = data_dir / "train.jsonl"
+    val_path   = data_dir / "val.jsonl"
+    stats_path = data_dir / "stats.json"
+
+    if not train_path.exists():
+        _download_dataset_from_hub(data_dir)
+
+    # Verify download succeeded
+    if not train_path.exists():
+        raise FileNotFoundError(
+            f"train.jsonl not found at {train_path} and Hub download failed.\n"
+            "Run: python prepare_coconut_dataset.py --output_dir data/coconut_v1 --push_to_hub"
+        )
 
     def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
                 line = line.strip()
                 if not line:
                     continue
@@ -593,25 +702,15 @@ def load_canonical_dataset(
                 rows.append(row)
         return rows
 
-    train_path = data_dir / "train.jsonl"
-    val_path = data_dir / "val.jsonl"
-    stats_path = data_dir / "stats.json"
-
-    if not train_path.exists():
-        raise FileNotFoundError(
-            f"train.jsonl not found at {train_path}. "
-            "Run prepare_coconut_dataset.py first."
-        )
-
     train = _load_jsonl(train_path)
-    val = _load_jsonl(val_path) if val_path.exists() else []
+    val   = _load_jsonl(val_path) if val_path.exists() else []
     stats = json.loads(stats_path.read_text(encoding="utf-8")) if stats_path.exists() else {}
 
     if max_samples is not None:
-        n_val = max(1, max_samples // 20) if val else 0
+        n_val   = max(1, max_samples // 20) if val else 0
         n_train = max(max_samples - n_val, 0)
-        train = train[:n_train]
-        val = val[:n_val] if n_val else []
+        train   = train[:n_train]
+        val     = val[:n_val] if n_val else []
 
     if _is_main_process():
         print(f"  Loaded {len(train)} train / {len(val)} val from {data_dir}")
@@ -1105,7 +1204,154 @@ def evaluate_stage(
         halt_gate.train()
     return ce_numer / max(ce_denom, 1), n_correct / max(n_total, 1)
 
+def _resolve_hf_token(cli_value: Optional[str]) -> Optional[str]:
+    """CLI > Kaggle Secrets > Colab Secrets > env var."""
+    if cli_value:
+        return cli_value
+    # Kaggle
+    try:
+        from kaggle_secrets import UserSecretsClient
+        tok = UserSecretsClient().get_secret("HF_TOKEN")
+        if tok:
+            return tok
+    except Exception:
+        pass
+    # Colab
+    try:
+        from google.colab import userdata as _cu
+        tok = _cu.get("HF_TOKEN")
+        if tok:
+            return tok
+    except Exception:
+        pass
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
+
+def _hub_upload_checkpoint(
+    ckpt_dir: Path,
+    hf_repo_id: str,
+    hf_token: str,
+    remote_prefix: str = "runs/stage3",
+    timeout_s: float = 300.0,
+) -> bool:
+    """
+    Upload one checkpoint directory to HF Hub. Fire-and-forget — never raises.
+    Uses run_as_future so the training loop is not blocked by slow uploads.
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        return False
+
+    remote_name = f"{remote_prefix.strip('/')}/{ckpt_dir.name}".strip("/")
+    try:
+        api = HfApi(token=hf_token)
+        api.create_repo(repo_id=hf_repo_id, private=True, exist_ok=True, token=hf_token)
+        future = api.upload_folder(
+            repo_id=hf_repo_id,
+            folder_path=str(ckpt_dir),
+            path_in_repo=remote_name,
+            token=hf_token,
+            commit_message=f"Upload {ckpt_dir.name}",
+            run_as_future=True,
+        )
+        future.result(timeout=timeout_s)
+        if _is_main_process():
+            print(f"  [hub] uploaded {remote_name} -> {hf_repo_id}")
+        return True
+    except Exception as exc:
+        if _is_main_process():
+            print(f"  [hub] upload failed for {remote_name}: {exc}")
+        return False
+
+
+def _hub_download_checkpoint(
+    ckpt_name: str,
+    local_dir: Path,
+    hf_repo_id: str,
+    hf_token: str,
+    remote_prefix: str = "runs/stage3",
+) -> Optional[Path]:
+    """
+    Download a single named checkpoint folder from HF Hub into local_dir.
+    Returns the local path on success, None on failure.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return None
+
+    local_dir.mkdir(parents=True, exist_ok=True)
+    remote_path = f"{remote_prefix.strip('/')}/{ckpt_name}".strip("/")
+    dest = local_dir / remote_path
+
+    try:
+        snapshot_download(
+            repo_id=hf_repo_id,
+            local_dir=str(local_dir),
+            token=hf_token,
+            force_download=True,
+            allow_patterns=[f"{remote_path}/*"],
+        )
+        return dest if dest.exists() else None
+    except Exception as exc:
+        if _is_main_process():
+            print(f"  [hub] download failed for {remote_path}: {exc}")
+        return None
+
+
+def _list_hub_stage_checkpoints(
+    hf_repo_id: str,
+    hf_token: str,
+    remote_prefix: str = "runs/stage3",
+) -> List[Tuple[int, int, str]]:
+    """
+    Return [(stage_k, step, ckpt_name)] for all checkpoint-* dirs on Hub,
+    sorted newest first (stage desc, step desc).
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        return []
+    try:
+        api = HfApi(token=hf_token)
+        files = list(api.list_repo_files(repo_id=hf_repo_id, token=hf_token))
+    except Exception:
+        return []
+
+    prefix = remote_prefix.strip("/")
+    found: set[Tuple[int, int, str]] = set()
+    for f in files:
+        # e.g. runs/stage3/stage_2/checkpoint-0001234/training_state.pt
+        parts = f.split("/")
+        try:
+            prefix_parts = prefix.split("/")
+            if parts[:len(prefix_parts)] != prefix_parts:
+                continue
+            rest = parts[len(prefix_parts):]          # ['stage_2', 'checkpoint-...', ...]
+            if len(rest) < 2:
+                continue
+            stage_dir = rest[0]   # 'stage_2'
+            ckpt_dir  = rest[1]   # 'checkpoint-0001234' or 'best'
+            stage_k = _parse_stage_dir_name(stage_dir)
+            if stage_k is None:
+                continue
+            if not (ckpt_dir.startswith("checkpoint-") or ckpt_dir == "best"):
+                continue
+            if ckpt_dir == "best":
+                step = 0
+            else:
+                tail = ckpt_dir.split("-")[-1]
+                step = int(tail) if tail.isdigit() else 0
+            # remote name relative to prefix: stage_2/checkpoint-0001234
+            rel = "/".join(rest[:2])
+            found.add((stage_k, step, rel))
+        except Exception:
+            continue
+
+    # Sort: best = stage desc, then step desc ('best' checkpoints get step=0, listed last per stage)
+    return sorted(found, key=lambda x: (x[0], x[1]), reverse=True)
+  
 def save_checkpoint(
     output_dir: Path,
     step: int,
@@ -1158,6 +1404,15 @@ def save_checkpoint(
     label = "best" if tag == "best" else "saved"
     if _is_main_process():
         print(f"  [ckpt] {label} -> {ckpt}  acc={val_acc}  ce={val_ce}")
+      
+    # ── NEW: Hub push ─────────────────────────────────────────────────────────
+    hf_token  = getattr(args, "_resolved_hf_token", None)
+    push      = getattr(args, "push_to_hub", False)
+    repo_id   = getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros")
+    subdir    = getattr(args, "hf_stage_subdir", "runs/stage3")
+    if push and hf_token and _is_main_process():
+        _hub_upload_checkpoint(ckpt, repo_id, hf_token, remote_prefix=subdir)
+
     return ckpt
 
 
@@ -1299,40 +1554,85 @@ def make_timeout_checker(args: argparse.Namespace, rank: int):
     return check
 
 
-def find_latest_resume_checkpoint(output_dir: Path) -> Optional[Path]:
+def find_latest_resume_checkpoint(
+    output_dir: Path,
+    hf_token: Optional[str] = None,
+    hf_repo_id: str = "WeirdRunner/Ouroboros",
+    hf_stage_subdir: str = "runs/stage3",
+) -> Optional[Path]:
     """
-    Discover the latest in-progress checkpoint in output_dir.
-    Intentionally ignores /best so reruns prefer the freshest resumable state.
+    Find the latest in-progress checkpoint.
+
+    Search order:
+      1. Local output_dir (fastest, preferred)
+      2. HF Hub (fallback for fresh Kaggle sessions)
+
+    'best' checkpoints are intentionally skipped so reruns prefer
+    the freshest resumable training state, not the best eval snapshot.
     """
+    # ── Local scan ────────────────────────────────────────────────────────────
     best_path: Optional[Path] = None
-    best_key: Optional[Tuple[int, int, int, int]] = None
-    if not output_dir.exists():
+    best_key:  Optional[Tuple[int, int, int, int]] = None
+
+    if output_dir.exists():
+        for stage_dir in output_dir.iterdir():
+            stage_k = _parse_stage_dir_name(stage_dir.name)
+            if stage_k is None or not stage_dir.is_dir():
+                continue
+            for ckpt in stage_dir.iterdir():
+                if not ckpt.is_dir() or not ckpt.name.startswith("checkpoint-"):
+                    continue
+                state_path = ckpt / "training_state.pt"
+                if not state_path.exists():
+                    continue
+                try:
+                    state = _read_training_state(ckpt, map_location="cpu")
+                except Exception:
+                    continue
+                key = (
+                    stage_k,
+                    int(state.get("epoch", -1)),
+                    int(state.get("step_in_epoch", -1)),
+                    int(state.get("step", -1)),
+                )
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_path = ckpt
+
+    if best_path is not None:
+        return best_path
+
+    # ── Hub fallback (only when local is empty) ───────────────────────────────
+    if not hf_token:
         return None
 
-    for stage_dir in output_dir.iterdir():
-        stage_num = _parse_stage_dir_name(stage_dir.name)
-        if stage_num is None or not stage_dir.is_dir():
-            continue
-        for ckpt in stage_dir.iterdir():
-            if not ckpt.is_dir() or not ckpt.name.startswith("checkpoint-"):
-                continue
-            state_path = ckpt / "training_state.pt"
-            if not state_path.exists():
-                continue
-            try:
-                state = _read_training_state(ckpt, map_location="cpu")
-            except Exception:
-                continue
-            key = (
-                stage_num,
-                int(state.get("epoch", -1)),
-                int(state.get("step_in_epoch", -1)),
-                int(state.get("step", -1)),
-            )
-            if best_key is None or key > best_key:
-                best_key = key
-                best_path = ckpt
-    return best_path
+    if _is_main_process():
+        print("  [resume] No local checkpoints found. Scanning Hub...")
+
+    hub_candidates = _list_hub_stage_checkpoints(hf_repo_id, hf_token, hf_stage_subdir)
+    # Skip 'best' entries (step==0) for resuming; prefer checkpoint-NNNNNNN
+    hub_candidates = [(k, s, n) for k, s, n in hub_candidates if not n.endswith("/best")]
+
+    hub_resume_dir = output_dir / ".hub_resume"
+
+    for stage_k, step, rel_name in hub_candidates:
+        ckpt_name = rel_name.split("/")[-1]   # e.g. checkpoint-0001234
+        if _is_main_process():
+            print(f"  [hub] downloading {rel_name} ...")
+        downloaded = _hub_download_checkpoint(
+            ckpt_name=ckpt_name,
+            local_dir=hub_resume_dir,
+            hf_repo_id=hf_repo_id,
+            hf_token=hf_token,
+            # remote_prefix must include the stage subdir AND stage folder
+            remote_prefix=f"{hf_stage_subdir}/stage_{stage_k}",
+        )
+        if downloaded is not None and (downloaded / "training_state.pt").exists():
+            if _is_main_process():
+                print(f"  [hub] using {rel_name} as resume checkpoint")
+            return downloaded
+
+    return None
 
 
 @torch.no_grad()
@@ -1469,6 +1769,14 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    hf_token = _resolve_hf_token(getattr(args, "hf_token", None))
+    args._resolved_hf_token = hf_token   # used by save_checkpoint
+
+    if getattr(args, "push_to_hub", False) and not hf_token:
+        if _is_main_process():
+            print("[warn] --push_to_hub set but no HF token found; Hub sync disabled.")
+        args.push_to_hub = False
+      
     wandb_run = None
     if is_main and args.wandb_mode != "disabled":
         try:
@@ -1490,9 +1798,19 @@ def main() -> None:
 
     resume_path: Optional[Path] = Path(args.resume_from) if args.resume_from else None
     if resume_path is None:
-        resume_path = find_latest_resume_checkpoint(output_dir)
+        resume_path = find_latest_resume_checkpoint(
+            output_dir,
+            hf_token=hf_token,
+            hf_repo_id=getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros"),
+            hf_stage_subdir=getattr(args, "hf_stage_subdir", "runs/stage3"),
+        )
+
+        # Clean up hub_resume dir after loading (keeps output_dir tidy)
+        hub_resume_dir = output_dir / ".hub_resume"
+      
         if resume_path is not None and is_main:
             print(f"  [resume] discovered latest checkpoint: {resume_path}")
+          
     if resume_path is not None and not (resume_path / "training_state.pt").exists():
         if is_main:
             print(f"  [warn] resume checkpoint not found: {resume_path}")
@@ -1529,6 +1847,11 @@ def main() -> None:
             device=device,
             verbose=is_main,
         )
+
+        # Cleanup Hub resume cache — files are now loaded, no need to keep the copy
+        if hub_resume_dir.exists():
+           shutil.rmtree(hub_resume_dir, ignore_errors=True)
+
         resume_stage = int(resume_state.get("stage_k", 0))
         global_step = int(resume_state.get("step", 0))
         if args.use_halt_gate:
