@@ -499,14 +499,6 @@ def load_model_and_tokenizer(
     if device.type == "cuda":
         load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
 
-    if _TF_VERSION >= (4, 54):
-        load_kwargs["use_mamba_kernels"] = False
-    elif is_main:
-        print(
-            f"  [warn] transformers {_tf.__version__} < 4.54.0; "
-            "use_mamba_kernels kwarg skipped (upgrade for reliable Mamba CPU fallback)"
-        )
-
     if args.use_4bit:
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
