@@ -498,7 +498,10 @@ def load_model_and_tokenizer(
 
     if device.type == "cuda":
         load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
-
+    # Always disable CUDA Mamba kernels — fast path requires mamba_ssm CUDA extensions
+    # compiled for the exact env, which is unreliable on Colab/variable environments.
+    load_kwargs["use_mamba_kernels"] = False
+  
     if args.use_4bit:
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
