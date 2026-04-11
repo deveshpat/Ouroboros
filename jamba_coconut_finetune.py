@@ -20,25 +20,25 @@ References:
   Jamba Reasoning 3B (AI21, ai21labs/AI21-Jamba-Reasoning-3B, Oct 2025)
 
 Install:
-  pip install "transformers>=4.54.0" peft datasets tqdm wandb bitsandbytes accelerate
-  pip install flash-attn --no-build-isolation   # optional but recommended
-  pip install causal-conv1d>=1.2.0 mamba-ssm    # optional; use_mamba_kernels=False if absent
-
+  !pip install -q "transformers>=4.54.0" peft datasets tqdm wandb bitsandbytes accelerate
+  !pip install -q flash-attn --no-build-isolation   # optional but recommended
+  !pip install -q https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl
+  !pip install -q https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl
 Run (smoke test, Colab T4):
-  python jamba_coconut_finetune.py \
+  !python jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
     --epochs_per_stage 1 --max_stage 2 --max_samples 200 \
     --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
 
 Run (Phase 3.1 through 3.K, Kaggle Dual T4):
-  torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
+  !torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
     --epochs_per_stage 3 --batch_size 2 --grad_accum 8 \
     --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
     --output_dir runs/stage3_curriculum
 
 Run (Phase 3.4, DGAC gate, from Stage K best checkpoint):
-  python jamba_coconut_finetune.py \
+  !python jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
     --use_halt_gate --resume_from runs/stage3_curriculum/stage_K/best \
     --epochs_per_stage 3 --output_dir runs/stage3_dgac
