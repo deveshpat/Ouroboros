@@ -9,10 +9,16 @@ Each sample is suitable for Coconut's progressive replacement curriculum.
 Run once before training:
     python prepare_coconut_dataset.py --output_dir data/coconut_v1
 
+To also push to the HuggingFace Hub (recommended for Kaggle resume):
+    python prepare_coconut_dataset.py --output_dir data/coconut_v1 \\
+        --push_to_hub --hf_token YOUR_TOKEN
+
 Output files:
     data/coconut_v1/train.jsonl
     data/coconut_v1/val.jsonl
     data/coconut_v1/stats.json
+
+Hub config pushed as:  WeirdRunner/Ouroboros  (config: coconut-v1, type: dataset)
 
 Canonical sample format (one JSON object per line):
     {
@@ -28,16 +34,6 @@ Canonical sample format (one JSON object per line):
 Training script (jamba_coconut_finetune.py) reads ONLY this output —
 it never loads raw HuggingFace datasets. This strict separation means the
 preprocessing can be re-run or audited without touching the training code.
-
-Sources (same as sft-mix-v1, raw not tokenized):
-    1. bespokelabs/Bespoke-Stratos-17k   — rich <think> blocks
-    2. meta-math/MetaMathQA              — augmented math CoT
-    3. teknium/OpenHermes-2.5            — general instruction; mostly filtered at min_steps
-    4. open-r1/OpenR1-Math-220k          — RLVR math reasoning
-    5. open-r1/OpenR1-Code               — code with reasoning traces
-
-Samples that segment into fewer than --min_steps steps are dropped automatically.
-No source requires special-casing; the filter handles quality uniformly.
 """
 from __future__ import annotations
 
@@ -45,13 +41,27 @@ import argparse
 import hashlib
 import json
 import math
+import os
+import random
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# ── Colab-friendly token resolution ──────────────────────────────────────────
+# Priority: 1) Colab Secrets  2) env var  3) CLI --hf_token  4) placeholder
+_COLAB_HF_TOKEN: Optional[str] = None
 try:
-    from datasets import load_dataset
+    from google.colab import userdata as _colab_userdata
+    _COLAB_HF_TOKEN = _colab_userdata.get("HF_TOKEN")
+except Exception:
+    pass
+
+# Local Google Drive backup path (used when --push_to_hub is set)
+_DRIVE_BACKUP_PATH = "/content/drive/MyDrive/Ouroboros/coconut_dataset_backup"
+
+try:
+    from datasets import Dataset, load_dataset
     from tqdm.auto import tqdm
 except ImportError:
     sys.exit("pip install datasets tqdm")
@@ -71,7 +81,6 @@ _NUMBERED_RE    = re.compile(r"^(?:\d+[\.\)]\s+|Step\s+\d+[:\.]?\s+)", re.MULTIL
 # ── Step segmentation ─────────────────────────────────────────────────────────
 
 def _clean_step(text: str) -> str:
-    """Strip leading/trailing whitespace and remove step prefixes like '1. ' or 'Step 3: '."""
     text = text.strip()
     text = re.sub(r"^(?:\d+[\.\)]\s+|Step\s+\d+[:\.]?\s+)", "", text, flags=re.IGNORECASE)
     return text.strip()
@@ -92,22 +101,17 @@ def segment_into_steps(text: str, min_step_chars: int = 15) -> List[str]:
     if not text or not text.strip():
         return []
 
-    # 1. Numbered / labelled steps
     if _NUMBERED_RE.search(text):
         raw = _NUMBERED_RE.split(text)
         steps = [_clean_step(s) for s in raw if s.strip()]
-    # 2. Double-newline paragraphs
     elif "\n\n" in text:
         steps = [_clean_step(s) for s in text.split("\n\n") if s.strip()]
-    # 3. Single-newline lines
     elif "\n" in text and text.count("\n") >= 2:
         steps = [_clean_step(s) for s in text.split("\n") if s.strip()]
-    # 4. Sentence boundaries
     else:
         raw = re.split(r"(?<=[.!?])\s+", text)
         steps = [_clean_step(s) for s in raw if s.strip()]
 
-    # Merge very short steps into the previous one
     merged: List[str] = []
     for step in steps:
         if not step:
@@ -121,71 +125,43 @@ def segment_into_steps(text: str, min_step_chars: int = 15) -> List[str]:
 
 
 def normalize_answer(text: str) -> str:
-    """
-    Extract a normalized final answer string for accuracy evaluation.
-
-    Priority:
-      1. \\boxed{...} — LaTeX math answer (GSM8K, competition math)
-      2. "The answer is X" / "= X" patterns
-      3. Last standalone number in the text
-      4. Last non-empty sentence (general fallback)
-    """
     if not text:
         return ""
-
-    # \\boxed{...}
     m = _BOXED_RE.search(text)
     if m:
         return m.group(1).strip()
-
-    # "The answer is X" / "answer: X"
     m = _FINAL_ANS_RE.search(text)
     if m:
         return m.group(1).strip().replace(",", "")
-
-    # Last standalone number
     nums = _NUMBER_RE.findall(text)
     if nums:
         return nums[-1].replace(",", "")
-
-    # Last non-empty sentence
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
     return sentences[-1] if sentences else text.strip()[:120]
 
 
 def _doc_hash(q: str) -> str:
-    """Stable hash for deduplication."""
     return hashlib.sha1(q.encode("utf-8", errors="replace")).hexdigest()
 
 
 # ── Per-source extractors ─────────────────────────────────────────────────────
 
 def _extract_think_and_answer(assistant_blob: str) -> Tuple[str, str]:
-    """
-    Extract (reasoning_text, answer_text) from an assistant response
-    that may contain <think>...</think> or <|begin_of_thought|>...<|end_of_thought|>.
-    """
-    # Stratos / OpenR1 style
     m = _THINK_RE.search(assistant_blob)
     if m:
         reasoning = m.group(1).strip()
         m2 = _SOLUTION_RE.search(assistant_blob)
         answer = m2.group(1).strip() if m2 else assistant_blob[m.end():].strip()
         return reasoning, answer
-
-    # Standard <think> style
     m = _THINK2_RE.search(assistant_blob)
     if m:
         reasoning = m.group(1).strip()
         answer = assistant_blob[m.end():].strip()
         return reasoning, answer
-
-    # No thinking block — full blob is the answer
     return "", assistant_blob.strip()
 
 
 def _chat_pair(turns: Any) -> Tuple[str, str]:
-    """Extract (user_question, assistant_blob) from a turns list."""
     q, a = "", ""
     for turn in (turns or []):
         role = str(turn.get("role") or turn.get("from") or "").lower().strip()
@@ -198,21 +174,16 @@ def _chat_pair(turns: Any) -> Tuple[str, str]:
 
 
 def extract_bespoke(ex: Dict[str, Any]) -> Tuple[str, str, str]:
-    """bespokelabs/Bespoke-Stratos-17k — (question, reasoning, answer)."""
     q, blob = _chat_pair(ex.get("conversations"))
     reasoning, answer = _extract_think_and_answer(blob)
     return q.strip(), reasoning.strip(), answer.strip()
 
 
 def extract_metamath(ex: Dict[str, Any]) -> Tuple[str, str, str]:
-    """meta-math/MetaMathQA — no explicit think block; full response is reasoning+answer."""
     q = str(ex.get("original_question") or ex.get("query") or "").strip()
     blob = str(ex.get("response") or ex.get("output") or "").strip()
-    # MetaMathQA interleaves reasoning and answer; treat full blob as reasoning steps
-    # and extract last sentence / number as answer.
     reasoning = blob
     answer = normalize_answer(blob)
-    # If answer_full is very short or same as full blob, split differently
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", blob) if s.strip()]
     if sentences:
         answer_full = sentences[-1]
@@ -223,19 +194,14 @@ def extract_metamath(ex: Dict[str, Any]) -> Tuple[str, str, str]:
 
 
 def extract_openhermes(ex: Dict[str, Any]) -> Tuple[str, str, str]:
-    """teknium/OpenHermes-2.5 — no reasoning; most samples filtered at min_steps."""
     q, blob = _chat_pair(ex.get("conversations"))
-    # No think block — treat as step-less; will be filtered unless blob has paragraphs
     return q.strip(), blob.strip(), ""
 
 
 def extract_openr1_math(ex: Dict[str, Any]) -> Tuple[str, str, str]:
-    """open-r1/OpenR1-Math-220k."""
     q, blob = _chat_pair(ex.get("messages"))
     if not q:
         q = str(ex.get("problem") or ex.get("question") or "").strip()
-
-    # Some rows have a 'generations' list; pick a verified one
     generations = ex.get("generations") or []
     if generations and not blob:
         math_v = list(ex.get("correctness_math_verify") or [])
@@ -246,10 +212,8 @@ def extract_openr1_math(ex: Dict[str, Any]) -> Tuple[str, str, str]:
                 break
         if not blob:
             blob = str(generations[0]).strip()
-
     if not blob:
         blob = str(ex.get("solution") or "").strip()
-
     reasoning, answer = _extract_think_and_answer(blob)
     if not reasoning:
         reasoning = blob
@@ -259,7 +223,6 @@ def extract_openr1_math(ex: Dict[str, Any]) -> Tuple[str, str, str]:
 
 
 def extract_openr1_code(ex: Dict[str, Any]) -> Tuple[str, str, str]:
-    """open-r1/OpenR1-Code (or codeforces-cots fallbacks)."""
     q, blob = _chat_pair(ex.get("messages"))
     if not q:
         title = str(ex.get("title") or "").strip()
@@ -295,7 +258,7 @@ SOURCES = [
         "candidates": [("teknium/OpenHermes-2.5", None)],
         "split": "train",
         "extractor": extract_openhermes,
-        "weight": 0.10,  # low weight — most samples will be filtered
+        "weight": 0.10,
     },
     {
         "name": "openr1_math",
@@ -322,11 +285,9 @@ SOURCES = [
 
 
 def _load_first_available(candidates, split):
-    """Try each (dataset_name, config) candidate until one loads."""
-    from datasets import load_dataset as _load
     for ds_name, config in candidates:
         try:
-            ds = _load(ds_name, config, split=split) if config else _load(ds_name, split=split)
+            ds = load_dataset(ds_name, config, split=split) if config else load_dataset(ds_name, split=split)
             label = f"{ds_name}[{config}]" if config else ds_name
             return ds, label
         except Exception:
@@ -345,7 +306,6 @@ def process_source(
     id_prefix_counter: List[int],
     seen_hashes: set,
 ) -> List[Dict[str, Any]]:
-    """Load, extract, segment, and filter one source. Returns canonical samples."""
     ds, label = _load_first_available(source["candidates"], source["split"])
     if ds is None:
         print(f"  [warn] {source['name']}: could not load from any candidate — skipping.")
@@ -365,22 +325,17 @@ def process_source(
             skipped += 1
             continue
 
-        # For sources with no reasoning block (OpenHermes), use answer_text as reasoning
         think_text = reasoning if reasoning else answer_text
         answer_full = answer_text if answer_text else reasoning
 
-        # Segment reasoning into steps
         steps = segment_into_steps(think_text)
 
         if len(steps) < min_steps:
             skipped += 1
             continue
         if len(steps) > max_steps:
-            # Truncate to max_steps — don't drop long samples entirely
             steps = steps[:max_steps]
 
-        # answer_full: if we used reasoning as think_text, answer_full is the last step
-        # otherwise it's the actual answer text
         if not answer_full:
             answer_full = steps[-1]
             steps = steps[:-1]
@@ -392,7 +347,6 @@ def process_source(
             skipped += 1
             continue
 
-        # Deduplication
         h = _doc_hash(q)
         if h in seen_hashes:
             skipped += 1
@@ -423,11 +377,6 @@ def build_balanced_mix(
     all_by_source: Dict[str, List[Dict]],
     source_weights: Dict[str, float],
 ) -> List[Dict[str, Any]]:
-    """
-    Balance sources by weight, anchoring to the scarcest source relative to its weight.
-    Same logic as sft-mix-v1 to match diversity.
-    """
-    import math as _math
     available = {name: len(samples) for name, samples in all_by_source.items() if samples}
     if not available:
         return []
@@ -435,13 +384,9 @@ def build_balanced_mix(
     weight_sum = sum(source_weights[n] for n in available)
     weights = {n: source_weights[n] / weight_sum for n in available}
 
-    # Anchor to scarcest source
-    target_total = max(1, int(min(
-        available[n] / weights[n] for n in available
-    )))
-    targets = {n: min(available[n], int(_math.floor(target_total * weights[n]))) for n in available}
+    target_total = max(1, int(min(available[n] / weights[n] for n in available)))
+    targets = {n: min(available[n], int(math.floor(target_total * weights[n]))) for n in available}
 
-    # Distribute remainder
     remaining = target_total - sum(targets.values())
     if remaining > 0:
         by_frac = sorted(available.keys(), key=lambda n: target_total * weights[n] - targets[n], reverse=True)
@@ -458,7 +403,6 @@ def build_balanced_mix(
         mixed.extend(samples[:t])
         print(f"    {name}: {t} samples selected (available: {available.get(name, 0)})")
 
-    import random
     random.seed(42)
     random.shuffle(mixed)
     return mixed
@@ -469,8 +413,6 @@ def split_train_val(
     val_fraction: float,
     seed: int,
 ) -> Tuple[List[Dict], List[Dict]]:
-    """Deterministic stratified train/val split preserving source distribution."""
-    import random
     rng = random.Random(seed)
     by_source: Dict[str, List[Dict]] = {}
     for s in samples:
@@ -498,24 +440,103 @@ def write_jsonl(samples: List[Dict], path: Path) -> None:
 
 
 def compute_stats(train: List[Dict], val: List[Dict]) -> Dict[str, Any]:
-    """Compute and return dataset statistics for the stats.json manifest."""
     def _stats(samples):
         if not samples:
             return {}
         n_steps = [s["n_steps"] for s in samples]
-        sources = {}
+        sources: Dict[str, int] = {}
         for s in samples:
             sources[s["source"]] = sources.get(s["source"], 0) + 1
         return {
-            "n_samples":     len(samples),
-            "n_steps_mean":  round(sum(n_steps) / len(n_steps), 2),
-            "n_steps_min":   min(n_steps),
-            "n_steps_max":   max(n_steps),
+            "n_samples":      len(samples),
+            "n_steps_mean":   round(sum(n_steps) / len(n_steps), 2),
+            "n_steps_min":    min(n_steps),
+            "n_steps_max":    max(n_steps),
             "n_steps_median": sorted(n_steps)[len(n_steps) // 2],
-            "by_source":     sources,
+            "by_source":      sources,
+        }
+    return {"train": _stats(train), "val": _stats(val)}
+
+
+# ── Hub push ──────────────────────────────────────────────────────────────────
+
+def upload_to_hub(
+    train: List[Dict],
+    val: List[Dict],
+    hf_token: str,
+    hf_repo_id: str,
+    hf_dataset_config: str,
+    backup_path: str,
+) -> None:
+    """
+    Push the canonical Coconut JSONL dataset to the HuggingFace Hub as a dataset repo.
+
+    Schema pushed: {id, source, question, steps, answer_full, answer_norm, n_steps}
+    steps is stored as a JSON string per row (HF datasets doesn't natively support
+    list-of-strings columns with variable length across rows without Arrow overhead).
+    jamba_coconut_finetune.py loads from local JSONL and never touches this Hub copy
+    directly — the Hub copy exists solely for backup/resume across sessions.
+
+    Local Google Drive backup is saved first to guard against 504 Hub errors.
+    """
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=hf_token)
+    api.create_repo(
+        repo_id=hf_repo_id,
+        repo_type="dataset",
+        private=True,
+        exist_ok=True,
+        token=hf_token,
+    )
+    print(f"  HF dataset repo ready: {hf_repo_id}")
+
+    def _to_hf_dict(samples: List[Dict]) -> Dict[str, List]:
+        return {
+            "id":          [s["id"] for s in samples],
+            "source":      [s["source"] for s in samples],
+            "question":    [s["question"] for s in samples],
+            # Serialize steps list to JSON string to avoid Arrow nested-type issues
+            "steps":       [json.dumps(s["steps"], ensure_ascii=False) for s in samples],
+            "answer_full": [s["answer_full"] for s in samples],
+            "answer_norm": [s["answer_norm"] for s in samples],
+            "n_steps":     [s["n_steps"] for s in samples],
         }
 
-    return {"train": _stats(train), "val": _stats(val)}
+    train_ds = Dataset.from_dict(_to_hf_dict(train))
+    val_ds   = Dataset.from_dict(_to_hf_dict(val))
+
+    # ── Local Drive backup first (guards against 504 Hub errors) ─────────────
+    backup = Path(backup_path)
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    print(f"  Saving local backup to {backup} ...")
+    train_ds.save_to_disk(str(backup / "train"))
+    val_ds.save_to_disk(str(backup / "val"))
+    print("  Local backup saved.")
+
+    # ── Push train split ─────────────────────────────────────────────────────
+    print(f"  Pushing train ({len(train_ds):,} rows) to {hf_repo_id}[{hf_dataset_config}] ...")
+    train_ds.push_to_hub(
+        repo_id=hf_repo_id,
+        config_name=hf_dataset_config,
+        split="train",
+        token=hf_token,
+        private=True,
+    )
+
+    # ── Push val split ───────────────────────────────────────────────────────
+    print(f"  Pushing val ({len(val_ds):,} rows) to {hf_repo_id}[{hf_dataset_config}] ...")
+    val_ds.push_to_hub(
+        repo_id=hf_repo_id,
+        config_name=hf_dataset_config,
+        split="validation",
+        token=hf_token,
+        private=True,
+    )
+
+    print(f"\n  Done. Reload with:")
+    print(f'    load_dataset("{hf_repo_id}", "{hf_dataset_config}", split="train")')
+    print(f"  Note: 'steps' column is JSON-encoded strings. Deserialize with json.loads().")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -531,34 +552,54 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Cap per-source samples before filtering. None = use all. "
-             "Set to 5000 for a quick dry-run."
+             "Set to 5000 for a quick dry-run.",
     )
-    parser.add_argument(
-        "--min_steps",
-        type=int,
-        default=3,
-        help="Minimum number of reasoning steps. Samples with fewer are dropped.",
-    )
-    parser.add_argument(
-        "--max_steps",
-        type=int,
-        default=16,
-        help="Maximum number of reasoning steps. Longer samples are truncated, not dropped.",
-    )
-    parser.add_argument(
-        "--min_answer_chars",
-        type=int,
-        default=5,
-        help="Minimum answer_full length in characters.",
-    )
+    parser.add_argument("--min_steps",  type=int, default=3,
+        help="Minimum reasoning steps. Samples with fewer are dropped.")
+    parser.add_argument("--max_steps",  type=int, default=16,
+        help="Maximum reasoning steps. Longer samples are truncated, not dropped.")
+    parser.add_argument("--min_answer_chars", type=int, default=5,
+        help="Minimum answer_full length in characters.")
     parser.add_argument("--val_fraction", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
+
+    # ── Hub push args (mirrors prepare_sft_dataset.py pattern) ───────────────
+    parser.add_argument("--push_to_hub", action="store_true",
+        help="Push canonical JSONL dataset to HuggingFace Hub after building.")
+    parser.add_argument("--hf_token", default=None,
+        help="HF write token. Falls back to Colab Secrets → HF_TOKEN env var.")
+    parser.add_argument("--hf_repo_id", default="WeirdRunner/Ouroboros",
+        help="HuggingFace dataset repo to push to.")
+    parser.add_argument("--hf_dataset_config", default="coconut-v1",
+        help="Dataset config name (appears as a tab in the HF dataset viewer).")
+    parser.add_argument("--backup_path", default=_DRIVE_BACKUP_PATH,
+        help="Local path for Google Drive backup before Hub push.")
+
     return parser.parse_args()
+
+
+def _resolve_hf_token(cli_value: Optional[str]) -> Optional[str]:
+    """Resolve HF token: CLI > Colab Secrets > env var."""
+    if cli_value:
+        return cli_value
+    if _COLAB_HF_TOKEN:
+        return _COLAB_HF_TOKEN
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
 
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
+    random.seed(args.seed)
+
+    hf_token: Optional[str] = None
+    if args.push_to_hub:
+        hf_token = _resolve_hf_token(args.hf_token)
+        if not hf_token:
+            sys.exit(
+                "ERROR: --push_to_hub requires an HF write token.\n"
+                "  Provide via --hf_token, Colab Secrets (HF_TOKEN), or env var HF_TOKEN."
+            )
 
     print("=" * 64)
     print("  Coconut Dataset Preparation — Project Ouroboros")
@@ -569,6 +610,11 @@ def main() -> None:
     print(f"  max_steps           : {args.max_steps}")
     print(f"  min_answer_chars    : {args.min_answer_chars}")
     print(f"  val_fraction        : {args.val_fraction}")
+    print(f"  push_to_hub         : {args.push_to_hub}")
+    if args.push_to_hub:
+        print(f"  hf_repo_id          : {args.hf_repo_id}")
+        print(f"  hf_dataset_config   : {args.hf_dataset_config}")
+        print(f"  backup_path         : {args.backup_path}")
     print()
 
     seen_hashes: set = set()
@@ -612,12 +658,27 @@ def main() -> None:
     t = stats["train"]
     v = stats["val"]
     print(f"  Train  : {t['n_samples']:,} samples  steps: "
-          f"min={t['n_steps_min']} median={t['n_steps_median']} mean={t['n_steps_mean']} max={t['n_steps_max']}")
+          f"min={t['n_steps_min']} median={t['n_steps_median']} "
+          f"mean={t['n_steps_mean']} max={t['n_steps_max']}")
     print(f"  Val    : {v['n_samples']:,} samples  steps: "
-          f"min={v['n_steps_min']} median={v['n_steps_median']} mean={v['n_steps_mean']} max={v['n_steps_max']}")
+          f"min={v['n_steps_min']} median={v['n_steps_median']} "
+          f"mean={v['n_steps_mean']} max={v['n_steps_max']}")
     print()
     print(f"  Recommended --max_stage for jamba_coconut_finetune.py : {t['n_steps_median']}")
     print(f"  (Run with --max_stage {t['n_steps_median']} to cover median sample fully)")
+
+    if args.push_to_hub and hf_token:
+        print()
+        print("  Pushing to HuggingFace Hub ...")
+        upload_to_hub(
+            train=train,
+            val=val,
+            hf_token=hf_token,
+            hf_repo_id=args.hf_repo_id,
+            hf_dataset_config=args.hf_dataset_config,
+            backup_path=args.backup_path,
+        )
+
     print()
     print("  Dataset ready. Feed to training script:")
     print(f"    python jamba_coconut_finetune.py --data_dir {output_dir} ...")

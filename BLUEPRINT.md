@@ -17,20 +17,40 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | 0 | Architecture & Viability (nano) | ✅ COMPLETE |
 | 1 | Pre-training (nano) | ✅ Pipeline test only; retired |
 | 2 | SFT (nano) | 🔴 RETIRED |
-| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 NEXT |
+| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 NEXT — agent prompt ready, see Part 0.1 |
 | 4 | GRPO on Jamba Reasoning 3B | ⬜ NOT STARTED |
 | 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
 
 ### TRC Status
 ✅ Accepted (email 2026-04-07). **Do not claim quota yet.** Claim after K=4 gate passes on Kaggle Dual T4.
 
-### Immediate Next Actions
+### Part 0.1 — Immediate Next Actions (ordered)
 
-1. Run `prepare_coconut_dataset.py --output_dir data/coconut_v1` to build canonical dataset.
-2. Feed `jamba_stage3_agent_prompt.md` to coding agent → generate `jamba_coconut_finetune.py`.
-3. Smoke test on free Colab T4 (see checklist in agent prompt Part 14).
-4. K=0→K_max curriculum on Kaggle Dual T4.
-5. If K=4 gate passes: claim TRC, run K=16 + DGAC Phase 3.4.
+1. **Run** `prepare_coconut_dataset.py --output_dir data/coconut_v1 --push_to_hub --hf_token YOUR_TOKEN`
+   - Produces `train.jsonl`, `val.jsonl`, `stats.json`
+   - Pushes to Hub as `WeirdRunner/Ouroboros` config `coconut-v1` (dataset, not model)
+   - Read `stats.json → train.n_steps_median` → this becomes `--max_stage` for training
+2. **Feed** `jamba_stage3_agent_prompt.md` (updated 2026-04-11) to coding agent → generates `jamba_coconut_finetune.py`
+3. **Smoke test** on free Colab T4 (Part 15 checklist in agent prompt — all items must pass)
+4. **K=0→K_max curriculum** on Kaggle Dual T4 with `torchrun --nproc_per_node=2`
+5. **If K=4 gate passes**: claim TRC, run K=16 + DGAC Phase 3.4 on A100
+
+### Part 0.2 — Pre-flight Blockers Resolved (2026-04-11 audit)
+
+All four blockers that prevented 95% confidence are now addressed in the agent prompt:
+
+| Blocker | Resolution |
+|---|---|
+| `attn_implementation` hardcoded crash | try/except fallback to `eager` (Part 0.1 of prompt) |
+| `use_mamba_kernels` kwarg on old TF | Version guard `_TF_VERSION >= (4, 54)` (Part 0.2) |
+| `last_hidden_state` silent None | `assert out.last_hidden_state is not None` in both Stage 0 and Phase B (Part 0.3) |
+| No graceful timeout → lost Kaggle work | `make_timeout_checker()` + emergency save integrated in main loop (Part 0.4) |
+| `conv1d` in LoRA targets (malformed) | Explicitly excluded with comment (Part 0.5) |
+| NCCL watchdog (killed S5–S7) | `timeout=timedelta(minutes=60)` + `TORCH_NCCL_ASYNC_ERROR_HANDLING=1` (Part 0.6) |
+| OOM at first val step (S8) | `torch.cuda.empty_cache()` + `val_batch_size=1` default (Part 0.4) |
+
+One item still requires empirical verification during smoke test:
+- `inputs_embeds` → `last_hidden_state` path for Jamba Reasoning 3B base model layer. The assert will fire immediately if broken.
 
 ---
 
@@ -52,9 +72,7 @@ Post-training: mid-train 0.5T tokens (math+code) → cold-start SFT → DPO → 
 Reasoning   : native <think>...</think> traces; vLLM uses deepseek_r1 parser
 ```
 
-**Why Reasoning 3B over Jamba2-3B:** Reasoning 3B already has explicit CoT traces that Coconut progressively replaces with latent passes. Jamba2-3B targets enterprise grounding (IFBench, RAG), has no reasoning traces, and would require re-teaching CoT from scratch. Wrong model for Coconut.
-
-**Architecture note:** Reasoning 3B has a 13:1 Mamba:Attention ratio (not 1:7 as Jamba 1.5). This is MORE Mamba-heavy — better for Coconut since more SSM state is available to accumulate latent reasoning.
+**Why Reasoning 3B over Jamba2-3B:** Reasoning 3B already has explicit CoT traces that Coconut progressively replaces with latent passes. Jamba2-3B targets enterprise grounding (IFBench, RAG), has no reasoning traces, and would require re-teaching CoT from scratch.
 
 ---
 
@@ -64,7 +82,7 @@ Reasoning   : native <think>...</think> traces; vLLM uses deepseek_r1 parser
 |---|---|
 | Primary research model | Jamba Reasoning 3B (ai21labs/AI21-Jamba-Reasoning-3B, Oct 2025) |
 | Fine-tuning approach | QLoRA on GPU (bitsandbytes, 4-bit NF4); LoRA only on TPU — `--use_4bit` flag |
-| LoRA target modules | q_proj, k_proj, v_proj, o_proj (attention) + in_proj, x_proj, dt_proj, out_proj (Mamba) |
+| LoRA target modules | q_proj, k_proj, v_proj, o_proj (attention) + in_proj, x_proj, dt_proj, out_proj (Mamba); conv1d excluded |
 | Coconut curriculum | Paper's correct mechanism: progressive step replacement (NOT fixed-K tokens at question end) |
 | Stage advancement | Epoch-based (fixed epochs_per_stage) + best-accuracy checkpoint selection at end of stage |
 | Dataset pipeline | Separate `prepare_coconut_dataset.py` → canonical JSONL; training script never touches HF datasets |
@@ -79,6 +97,12 @@ Reasoning   : native <think>...</think> traces; vLLM uses deepseek_r1 parser
 | Platform: K=16 + DGAC | TRC A100 80GB |
 | Stage 1 gate | Bypassed (val_ce=5.32). Architecture proven. Hub: ckpt-0021000. |
 | Stage 2 dataset | sft-mix-v1 (55k, WeirdRunner/Ouroboros) — SFT format; NOT reused for Coconut |
+| Coconut dataset Hub config | `coconut-v1` under `WeirdRunner/Ouroboros` (dataset repo) |
+| `attn_implementation` | Detected at runtime: flash_attention_2 if available, else eager |
+| `use_mamba_kernels` | Disabled (False) when transformers >= 4.54.0 |
+| Session timeout (Kaggle) | `--session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20` |
+| val_batch_size | Default 1 (Stage 2 S8 OOM'd with val_batch_size=16 at seq=2048) |
+| NCCL timeout | `timedelta(minutes=60)` in init_process_group |
 
 ---
 
@@ -86,7 +110,7 @@ Reasoning   : native <think>...</think> traces; vLLM uses deepseek_r1 parser
 
 | Question | Status |
 |---|---|
-| Does `inputs_embeds` bypass work cleanly with Jamba Reasoning 3B on HF? | 🟡 VERIFY during smoke test |
+| Does `inputs_embeds` → `last_hidden_state` work cleanly with Jamba Reasoning 3B? | 🟡 VERIFY during smoke test (assert in code will catch failure immediately) |
 | Jamba Reasoning 3B mamba-ssm TPU XLA fallback: does `use_mamba_kernels=False` compile? | 🔴 OPEN — not blocking for GPU path |
 | DGAC Phase 3.4: does mean halt_step distribute across K≥2 after training? | 🔴 OPEN — primary research validation metric |
 | Optimal max_stage K: does stats.json median match what Reasoning 3B's traces segment to? | 🟡 CHECK after running prepare_coconut_dataset.py |
@@ -102,10 +126,10 @@ Reasoning   : native <think>...</think> traces; vLLM uses deepseek_r1 parser
 | `training_utils.py` | All nano | ✅ COMPLETE | Not used in Jamba scripts |
 | `pretrain.py` | 1 | ✅ COMPLETE | Hub: ckpt-0021000 |
 | `prepare_sft_dataset.py` | 2 | ✅ DONE | sft-mix-v1 cached; not reused for Coconut |
-| `train_sft.py` | 2 | ✅ PATCHED (DDP v2) | Not being run further |
-| `prepare_coconut_dataset.py` | 3 | ✅ WRITTEN | Run once; outputs data/coconut_v1/ |
-| `jamba_stage3_agent_prompt.md` | 3 | ✅ READY | Feed to coding agent → jamba_coconut_finetune.py |
-| `jamba_coconut_finetune.py` | 3 | ⬜ NOT CREATED | Generate from jamba_stage3_agent_prompt.md |
+| `train_sft.py` | 2 | ✅ PATCHED (DDP v2) | Retired |
+| `prepare_coconut_dataset.py` | 3 | ✅ PATCHED (2026-04-11) | Added hub push, Colab token, Drive backup, `--push_to_hub` CLI |
+| `jamba_stage3_agent_prompt.md` | 3 | ✅ PATCHED (2026-04-11) | 4 blockers fixed; see Part 0.2 |
+| `jamba_coconut_finetune.py` | 3 | ⬜ NOT CREATED | Generate from updated agent prompt |
 
 ---
 
@@ -122,8 +146,6 @@ Stage K:  [Q][●*K][A]            ← all steps replaced; labels on A only
 
 `●` = injected latent hidden state from sequential prefix pass. K = median n_steps from dataset.
 
-**Critical note:** Placing K fixed latent tokens at question end (our previous design) is equivalent to the paper's "pause token" baseline, which it found **inferior** to step replacement. This rewrite implements the correct mechanism.
-
 ### Dataset format (output of prepare_coconut_dataset.py)
 ```json
 {
@@ -136,6 +158,8 @@ Stage K:  [Q][●*K][A]            ← all steps replaced; labels on A only
   "n_steps":     3
 }
 ```
+
+**Hub note:** When loaded from Hub backup, `steps` is a JSON-encoded string. `load_canonical_dataset()` in `jamba_coconut_finetune.py` handles deserialization transparently.
 
 ---
 
@@ -164,16 +188,18 @@ L_diversity = mean_batch( Σ_k relu(cos_sim(h_k, h_{k-1}) − τ) )
 ```
 output_dir/
   stage_0/
-    checkpoint-0001234/   ← epoch checkpoints (pruned to keep_checkpoints_per_stage)
-    best/                  ← best-accuracy checkpoint; loaded before Stage 1 begins
-      adapter_model/       ← PEFT LoRA weights
-      halt_gate.pt         ← HaltGate state dict (Phase 3.4 only)
-      training_state.pt    ← {stage_k, step, epoch, val_ce, val_acc, optimizer, scheduler}
+    checkpoint-0001234/
+      adapter_model/         ← PEFT LoRA weights (.safetensors or .bin)
+      training_state.pt      ← {stage_k, step, epoch, val_ce, val_acc, optimizer, scheduler}
+    best/                    ← best-accuracy checkpoint for this stage
+      adapter_model/
+      halt_gate.pt           ← HaltGate state dict (Phase 3.4 only)
+      training_state.pt
   stage_1/
     best/
   ...
   stage_K/
-    best/                  ← final Coconut model, used as resume_from for Phase 3.4
+    best/                    ← resume_from for Phase 3.4 DGAC run
 ```
 
 ---
@@ -187,3 +213,18 @@ output_dir/
 | Stage 0→K | Kaggle Dual T4 (2×16GB) | QLoRA + DDP, epochs_per_stage=3 | ~4–8h per session |
 | Phase 3.4 (DGAC) | TRC A100 80GB | QLoRA or LoRA, grad_ckpt | ~6–8h |
 | Phase 4 (GRPO) | TRC A100 80GB | TBD | ~8–12h |
+
+---
+
+## Part 9 — Hard Lessons from Prior Stages (Do Not Repeat)
+
+These caused lost sessions and are now codified as defaults in `jamba_coconut_finetune.py`:
+
+| Lesson | Source | Codified As |
+|---|---|---|
+| val_batch_size=16 at seq=2048 → 9.25 GiB OOM | Stage 2 S8 | `--val_batch_size 1` default + `torch.cuda.empty_cache()` before val |
+| NCCL watchdog kills DDP after val+gen timeout | Stage 2 S5–S7 | `timeout=timedelta(minutes=60)` + graceful exit before budget expires |
+| No timeout → losing hours of training | Stage 2 S5–S7 | `make_timeout_checker()` in main loop; emergency checkpoint on trigger |
+| max_seq_len=1024 filtered 97% of reasoning chains | Stage 2 S1 | `--max_seq_len 512` for Jamba (shorter chains; not pre-training) |
+| Hard-coded `attn_implementation` crash on Colab | Audit 2026-04-11 | try/except flash-attn detection with eager fallback |
+| `use_mamba_kernels` kwarg on old transformers | Audit 2026-04-11 | Version guard `_TF_VERSION >= (4, 54)` |
