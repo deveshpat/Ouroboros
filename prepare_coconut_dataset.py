@@ -49,7 +49,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # ── Colab-friendly token resolution ──────────────────────────────────────────
-# Priority: 1) Colab Secrets  2) env var  3) CLI --hf_token  4) placeholder
+# ── Environment-friendly token resolution ────────────────────────────────────
+# Priority: 1) Kaggle Secrets 2) Colab Secrets 3) env var 4) CLI 5) placeholder
+
+_KAGGLE_HF_TOKEN: Optional[str] = None
+try:
+    from kaggle_secrets import UserSecretsClient
+    _user_secrets = UserSecretsClient()
+    _KAGGLE_HF_TOKEN = _user_secrets.get_secret("HF_TOKEN")
+except ImportError:
+    pass
+
 _COLAB_HF_TOKEN: Optional[str] = None
 try:
     from google.colab import userdata as _colab_userdata
@@ -57,8 +67,11 @@ try:
 except Exception:
     pass
 
-# Local Google Drive backup path (used when --push_to_hub is set)
-_DRIVE_BACKUP_PATH = "/content/drive/MyDrive/Ouroboros/coconut_dataset_backup"
+# Dynamic Backup path depending on environment (Kaggle vs Colab/Local)
+if os.path.exists("/kaggle/working"):
+    _DEFAULT_BACKUP_PATH = "/kaggle/working/Ouroboros/coconut_dataset_backup"
+else:
+    _DEFAULT_BACKUP_PATH = "/content/drive/MyDrive/Ouroboros/coconut_dataset_backup"
 
 try:
     from datasets import Dataset, load_dataset
@@ -572,16 +585,18 @@ def parse_args() -> argparse.Namespace:
         help="HuggingFace dataset repo to push to.")
     parser.add_argument("--hf_dataset_config", default="coconut-v1",
         help="Dataset config name (appears as a tab in the HF dataset viewer).")
-    parser.add_argument("--backup_path", default=_DRIVE_BACKUP_PATH,
-        help="Local path for Google Drive backup before Hub push.")
+    parser.add_argument("--backup_path", default=_DEFAULT_BACKUP_PATH,
+        help="Local path for workspace/drive backup before Hub push.")
 
     return parser.parse_args()
 
 
 def _resolve_hf_token(cli_value: Optional[str]) -> Optional[str]:
-    """Resolve HF token: CLI > Colab Secrets > env var."""
+    """Resolve HF token: CLI > Kaggle Secrets > Colab Secrets > env var."""
     if cli_value:
         return cli_value
+    if _KAGGLE_HF_TOKEN:
+        return _KAGGLE_HF_TOKEN
     if _COLAB_HF_TOKEN:
         return _COLAB_HF_TOKEN
     return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
@@ -598,8 +613,9 @@ def main() -> None:
         if not hf_token:
             sys.exit(
                 "ERROR: --push_to_hub requires an HF write token.\n"
-                "  Provide via --hf_token, Colab Secrets (HF_TOKEN), or env var HF_TOKEN."
+                "  Provide via --hf_token, Kaggle/Colab Secrets (HF_TOKEN), or env var HF_TOKEN."
             )
+
 
     print("=" * 64)
     print("  Coconut Dataset Preparation — Project Ouroboros")
