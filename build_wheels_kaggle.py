@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """
-build_wheels_kaggle.py — One-time Mamba/flash-attn wheel builder for Project Ouroboros
-========================================================================================
+build_wheels_kaggle.py — Mamba kernel wheel builder for Project Ouroboros
+==========================================================================
 Run once in a fresh Kaggle GPU session (T4 or better).
 Builds environment-matched wheels for:
-  - flash-attn
-  - causal-conv1d
-  - mamba-ssm
+  - causal-conv1d   (~5-10 min)
+  - mamba-ssm       (~10-15 min)
 
-Then uploads them to HF Hub so every subsequent session installs in ~90 seconds
-instead of compiling for 30-60 minutes.
+flash-attn is deliberately EXCLUDED by default. Jamba Reasoning 3B has
+26 Mamba layers and only 2 attention layers (13:1 ratio). flash-attn would
+accelerate 7% of the model while costing 2-3 hours of compilation from source
+(73 CUDA translation units on T4, no PyPI wheel for cu128+). The eager
+attention fallback on 2 layers is negligible vs the mamba fast path on 26.
+Use --include_flash_attn only if you have a specific reason and spare quota.
 
 Usage (Kaggle notebook cell):
   !python build_wheels_kaggle.py --hf_repo_id WeirdRunner/Ouroboros --hf_token YOUR_TOKEN
 
-After this runs once, update the WHEEL_URLS dict in jamba_coconut_finetune.py
-with the printed URLs.
+After this runs (~20 min), paste the printed wheel URLs into the Install
+section of jamba_coconut_finetune.py.
 
-Notes:
-  - All three packages require --no-build-isolation: they need the live torch/CUDA
-    headers from the current env during compilation (not pip's isolated build venv).
-  - flash-attn has no PyPI pre-built wheel → always compiles from source.
-  - causal-conv1d and mamba-ssm have PyPI wheels for cu118/cu121 only;
-    cu128+ requires source build.
-  - Expected build times: flash-attn ~20-30 min, causal-conv1d ~5-10 min,
-    mamba-ssm ~10-15 min. Total: ~45-60 min. Run ONCE; subsequent sessions
-    use the Hub wheels.
+Re-run when Kaggle upgrades its container. Check with:
+  python -c "import torch; print(torch.__version__, torch.version.cuda)"
+
+Why --no-build-isolation for all packages:
+  Both packages compile CUDA C++ extensions via torch.utils.cpp_extension.
+  pip's isolated build venv has no CUDA toolkit or PyTorch headers, so
+  compilation fails without this flag. Required for all source builds.
 """
 
 import argparse
@@ -46,17 +47,12 @@ def detect_env() -> dict:
     import torch
 
     py_ver = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    torch_full = torch.__version__.split("+")[0]
+    torch_short = ".".join(torch_full.split(".")[:2])
+    cuda_ver = torch.version.cuda or ""
 
-    torch_full = torch.__version__.split("+")[0]          # e.g. "2.10.0"
-    torch_short = ".".join(torch_full.split(".")[:2])      # e.g. "2.10"
-    torch_tag = torch_short.replace(".", "")               # e.g. "210"
-
-    cuda_ver = torch.version.cuda or ""                    # e.g. "12.8"
-    cuda_tag = cuda_ver.replace(".", "")                   # e.g. "128"
-
-    # Detect CXX11 ABI used when building PyTorch
     try:
-        cxx11 = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()  # "TRUE" or "FALSE"
+        cxx11 = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
     except AttributeError:
         cxx11 = "FALSE"
 
@@ -64,9 +60,7 @@ def detect_env() -> dict:
         "py_ver": py_ver,
         "torch_full": torch_full,
         "torch_short": torch_short,
-        "torch_tag": torch_tag,
         "cuda_ver": cuda_ver,
-        "cuda_tag": cuda_tag,
         "cxx11": cxx11,
     }
     print("\n=== Detected Environment ===")
@@ -76,27 +70,26 @@ def detect_env() -> dict:
     return env
 
 
-def build_wheels(wheel_dir: Path, env: dict) -> list:
+def build_wheels(wheel_dir: Path, env: dict, include_flash_attn: bool) -> list:
     """
-    Build all three packages from source. Returns list of built .whl paths.
-    All three use --no-build-isolation so the live torch/CUDA env is visible
-    to the C++ extension compiler (torch.utils.cpp_extension needs it).
+    Build mamba packages from source. Returns list of built .whl paths.
+    flash-attn skipped by default (see module docstring).
     """
     wheel_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build dependencies (ninja speeds up compilation significantly)
     _run([sys.executable, "-m", "pip", "install", "-q",
           "ninja", "packaging", "wheel", "setuptools"])
 
-    built = []
-
     packages = [
-        # (pip_spec, max_jobs_env_var)
-        ("causal-conv1d>=1.4.0",  "MAX_JOBS=4"),
-        ("mamba-ssm",              "MAX_JOBS=4"),
-        ("flash-attn",             "MAX_JOBS=4"),
+        ("causal-conv1d>=1.4.0", "MAX_JOBS=4"),
+        ("mamba-ssm",             "MAX_JOBS=4"),
     ]
+    if include_flash_attn:
+        print("\n[warn] flash-attn requested. Expect 2-3 hours on T4 (73 CUDA TUs).")
+        print("       NOT needed for Jamba — only 2/28 layers use attention.")
+        packages.append(("flash-attn", "MAX_JOBS=4"))
 
+    built = []
     for spec, jobs_env in packages:
         name = spec.split(">=")[0].split("==")[0].strip()
         print(f"\n{'='*60}")
@@ -115,7 +108,7 @@ def build_wheels(wheel_dir: Path, env: dict) -> list:
         ]
         result = subprocess.run(cmd, env=env_vars, check=False)
         if result.returncode != 0:
-            print(f"\n[ERROR] Failed to build {name}. Check CUDA toolkit visibility.")
+            print(f"\n[ERROR] Failed to build {name}.")
             print("Ensure: nvcc --version works and CUDA_HOME is set.")
             continue
 
@@ -130,7 +123,7 @@ def build_wheels(wheel_dir: Path, env: dict) -> list:
 
 
 def upload_wheels(wheel_dir: Path, built: list, hf_repo_id: str, hf_token: str) -> list:
-    """Upload built wheels to HF Hub model repo. Returns list of direct download URLs."""
+    """Upload built wheels to HF Hub model repo. Returns list of (name, url) tuples."""
     try:
         from huggingface_hub import HfApi
     except ImportError:
@@ -161,93 +154,91 @@ def upload_wheels(wheel_dir: Path, built: list, hf_repo_id: str, hf_token: str) 
 
 def print_install_command(urls: list, env: dict) -> None:
     print("\n" + "=" * 70)
-    print("COPY THIS — paste into jamba_coconut_finetune.py docstring")
+    print("COPY THIS — paste into jamba_coconut_finetune.py Install section")
     print("=" * 70)
     print(f"# Environment: CUDA {env['cuda_ver']}  "
           f"PyTorch {env['torch_short']}  "
           f"Python {env['py_ver']}  "
           f"cxx11ABI={env['cxx11']}")
-    parts = ["!pip install -q",
-             '"transformers>=4.54.0"',
-             "peft datasets tqdm wandb bitsandbytes accelerate huggingface_hub",
-             "\\"]
+    print("!pip install -q \"transformers>=4.54.0\" peft datasets tqdm wandb \\")
+    print("             bitsandbytes accelerate huggingface_hub \\")
     for name, url in urls:
-        parts.append(f"  {url} \\")
-    print(" ".join(parts))
-    print("\nPaste these WHEEL_URLS into jamba_coconut_finetune.py:")
+        print(f"  {url} \\")
+    print("\nWheel URLs for jamba_coconut_finetune.py:")
     for name, url in urls:
         print(f'  "{name}": "{url}",')
     print("=" * 70)
 
 
 def verify_imports() -> None:
-    """Quick smoke-test that the CUDA fast path is now active."""
+    """Confirm mamba CUDA fast path is active after installation."""
     print("\n=== Verifying Fast Path ===")
-    errors = []
-    for mod, attr in [
+    checks = [
         ("mamba_ssm.ops.selective_scan_interface", "selective_scan_fn"),
         ("mamba_ssm.ops.selective_scan_interface", "selective_state_update"),
         ("causal_conv1d", "causal_conv1d_fn"),
-    ]:
+    ]
+    errors = []
+    for mod, attr in checks:
         try:
             m = __import__(mod, fromlist=[attr])
             obj = getattr(m, attr, None)
             status = "OK" if obj is not None else "None (FAIL)"
+            if obj is None:
+                errors.append(f"{mod}.{attr}")
         except ImportError as e:
             status = f"ImportError: {e}"
             errors.append(f"{mod}.{attr}")
         print(f"  {mod}.{attr}: {status}")
 
     if not errors:
-        print("\n  Fast path ACTIVE. use_mamba_kernels=True will work.")
+        print("\n  Fast path ACTIVE. Training will use ~5s/step (not ~500s/step).")
     else:
-        print(f"\n  [WARN] {len(errors)} import(s) failed. Fast path not available.")
-        print("  Check CUDA_HOME, nvcc, and wheel compatibility.")
+        print(f"\n  [WARN] {len(errors)} import(s) failed. Slow path will be used.")
+        print("  Check: nvcc --version, echo $CUDA_HOME")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build mamba/flash-attn wheels and upload to HF Hub",
+        description="Build mamba CUDA wheels and upload to HF Hub",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--hf_repo_id", default="WeirdRunner/Ouroboros")
     parser.add_argument("--hf_token", default=None,
                         help="HF write token. Falls back to HF_TOKEN env var.")
-    parser.add_argument("--wheel_dir", default="/kaggle/working/wheels",
-                        help="Local directory to write built .whl files.")
+    parser.add_argument("--wheel_dir", default="/kaggle/working/wheels")
+    parser.add_argument("--include_flash_attn", action="store_true",
+                        help="Also build flash-attn (~2-3 hrs). Not needed for Jamba.")
     parser.add_argument("--skip_upload", action="store_true",
-                        help="Build wheels only, don't upload.")
+                        help="Build only, don't upload to Hub.")
     parser.add_argument("--skip_build", action="store_true",
-                        help="Skip build, only upload existing wheels in --wheel_dir.")
+                        help="Skip build, upload existing wheels in --wheel_dir.")
     parser.add_argument("--verify_only", action="store_true",
-                        help="Only run the import verification; don't build.")
+                        help="Only check if fast path is importable; don't build.")
     args = parser.parse_args()
 
     hf_token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-
     env = detect_env()
 
     if args.verify_only:
         _run([sys.executable, "-m", "pip", "install", "-q",
-              "causal-conv1d>=1.4.0", "--no-build-isolation"])
-        _run([sys.executable, "-m", "pip", "install", "-q",
-              "mamba-ssm", "--no-build-isolation"])
+              "causal-conv1d>=1.4.0", "mamba-ssm", "--no-build-isolation"], check=False)
         verify_imports()
         return
 
     wheel_dir = Path(args.wheel_dir)
 
     if not args.skip_build:
-        built = build_wheels(wheel_dir, env)
+        built = build_wheels(wheel_dir, env, include_flash_attn=args.include_flash_attn)
         if not built:
-            print("\n[FATAL] No wheels built successfully.")
+            print("\n[FATAL] No wheels built. Check CUDA toolkit and try again.")
             sys.exit(1)
         print(f"\nBuilt {len(built)} wheel(s):")
         for w in built:
             print(f"  {w.name}")
     else:
         built = list(wheel_dir.glob("*.whl"))
-        print(f"Skipping build. Found {len(built)} existing wheel(s) in {wheel_dir}.")
+        print(f"Skipping build. Found {len(built)} wheel(s) in {wheel_dir}.")
 
     if not args.skip_upload:
         if not hf_token:
@@ -256,11 +247,10 @@ def main() -> None:
         urls = upload_wheels(wheel_dir, built, args.hf_repo_id, hf_token)
         print_install_command(urls, env)
     else:
-        print("Skipping Hub upload (--skip_upload).")
+        print("Skipping Hub upload.")
         for whl in built:
             print(f"  Local: {whl}")
 
-    # Install fresh so verify_imports() works
     for whl in built:
         _run([sys.executable, "-m", "pip", "install", "--force-reinstall", str(whl)], check=False)
 
