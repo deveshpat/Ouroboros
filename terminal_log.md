@@ -5,9 +5,41 @@
 
 ---
 
+## Post-Smoke-Test Audit (2026-04-12)
+**Status:** ✅ Root causes identified. Patches ready.
+
+### Discrepancy note
+Terminal log records **3768.7s script runtime** for the smoke test. User reported ~90 min total.
+Delta (~27 min) = Kaggle notebook startup + Jamba 3B download (~6 GB) + pip install time.
+Not a fabrication. Terminal log correctly captures script execution time, not total wall time.
+
+The "2 max samples" feeling: with `--max_seq_len 512` active, `build_sample_at_stage` returns
+`None` for nearly all val samples at stages 1+. `steps_per_epoch` collapses to `max(1, ...)` = 1.
+Effectively 0 real training samples processed at stages 1 and 2 despite `--max_samples 200` in CLI.
+
+### Three-layer failure: mamba fast path never used
+
+**Layer 1 — Code (primary):** `use_mamba_kernels=False` is **unconditionally hardcoded** in
+`load_model_and_tokenizer`. Blueprint Part 0.2 describes it as a version-guard; actual code has
+no guard — it forces slow PyTorch SSM path always (~100× slower). Pure-PyTorch SSM scan
+explains the ~520s/step timing. **Fix: Patch 3 in jamba_coconut_patches.md.**
+
+**Layer 2 — Wheel/ABI mismatch:** Existing Hub wheels are `cu128+torch2.10+py312+cxx11FALSE`.
+"Latest Container Image" (not pinned) → different PyTorch/CUDA version → CUDA extensions
+don't load → `selective_scan_fn = None` → model warns and falls back silently.
+**Fix: Run `build_wheels_kaggle.py` once per container image, pin environment.**
+
+**Layer 3 — `--no-build-isolation` for all three:** All three packages (flash-attn, causal-conv1d,
+mamba-ssm) require `--no-build-isolation` for source builds. ai21labs' HF page only lists it for
+flash-attn because they assume PyPI pre-built wheels exist for causal-conv1d and mamba-ssm.
+For `cu128+torch2.10` (very new), no PyPI wheels exist → source build → needs the flag.
+`build_wheels_kaggle.py` passes `--no-build-isolation` for all three.
+
+---
+
 ## Stage 3 — Smoke Test (Kaggle Dual T4, Latest Container Image)
 **Script:** `jamba_coconut_finetune.py`  **Date:** 2026-04-11  **Hardware:** Kaggle Dual T4 (single GPU used)
-**Status:** ✅ COMPLETED — all 3 stages ran without crashing. Two bugs found.
+**Status:** ✅ COMPLETED — all 3 stages ran without crashing. Two training bugs found. Three root causes identified post-run.
 
 **Command:**
 ```
@@ -75,12 +107,13 @@ Mean UWR: 0.290
 1. **val=0.0**: `build_sample_at_stage` returns None for all val samples because sequences exceed `--max_seq_len 512`. `n_valid_total` stays 0, function returns `torch.zeros` fallback silently.
 2. **gn=36.926**: Latent injection at k=2 with only 1 training step destabilises gradients. Real run needs `--max_grad_norm 0.3` or lower for k≥2.
 
-**Fixes before real run:**
+**Fixes (incorporated in patches + updated docstring):**
 - `--max_seq_len 1024` (512 too tight for Jamba reasoning traces)
 - `--max_grad_norm 0.3`
-- Pin Kaggle environment to get mamba CUDA kernels working
+- Build env-matched wheels; patch `use_mamba_kernels` probe (see audit above)
+- Pin Kaggle container to match built wheels
 
-**Duration:** 3768.7s (~62 min). Stage 0 truncated in log (ran ~24 steps before log capture). Stages 1 and 2 each ran 1 step.
+**Script runtime:** 3768.7s (~63 min). Total session ~90 min (includes download + pip install).
 
 ---
 
