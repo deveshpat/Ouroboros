@@ -204,3 +204,41 @@ G3 gnorm < 10.0    max = 4.0312        PASS ✓
 G4 VRAM Δ < 1.0GB  Δ = 0.000 GB       PASS ✓
 Total time: 3.4 min   Peak VRAM: 2.07 GB
 ```
+
+---
+
+## Wheel Build Session (Kaggle Dual T4, 2026-04-12)
+**Script:** `build_wheels_kaggle.py`  **Status:** ✅ Built + uploaded. ✗ Fast path still blocked.
+
+**Environment:** CUDA 12.8  PyTorch 2.10  Python cp312  cxx11=TRUE
+
+**Key result (verbatim):**
+```
+=== Verifying Fast Path (import check only) ===
+mamba_ssm.ops.selective_scan_interface.selective_scan_fn: OK
+mamba_ssm.ops.selective_scan_interface.selective_state_update: None — ABI mismatch or bad build (FAIL)
+causal_conv1d.causal_conv1d_fn: OK
+✗ 1 symbol(s) missing.
+```
+
+**Upload status:**
+```
+→ https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl
+No files have been modified since last commit. Skipping to prevent empty commit.   ← mamba_ssm identical hash
+→ https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl
+```
+
+**Root cause confirmed:** `mamba_ssm 2.3.1` (2.x series) restructured internals.
+`selective_state_update` no longer lives at `mamba_ssm.ops.selective_scan_interface`
+in 2.x — it moved to a Triton-based path. transformers' Jamba implementation checks
+five symbols at the 1.x import paths. With 2.3.1, `selective_state_update=None`
+silently disables the fast path regardless of build quality.
+
+This is also the root cause of the warning visible since the first smoke test:
+```
+The fast path is not available because on of `(selective_state_update, selective_scan_fn,
+causal_conv1d_fn, causal_conv1d_update, mamba_inner_fn)` is None.
+```
+
+**Fix:** Pin `mamba-ssm==1.2.2`. Updated in `build_wheels_kaggle.py`.
+Next session: rebuild mamba_ssm only (~15 min), re-upload, verify all 5 symbols.
