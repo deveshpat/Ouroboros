@@ -20,16 +20,31 @@ References:
   Jamba Reasoning 3B (AI21, ai21labs/AI21-Jamba-Reasoning-3B, Oct 2025)
 
 Install:
-  !pip install -q "transformers>=4.54.0" peft datasets tqdm wandb bitsandbytes accelerate \
-   https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/flash_attn-2.8.3+cu128torch2.10cxx11abiFALSE-cp312-cp312-linux_x86_64.whl \
-   https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl \
-   https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl
-Run (smoke test, Colab T4):
+  # PREREQUISITE (once per new container image):
+  #   python build_wheels_kaggle.py --hf_repo_id WeirdRunner/Ouroboros --hf_token YOUR_TOKEN
+  #   If unsure whether env changed: python build_wheels_kaggle.py --verify_only
+  #   Re-run when Kaggle upgrades its container (check: python -c "import torch; print(torch.__version__, torch.version.cuda)")
+  #
+  # All three packages require --no-build-isolation for source builds (they compile
+  # CUDA extensions against the live PyTorch/CUDA env, which pip's isolated build
+  # venv does not expose). build_wheels_kaggle.py handles this automatically.
+  #
+  # Paste the exact wheel URLs printed by build_wheels_kaggle.py below:
+  !pip install -q "transformers>=4.54.0" peft datasets tqdm wandb \
+               bitsandbytes accelerate huggingface_hub \
+               https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/<FLASH_ATTN_WHEEL>.whl \
+               https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/<CAUSAL_CONV1D_WHEEL>.whl \
+               https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/<MAMBA_SSM_WHEEL>.whl
+   
+  Run (smoke test, Colab/Kaggle T4):
   !python jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
     --epochs_per_stage 1 --max_stage 2 --max_samples 200 \
+    --max_seq_len 1024 --max_grad_norm 0.3 \
     --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
-
+  # --max_seq_len 512 filters almost all Jamba reasoning traces at stage >= 1 (confirmed S8).
+  # --max_grad_norm 0.3 prevents exploding gradients at k>=2 (confirmed smoke test gn=36.9).
+  
 Run (Phase 3.1 through 3.K, Kaggle Dual T4):
   !torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
@@ -498,10 +513,29 @@ def load_model_and_tokenizer(
 
     if device.type == "cuda":
         load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
-    # Always disable CUDA Mamba kernels — fast path requires mamba_ssm CUDA extensions
-    # compiled for the exact env, which is unreliable on Colab/variable environments.
-    load_kwargs["use_mamba_kernels"] = False
-  
+
+    # Probe for mamba CUDA kernels before model load.
+    # NEVER hardcode False unconditionally — that forces the ~100x slower PyTorch fallback
+    # even when correctly-built wheels are present. Probe; only set False on failure.
+    _mamba_fast_path = False
+    if device.type == "cuda":
+        try:
+            from mamba_ssm.ops.selective_scan_interface import selective_scan_fn          # noqa: F401
+            from mamba_ssm.ops.selective_scan_interface import selective_state_update      # noqa: F401
+            from causal_conv1d import causal_conv1d_fn                                    # noqa: F401
+            _mamba_fast_path = True
+            if is_main:
+                print("  mamba CUDA kernels: OK — fast path ACTIVE (~5s/step expected)")
+        except (ImportError, Exception) as _kern_exc:
+            load_kwargs["use_mamba_kernels"] = False
+            if is_main:
+                print(f"  [WARN] mamba CUDA kernels unavailable: {_kern_exc}")
+                print("         Slow PyTorch path forced (~500s/step).")
+                print("         Fix: python build_wheels_kaggle.py --hf_repo_id WeirdRunner/Ouroboros")
+    else:
+        # Non-CUDA devices: always slow path
+        load_kwargs["use_mamba_kernels"] = False
+
     if args.use_4bit:
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
