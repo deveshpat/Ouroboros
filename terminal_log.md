@@ -242,3 +242,37 @@ causal_conv1d_fn, causal_conv1d_update, mamba_inner_fn)` is None.
 
 **Fix:** Pin `mamba-ssm==1.2.2`. Updated in `build_wheels_kaggle.py`.
 Next session: rebuild mamba_ssm only (~15 min), re-upload, verify all 5 symbols.
+
+---
+
+## Wheel Build Session 2 (Kaggle, 2026-04-12)
+**Script:** `build_wheels_kaggle.py` (mamba-ssm==1.2.2)  **Status:** ✅ causal_conv1d built. ✗ mamba_ssm build failed.
+
+**Critical discovery — GPU is Blackwell (sm_120), not T4 (sm_75):**
+```
+ptxas: Compiling ... for 'sm_120'   ← every kernel in this session
+```
+Kaggle allocated a Blackwell GPU despite "T4 x2" label in notebook UI.
+All wheels from previous sessions (sm_72, sm_75) are wrong-arch and unusable.
+
+**mamba_ssm==1.2.2 build failed — root cause: no sm_120 in setup.py arch list:**
+```
+causal_conv1d-1.6.1: built and uploaded ✓   (254 MB)
+mamba_ssm==1.2.2:    build failed silently ✗  → No module named 'mamba_ssm'
+```
+1.2.2 was released before Blackwell existed. Its setup.py TORCH_CUDA_ARCH_LIST
+does not include sm_120 → nvcc rejects the target → build exits non-zero.
+
+**Verification (verbatim):**
+```
+✗ mamba_ssm.ops.selective_scan_interface.selective_scan_fn: ImportError: No module named 'mamba_ssm'
+✗ mamba_ssm.ops.selective_scan_interface.selective_state_update: ImportError: No module named 'mamba_ssm'
+✗ mamba_ssm.ops.selective_scan_interface.mamba_inner_fn: ImportError: No module named 'mamba_ssm'
+✓ causal_conv1d.causal_conv1d_fn: OK
+✓ causal_conv1d.causal_conv1d_update: OK
+```
+
+**Fix:** Auto-detect GPU CC at runtime (`torch.cuda.get_device_capability()`) and inject
+`TORCH_CUDA_ARCH_LIST="{major}.{minor}+PTX"` into subprocess env before every build.
+This forces the package's setup.py to compile for whatever GPU Kaggle actually allocates.
+Updated in `build_wheels_kaggle.py`.
