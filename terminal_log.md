@@ -5,6 +5,85 @@
 
 ---
 
+## Stage 3 — Smoke Test (Kaggle Dual T4, Latest Container Image)
+**Script:** `jamba_coconut_finetune.py`  **Date:** 2026-04-11  **Hardware:** Kaggle Dual T4 (single GPU used)
+**Status:** ✅ COMPLETED — all 3 stages ran without crashing. Two bugs found.
+
+**Command:**
+```
+python jamba_coconut_finetune.py \
+  --data_dir data/coconut_v1 --use_4bit \
+  --epochs_per_stage 1 --max_stage 2 --max_samples 200 \
+  --batch_size 2 --grad_accum 4 \
+  --session_timeout_hours 1.5 --graceful_exit_buffer_minutes 10 \
+  --wandb_mode disabled --output_dir runs/smoke
+```
+
+**Environment:** Latest Container Image (NOT pinned) — mamba CUDA kernels unavailable, slow path used (~520s/step)
+
+**Key metrics (verbatim):**
+```
+trainable params: 26,851,328 || all params: 3,056,191,360 || trainable%: 0.8786
+d_model=2560  layers=28
+<|lat|> token id: 65536  vocab: 65537
+embed_tokens and lm_head paths verified after PEFT wrap.
+
+Stage 0/2  (CoT warmup)   Epochs: 1  Steps/epoch: 24  Total: 24
+Stage 1/2  1 latent pass  Epochs: 1  Steps/epoch: 1   Total: 1
+  S1E0: 100%  ce=0.872  gn=0.954
+  [val] s=1 ep=0 val_ce=0.0000 val_acc=0.0000   ← BUG
+
+Stage 2/2  2 latent pass  Epochs: 1  Steps/epoch: 1   Total: 1
+  S2E0: 100%  ce=1.464  gn=36.926               ← EXPLODING GRAD
+  [val] s=2 ep=0 val_ce=0.0000 val_acc=0.0000   ← BUG
+```
+
+**Generation samples (verbatim):**
+```
+-- Generation @ step 2 stage=1 --
+Q: What is 15 + 27?
+A: The user is asking for the sum of 15 and 27...15 plus 20 is 35, then plus 7 more  [k_actual=1 uwr=0.613]
+Q: What is the capital of Japan?
+A: The user is asking for the capital of Japan. The answer is straightforward: the capital is Tokyo.  [k_actual=1 uwr=0.506]
+Q: Solve for x: 3x + 6 = 21.
+A: The user wants to solve the equation...x = 15/3 = 5. Wait, but let me check  [k_actual=1 uwr=0.716]
+Mean UWR: 0.592
+
+-- Generation @ step 3 stage=2 --
+Q: What is the capital of Japan?
+A: ,aemic for Japan. </think> about the question...Wait is a term for a type of furniture.  [k_actual=2 uwr=0.296]
+Q: Explain what a neural network is in simple terms.
+A: , </think>  Okay </think>  <think>  <think>  <think>  the  the  the  the  [k_actual=2 uwr=0.074]
+Mean UWR: 0.290
+```
+
+**Checklist against Part 15:**
+- [x] No import errors; trainable parameters printed
+- [x] attn_implementation: eager fallback (flash-attn absent)
+- [x] `<|lat|>` token added; embed_tokens resized
+- [x] embed_tokens and lm_head paths verified after PEFT wrap
+- [x] Stage 0 forward: last_hidden_state assert passes; loss finite
+- [x] Stage 1 forward: prefix pass works; CE finite
+- [x] Stage 2 forward: two prefix passes; no shape errors
+- [x] stage_0/best/ created with adapter_model/ + training_state.pt
+- [x] Stage advancement loads best_ckpt before next stage
+- [x] Curriculum complete banner printed
+- [ ] val_ce / val_acc correct — **FAIL: always 0.0**
+- [ ] Gradient norm stable — **FAIL: gn=36.926 at stage 2**
+
+**Root causes:**
+1. **val=0.0**: `build_sample_at_stage` returns None for all val samples because sequences exceed `--max_seq_len 512`. `n_valid_total` stays 0, function returns `torch.zeros` fallback silently.
+2. **gn=36.926**: Latent injection at k=2 with only 1 training step destabilises gradients. Real run needs `--max_grad_norm 0.3` or lower for k≥2.
+
+**Fixes before real run:**
+- `--max_seq_len 1024` (512 too tight for Jamba reasoning traces)
+- `--max_grad_norm 0.3`
+- Pin Kaggle environment to get mamba CUDA kernels working
+
+**Duration:** 3768.7s (~62 min). Stage 0 truncated in log (ran ~24 steps before log capture). Stages 1 and 2 each ran 1 step.
+
+---
+
 ## Stage 2 SFT — Session 9 (Single GPU, 3 epochs attempt)
 **Script:** `train_sft_single_gpu.py`  **Date:** 2026-04-09  **Hardware:** Kaggle Single T4
 **wandb run:** `comic-planet-8`  **Status:** 🔴 DEGENERATE — val_acc collapsed, no `<think>` tags
@@ -31,14 +110,6 @@ Q: Write a Python function...            A: "1. The first two num..."
 
 **Duration:** 14,472s (~4 hours). ~800/9,840 steps before timeout.
 
-**Root cause:**
-- "1000" loop = greedy-decode number attractor at low training signal. Model hasn't seen enough answer tokens to break it.
-- val_acc declining while train_ce falling → overfitting signal. lr=3e-4 too aggressive for fine-tuning from plain-text pretrain.
-- No `<think>` tags → model hasn't learned CoT format entry point; only ~8% of the schedule completed.
-- Greedy decode masks true quality; temperature sampling required to diagnose properly.
-
-**Fixes for S10:** lr=1e-4, warmup=100, dropout=0.1, ema_decay=0.995, num_epochs=5, temp=0.8/top_p=0.9 generation.
-
 ---
 
 ## Stage 2 SFT — Session 8 (DDP, OOM at step 250)
@@ -58,15 +129,6 @@ Q: Write a Python function...            A: "1. The first two num..."
 torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 9.25 GiB.
 GPU 1: 14.56 GiB total, 433.81 MiB free
 ```
-Root cause: `val_batch_size=16`, seq=2048, vocab=151,680 → logit tensor = 9.25 GiB. Fix: `val_batch_size=2` + `torch.cuda.empty_cache()`.
-
-**Resume fingerprint (correct behavior):**
-```
-[resume] checkpoint-0003500: loaded model weights (step=3500),
-         but data stream changed — resetting step/optimizer/scheduler.
-[resume] saved_data={'dataset_mix': 'full', ...}
-[resume] new_data  ={'dataset_mix': 'cached', ...}
-```
 
 ---
 
@@ -75,11 +137,9 @@ Root cause: `val_batch_size=16`, seq=2048, vocab=151,680 → logit tensor = 9.25
 
 | Session | Steps | Last val_ce | Root cause |
 |---|---|---|---|
-| S5 | ~3700 | 5.62 | val(557s)+gen(90s) > NCCL 600s timeout (SIGKILL exit 137) |
+| S5 | ~3700 | 5.62 | val(557s)+gen(90s) > NCCL 600s timeout |
 | S6 | 3750 | 5.63 | Same (SIGABRT) |
 | S7 | 3522 | ~3.24 | Same — rewrite not applied before run |
-
-Fix: `stage2_rewrite_prompt.md` → val capped (500 samples, batch=2, ~10s), `gen_every=500`, NCCL timeout raised to 1800s.
 
 ---
 
@@ -90,8 +150,6 @@ Fix: `stage2_rewrite_prompt.md` → val capped (500 samples, batch=2, ~10s), `ge
 | S1 | 2979 | 4.92 | Plateau. max_seq_len=1024 filtered 97% of reasoning chains. |
 | S2 | ~1500 | 5.71 | Bugs 6–10 cascade; prune bug deleted all local checkpoints. |
 | S3–S4 | <100 | — | Dry-runs only; patches verified. |
-
-Fix: max_seq_len raised to 2048.
 
 ---
 
@@ -112,9 +170,4 @@ G2 UWR > 0.1       mean UWR = 0.573    PASS ✓
 G3 gnorm < 10.0    max = 4.0312        PASS ✓
 G4 VRAM Δ < 1.0GB  Δ = 0.000 GB       PASS ✓
 Total time: 3.4 min   Peak VRAM: 2.07 GB
-```
-
-## Stage 0 — Baseline Smoke Test ✅ PASSED
-```
-parameters: 92,477,440 (92.5M)   initial loss: 11.9904   All checks passed.
 ```
