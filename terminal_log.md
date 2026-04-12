@@ -5,13 +5,56 @@
 
 ---
 
+## Stage 3 — Smoke Test Attempt 2 (Kaggle, 2026-04-13)
+**Script:** `jamba_coconut_finetune.py`  **Hardware:** Kaggle GPU (exact GPU unknown)
+**Status:** 🔴 CRASHED — bitsandbytes version too old; mamba_ssm source build silently failed again
+
+**Key events (verbatim):**
+```
+13.2s  [bootstrap] Installing dependencies (skips already-installed)...
+       ... (~29.7 min: mamba-ssm==1.2.2 source build ran; build output truncated) ...
+1795.4s [data] train: 36906 samples -> data/coconut_v1/train.jsonl
+1797.8s [data] val:   1940 samples  -> data/coconut_v1/val.jsonl
+1797.8s [data] stats.json written. median_steps=10  recommended --max_stage=10
+1801.1s Loaded 190 train / 10 val from data/coconut_v1
+1801.1s Step stats: median=10 mean=10.42 max=16
+1806.3s <|lat|> token id: 65536  vocab: 65537
+1806.3s flash-attn not installed: falling back to eager attention
+1806.3s [WARN] mamba CUDA kernels unavailable: No module named 'mamba_ssm'
+1806.3s Slow PyTorch path forced (~500s/step).
+1806.9s ImportError: Using `bitsandbytes` 4-bit quantization requires bitsandbytes:
+        `pip install -U bitsandbytes>=0.46.1`
+```
+
+**Crash location:** `load_model_and_tokenizer` → `_safe_from_pretrained` → `quantizer_bnb_4bit.py:60`
+
+**Root cause 1 — bitsandbytes version floor missing (PRIMARY, easy fix):**
+Container ships bitsandbytes < 0.46.1. `_bootstrap()` installs `"bitsandbytes"` with no version
+constraint → pip sees it already satisfied → old version stays → crash on 4-bit load.
+**Fix:** Change `"bitsandbytes"` to `"bitsandbytes>=0.46.1"` in `_bootstrap()`.
+
+**Root cause 2 — mamba_ssm source build failed again (BLOCKING, unresolved):**
+Bootstrap spent ~29.7 min — build definitely ran (visible pip progress in first 94 log lines).
+Module still absent post-install. Build stderr is in ~8000 truncated log lines; exact failure
+not visible. Likely causes:
+  (a) nvcc missing / CUDA toolkit headers absent in this container image
+  (b) Arch list issue despite `--no-build-isolation` (needs verbose build log to confirm)
+**Next step:** add `--verbose` to the mamba-ssm pip install call in `_bootstrap()` and
+capture stderr to a file; also inject `TORCH_CUDA_ARCH_LIST` env var in bootstrap subprocess.
+
+**Dataset confirmed (first successful Hub download):**
+- Train: 36,906 samples  Val: 1,940 samples
+- median_steps=10  mean=10.42  max=16
+- **Confirmed `--max_stage=10` for production runs**
+
+---
+
 ## Post-Smoke-Test Audit (2026-04-12)
 **Status:** ✅ Root causes identified. Patches ready.
 
 ### Discrepancy note
 Terminal log records **3768.7s script runtime** for the smoke test. User reported ~90 min total.
 Delta (~27 min) = Kaggle notebook startup + Jamba 3B download (~6 GB) + pip install time.
-Not a fabrication. Terminal log correctly captures script execution time, not total wall time.
 
 The "2 max samples" feeling: with `--max_seq_len 512` active, `build_sample_at_stage` returns
 `None` for nearly all val samples at stages 1+. `steps_per_epoch` collapses to `max(1, ...)` = 1.
@@ -19,27 +62,19 @@ Effectively 0 real training samples processed at stages 1 and 2 despite `--max_s
 
 ### Three-layer failure: mamba fast path never used
 
-**Layer 1 — Code (primary):** `use_mamba_kernels=False` is **unconditionally hardcoded** in
-`load_model_and_tokenizer`. Blueprint Part 0.2 describes it as a version-guard; actual code has
-no guard — it forces slow PyTorch SSM path always (~100× slower). Pure-PyTorch SSM scan
-explains the ~520s/step timing. **Fix: Patch 3 in jamba_coconut_patches.md.**
+**Layer 1 — Code (primary):** `use_mamba_kernels=False` was unconditionally hardcoded.
+**Fix:** Replaced with runtime probe — import `selective_scan_fn`; only set False on ImportError.
 
-**Layer 2 — Wheel/ABI mismatch:** Existing Hub wheels are `cu128+torch2.10+py312+cxx11FALSE`.
-"Latest Container Image" (not pinned) → different PyTorch/CUDA version → CUDA extensions
-don't load → `selective_scan_fn = None` → model warns and falls back silently.
-**Fix: Run `build_wheels_kaggle.py` once per container image, pin environment.**
+**Layer 2 — Wheel/ABI mismatch:** Existing Hub wheels were wrong-arch.
+**Fix:** Retired wheel workflow. Script self-installs via `_bootstrap()`.
 
-**Layer 3 — `--no-build-isolation` for all three:** All three packages (flash-attn, causal-conv1d,
-mamba-ssm) require `--no-build-isolation` for source builds. ai21labs' HF page only lists it for
-flash-attn because they assume PyPI pre-built wheels exist for causal-conv1d and mamba-ssm.
-For `cu128+torch2.10` (very new), no PyPI wheels exist → source build → needs the flag.
+**Layer 3 — `--no-build-isolation` required for source builds:** All three packages need it.
 `build_wheels_kaggle.py` passes `--no-build-isolation` for all three.
 
 ---
 
-## Stage 3 — Smoke Test (Kaggle Dual T4, Latest Container Image)
-**Script:** `jamba_coconut_finetune.py`  **Date:** 2026-04-11  **Hardware:** Kaggle Dual T4 (single GPU used)
-**Status:** ✅ COMPLETED — all 3 stages ran without crashing. Two training bugs found. Three root causes identified post-run.
+## Stage 3 — Smoke Test (Kaggle Dual T4, 2026-04-11)
+**Script:** `jamba_coconut_finetune.py`  **Status:** ✅ COMPLETED — all 3 stages ran without crashing. Two training bugs found.
 
 **Command:**
 ```
@@ -77,8 +112,6 @@ Q: What is 15 + 27?
 A: The user is asking for the sum of 15 and 27...15 plus 20 is 35, then plus 7 more  [k_actual=1 uwr=0.613]
 Q: What is the capital of Japan?
 A: The user is asking for the capital of Japan. The answer is straightforward: the capital is Tokyo.  [k_actual=1 uwr=0.506]
-Q: Solve for x: 3x + 6 = 21.
-A: The user wants to solve the equation...x = 15/3 = 5. Wait, but let me check  [k_actual=1 uwr=0.716]
 Mean UWR: 0.592
 
 -- Generation @ step 3 stage=2 --
@@ -89,56 +122,61 @@ A: , </think>  Okay </think>  <think>  <think>  <think>  the  the  the  the  [k_
 Mean UWR: 0.290
 ```
 
-**Checklist against Part 15:**
-- [x] No import errors; trainable parameters printed
-- [x] attn_implementation: eager fallback (flash-attn absent)
-- [x] `<|lat|>` token added; embed_tokens resized
-- [x] embed_tokens and lm_head paths verified after PEFT wrap
-- [x] Stage 0 forward: last_hidden_state assert passes; loss finite
-- [x] Stage 1 forward: prefix pass works; CE finite
-- [x] Stage 2 forward: two prefix passes; no shape errors
-- [x] stage_0/best/ created with adapter_model/ + training_state.pt
-- [x] Stage advancement loads best_ckpt before next stage
-- [x] Curriculum complete banner printed
-- [ ] val_ce / val_acc correct — **FAIL: always 0.0**
-- [ ] Gradient norm stable — **FAIL: gn=36.926 at stage 2**
-
 **Root causes:**
-1. **val=0.0**: `build_sample_at_stage` returns None for all val samples because sequences exceed `--max_seq_len 512`. `n_valid_total` stays 0, function returns `torch.zeros` fallback silently.
-2. **gn=36.926**: Latent injection at k=2 with only 1 training step destabilises gradients. Real run needs `--max_grad_norm 0.3` or lower for k≥2.
+1. **val=0.0**: `build_sample_at_stage` returns None for all val samples (sequences exceed `--max_seq_len 512`)
+2. **gn=36.926**: Latent injection at k=2 with only 1 training step destabilises gradients
 
-**Fixes (incorporated in patches + updated docstring):**
-- `--max_seq_len 1024` (512 too tight for Jamba reasoning traces)
-- `--max_grad_norm 0.3`
-- Build env-matched wheels; patch `use_mamba_kernels` probe (see audit above)
-- Pin Kaggle container to match built wheels
+**Script runtime:** 3768.7s (~63 min). Total session ~90 min.
 
-**Script runtime:** 3768.7s (~63 min). Total session ~90 min (includes download + pip install).
+---
+
+## Wheel Build Session 2 (Kaggle, 2026-04-12)
+**Script:** `build_wheels_kaggle.py` (mamba-ssm==1.2.2)  **Status:** ✅ causal_conv1d built. ✗ mamba_ssm build failed.
+
+**Critical discovery — GPU is Blackwell (sm_120), not T4:**
+```
+ptxas: Compiling ... for 'sm_120'
+causal_conv1d-1.6.1: built and uploaded ✓   (254 MB)
+mamba_ssm==1.2.2:    build failed silently ✗  → No module named 'mamba_ssm'
+```
+
+1.2.2 was released before Blackwell. Its setup.py TORCH_CUDA_ARCH_LIST does not include sm_120.
+**Fix:** Auto-detect GPU CC and inject `TORCH_CUDA_ARCH_LIST="{major}.{minor}+PTX"` into env.
+Updated in `build_wheels_kaggle.py`.
+
+**Verification (verbatim):**
+```
+✗ mamba_ssm.ops.selective_scan_interface.selective_scan_fn: ImportError: No module named 'mamba_ssm'
+✓ causal_conv1d.causal_conv1d_fn: OK
+✓ causal_conv1d.causal_conv1d_update: OK
+```
+
+---
+
+## Wheel Build Session 1 (Kaggle Dual T4, 2026-04-12)
+**Script:** `build_wheels_kaggle.py`  **Status:** ✅ Built + uploaded. ✗ Fast path blocked (wrong version).
+
+**Environment:** CUDA 12.8  PyTorch 2.10  Python cp312  cxx11=TRUE
+
+**Root cause confirmed:** `mamba_ssm 2.3.1` (2.x series) — `selective_state_update` moved to Triton path.
+**Fix:** Pin `mamba-ssm==1.2.2`. Updated in `build_wheels_kaggle.py`.
+
+**Verification (verbatim):**
+```
+mamba_ssm.ops.selective_scan_interface.selective_scan_fn: OK
+mamba_ssm.ops.selective_scan_interface.selective_state_update: None — ABI mismatch (FAIL)
+✗ 1 symbol(s) missing.
+```
 
 ---
 
 ## Stage 2 SFT — Session 9 (Single GPU, 3 epochs attempt)
-**Script:** `train_sft_single_gpu.py`  **Date:** 2026-04-09  **Hardware:** Kaggle Single T4
-**wandb run:** `comic-planet-8`  **Status:** 🔴 DEGENERATE — val_acc collapsed, no `<think>` tags
+**wandb run:** `comic-planet-8`  **Status:** 🔴 DEGENERATE — val_acc collapsed
 
-**Key metrics (verbatim from wandb):**
+**Key metrics (verbatim):**
 ```
 train/ce:         2.17731
-train/ce_smooth:  2.04761
-train/accuracy:   0.51889
 gen/mean_uwr:     0.08077   ← BELOW viability threshold (0.10)
-val/accuracy:     █▅▄▂▁▁    ← DECLINING over 6 val steps
-train/lr:         ██▇▇▇▆▆▅▅▄▄▃▃▂▂▁▁  ← cosine ran to near-completion
-world_size:       1
-```
-
-**Generation samples (verbatim):**
-```
-Q: What is 15 + 27?                     A: "1000 + 1000 + 1000 +..."
-Q: What is the capital of Japan?         A: "1000 (1000) (1000) ..."
-Q: Solve for x: 3x + 6 = 21.            A: "2012. The answer is ..."
-Q: Explain what a neural network is...  A: "1. The answer is 1. ..."
-Q: Write a Python function...            A: "1. The first two num..."
 ```
 
 **Duration:** 14,472s (~4 hours). ~800/9,840 steps before timeout.
@@ -146,18 +184,7 @@ Q: Write a Python function...            A: "1. The first two num..."
 ---
 
 ## Stage 2 SFT — Session 8 (DDP, OOM at step 250)
-**Script:** `train_sft.py` (DDP v2)  **Date:** 2026-04-08  **Hardware:** Kaggle Dual T4
 **Status:** 🔴 OOM at first val step
-
-**Training snippet (verbatim):**
-```
-      1     3.6784      0.3993          -         -   1.2656   1.20e-05    1.527     4599
-    100     3.1499      0.4089          -         -   1.4531   3.00e-04    4.345     4362
-    200     2.6602      0.4589          -         -   0.9648   2.99e-04    4.345     4236
-    240     2.6970      0.4450          -         -   1.0547   2.99e-04    1.546     4165
-```
-
-**Crash:**
 ```
 torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 9.25 GiB.
 GPU 1: 14.56 GiB total, 433.81 MiB free
@@ -166,29 +193,12 @@ GPU 1: 14.56 GiB total, 433.81 MiB free
 ---
 
 ## Stage 2 SFT — Sessions 5–7 (DDP, NCCL watchdog)
-**Status:** 🔴 All killed by NCCL watchdog
-
-| Session | Steps | Last val_ce | Root cause |
-|---|---|---|---|
-| S5 | ~3700 | 5.62 | val(557s)+gen(90s) > NCCL 600s timeout |
-| S6 | 3750 | 5.63 | Same (SIGABRT) |
-| S7 | 3522 | ~3.24 | Same — rewrite not applied before run |
-
----
-
-## Stage 2 SFT — Sessions 1–4 (Single GPU, early runs)
-
-| Session | Steps | val_ce | Outcome |
-|---|---|---|---|
-| S1 | 2979 | 4.92 | Plateau. max_seq_len=1024 filtered 97% of reasoning chains. |
-| S2 | ~1500 | 5.71 | Bugs 6–10 cascade; prune bug deleted all local checkpoints. |
-| S3–S4 | <100 | — | Dry-runs only; patches verified. |
+**Status:** 🔴 All killed by NCCL watchdog (val+gen > 600s timeout)
 
 ---
 
 ## Stage 1 Pre-training — Session 6 (Final)
-**Hardware:** Kaggle Dual T4  **Status:** ✅ COMPLETE (graceful timeout)
-
+**Status:** ✅ COMPLETE (graceful timeout)
 ```
 Tokens processed: 704,544,768   Last val CE: 5.324
 Hub: checkpoint-0021000 (commit=d70d2c49)
@@ -204,75 +214,3 @@ G3 gnorm < 10.0    max = 4.0312        PASS ✓
 G4 VRAM Δ < 1.0GB  Δ = 0.000 GB       PASS ✓
 Total time: 3.4 min   Peak VRAM: 2.07 GB
 ```
-
----
-
-## Wheel Build Session (Kaggle Dual T4, 2026-04-12)
-**Script:** `build_wheels_kaggle.py`  **Status:** ✅ Built + uploaded. ✗ Fast path still blocked.
-
-**Environment:** CUDA 12.8  PyTorch 2.10  Python cp312  cxx11=TRUE
-
-**Key result (verbatim):**
-```
-=== Verifying Fast Path (import check only) ===
-mamba_ssm.ops.selective_scan_interface.selective_scan_fn: OK
-mamba_ssm.ops.selective_scan_interface.selective_state_update: None — ABI mismatch or bad build (FAIL)
-causal_conv1d.causal_conv1d_fn: OK
-✗ 1 symbol(s) missing.
-```
-
-**Upload status:**
-```
-→ https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl
-No files have been modified since last commit. Skipping to prevent empty commit.   ← mamba_ssm identical hash
-→ https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl
-```
-
-**Root cause confirmed:** `mamba_ssm 2.3.1` (2.x series) restructured internals.
-`selective_state_update` no longer lives at `mamba_ssm.ops.selective_scan_interface`
-in 2.x — it moved to a Triton-based path. transformers' Jamba implementation checks
-five symbols at the 1.x import paths. With 2.3.1, `selective_state_update=None`
-silently disables the fast path regardless of build quality.
-
-This is also the root cause of the warning visible since the first smoke test:
-```
-The fast path is not available because on of `(selective_state_update, selective_scan_fn,
-causal_conv1d_fn, causal_conv1d_update, mamba_inner_fn)` is None.
-```
-
-**Fix:** Pin `mamba-ssm==1.2.2`. Updated in `build_wheels_kaggle.py`.
-Next session: rebuild mamba_ssm only (~15 min), re-upload, verify all 5 symbols.
-
----
-
-## Wheel Build Session 2 (Kaggle, 2026-04-12)
-**Script:** `build_wheels_kaggle.py` (mamba-ssm==1.2.2)  **Status:** ✅ causal_conv1d built. ✗ mamba_ssm build failed.
-
-**Critical discovery — GPU is Blackwell (sm_120), not T4 (sm_75):**
-```
-ptxas: Compiling ... for 'sm_120'   ← every kernel in this session
-```
-Kaggle allocated a Blackwell GPU despite "T4 x2" label in notebook UI.
-All wheels from previous sessions (sm_72, sm_75) are wrong-arch and unusable.
-
-**mamba_ssm==1.2.2 build failed — root cause: no sm_120 in setup.py arch list:**
-```
-causal_conv1d-1.6.1: built and uploaded ✓   (254 MB)
-mamba_ssm==1.2.2:    build failed silently ✗  → No module named 'mamba_ssm'
-```
-1.2.2 was released before Blackwell existed. Its setup.py TORCH_CUDA_ARCH_LIST
-does not include sm_120 → nvcc rejects the target → build exits non-zero.
-
-**Verification (verbatim):**
-```
-✗ mamba_ssm.ops.selective_scan_interface.selective_scan_fn: ImportError: No module named 'mamba_ssm'
-✗ mamba_ssm.ops.selective_scan_interface.selective_state_update: ImportError: No module named 'mamba_ssm'
-✗ mamba_ssm.ops.selective_scan_interface.mamba_inner_fn: ImportError: No module named 'mamba_ssm'
-✓ causal_conv1d.causal_conv1d_fn: OK
-✓ causal_conv1d.causal_conv1d_update: OK
-```
-
-**Fix:** Auto-detect GPU CC at runtime (`torch.cuda.get_device_capability()`) and inject
-`TORCH_CUDA_ARCH_LIST="{major}.{minor}+PTX"` into subprocess env before every build.
-This forces the package's setup.py to compile for whatever GPU Kaggle actually allocates.
-Updated in `build_wheels_kaggle.py`.

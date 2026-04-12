@@ -20,12 +20,13 @@ References:
   Jamba Reasoning 3B (AI21, ai21labs/AI21-Jamba-Reasoning-3B, Oct 2025)
 
 Install:
-  This script is self-sufficient. On first run it pip-installs all dependencies
-  automatically, including mamba-ssm==1.2.2 and causal-conv1d compiled from source
-  against the live PyTorch/CUDA environment (~20-30 min on first fresh session;
-  subsequent sessions skip already-installed packages in seconds).
-
-  No manual wheel building or Hub wheel caching required.
+  Self-contained. _bootstrap() runs on every startup in three phases:
+    Phase 1: build tools (ninja, packaging, wheel, setuptools)
+    Phase 2: pure-Python deps including bitsandbytes>=0.46.1
+    Phase 3: CUDA extensions (mamba-ssm==1.2.2, causal-conv1d) compiled from source
+             against the live PyTorch/CUDA env, with TORCH_CUDA_ARCH_LIST auto-injected
+             from the actual GPU capability (handles Blackwell sm_120, T4 sm_75, etc.)
+  First run ~20-30 min for CUDA extension source builds; subsequent runs: seconds.
 
 Run (smoke test, Colab/Kaggle T4):
   !python jamba_coconut_finetune.py \
@@ -37,14 +38,14 @@ Run (smoke test, Colab/Kaggle T4):
 Run (Phase 3.1 through 3.K, Kaggle Dual T4):
   !torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
-    --epochs_per_stage 3 --batch_size 2 --grad_accum 8 \
+    --epochs_per_stage 3 --max_stage 10 --batch_size 2 --grad_accum 8 \
     --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
     --output_dir runs/stage3_curriculum
 
 Run (Phase 3.4, DGAC gate, from Stage K best checkpoint):
   !python jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
-    --use_halt_gate --resume_from runs/stage3_curriculum/stage_K/best \
+    --use_halt_gate --resume_from runs/stage3_curriculum/stage_10/best \
     --epochs_per_stage 3 --output_dir runs/stage3_dgac
 """
 
@@ -73,37 +74,118 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 def _bootstrap() -> None:
     """
     Self-install all dependencies before any third-party imports.
-    Runs pip install on every startup; pip skips already-satisfied packages.
-    mamba-ssm==1.2.2 and causal-conv1d compile from source (~20-30 min on a
-    fresh session with no compatible PyPI wheel; seconds if already installed).
-    --no-build-isolation is required for source builds so they compile against
-    the live PyTorch/CUDA environment rather than pip's isolated build venv.
+
+    Three-phase approach to reliably build mamba CUDA extensions on any Kaggle GPU:
+
+    Phase 1 — Build tools:
+      ninja, packaging, wheel, setuptools — required for mamba-ssm source compilation.
+      Installed first so they are available in the build environment.
+
+    Phase 2 — Pure-Python runtime deps:
+      All packages that don't require CUDA compilation, including bitsandbytes>=0.46.1
+      (Kaggle containers ship an older version; must pin the floor).
+
+    Phase 3 — CUDA extension packages (per-package, with arch injection):
+      causal-conv1d and mamba-ssm==1.2.2 are built from source with:
+        --no-build-isolation  → compile against the live PyTorch/CUDA env, not an
+                                 isolated venv that lacks torch headers
+        TORCH_CUDA_ARCH_LIST  → auto-detected from torch.cuda.get_device_capability()
+                                 so that mamba-ssm 1.2.2 (which predates Blackwell/sm_120)
+                                 compiles correctly on whatever GPU Kaggle allocates
+        MAX_JOBS=4            → parallel nvcc compilation
+
+    Phase 4 — Verify fast-path symbols:
+      Imports all 5 symbols that transformers' Jamba checks. Prints a clear
+      ACTIVE/UNAVAILABLE banner so the user can diagnose failures early.
     """
-    packages = [
-        "transformers>=4.54.0",
-        "peft",
-        "datasets",
-        "tqdm",
-        "wandb",
-        "bitsandbytes",
-        "accelerate",
-        "huggingface_hub",
-        "mamba-ssm==1.2.2",
-        "causal-conv1d>=1.4.0",
-    ]
-    print("[bootstrap] Installing dependencies (skips already-installed)...")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", *packages],
+    import importlib as _il
+
+    # ── Phase 1: build prerequisites ─────────────────────────────────────────
+    print("[bootstrap] Phase 1: build tools...")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q",
+         "ninja", "packaging", "wheel", "setuptools"],
         check=False,
     )
-    if result.returncode != 0:
-        print(
-            "[bootstrap] WARNING: pip install returned non-zero. "
-            "mamba CUDA kernels may fall back to slow PyTorch path. "
-            "Check CUDA toolkit availability."
+
+    # ── Phase 2: pure-Python runtime deps ────────────────────────────────────
+    print("[bootstrap] Phase 2: pure-Python deps...")
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q",
+         "transformers>=4.54.0",
+         "peft",
+         "datasets",
+         "tqdm",
+         "wandb",
+         "bitsandbytes>=0.46.1",   # Kaggle containers ship < 0.46.1; must upgrade
+         "accelerate",
+         "huggingface_hub"],
+        check=False,
+    )
+    if r.returncode != 0:
+        print("[bootstrap] WARNING: Phase 2 pip returned non-zero; check output above.")
+
+    # ── Phase 3: CUDA extension packages ─────────────────────────────────────
+    cuda_env = os.environ.copy()
+    cuda_env["MAX_JOBS"] = "4"
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _major, _minor = _torch.cuda.get_device_capability(0)
+            _arch = f"{_major}.{_minor}+PTX"
+            cuda_env["TORCH_CUDA_ARCH_LIST"] = _arch
+            print(f"[bootstrap] Phase 3: GPU={_torch.cuda.get_device_name(0)} "
+                  f"sm_{_major}{_minor}  TORCH_CUDA_ARCH_LIST={_arch}")
+        else:
+            print("[bootstrap] Phase 3: No CUDA GPU — mamba kernels will be unavailable.")
+    except Exception as _e:
+        print(f"[bootstrap] Phase 3: GPU capability detection failed ({_e}); "
+              "proceeding without ARCH_LIST override.")
+
+    for _spec, _name in [
+        ("causal-conv1d>=1.4.0", "causal-conv1d"),
+        ("mamba-ssm==1.2.2",     "mamba-ssm"),
+    ]:
+        print(f"[bootstrap] Building {_spec} ...")
+        _r = subprocess.run(
+            [sys.executable, "-m", "pip", "install",
+             "--no-build-isolation", _spec],
+            env=cuda_env,
+            check=False,
         )
+        if _r.returncode != 0:
+            print(f"[bootstrap] WARNING: {_name} build FAILED (returncode={_r.returncode}).")
+            print( "[bootstrap]          Slow PyTorch SSM path will be used (~500s/step).")
+            print( "[bootstrap]          Verify: `nvcc --version` and CUDA headers in container.")
+
+    # ── Phase 4: verify fast-path symbols ────────────────────────────────────
+    _il.invalidate_caches()   # flush module finder cache after fresh installs
+    print("[bootstrap] Phase 4: verifying mamba fast-path symbols...")
+    _checks = [
+        ("mamba_ssm.ops.selective_scan_interface", "selective_scan_fn"),
+        ("mamba_ssm.ops.selective_scan_interface", "selective_state_update"),
+        ("mamba_ssm.ops.selective_scan_interface", "mamba_inner_fn"),
+        ("causal_conv1d",                          "causal_conv1d_fn"),
+        ("causal_conv1d",                          "causal_conv1d_update"),
+    ]
+    _missing: List[str] = []
+    for _mod, _attr in _checks:
+        try:
+            _m = __import__(_mod, fromlist=[_attr])
+            _obj = getattr(_m, _attr, None)
+            _ok = _obj is not None
+            print(f"  {'✓' if _ok else '✗'} {_attr}: {'OK' if _ok else 'None — API mismatch (2.x?)'}")
+            if not _ok:
+                _missing.append(_attr)
+        except ImportError as _ie:
+            print(f"  ✗ {_attr}: ImportError: {_ie}")
+            _missing.append(_attr)
+
+    if not _missing:
+        print("[bootstrap] Mamba fast path: ACTIVE — ~5s/step expected.")
     else:
-        print("[bootstrap] Dependencies ready.")
+        print(f"[bootstrap] Mamba fast path: UNAVAILABLE ({len(_missing)} symbol(s) missing).")
+        print( "[bootstrap] Slow path (~500s/step). Fix: ensure nvcc is available and re-run.")
 
 
 _bootstrap()
@@ -419,7 +501,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session_timeout_hours", type=float, default=11.0)
     parser.add_argument("--graceful_exit_buffer_minutes", type=float, default=20.0)
 
-    # ── Hub checkpoint sync ───────────────────────────────────────────────────
+    # Hub checkpoint sync
     parser.add_argument("--push_to_hub", action="store_true",
         help="Push checkpoints to HF Hub after each epoch save.")
     parser.add_argument("--hf_token", default=None,
@@ -492,7 +574,7 @@ def load_model_and_tokenizer(
 
     Key implementation notes:
     - attn_implementation: tries flash_attention_2, falls back to 'eager'
-    - use_mamba_kernels=False: only passed on transformers>=4.54.0
+    - use_mamba_kernels: probed at runtime; False only set when probe fails
     - <|lat|> token: added if absent; embed_tokens resized accordingly
     - device_map: pinned to the local process GPU when using torchrun
     - amp dtype: bfloat16 when supported, else float16 on CUDA (T4-safe)
@@ -519,7 +601,7 @@ def load_model_and_tokenizer(
     if is_main:
         print(f"  <|lat|> token id: {lat_token_id}  vocab: {len(tokenizer)}")
 
-    # Determine attn_implementation with fallback (never hardcode without fallback)
+    # Determine attn_implementation with fallback
     attn_impl = "eager"
     if device.type == "cuda":
         try:
@@ -544,14 +626,34 @@ def load_model_and_tokenizer(
         load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
 
     # Probe for mamba CUDA kernels before model load.
-    # NEVER hardcode False unconditionally — that forces the ~100x slower PyTorch fallback
-    # even when correctly-built wheels are present. Probe; only set False on failure.
+    # Check all 5 symbols that transformers' Jamba fast path requires.
+    # Also verify none are None (mamba_ssm 2.x returns None for some symbols
+    # that moved to a Triton path — this silently disables the fast path).
+    # NEVER hardcode use_mamba_kernels=False — that forces ~100x slower path always.
     _mamba_fast_path = False
     if device.type == "cuda":
         try:
-            from mamba_ssm.ops.selective_scan_interface import selective_scan_fn          # noqa: F401
-            from mamba_ssm.ops.selective_scan_interface import selective_state_update      # noqa: F401
-            from causal_conv1d import causal_conv1d_fn                                    # noqa: F401
+            from mamba_ssm.ops.selective_scan_interface import (  # noqa: F401
+                selective_scan_fn,
+                selective_state_update,
+                mamba_inner_fn,
+            )
+            from causal_conv1d import causal_conv1d_fn, causal_conv1d_update  # noqa: F401
+
+            # Verify none are None (2.x API mismatch guard)
+            _sym_check = {
+                "selective_scan_fn":     selective_scan_fn,
+                "selective_state_update": selective_state_update,
+                "mamba_inner_fn":        mamba_inner_fn,
+                "causal_conv1d_fn":      causal_conv1d_fn,
+                "causal_conv1d_update":  causal_conv1d_update,
+            }
+            _none_syms = [k for k, v in _sym_check.items() if v is None]
+            if _none_syms:
+                raise ImportError(
+                    f"Symbols are None (mamba_ssm 2.x API mismatch): {_none_syms}. "
+                    "Ensure mamba-ssm==1.2.2 is installed."
+                )
             _mamba_fast_path = True
             if is_main:
                 print("  mamba CUDA kernels: OK — fast path ACTIVE (~5s/step expected)")
@@ -560,8 +662,6 @@ def load_model_and_tokenizer(
             if is_main:
                 print(f"  [WARN] mamba CUDA kernels unavailable: {_kern_exc}")
                 print("         Slow PyTorch path forced (~500s/step).")
-                print("         mamba-ssm==1.2.2 bootstrap should have compiled kernels above.")
-                print("         Check pip install output at startup for errors.")
     else:
         # Non-CUDA devices: always slow path
         load_kwargs["use_mamba_kernels"] = False
@@ -636,6 +736,7 @@ def load_model_and_tokenizer(
     return model, tokenizer, d_model, lat_token_id
 
 
+
 def _download_dataset_from_hub(
     data_dir: Path,
     hf_repo_id: str = "WeirdRunner/Ouroboros",
@@ -667,7 +768,6 @@ def _download_dataset_from_hub(
         rows: List[Dict[str, Any]] = []
         with out_path.open("w", encoding="utf-8") as fh:
             for row in ds:
-                # 'steps' is JSON-encoded string on Hub; decode it
                 steps = row.get("steps", [])
                 if isinstance(steps, str):
                     try:
@@ -693,7 +793,6 @@ def _download_dataset_from_hub(
     train_rows = _write_split("train", "train",      data_dir / "train.jsonl")
     val_rows   = _write_split("val",   "validation", data_dir / "val.jsonl")
 
-    # Regenerate stats.json from downloaded data
     def _quick_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not rows:
             return {}
@@ -737,7 +836,6 @@ def load_canonical_dataset(
     if not train_path.exists():
         _download_dataset_from_hub(data_dir)
 
-    # Verify download succeeded
     if not train_path.exists():
         raise FileNotFoundError(
             f"train.jsonl not found at {train_path} and Hub download failed.\n"
@@ -791,8 +889,8 @@ def get_max_stage(args: argparse.Namespace, stats: Dict[str, Any]) -> int:
             print(f"  --max_stage not set; using n_steps_median={median} from stats.json")
         return int(median)
     if _is_main_process():
-        print("  [warn] --max_stage not set and stats.json absent; defaulting to 4")
-    return 4
+        print("  [warn] --max_stage not set and stats.json absent; defaulting to 10")
+    return 10
 
 
 def build_sample_at_stage(
@@ -1142,6 +1240,7 @@ def normalize_pred(text: str) -> str:
     return last_line.strip(" .,:;!*")
 
 
+
 @torch.no_grad()
 def evaluate_stage(
     model,
@@ -1263,11 +1362,11 @@ def evaluate_stage(
         halt_gate.train()
     return ce_numer / max(ce_denom, 1), n_correct / max(n_total, 1)
 
+
 def _resolve_hf_token(cli_value: Optional[str]) -> Optional[str]:
     """CLI > Kaggle Secrets > Colab Secrets > env var."""
     if cli_value:
         return cli_value
-    # Kaggle
     try:
         from kaggle_secrets import UserSecretsClient
         tok = UserSecretsClient().get_secret("HF_TOKEN")
@@ -1275,7 +1374,6 @@ def _resolve_hf_token(cli_value: Optional[str]) -> Optional[str]:
             return tok
     except Exception:
         pass
-    # Colab
     try:
         from google.colab import userdata as _cu
         tok = _cu.get("HF_TOKEN")
@@ -1293,10 +1391,7 @@ def _hub_upload_checkpoint(
     remote_prefix: str = "runs/stage3",
     timeout_s: float = 300.0,
 ) -> bool:
-    """
-    Upload one checkpoint directory to HF Hub. Fire-and-forget — never raises.
-    Uses run_as_future so the training loop is not blocked by slow uploads.
-    """
+    """Upload one checkpoint directory to HF Hub. Fire-and-forget — never raises."""
     try:
         from huggingface_hub import HfApi
     except ImportError:
@@ -1331,10 +1426,7 @@ def _hub_download_checkpoint(
     hf_token: str,
     remote_prefix: str = "runs/stage3",
 ) -> Optional[Path]:
-    """
-    Download a single named checkpoint folder from HF Hub into local_dir.
-    Returns the local path on success, None on failure.
-    """
+    """Download a single named checkpoint folder from HF Hub into local_dir."""
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
@@ -1364,10 +1456,7 @@ def _list_hub_stage_checkpoints(
     hf_token: str,
     remote_prefix: str = "runs/stage3",
 ) -> List[Tuple[int, int, str]]:
-    """
-    Return [(stage_k, step, ckpt_name)] for all checkpoint-* dirs on Hub,
-    sorted newest first (stage desc, step desc).
-    """
+    """Return [(stage_k, step, ckpt_name)] sorted newest first."""
     try:
         from huggingface_hub import HfApi
     except ImportError:
@@ -1379,19 +1468,18 @@ def _list_hub_stage_checkpoints(
         return []
 
     prefix = remote_prefix.strip("/")
-    found: set[Tuple[int, int, str]] = set()
+    found: set = set()
     for f in files:
-        # e.g. runs/stage3/stage_2/checkpoint-0001234/training_state.pt
         parts = f.split("/")
         try:
             prefix_parts = prefix.split("/")
             if parts[:len(prefix_parts)] != prefix_parts:
                 continue
-            rest = parts[len(prefix_parts):]          # ['stage_2', 'checkpoint-...', ...]
+            rest = parts[len(prefix_parts):]
             if len(rest) < 2:
                 continue
-            stage_dir = rest[0]   # 'stage_2'
-            ckpt_dir  = rest[1]   # 'checkpoint-0001234' or 'best'
+            stage_dir = rest[0]
+            ckpt_dir  = rest[1]
             stage_k = _parse_stage_dir_name(stage_dir)
             if stage_k is None:
                 continue
@@ -1402,14 +1490,13 @@ def _list_hub_stage_checkpoints(
             else:
                 tail = ckpt_dir.split("-")[-1]
                 step = int(tail) if tail.isdigit() else 0
-            # remote name relative to prefix: stage_2/checkpoint-0001234
             rel = "/".join(rest[:2])
             found.add((stage_k, step, rel))
         except Exception:
             continue
 
-    # Sort: best = stage desc, then step desc ('best' checkpoints get step=0, listed last per stage)
     return sorted(found, key=lambda x: (x[0], x[1]), reverse=True)
+
 
 def save_checkpoint(
     output_dir: Path,
@@ -1464,7 +1551,6 @@ def save_checkpoint(
     if _is_main_process():
         print(f"  [ckpt] {label} -> {ckpt}  acc={val_acc}  ce={val_ce}")
 
-    # Hub push
     hf_token  = getattr(args, "_resolved_hf_token", None)
     push      = getattr(args, "push_to_hub", False)
     repo_id   = getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros")
@@ -1537,8 +1623,8 @@ def load_checkpoint(
 def prune_epoch_checkpoints(stage_dir: Path, keep: int) -> None:
     keep = max(int(keep), 0)
     checkpoints = sorted(
-        [path for path in stage_dir.iterdir() if path.is_dir() and path.name.startswith("checkpoint-")],
-        key=lambda path: int(path.name.split("-")[-1]) if path.name.split("-")[-1].isdigit() else -1,
+        [p for p in stage_dir.iterdir() if p.is_dir() and p.name.startswith("checkpoint-")],
+        key=lambda p: int(p.name.split("-")[-1]) if p.name.split("-")[-1].isdigit() else -1,
     )
     for old in checkpoints[:-keep] if keep > 0 else checkpoints:
         shutil.rmtree(old, ignore_errors=True)
@@ -1548,9 +1634,9 @@ def get_trainable_parameters(
     model: nn.Module,
     halt_gate: Optional[nn.Module],
 ) -> List[nn.Parameter]:
-    params = [param for param in model.parameters() if param.requires_grad]
+    params = [p for p in model.parameters() if p.requires_grad]
     if halt_gate is not None:
-        params.extend(param for param in halt_gate.parameters() if param.requires_grad)
+        params.extend(p for p in halt_gate.parameters() if p.requires_grad)
     return params
 
 
@@ -1561,11 +1647,11 @@ def build_optimizer_and_scheduler(
     total_steps: int,
 ) -> Tuple[AdamW, LambdaLR]:
     trainable = get_trainable_parameters(model, halt_gate)
-    decay = [param for param in trainable if param.ndim >= 2]
-    no_decay = [param for param in trainable if param.ndim < 2]
+    decay    = [p for p in trainable if p.ndim >= 2]
+    no_decay = [p for p in trainable if p.ndim < 2]
     optimizer = AdamW(
         [
-            {"params": decay, "weight_decay": args.weight_decay},
+            {"params": decay,    "weight_decay": args.weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ],
         lr=args.lr,
@@ -1584,13 +1670,9 @@ def build_optimizer_and_scheduler(
 
 
 def make_timeout_checker(args: argparse.Namespace, rank: int):
-    """
-    Returns a callable that returns True when the session is within the
-    graceful exit buffer. Only rank 0 checks wall time; other ranks follow
-    via broadcast in the main loop.
-    """
+    """Returns callable → True when session is within graceful exit buffer."""
     session_start = time.perf_counter()
-    timeout_limit_s = args.session_timeout_hours * 3600.0
+    timeout_limit_s  = args.session_timeout_hours * 3600.0
     timeout_buffer_s = args.graceful_exit_buffer_minutes * 60.0
     triggered = [False]
 
@@ -1621,15 +1703,9 @@ def find_latest_resume_checkpoint(
 ) -> Optional[Path]:
     """
     Find the latest in-progress checkpoint.
-
-    Search order:
-      1. Local output_dir (fastest, preferred)
-      2. HF Hub (fallback for fresh Kaggle sessions)
-
-    'best' checkpoints are intentionally skipped so reruns prefer
-    the freshest resumable training state, not the best eval snapshot.
+    Search order: local output_dir first, then HF Hub fallback.
+    'best' checkpoints skipped so reruns prefer the freshest resumable state.
     """
-    # ── Local scan ────────────────────────────────────────────────────────────
     best_path: Optional[Path] = None
     best_key:  Optional[Tuple[int, int, int, int]] = None
 
@@ -1661,7 +1737,6 @@ def find_latest_resume_checkpoint(
     if best_path is not None:
         return best_path
 
-    # ── Hub fallback (only when local is empty) ───────────────────────────────
     if not hf_token:
         return None
 
@@ -1669,13 +1744,12 @@ def find_latest_resume_checkpoint(
         print("  [resume] No local checkpoints found. Scanning Hub...")
 
     hub_candidates = _list_hub_stage_checkpoints(hf_repo_id, hf_token, hf_stage_subdir)
-    # Skip 'best' entries (step==0) for resuming; prefer checkpoint-NNNNNNN
     hub_candidates = [(k, s, n) for k, s, n in hub_candidates if not n.endswith("/best")]
 
     hub_resume_dir = output_dir / ".hub_resume"
 
     for stage_k, step, rel_name in hub_candidates:
-        ckpt_name = rel_name.split("/")[-1]   # e.g. checkpoint-0001234
+        ckpt_name = rel_name.split("/")[-1]
         if _is_main_process():
             print(f"  [hub] downloading {rel_name} ...")
         downloaded = _hub_download_checkpoint(
@@ -1779,7 +1853,6 @@ def run_generation_callback(
     print(f"  Mean UWR: {mean_uwr:.3f}\n")
     if wandb_run is not None:
         import wandb
-
         wandb.log({"gen/mean_uwr": mean_uwr, "gen/stage": stage_k}, step=step)
     model.train()
     if halt_gate is not None:
@@ -1793,19 +1866,20 @@ def _best_state_for_stage(stage_dir: Path) -> Tuple[float, float, Optional[Path]
         return -1.0, float("inf"), None
     state = _read_training_state(best_dir, map_location="cpu")
     val_acc = float(state.get("val_acc", -1.0) if state.get("val_acc") is not None else -1.0)
-    val_ce = float(state.get("val_ce", float("inf")) if state.get("val_ce") is not None else float("inf"))
+    val_ce  = float(state.get("val_ce", float("inf")) if state.get("val_ce") is not None else float("inf"))
     return val_acc, val_ce, best_dir
+
 
 
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
-    rank = _rank()
+    rank       = _rank()
     world_size = _world_size()
     local_rank = _local_rank()
     distributed = world_size > 1
-    is_main = rank == 0
+    is_main    = rank == 0
 
     if distributed:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
@@ -1828,7 +1902,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     hf_token = _resolve_hf_token(getattr(args, "hf_token", None))
-    args._resolved_hf_token = hf_token   # used by save_checkpoint
+    args._resolved_hf_token = hf_token
 
     if getattr(args, "push_to_hub", False) and not hf_token:
         if _is_main_process():
@@ -1839,7 +1913,6 @@ def main() -> None:
     if is_main and args.wandb_mode != "disabled":
         try:
             import wandb
-
             wandb_run = wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name,
@@ -1855,6 +1928,8 @@ def main() -> None:
     curriculum_max_stage = get_max_stage(args, stats)
 
     resume_path: Optional[Path] = Path(args.resume_from) if args.resume_from else None
+    hub_resume_dir = output_dir / ".hub_resume"
+
     if resume_path is None:
         resume_path = find_latest_resume_checkpoint(
             output_dir,
@@ -1862,8 +1937,6 @@ def main() -> None:
             hf_repo_id=getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros"),
             hf_stage_subdir=getattr(args, "hf_stage_subdir", "runs/stage3"),
         )
-
-        hub_resume_dir = output_dir / ".hub_resume"
 
         if resume_path is not None and is_main:
             print(f"  [resume] discovered latest checkpoint: {resume_path}")
@@ -1883,7 +1956,7 @@ def main() -> None:
     if args.use_halt_gate:
         halt_gate = HaltGate(d_model).to(device=device, dtype=torch.float32)
         if is_main:
-            n_params = sum(param.numel() for param in halt_gate.parameters())
+            n_params = sum(p.numel() for p in halt_gate.parameters())
             print(f"  DGAC HaltGate: d_model={d_model}  params={n_params}")
 
     resume_state: Optional[Dict[str, Any]] = None
@@ -1906,20 +1979,20 @@ def main() -> None:
         )
 
         if hub_resume_dir.exists():
-           shutil.rmtree(hub_resume_dir, ignore_errors=True)
+            shutil.rmtree(hub_resume_dir, ignore_errors=True)
 
         resume_stage = int(resume_state.get("stage_k", 0))
-        global_step = int(resume_state.get("step", 0))
+        global_step  = int(resume_state.get("step", 0))
         if args.use_halt_gate:
             resume_same_stage = bool(resume_state.get("use_halt_gate", False) and resume_path.name != "best")
             if resume_same_stage:
-                resume_epoch = int(resume_state.get("epoch", 0))
-                resume_step_in_epoch = int(resume_state.get("step_in_epoch", -1))
-                step_in_phase = int(resume_state.get("step_in_phase", 0))
+                resume_epoch          = int(resume_state.get("epoch", 0))
+                resume_step_in_epoch  = int(resume_state.get("step_in_epoch", -1))
+                step_in_phase         = int(resume_state.get("step_in_phase", 0))
         else:
             resume_same_stage = resume_path.name != "best"
             if resume_same_stage:
-                resume_epoch = int(resume_state.get("epoch", 0))
+                resume_epoch         = int(resume_state.get("epoch", 0))
                 resume_step_in_epoch = int(resume_state.get("step_in_epoch", -1))
 
     if args.use_halt_gate:
@@ -1947,7 +2020,6 @@ def main() -> None:
             torch.distributed.destroy_process_group()
         if wandb_run is not None:
             import wandb
-
             wandb.finish()
         return
 
@@ -1969,8 +2041,8 @@ def main() -> None:
             optimizer, scheduler = build_optimizer_and_scheduler(model, halt_gate, args, total_stage_steps)
             trainable_params = get_trainable_parameters(model, halt_gate)
 
-            stage_start_epoch = 0
-            stage_start_step_in_epoch = -1
+            stage_start_epoch          = 0
+            stage_start_step_in_epoch  = -1
             if resume_same_stage and stage_k == resume_stage and resume_path is not None:
                 state = load_checkpoint(
                     resume_path,
@@ -1981,8 +2053,8 @@ def main() -> None:
                     device=device,
                     verbose=is_main,
                 )
-                global_step = int(state.get("step", global_step))
-                stage_start_epoch = int(state.get("epoch", resume_epoch))
+                global_step               = int(state.get("step", global_step))
+                stage_start_epoch         = int(state.get("epoch", resume_epoch))
                 stage_start_step_in_epoch = int(state.get("step_in_epoch", resume_step_in_epoch))
                 if args.use_halt_gate:
                     step_in_phase = int(state.get("step_in_phase", step_in_phase))
@@ -2017,12 +2089,11 @@ def main() -> None:
                     halt_gate.train()
                 optimizer.zero_grad(set_to_none=True)
 
-                start_step = stage_start_step_in_epoch + 1 if epoch == stage_start_epoch else 0
+                start_step      = stage_start_step_in_epoch + 1 if epoch == stage_start_epoch else 0
                 remaining_steps = max(steps_per_epoch - start_step, 0)
                 pbar = (
                     tqdm(total=remaining_steps, desc=f"S{stage_k}E{epoch}", dynamic_ncols=True)
-                    if is_main
-                    else None
+                    if is_main else None
                 )
 
                 for step_idx in range(start_step, steps_per_epoch):
@@ -2049,12 +2120,12 @@ def main() -> None:
                         break
 
                     step_metrics_accum: Dict[str, float] = defaultdict(float)
-                    micro_count = 0
+                    micro_count  = 0
                     did_backward = False
 
                     for micro in range(args.grad_accum):
                         global_micro_base = (step_idx * args.grad_accum + micro) * args.batch_size
-                        rank_base = global_micro_base + rank * local_bs
+                        rank_base   = global_micro_base + rank * local_bs
                         batch_indices = [
                             perm[(rank_base + offset) % len(train_samples)]
                             for offset in range(local_bs)
@@ -2062,15 +2133,11 @@ def main() -> None:
                         batch_raw = [train_samples[idx] for idx in batch_indices]
                         built = [
                             build_sample_at_stage(
-                                tokenizer,
-                                sample,
-                                stage_k,
-                                lat_token_id,
-                                args.max_seq_len,
+                                tokenizer, sample, stage_k, lat_token_id, args.max_seq_len,
                             )
                             for sample in batch_raw
                         ]
-                        built = [sample for sample in built if sample is not None]
+                        built = [s for s in built if s is not None]
                         if not built:
                             continue
                         batch = collate_stage_k(built, pad_id)
@@ -2084,10 +2151,10 @@ def main() -> None:
                             step_in_phase=step_in_phase,
                         )
                         (loss / args.grad_accum).backward()
-                        did_backward = True
-                        micro_count += 1
-                        for key, value in metrics.items():
-                            step_metrics_accum[key] += float(value)
+                        did_backward  = True
+                        micro_count  += 1
+                        for k, v in metrics.items():
+                            step_metrics_accum[k] += float(v)
 
                     if not did_backward:
                         optimizer.zero_grad(set_to_none=True)
@@ -2099,7 +2166,9 @@ def main() -> None:
                     if distributed:
                         all_reduce_gradients(trainable_params, world_size)
 
-                    grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm))
+                    grad_norm = float(
+                        torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                    )
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -2108,8 +2177,7 @@ def main() -> None:
                         step_in_phase += 1
 
                     mean_metrics = {
-                        key: value / max(micro_count, 1)
-                        for key, value in step_metrics_accum.items()
+                        k: v / max(micro_count, 1) for k, v in step_metrics_accum.items()
                     }
                     mean_ce = mean_metrics.get("ce", 0.0)
 
@@ -2119,11 +2187,11 @@ def main() -> None:
 
                     if is_main and global_step % args.log_every == 0:
                         log_payload = {
-                            "train/ce": mean_ce,
+                            "train/ce":        mean_ce,
                             "train/grad_norm": grad_norm,
-                            "train/lr": scheduler.get_last_lr()[0],
-                            "train/stage": stage_k,
-                            **{f"train/{key}": value for key, value in mean_metrics.items()},
+                            "train/lr":        scheduler.get_last_lr()[0],
+                            "train/stage":     stage_k,
+                            **{f"train/{k}": v for k, v in mean_metrics.items()},
                         }
                         tqdm.write(
                             f"  step={global_step:6d} s={stage_k} ep={epoch} "
@@ -2131,7 +2199,6 @@ def main() -> None:
                         )
                         if wandb_run is not None:
                             import wandb
-
                             wandb.log(log_payload, step=global_step)
 
                 if pbar is not None:
@@ -2159,7 +2226,6 @@ def main() -> None:
                     )
                     if wandb_run is not None:
                         import wandb
-
                         wandb.log(
                             {"val/ce": val_ce, "val/acc": val_acc, "val/stage": stage_k},
                             step=global_step,
@@ -2187,7 +2253,7 @@ def main() -> None:
                     )
                     if is_better:
                         best_val_acc = val_acc
-                        best_val_ce = val_ce
+                        best_val_ce  = val_ce
                         best_ckpt = save_checkpoint(
                             output_dir=output_dir,
                             step=global_step,
@@ -2267,7 +2333,6 @@ def main() -> None:
             torch.distributed.destroy_process_group()
         if wandb_run is not None:
             import wandb
-
             wandb.finish()
 
 
