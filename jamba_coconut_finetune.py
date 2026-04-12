@@ -20,31 +20,20 @@ References:
   Jamba Reasoning 3B (AI21, ai21labs/AI21-Jamba-Reasoning-3B, Oct 2025)
 
 Install:
-  # PREREQUISITE (once per new container image):
-  #   python build_wheels_kaggle.py --hf_repo_id WeirdRunner/Ouroboros --hf_token YOUR_TOKEN
-  #   If unsure whether env changed: python build_wheels_kaggle.py --verify_only
-  #   Re-run when Kaggle upgrades its container (check: python -c "import torch; print(torch.__version__, torch.version.cuda)")
-  #
-  # All three packages require --no-build-isolation for source builds (they compile
-  # CUDA extensions against the live PyTorch/CUDA env, which pip's isolated build
-  # venv does not expose). build_wheels_kaggle.py handles this automatically.
-  #
-  # Paste the exact wheel URLs printed by build_wheels_kaggle.py below:
-  !pip install -q "transformers>=4.54.0" peft datasets tqdm wandb \
-               bitsandbytes accelerate huggingface_hub \
-               https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/<FLASH_ATTN_WHEEL>.whl \
-               https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/<CAUSAL_CONV1D_WHEEL>.whl \
-               https://huggingface.co/WeirdRunner/Ouroboros/resolve/main/<MAMBA_SSM_WHEEL>.whl
-   
-  Run (smoke test, Colab/Kaggle T4):
+  This script is self-sufficient. On first run it pip-installs all dependencies
+  automatically, including mamba-ssm==1.2.2 and causal-conv1d compiled from source
+  against the live PyTorch/CUDA environment (~20-30 min on first fresh session;
+  subsequent sessions skip already-installed packages in seconds).
+
+  No manual wheel building or Hub wheel caching required.
+
+Run (smoke test, Colab/Kaggle T4):
   !python jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
     --epochs_per_stage 1 --max_stage 2 --max_samples 200 \
     --max_seq_len 1024 --max_grad_norm 0.3 \
     --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
-  # --max_seq_len 512 filters almost all Jamba reasoning traces at stage >= 1 (confirmed S8).
-  # --max_grad_norm 0.3 prevents exploding gradients at k>=2 (confirmed smoke test gn=36.9).
-  
+
 Run (Phase 3.1 through 3.K, Kaggle Dual T4):
   !torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
@@ -67,6 +56,7 @@ import os
 import random
 import re as _re
 import shutil
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -78,6 +68,45 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def _bootstrap() -> None:
+    """
+    Self-install all dependencies before any third-party imports.
+    Runs pip install on every startup; pip skips already-satisfied packages.
+    mamba-ssm==1.2.2 and causal-conv1d compile from source (~20-30 min on a
+    fresh session with no compatible PyPI wheel; seconds if already installed).
+    --no-build-isolation is required for source builds so they compile against
+    the live PyTorch/CUDA environment rather than pip's isolated build venv.
+    """
+    packages = [
+        "transformers>=4.54.0",
+        "peft",
+        "datasets",
+        "tqdm",
+        "wandb",
+        "bitsandbytes",
+        "accelerate",
+        "huggingface_hub",
+        "mamba-ssm==1.2.2",
+        "causal-conv1d>=1.4.0",
+    ]
+    print("[bootstrap] Installing dependencies (skips already-installed)...")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", *packages],
+        check=False,
+    )
+    if result.returncode != 0:
+        print(
+            "[bootstrap] WARNING: pip install returned non-zero. "
+            "mamba CUDA kernels may fall back to slow PyTorch path. "
+            "Check CUDA toolkit availability."
+        )
+    else:
+        print("[bootstrap] Dependencies ready.")
+
+
+_bootstrap()
 
 import torch
 import torch.nn as nn
@@ -94,8 +123,8 @@ try:
     from tqdm.auto import tqdm
 except ImportError as exc:
     sys.exit(
-        f"Missing dependency: {exc}\n"
-        "pip install 'transformers>=4.54.0' peft tqdm wandb bitsandbytes accelerate"
+        f"Missing dependency after bootstrap: {exc}\n"
+        "Check pip install output above for errors."
     )
 
 MODEL_ID = "ai21labs/AI21-Jamba-Reasoning-3B"
@@ -340,7 +369,7 @@ def parse_args() -> argparse.Namespace:
     )
     # Model
     parser.add_argument("--model_id", default=MODEL_ID)
-    parser.add_argument("--max_seq_len", type=int, default=512)
+    parser.add_argument("--max_seq_len", type=int, default=1024)
 
     # LoRA / QLoRA
     parser.add_argument(
@@ -399,7 +428,7 @@ def parse_args() -> argparse.Namespace:
         help="HF model repo to sync checkpoints to.")
     parser.add_argument("--hf_stage_subdir", default="runs/stage3",
         help="Remote subdirectory inside the HF repo for Stage 3 checkpoints.")
-  
+
     # I/O
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--output_dir", default="runs/stage3")
@@ -531,7 +560,8 @@ def load_model_and_tokenizer(
             if is_main:
                 print(f"  [WARN] mamba CUDA kernels unavailable: {_kern_exc}")
                 print("         Slow PyTorch path forced (~500s/step).")
-                print("         Fix: python build_wheels_kaggle.py --hf_repo_id WeirdRunner/Ouroboros")
+                print("         mamba-ssm==1.2.2 bootstrap should have compiled kernels above.")
+                print("         Check pip install output at startup for errors.")
     else:
         # Non-CUDA devices: always slow path
         load_kwargs["use_mamba_kernels"] = False
@@ -1380,7 +1410,7 @@ def _list_hub_stage_checkpoints(
 
     # Sort: best = stage desc, then step desc ('best' checkpoints get step=0, listed last per stage)
     return sorted(found, key=lambda x: (x[0], x[1]), reverse=True)
-  
+
 def save_checkpoint(
     output_dir: Path,
     step: int,
@@ -1433,8 +1463,8 @@ def save_checkpoint(
     label = "best" if tag == "best" else "saved"
     if _is_main_process():
         print(f"  [ckpt] {label} -> {ckpt}  acc={val_acc}  ce={val_ce}")
-      
-    # ── NEW: Hub push ─────────────────────────────────────────────────────────
+
+    # Hub push
     hf_token  = getattr(args, "_resolved_hf_token", None)
     push      = getattr(args, "push_to_hub", False)
     repo_id   = getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros")
@@ -1653,7 +1683,6 @@ def find_latest_resume_checkpoint(
             local_dir=hub_resume_dir,
             hf_repo_id=hf_repo_id,
             hf_token=hf_token,
-            # remote_prefix must include the stage subdir AND stage folder
             remote_prefix=f"{hf_stage_subdir}/stage_{stage_k}",
         )
         if downloaded is not None and (downloaded / "training_state.pt").exists():
@@ -1805,7 +1834,7 @@ def main() -> None:
         if _is_main_process():
             print("[warn] --push_to_hub set but no HF token found; Hub sync disabled.")
         args.push_to_hub = False
-      
+
     wandb_run = None
     if is_main and args.wandb_mode != "disabled":
         try:
@@ -1834,12 +1863,11 @@ def main() -> None:
             hf_stage_subdir=getattr(args, "hf_stage_subdir", "runs/stage3"),
         )
 
-        # Clean up hub_resume dir after loading (keeps output_dir tidy)
         hub_resume_dir = output_dir / ".hub_resume"
-      
+
         if resume_path is not None and is_main:
             print(f"  [resume] discovered latest checkpoint: {resume_path}")
-          
+
     if resume_path is not None and not (resume_path / "training_state.pt").exists():
         if is_main:
             print(f"  [warn] resume checkpoint not found: {resume_path}")
@@ -1877,14 +1905,12 @@ def main() -> None:
             verbose=is_main,
         )
 
-        # Cleanup Hub resume cache — files are now loaded, no need to keep the copy
         if hub_resume_dir.exists():
            shutil.rmtree(hub_resume_dir, ignore_errors=True)
 
         resume_stage = int(resume_state.get("stage_k", 0))
         global_step = int(resume_state.get("step", 0))
         if args.use_halt_gate:
-            # Resume same stage only if checkpoint itself already belongs to DGAC and is not /best.
             resume_same_stage = bool(resume_state.get("use_halt_gate", False) and resume_path.name != "best")
             if resume_same_stage:
                 resume_epoch = int(resume_state.get("epoch", 0))
@@ -1911,8 +1937,6 @@ def main() -> None:
             start_stage = resume_stage if resume_state is not None else 0
         stages = list(range(start_stage, curriculum_max_stage + 1))
 
-    # Keep all trainable parameters byte-identical across ranks. This is especially
-    # important because LoRA adapters and the halt gate are initialized locally.
     if distributed:
         broadcast_parameters(get_trainable_parameters(model, halt_gate), src=0)
 

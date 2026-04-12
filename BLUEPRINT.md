@@ -17,7 +17,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | 0 | Architecture & Viability (nano) | ✅ COMPLETE |
 | 1 | Pre-training (nano) | ✅ Pipeline test only; retired |
 | 2 | SFT (nano) | 🔴 RETIRED |
-| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 NEXT — smoke test done; patches ready; wheel build required before real run |
+| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 NEXT — smoke test done; script self-sufficient; ready to run |
 | 4 | GRPO on Jamba Reasoning 3B | ⬜ NOT STARTED |
 | 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
 
@@ -26,20 +26,12 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 
 ### Part 0.1 — Immediate Next Actions (ordered)
 
-**0. (ONCE) Build env-matched wheels → push to Hub**
-   - `python build_wheels_kaggle.py --hf_repo_id WeirdRunner/Ouroboros --hf_token YOUR_TOKEN`
-   - Takes ~45-60 min to compile; subsequent sessions install in ~90 seconds
-   - After run: paste the printed wheel URLs into the Install section of `jamba_coconut_finetune.py`
-   - If Kaggle container image changes (check: `python -c "import torch; print(torch.__version__, torch.version.cuda)"`), rebuild
-
 1. **Run** `prepare_coconut_dataset.py --output_dir data/coconut_v1 --push_to_hub --hf_token YOUR_TOKEN`
    - Produces `train.jsonl`, `val.jsonl`, `stats.json`
    - Pushes to Hub as `WeirdRunner/Ouroboros` config `coconut-v1` (dataset, not model)
    - Read `stats.json → train.n_steps_median` → this becomes `--max_stage` for training
 
-2. **Apply** patches in `jamba_coconut_patches.md` to `jamba_coconut_finetune.py` (3 targeted changes)
-
-3. **Smoke test** (Colab/Kaggle T4, must pass ALL checklist items):
+2. **Smoke test** (Colab/Kaggle T4, must pass ALL checklist items):
    ```
    python jamba_coconut_finetune.py \
      --data_dir data/coconut_v1 --use_4bit \
@@ -47,11 +39,11 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
      --max_seq_len 1024 --max_grad_norm 0.3 \
      --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
    ```
-   Verify: mamba fast path active (`mamba CUDA kernels: OK` in output), val_acc non-zero, grad_norm < 2.0
+   The script self-installs all dependencies on startup (~20-30 min first run for mamba-ssm source build; seconds if already installed). Verify: `mamba CUDA kernels: OK` in output, val_acc non-zero, grad_norm < 2.0.
 
-4. **K=0→K_max curriculum** on Kaggle Dual T4 with `torchrun --nproc_per_node=2`
+3. **K=0→K_max curriculum** on Kaggle Dual T4 with `torchrun --nproc_per_node=2`
 
-5. **If K=4 gate passes**: claim TRC, run K=16 + DGAC Phase 3.4 on A100
+4. **If K=4 gate passes**: claim TRC, run K=16 + DGAC Phase 3.4 on A100
 
 ### Part 0.2 — Pre-flight Blockers Resolved (updated 2026-04-12)
 
@@ -61,15 +53,17 @@ All blockers now addressed:
 |---|---|
 | `attn_implementation` hardcoded crash | try/except fallback to `eager` (load_model_and_tokenizer) |
 | `use_mamba_kernels` kwarg on old TF | `_safe_from_pretrained` retries without kwarg if rejected |
-| `use_mamba_kernels=False` hardcoded | **NEW (2026-04-12):** replaced with kernel probe; only set False on ImportError. Was forcing ~100× slow path unconditionally. See jamba_coconut_patches.md Patch 3. |
+| `use_mamba_kernels=False` hardcoded | Replaced with kernel probe; only set False on ImportError |
 | `last_hidden_state` silent None | `assert out.last_hidden_state is not None` in both Stage 0 and Phase B |
 | No graceful timeout → lost Kaggle work | `make_timeout_checker()` + emergency save integrated in main loop |
 | `conv1d` in LoRA targets (malformed) | Explicitly excluded with comment |
 | NCCL watchdog (killed S5–S7) | `timeout=timedelta(minutes=60)` + `TORCH_NCCL_ASYNC_ERROR_HANDLING=1` |
 | OOM at first val step (S8) | `torch.cuda.empty_cache()` + `val_batch_size=1` default |
-| `--max_seq_len 512` filtered all stage 1+ samples | **NEW (2026-04-12):** default changed to 1024 in docstring + patches |
-| Exploding gradients at k≥2 (gn=36.9) | **NEW (2026-04-12):** `--max_grad_norm 0.3` in smoke test and real run commands |
-| Wheel/ABI mismatch → slow path silently | **NEW (2026-04-12):** `build_wheels_kaggle.py` — builds all three with `--no-build-isolation`; push to Hub once per container image |
+| `--max_seq_len 512` filtered all stage 1+ samples | Default changed to 1024; Jamba traces are long |
+| Exploding gradients at k≥2 (gn=36.9) | `--max_grad_norm 0.3` in smoke test and real run commands |
+| Wheel/ABI mismatch across Kaggle GPU allocations | **Retired wheel workflow.** Script self-installs via `_bootstrap()` every run; always matches live GPU+PyTorch ABI. ~20-30 min first run per fresh session. |
+| mamba-ssm 2.x API broke `selective_state_update` path | Pinned to `mamba-ssm==1.2.2` in `_bootstrap()` |
+| Blackwell GPU (sm_120) not in 1.2.2 arch list | Moot — source build compiles against live env automatically via `--no-build-isolation` |
 
 One item still requires empirical verification during smoke test:
 - `inputs_embeds` → `last_hidden_state` path for Jamba Reasoning 3B with fast Mamba kernels active (previously only verified on slow path)
@@ -121,8 +115,8 @@ Reasoning   : native <think>...</think> traces; vLLM uses deepseek_r1 parser
 | Stage 2 dataset | sft-mix-v1 (55k, WeirdRunner/Ouroboros) — SFT format; NOT reused for Coconut |
 | Coconut dataset Hub config | `coconut-v1` under `WeirdRunner/Ouroboros` (dataset repo) |
 | `attn_implementation` | Detected at runtime: flash_attention_2 if available, else eager |
-| `use_mamba_kernels` | **Probe at runtime** (2026-04-12): import `selective_scan_fn` + `causal_conv1d_fn`; only set False if ImportError. Never unconditionally False. |
-| Mamba wheel strategy | Build once per Kaggle container image with `build_wheels_kaggle.py`; all three packages need `--no-build-isolation` for source builds; push to Hub; install via wheel URLs (~90s vs ~60min) |
+| `use_mamba_kernels` | Probe at runtime: import `selective_scan_fn` + `causal_conv1d_fn`; only set False if ImportError |
+| Mamba install strategy | **`_bootstrap()` in `jamba_coconut_finetune.py`** — self-installs `mamba-ssm==1.2.2` + `causal-conv1d>=1.4.0` via `pip install --no-build-isolation` on every run. Source builds against live PyTorch/CUDA env automatically. ~20-30 min first run; seconds if already installed. No wheel caching, no Hub wheel repo, no arch list management. `build_wheels_kaggle.py` retained as fallback for TRC A100 sessions only. |
 | Session timeout (Kaggle) | `--session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20` |
 | val_batch_size | Default 1 (Stage 2 S8 OOM'd with val_batch_size=16 at seq=2048) |
 | NCCL timeout | `timedelta(minutes=60)` in init_process_group |
@@ -153,10 +147,8 @@ Reasoning   : native <think>...</think> traces; vLLM uses deepseek_r1 parser
 | `prepare_sft_dataset.py` | 2 | ✅ DONE | sft-mix-v1 cached; not reused for Coconut |
 | `train_sft.py` | 2 | ✅ PATCHED (DDP v2) | Retired |
 | `prepare_coconut_dataset.py` | 3 | ✅ PATCHED (2026-04-11) | Added hub push, Colab token, Drive backup, `--push_to_hub` CLI |
-| `jamba_stage3_agent_prompt.md` | 3 | ✅ PATCHED (2026-04-11) | 4 blockers fixed; see Part 0.2 |
-| `jamba_coconut_finetune.py` | 3 | 🟡 PATCHES PENDING | Apply `jamba_coconut_patches.md` (3 changes) before next run |
-| `jamba_coconut_patches.md` | 3 | ✅ READY (2026-04-12) | 3 targeted patches: docstring, smoke cmd, kernel probe |
-| `build_wheels_kaggle.py` | 3 | ✅ READY (2026-04-12) | One-time wheel builder; run before first real training session |
+| `jamba_coconut_finetune.py` | 3 | ✅ SELF-SUFFICIENT (2026-04-12) | `_bootstrap()` self-installs all deps; no external wheel setup required |
+| `build_wheels_kaggle.py` | 3 | 🟡 FALLBACK ONLY | Retained for TRC A100 sessions where session overhead budget justifies pre-built wheels; not needed for Kaggle runs |
 
 ---
 
@@ -235,18 +227,15 @@ output_dir/
 
 | Phase | Platform | Approach | Estimate |
 |---|---|---|---|
-| Wheel build (once) | Kaggle GPU (any) | build_wheels_kaggle.py | ~45-60 min, once per container image |
 | Dataset prep | CPU (local or Kaggle) | prepare_coconut_dataset.py | ~30–60 min |
-| Smoke test | Free Colab/Kaggle T4 (15GB) | QLoRA, batch=1, max_stage=2, max_samples=200, max_seq_len=1024 | ~10 min with fast path |
-| Stage 0→K | Kaggle Dual T4 (2×16GB) | QLoRA + DDP, epochs_per_stage=3 | ~4–8h per session |
+| Smoke test | Free Colab/Kaggle T4 (15GB) | QLoRA, batch=1, max_stage=2, max_samples=200, max_seq_len=1024 | ~30-60 min first run (mamba build) + ~10 min training |
+| Stage 0→K | Kaggle Dual T4 (2×16GB) | QLoRA + DDP, epochs_per_stage=3 | ~25-30 min first-session install + ~4–8h training per session |
 | Phase 3.4 (DGAC) | TRC A100 80GB | QLoRA or LoRA, grad_ckpt | ~6–8h |
 | Phase 4 (GRPO) | TRC A100 80GB | TBD | ~8–12h |
 
 ---
 
 ## Part 9 — Hard Lessons from Prior Stages (Do Not Repeat)
-
-These caused lost sessions and are now codified as defaults in `jamba_coconut_finetune.py`:
 
 | Lesson | Source | Codified As |
 |---|---|---|
@@ -256,6 +245,7 @@ These caused lost sessions and are now codified as defaults in `jamba_coconut_fi
 | max_seq_len=512 filtered ~100% of stage 1+ samples | Stage 3 smoke test | `--max_seq_len 1024`; Jamba traces are long |
 | gn=36.9 at k=2 with few steps | Stage 3 smoke test | `--max_grad_norm 0.3` for k≥2 stages |
 | Hard-coded `attn_implementation` crash on Colab | Audit 2026-04-11 | try/except flash-attn detection with eager fallback |
-| `use_mamba_kernels=False` HARDCODED → ~100× slowdown always | Audit 2026-04-12 | Runtime probe: import `selective_scan_fn`; only set False on failure. See jamba_coconut_patches.md Patch 3. |
-| All 3 CUDA packages need `--no-build-isolation` for source builds | Audit 2026-04-12 | `build_wheels_kaggle.py` passes flag for all three; PyPI wheels only exist for cu118/cu121 |
-| Wheel/ABI mismatch silently falls back to slow path | Audit 2026-04-12 | Pin Kaggle container; rebuild wheels when image changes; probe on startup prints clear warning |
+| `use_mamba_kernels=False` HARDCODED → ~100× slowdown always | Audit 2026-04-12 | Runtime probe: import `selective_scan_fn`; only set False on failure |
+| mamba-ssm 2.x moved `selective_state_update` → Triton path; fast path silently disabled | Wheel build session 2026-04-12 | Pinned to `mamba-ssm==1.2.2` in `_bootstrap()` |
+| Kaggle GPU arch unpredictable (labelled T4, allocated Blackwell sm_120) | Wheel build session 2 2026-04-12 | **Retired wheel caching entirely.** `--no-build-isolation` source build in `_bootstrap()` always compiles for the actual live GPU. Arch list management complexity eliminated. |
+| Fat-wheel multi-arch build time (~60-80 min) exceeds savings for Kaggle session frequency | Decision 2026-04-12 | Direct pip install wins on total complexity budget; `build_wheels_kaggle.py` kept as TRC-only fallback |
