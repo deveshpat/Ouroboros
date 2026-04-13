@@ -20,13 +20,16 @@ References:
   Jamba Reasoning 3B (AI21, ai21labs/AI21-Jamba-Reasoning-3B, Oct 2025)
 
 Install:
-  Self-contained. _bootstrap() runs on every startup in three phases:
-    Phase 1: build tools (ninja, packaging, wheel, setuptools)
-    Phase 2: pure-Python deps including bitsandbytes>=0.46.1
-    Phase 3: CUDA extensions (mamba-ssm==1.2.2, causal-conv1d) compiled from source
-             against the live PyTorch/CUDA env, with TORCH_CUDA_ARCH_LIST auto-injected
-             from the actual GPU capability (handles Blackwell sm_120, T4 sm_75, etc.)
-  First run ~20-30 min for CUDA extension source builds; subsequent runs: seconds.
+  Self-contained. _bootstrap() runs on every startup:
+    Phase 1: pure-Python deps (transformers, peft, bitsandbytes>=0.46.1, huggingface_hub, ...)
+    Phase 2: download pre-built CUDA extension wheels from the private HF Hub repo
+             (WeirdRunner/Ouroboros) and install with --force-reinstall --no-deps.
+             No source compilation. ~seconds on every run.
+    Phase 3: functional verification — imports all 5 mamba fast-path symbols AND runs a
+             tiny causal_conv1d CUDA op on real tensors to catch silent ABI mismatches.
+             On failure: prints full ABI fingerprint and sys.exit(1).
+             There is NO fallback to slow path — a broken kernel wastes 500s/step silently.
+  HF_TOKEN must be set (Kaggle Secret or env var) so the private Hub repo is accessible.
 
 Run (smoke test, Colab/Kaggle T4):
   !python jamba_coconut_finetune.py \
@@ -71,121 +74,194 @@ os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
-def _bootstrap() -> None:
+
+# ── Hub wheel filenames (update here if you upload new builds) ────────────────
+# These are the pre-compiled wheels stored at WeirdRunner/Ouroboros on HF Hub.
+# Build new ones with build_wheels_kaggle.py whenever CUDA/PyTorch/Python changes.
+_HUB_WHEEL_FILES = [
+    "causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl",
+    "mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl",
+]
+_HUB_REPO_ID = "WeirdRunner/Ouroboros"
+
+
+def _bootstrap_resolve_token() -> Optional[str]:
+    """Resolve HF token before huggingface_hub is imported as a library."""
+    # Try Kaggle Secrets first (most common in headless sessions)
+    try:
+        from kaggle_secrets import UserSecretsClient
+        tok = UserSecretsClient().get_secret("HF_TOKEN")
+        if tok:
+            return tok
+    except Exception:
+        pass
+    # Colab
+    try:
+        from google.colab import userdata as _cu
+        tok = _cu.get("HF_TOKEN")
+        if tok:
+            return tok
+    except Exception:
+        pass
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+
+def _bootstrap_verify_fast_path() -> bool:
     """
-    Self-install all dependencies before any third-party imports.
+    Hard verification of the mamba fast path:
+      1. Import all 5 symbols transformers' Jamba checks.
+      2. Assert none are None (catches mamba-ssm 2.x silent API mismatch).
+      3. Run a tiny causal_conv1d CUDA op on real tensors to catch ABI mismatches
+         that pass the import check but crash on first kernel invocation.
 
-    Three-phase approach to reliably build mamba CUDA extensions on any Kaggle GPU:
-
-    Phase 1 — Build tools:
-      ninja, packaging, wheel, setuptools — required for mamba-ssm source compilation.
-      Installed first so they are available in the build environment.
-
-    Phase 2 — Pure-Python runtime deps:
-      All packages that don't require CUDA compilation, including bitsandbytes>=0.46.1
-      (Kaggle containers ship an older version; must pin the floor).
-
-    Phase 3 — CUDA extension packages (per-package, with arch injection):
-      causal-conv1d and mamba-ssm==1.2.2 are built from source with:
-        --no-build-isolation  → compile against the live PyTorch/CUDA env, not an
-                                 isolated venv that lacks torch headers
-        TORCH_CUDA_ARCH_LIST  → auto-detected from torch.cuda.get_device_capability()
-                                 so that mamba-ssm 1.2.2 (which predates Blackwell/sm_120)
-                                 compiles correctly on whatever GPU Kaggle allocates
-        MAX_JOBS=4            → parallel nvcc compilation
-
-    Phase 4 — Verify fast-path symbols:
-      Imports all 5 symbols that transformers' Jamba checks. Prints a clear
-      ACTIVE/UNAVAILABLE banner so the user can diagnose failures early.
+    Returns True only if all three checks pass.
+    Does NOT catch exceptions — caller decides what to do on failure.
     """
     import importlib as _il
+    import torch as _torch
 
-    # ── Phase 1: build prerequisites ─────────────────────────────────────────
-    print("[bootstrap] Phase 1: build tools...")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q",
-         "ninja", "packaging", "wheel", "setuptools"],
-        check=False,
+    _il.invalidate_caches()
+
+    # Step 1+2: symbol presence and non-None check
+    from mamba_ssm.ops.selective_scan_interface import (  # type: ignore
+        selective_scan_fn,
+        selective_state_update,
+        mamba_inner_fn,
     )
+    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update  # type: ignore
 
-    # ── Phase 2: pure-Python runtime deps ────────────────────────────────────
-    print("[bootstrap] Phase 2: pure-Python deps...")
-    r = subprocess.run(
+    _syms = {
+        "selective_scan_fn":      selective_scan_fn,
+        "selective_state_update": selective_state_update,
+        "mamba_inner_fn":         mamba_inner_fn,
+        "causal_conv1d_fn":       causal_conv1d_fn,
+        "causal_conv1d_update":   causal_conv1d_update,
+    }
+    _none = [k for k, v in _syms.items() if v is None]
+    if _none:
+        raise ImportError(
+            f"Symbols are None — API mismatch (mamba-ssm 2.x Triton-path issue?): {_none}"
+        )
+
+    # Step 3: real tensor op through causal_conv1d CUDA kernel
+    # x: (batch=1, dim=4, seqlen=8)   weight: (dim=4, 1, width=4)
+    # This hits the actual .so / nvcc-compiled kernel — catches silent ABI breaks.
+    _x = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
+    _w = _torch.randn(4, 1, 4, device="cuda", dtype=_torch.float32)
+    _out = causal_conv1d_fn(_x, _w)
+    assert _out.shape == _x.shape, f"Unexpected output shape: {_out.shape}"
+    _torch.cuda.synchronize()
+    return True
+
+
+def _bootstrap() -> None:
+    """
+    Install all dependencies before any third-party imports.
+
+    Phase 1 — Pure-Python deps (fast, ~seconds):
+      Installs transformers, peft, bitsandbytes>=0.46.1, huggingface_hub, etc.
+      bitsandbytes floor is required — Kaggle containers ship an older version.
+      huggingface_hub is installed here so Phase 2 can use hf_hub_download.
+
+    Phase 2 — Hub wheel install (fast, ~seconds):
+      Downloads pre-built causal-conv1d and mamba-ssm wheels from WeirdRunner/Ouroboros
+      using the HF token from Kaggle Secrets / env var.
+      Installs with --force-reinstall --no-deps so the exact Hub build is always used.
+      No source compilation. No TORCH_CUDA_ARCH_LIST gymnastics.
+
+    Phase 3 — Hard functional verification:
+      Imports all 5 symbols + runs a tiny causal_conv1d CUDA op on real tensors.
+      If ANY check fails: prints full ABI fingerprint and calls sys.exit(1).
+      There is intentionally NO fallback to the slow PyTorch path — a broken kernel
+      wastes 500s/step silently and burns the entire session budget undetected.
+      A hard exit here lets Kaggle allocate a fresh container with a compatible GPU.
+
+    To update wheels: run build_wheels_kaggle.py, upload to Hub, update _HUB_WHEEL_FILES.
+    """
+    import importlib as _il
+    import torch as _torch
+
+    # ── Phase 1: pure-Python deps ─────────────────────────────────────────────
+    print("[bootstrap] Phase 1: pure-Python deps...")
+    _r1 = subprocess.run(
         [sys.executable, "-m", "pip", "install", "-q",
          "transformers>=4.54.0",
          "peft",
          "datasets",
          "tqdm",
          "wandb",
-         "bitsandbytes>=0.46.1",   # Kaggle containers ship < 0.46.1; must upgrade
+         "bitsandbytes>=0.46.1",
          "accelerate",
          "huggingface_hub"],
         check=False,
     )
-    if r.returncode != 0:
-        print("[bootstrap] WARNING: Phase 2 pip returned non-zero; check output above.")
+    if _r1.returncode != 0:
+        print("[bootstrap] WARNING: Phase 1 pip returned non-zero — check output above.")
 
-    # ── Phase 3: CUDA extension packages ─────────────────────────────────────
-    cuda_env = os.environ.copy()
-    cuda_env["MAX_JOBS"] = "4"
-    try:
-        import torch as _torch
-        if _torch.cuda.is_available():
-            _major, _minor = _torch.cuda.get_device_capability(0)
-            _arch = f"{_major}.{_minor}+PTX"
-            cuda_env["TORCH_CUDA_ARCH_LIST"] = _arch
-            print(f"[bootstrap] Phase 3: GPU={_torch.cuda.get_device_name(0)} "
-                  f"sm_{_major}{_minor}  TORCH_CUDA_ARCH_LIST={_arch}")
-        else:
-            print("[bootstrap] Phase 3: No CUDA GPU — mamba kernels will be unavailable.")
-    except Exception as _e:
-        print(f"[bootstrap] Phase 3: GPU capability detection failed ({_e}); "
-              "proceeding without ARCH_LIST override.")
+    # ── Phase 2: Hub wheel install ────────────────────────────────────────────
+    print("[bootstrap] Phase 2: installing Hub wheels...")
+    _hf_token = _bootstrap_resolve_token()
+    if not _hf_token:
+        print("[bootstrap] FATAL: No HF_TOKEN found.")
+        print("            Set HF_TOKEN as a Kaggle Secret or environment variable.")
+        sys.exit(1)
 
-    for _spec, _name in [
-        ("causal-conv1d>=1.4.0", "causal-conv1d"),
-        ("mamba-ssm==1.2.2",     "mamba-ssm"),
-    ]:
-        print(f"[bootstrap] Building {_spec} ...")
+    _il.invalidate_caches()
+    from huggingface_hub import hf_hub_download  # now installed from Phase 1
+
+    _wheel_dir = Path("/tmp/ouroboros_wheels")
+    _wheel_dir.mkdir(exist_ok=True)
+
+    for _whl_name in _HUB_WHEEL_FILES:
+        print(f"[bootstrap]   Downloading {_whl_name} ...")
+        try:
+            _local = hf_hub_download(
+                repo_id=_HUB_REPO_ID,
+                filename=_whl_name,
+                token=_hf_token,
+                local_dir=str(_wheel_dir),
+            )
+        except Exception as _e:
+            print(f"[bootstrap] FATAL: Could not download {_whl_name}: {_e}")
+            print( "[bootstrap]        Upload a compatible wheel with build_wheels_kaggle.py.")
+            sys.exit(1)
+
         _r = subprocess.run(
             [sys.executable, "-m", "pip", "install",
-             "--no-build-isolation", _spec],
-            env=cuda_env,
+             "--force-reinstall", "--no-deps", _local],
             check=False,
         )
         if _r.returncode != 0:
-            print(f"[bootstrap] WARNING: {_name} build FAILED (returncode={_r.returncode}).")
-            print( "[bootstrap]          Slow PyTorch SSM path will be used (~500s/step).")
-            print( "[bootstrap]          Verify: `nvcc --version` and CUDA headers in container.")
+            print(f"[bootstrap] FATAL: pip install failed for {_whl_name}.")
+            sys.exit(1)
+        print(f"[bootstrap]   Installed {_whl_name} ✓")
 
-    # ── Phase 4: verify fast-path symbols ────────────────────────────────────
-    _il.invalidate_caches()   # flush module finder cache after fresh installs
-    print("[bootstrap] Phase 4: verifying mamba fast-path symbols...")
-    _checks = [
-        ("mamba_ssm.ops.selective_scan_interface", "selective_scan_fn"),
-        ("mamba_ssm.ops.selective_scan_interface", "selective_state_update"),
-        ("mamba_ssm.ops.selective_scan_interface", "mamba_inner_fn"),
-        ("causal_conv1d",                          "causal_conv1d_fn"),
-        ("causal_conv1d",                          "causal_conv1d_update"),
-    ]
-    _missing: List[str] = []
-    for _mod, _attr in _checks:
-        try:
-            _m = __import__(_mod, fromlist=[_attr])
-            _obj = getattr(_m, _attr, None)
-            _ok = _obj is not None
-            print(f"  {'✓' if _ok else '✗'} {_attr}: {'OK' if _ok else 'None — API mismatch (2.x?)'}")
-            if not _ok:
-                _missing.append(_attr)
-        except ImportError as _ie:
-            print(f"  ✗ {_attr}: ImportError: {_ie}")
-            _missing.append(_attr)
+    # ── Phase 3: hard functional verification ────────────────────────────────
+    print("[bootstrap] Phase 3: verifying mamba fast path (symbol + CUDA op)...")
 
-    if not _missing:
-        print("[bootstrap] Mamba fast path: ACTIVE — ~5s/step expected.")
-    else:
-        print(f"[bootstrap] Mamba fast path: UNAVAILABLE ({len(_missing)} symbol(s) missing).")
-        print( "[bootstrap] Slow path (~500s/step). Fix: ensure nvcc is available and re-run.")
+    # Print ABI fingerprint unconditionally — visible in logs for future debugging
+    try:
+        _gpu_name = _torch.cuda.get_device_name(0) if _torch.cuda.is_available() else "no-gpu"
+        _cc = _torch.cuda.get_device_capability(0) if _torch.cuda.is_available() else (0, 0)
+        print(f"[bootstrap]   ABI fingerprint: "
+              f"GPU={_gpu_name} sm_{_cc[0]}{_cc[1]} | "
+              f"CUDA={_torch.version.cuda} | "
+              f"PyTorch={_torch.__version__} | "
+              f"Python=cp{sys.version_info.major}{sys.version_info.minor}")
+        print(f"[bootstrap]   Wheels: {_HUB_WHEEL_FILES}")
+    except Exception:
+        pass
+
+    try:
+        _bootstrap_verify_fast_path()
+        print("[bootstrap] Mamba fast path: ACTIVE ✓ — ~5s/step expected.")
+    except Exception as _ve:
+        print(f"\n[bootstrap] FATAL: Mamba fast path verification FAILED: {_ve}")
+        print( "[bootstrap]        The installed Hub wheels are ABI-incompatible with this container.")
+        print( "[bootstrap]        Action: run build_wheels_kaggle.py in this exact session,")
+        print( "                   upload new wheels to Hub, update _HUB_WHEEL_FILES, re-run.")
+        print( "[bootstrap]        Exiting now (no slow-path fallback — 500s/step is unusable).")
+        sys.exit(1)
 
 
 _bootstrap()
@@ -626,41 +702,21 @@ def load_model_and_tokenizer(
         load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
 
     # Probe for mamba CUDA kernels before model load.
-    # Check all 5 symbols that transformers' Jamba fast path requires.
-    # Also verify none are None (mamba_ssm 2.x returns None for some symbols
-    # that moved to a Triton path — this silently disables the fast path).
-    # NEVER hardcode use_mamba_kernels=False — that forces ~100x slower path always.
+    # Re-uses the same hard verification from _bootstrap() so the check is identical.
+    # If bootstrap passed we expect this to pass too; but it's cheap and catches
+    # edge cases where the session state changed (e.g. import cache was cleared).
     _mamba_fast_path = False
     if device.type == "cuda":
         try:
-            from mamba_ssm.ops.selective_scan_interface import (  # noqa: F401
-                selective_scan_fn,
-                selective_state_update,
-                mamba_inner_fn,
-            )
-            from causal_conv1d import causal_conv1d_fn, causal_conv1d_update  # noqa: F401
-
-            # Verify none are None (2.x API mismatch guard)
-            _sym_check = {
-                "selective_scan_fn":     selective_scan_fn,
-                "selective_state_update": selective_state_update,
-                "mamba_inner_fn":        mamba_inner_fn,
-                "causal_conv1d_fn":      causal_conv1d_fn,
-                "causal_conv1d_update":  causal_conv1d_update,
-            }
-            _none_syms = [k for k, v in _sym_check.items() if v is None]
-            if _none_syms:
-                raise ImportError(
-                    f"Symbols are None (mamba_ssm 2.x API mismatch): {_none_syms}. "
-                    "Ensure mamba-ssm==1.2.2 is installed."
-                )
+            _bootstrap_verify_fast_path()
             _mamba_fast_path = True
             if is_main:
                 print("  mamba CUDA kernels: OK — fast path ACTIVE (~5s/step expected)")
-        except (ImportError, Exception) as _kern_exc:
+        except Exception as _kern_exc:
             load_kwargs["use_mamba_kernels"] = False
             if is_main:
                 print(f"  [WARN] mamba CUDA kernels unavailable: {_kern_exc}")
+                print("         This should not happen if _bootstrap() passed.")
                 print("         Slow PyTorch path forced (~500s/step).")
     else:
         # Non-CUDA devices: always slow path
