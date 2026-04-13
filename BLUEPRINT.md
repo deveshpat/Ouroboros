@@ -17,7 +17,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | 0 | Architecture & Viability (nano) | ✅ COMPLETE |
 | 1 | Pre-training (nano) | ✅ Pipeline test only; retired |
 | 2 | SFT (nano) | 🔴 RETIRED |
-| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🔴 BLOCKED — 2 bootstrap fixes required before smoke test can pass |
+| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🔴 BLOCKED — mamba_ssm wheel missing from Hub |
 | 4 | GRPO on Jamba Reasoning 3B | ⬜ NOT STARTED |
 | 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
 
@@ -29,21 +29,27 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 - **median_steps=10  mean=10.42  max=16**
 - **`--max_stage=10` for all production runs**
 
+### GPU Arch Confirmed (2026-04-13)
+Kaggle is allocating **sm_100 (Blackwell B100)**, not sm_120 (B200) as logged in prior sessions.
+`TORCH_CUDA_ARCH_LIST` injection in `build_wheels_kaggle.py` auto-detects this correctly.
+
 ---
 
 ### Part 0.1 — Immediate Next Actions (ordered)
 
-1. **Run `build_wheels_kaggle.py` (patched, as-is) on a Kaggle session that gets T4:**
+1. **Build mamba_ssm-1.2.2 wheel on Kaggle (sm_100) with verbose stderr capture:**
+   ```bash
+   python build_wheels_kaggle.py --hf_token YOUR_TOKEN --verbose_mamba
    ```
-   python build_wheels_kaggle.py --hf_token YOUR_TOKEN
-   ```
-   This will compile causal_conv1d + mamba_ssm==1.2.2 with `TORCH_CUDA_ARCH_LIST=7.5+PTX`.
-   sm_75+PTX is forward-JIT compatible with A100/H100/Blackwell — no further rebuilds needed.
-   Upload will overwrite Hub with the correct wheels.
-   After success, `_HUB_WHEEL_FILES` in `jamba_coconut_finetune.py` already points to correct names.
+   The build almost certainly fails due to a missing nvcc dependency or setup.py arch gap.
+   `--verbose` (already supported via `--verbose` in pip wheel call) will capture stderr to a file.
+   Upload will overwrite Hub with the correct sm_100 wheel.
+   **After success:** Bootstrap will pass Phase 3 and training can proceed.
 
-2. **Smoke test** (after build above):
-   ```
+   > **Capture stderr explicitly** — add `2>&1 | tee mamba_build.log` to the shell call so the full build output is visible even if truncated by Kaggle UI. Upload `mamba_build.log` here to diagnose if it fails again.
+
+2. **Smoke test** (after mamba_ssm wheel is on Hub):
+   ```bash
    python jamba_coconut_finetune.py \
      --data_dir data/coconut_v1 --use_4bit \
      --epochs_per_stage 1 --max_stage 2 --max_samples 200 \
@@ -62,7 +68,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 |---|---|
 | `attn_implementation` hardcoded crash | try/except fallback to `eager` ✅ |
 | `use_mamba_kernels` kwarg on old TF | `_safe_from_pretrained` retries without kwarg ✅ |
-| `use_mamba_kernels=False` hardcoded | Replaced with kernel probe ✅ |
+| `use_mamba_kernels=False` hardcoded | Replaced with runtime probe ✅ |
 | `last_hidden_state` silent None | assert in Stage 0 and Phase B ✅ |
 | No graceful timeout → lost Kaggle work | `make_timeout_checker()` integrated ✅ |
 | `conv1d` in LoRA targets | Explicitly excluded ✅ |
@@ -72,9 +78,9 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | Exploding gradients at k≥2 | `--max_grad_norm 0.3` ✅ |
 | Wheel/ABI mismatch | Retired wheel workflow; `_bootstrap()` self-installs ✅ |
 | mamba-ssm 2.x API | Pinned to `mamba-ssm==1.2.2` ✅ |
-| **mamba_ssm 2.x deleted selective_state_update from 1.x path** | **`_HUB_WHEEL_FILES` updated to `mamba_ssm-1.2.2-*`. Need to build 1.2.2 wheel on T4. 🔴 PENDING BUILD** |
-| **causal_conv1d Hub wheel compiled for sm_120 only (Blackwell)** | **Rebuild on T4 (sm_75+PTX → forward-JIT on all newer GPUs). 🔴 PENDING BUILD** |
-| **`build_wheels_kaggle.py` never run with patched arch injection** | **Run it. This is the only remaining action. 🔴 PENDING** |
+| bitsandbytes version floor missing | `bitsandbytes>=0.46.1` in `_bootstrap()` ✅ |
+| causal_conv1d Hub wheel (sm_100) | Built + uploaded for sm_100 ✅ (2026-04-13) |
+| **mamba_ssm-1.2.2 wheel missing from Hub (404)** | **Build failed silently in build session. Rebuild with stderr capture. 🔴 PENDING** |
 
 One item still requires empirical verification during smoke test:
 - `inputs_embeds` → `last_hidden_state` path for Jamba Reasoning 3B **with fast Mamba kernels active**
@@ -110,11 +116,12 @@ Context     : 256K tokens
 | Dataset Hub config | `coconut-v1` under `WeirdRunner/Ouroboros` |
 | `attn_implementation` | Runtime detection: flash_attention_2 if available, else eager |
 | `use_mamba_kernels` | Runtime probe; only False on ImportError |
-| Mamba install strategy | `_bootstrap()` self-installs `mamba-ssm==1.2.2` + `causal-conv1d>=1.4.0` via `--no-build-isolation`. `build_wheels_kaggle.py` retained for TRC A100 only. |
+| Mamba install strategy | `_bootstrap()` downloads pre-built wheels from Hub (no source compile at runtime). `build_wheels_kaggle.py` builds + uploads wheels. |
 | `--max_seq_len` | 1024 (512 filtered ~100% of traces at stage ≥ 1) |
 | `--max_grad_norm` | 0.3 for k≥2 stages |
 | Session timeout | `--session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20` |
 | val_batch_size | 1 (Stage 2 S8 OOM'd with 16 at seq=2048) |
+| Kaggle GPU arch | **sm_100 (B100)** — auto-detected by `build_wheels_kaggle.py` |
 
 ---
 
@@ -122,8 +129,8 @@ Context     : 256K tokens
 
 | Question | Status |
 |---|---|
+| Why does mamba_ssm 1.2.2 source build run but produce no installable module? | 🔴 OPEN — needs verbose stderr capture from next build session |
 | Does `inputs_embeds` → `last_hidden_state` work with Jamba + fast Mamba kernels active? | 🟡 VERIFY next smoke test |
-| Why does mamba_ssm source build run (~30 min) but module not install? | 🔴 OPEN — needs verbose stderr capture |
 | DGAC Phase 3.4: does halt_step distribute across K≥2 after training? | 🔴 OPEN — primary research validation |
 
 ---
@@ -139,8 +146,8 @@ Context     : 256K tokens
 | `prepare_sft_dataset.py` | 2 | ✅ DONE | sft-mix-v1 cached; not reused for Coconut |
 | `train_sft.py` | 2 | ✅ PATCHED | Retired |
 | `prepare_coconut_dataset.py` | 3 | ✅ DONE | coconut-v1 on Hub confirmed (36906/1940 samples) |
-| `jamba_coconut_finetune.py` | 3 | 🔴 NEEDS PATCH | `_bootstrap()` missing `bitsandbytes>=0.46.1` + ARCH_LIST injection |
-| `build_wheels_kaggle.py` | 3 | 🟡 FALLBACK ONLY | For TRC A100 sessions only |
+| `jamba_coconut_finetune.py` | 3 | 🟡 READY | All patches applied; blocked only on mamba_ssm wheel |
+| `build_wheels_kaggle.py` | 3 | 🔴 NEEDS RUN | Must build + upload mamba_ssm-1.2.2 for sm_100 |
 
 ---
 
@@ -186,8 +193,8 @@ output_dir/
 
 | Phase | Platform | Estimate |
 |---|---|---|
-| Smoke test | Kaggle T4 | ~30-60 min bootstrap (first session) + ~10 min training |
-| Stage 0→10 | Kaggle Dual T4 (2×16GB), QLoRA + DDP | ~4-8h training per session (multiple sessions) |
+| Smoke test | Kaggle sm_100 | ~10 min once wheel is on Hub |
+| Stage 0→10 | Kaggle Dual sm_100 (2×~80GB), QLoRA + DDP | ~4-8h training per session |
 | Phase 3.4 (DGAC) | TRC A100 80GB | ~6-8h |
 | Phase 4 (GRPO) | TRC A100 80GB | ~8-12h |
 
@@ -203,6 +210,7 @@ output_dir/
 | gn=36.9 at k=2 | `--max_grad_norm 0.3` |
 | `use_mamba_kernels=False` hardcoded → 100× slow | Runtime probe |
 | mamba-ssm 2.x broke fast path | Pinned to 1.2.2 |
-| Kaggle GPU arch unpredictable | `TORCH_CUDA_ARCH_LIST` injection at build time |
-| bitsandbytes not upgraded → crash on 4-bit load | `bitsandbytes>=0.46.1` in bootstrap (🔴 not yet applied) |
-| mamba_ssm build runs but module absent — stderr invisible | Verbose build log + stderr capture (🔴 not yet applied) |
+| Kaggle GPU arch unpredictable (was sm_120, now sm_100) | `TORCH_CUDA_ARCH_LIST` auto-injected from `torch.cuda.get_device_capability()` |
+| bitsandbytes not upgraded → crash on 4-bit load | `bitsandbytes>=0.46.1` in bootstrap ✅ |
+| mamba_ssm build runs but module absent — stderr invisible | Add `2>&1 | tee mamba_build.log` to build invocation; upload log here |
+| Truncated Kaggle logs hide root causes | Always run build in a dedicated cell with output saved to file |

@@ -22,23 +22,26 @@ References:
 Install:
   Self-contained. _bootstrap() runs on every startup:
     Phase 1: pure-Python deps (transformers, peft, bitsandbytes>=0.46.1, huggingface_hub, ...)
-    Phase 2: download pre-built CUDA extension wheels from the private HF Hub repo
-             (WeirdRunner/Ouroboros) and install with --force-reinstall --no-deps.
-             No source compilation. ~seconds on every run.
-    Phase 3: functional verification — imports all 5 mamba fast-path symbols AND runs a
-             tiny causal_conv1d CUDA op on real tensors to catch silent ABI mismatches.
+    Phase 2: arch-aware Hub wheel install.
+             Detects current GPU (e.g. sm100), tries to download the matching
+             arch-encoded wheel (e.g. mamba_ssm-1.2.2-...-sm100.whl) from Hub.
+             On 404: source-compiles with correct TORCH_CUDA_ARCH_LIST, uploads
+             the arch-encoded wheel to Hub for future sessions, then installs.
+             Over time Hub accumulates one wheel per GPU arch — compilation
+             becomes rare after the first session on each arch.
+    Phase 3: functional verification — imports all 5 mamba fast-path symbols AND
+             runs a tiny causal_conv1d CUDA op on real tensors.
              On failure: prints full ABI fingerprint and sys.exit(1).
-             There is NO fallback to slow path — a broken kernel wastes 500s/step silently.
-  HF_TOKEN must be set (Kaggle Secret or env var) so the private Hub repo is accessible.
+             There is NO fallback to slow path — a broken kernel wastes 500s/step.
 
-Run (smoke test, Colab/Kaggle T4):
+Run (smoke test, Kaggle):
   !python jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
     --epochs_per_stage 1 --max_stage 2 --max_samples 200 \
     --max_seq_len 1024 --max_grad_norm 0.3 \
     --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
 
-Run (Phase 3.1 through 3.K, Kaggle Dual T4):
+Run (Phase 3.1 through 3.K, Kaggle Dual GPU):
   !torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
     --epochs_per_stage 3 --max_stage 10 --batch_size 2 --grad_accum 8 \
@@ -74,20 +77,26 @@ os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
-
-# ── Hub wheel filenames (update here if you upload new builds) ────────────────
-# These are the pre-compiled wheels stored at WeirdRunner/Ouroboros on HF Hub.
-# Build new ones with build_wheels_kaggle.py whenever CUDA/PyTorch/Python changes.
-_HUB_WHEEL_FILES = [
-    "causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl",
-    "mamba_ssm-1.2.2-cp312-cp312-linux_x86_64.whl",  # 2.x removed selective_state_update from 1.x path
+# ── Hub wheel config ──────────────────────────────────────────────────────────
+# Base names without arch suffix. Arch (e.g. "-sm100") is resolved at runtime
+# from the current GPU and appended before the Hub lookup.
+# To update a package version: change the stem here and rebuild with
+# build_wheels_kaggle.py on any GPU — that session's arch gets cached on Hub.
+_HUB_WHEEL_BASES = [
+    "causal_conv1d-1.6.1-cp312-cp312-linux_x86_64",
+    "mamba_ssm-1.2.2-cp312-cp312-linux_x86_64",  # 2.x removed selective_state_update from 1.x path
 ]
 _HUB_REPO_ID = "WeirdRunner/Ouroboros"
+
+# All known arch suffixes — used to strip them during glob
+_KNOWN_ARCH_SUFFIXES = [
+    "sm70", "sm72", "sm75", "sm80", "sm86", "sm87", "sm89",
+    "sm90", "sm100", "sm120", "smunknown",
+]
 
 
 def _bootstrap_resolve_token() -> Optional[str]:
     """Resolve HF token before huggingface_hub is imported as a library."""
-    # Try Kaggle Secrets first (most common in headless sessions)
     try:
         from kaggle_secrets import UserSecretsClient
         tok = UserSecretsClient().get_secret("HF_TOKEN")
@@ -95,7 +104,6 @@ def _bootstrap_resolve_token() -> Optional[str]:
             return tok
     except Exception:
         pass
-    # Colab
     try:
         from google.colab import userdata as _cu
         tok = _cu.get("HF_TOKEN")
@@ -115,14 +123,12 @@ def _bootstrap_verify_fast_path() -> bool:
          that pass the import check but crash on first kernel invocation.
 
     Returns True only if all three checks pass.
-    Does NOT catch exceptions — caller decides what to do on failure.
     """
     import importlib as _il
     import torch as _torch
 
     _il.invalidate_caches()
 
-    # Step 1+2: symbol presence and non-None check
     from mamba_ssm.ops.selective_scan_interface import (  # type: ignore
         selective_scan_fn,
         selective_state_update,
@@ -143,9 +149,7 @@ def _bootstrap_verify_fast_path() -> bool:
             f"Symbols are None — API mismatch (mamba-ssm 2.x Triton-path issue?): {_none}"
         )
 
-    # Step 3: real tensor op through causal_conv1d CUDA kernel
-    # x: (batch=1, dim=4, seqlen=8)   weight: (dim=4, 1, width=4)
-    # This hits the actual .so / nvcc-compiled kernel — catches silent ABI breaks.
+    # Real tensor op through causal_conv1d CUDA kernel — catches silent ABI breaks
     _x = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
     _w = _torch.randn(4, 1, 4, device="cuda", dtype=_torch.float32)
     _out = causal_conv1d_fn(_x, _w)
@@ -158,25 +162,21 @@ def _bootstrap() -> None:
     """
     Install all dependencies before any third-party imports.
 
-    Phase 1 — Pure-Python deps (fast, ~seconds):
-      Installs transformers, peft, bitsandbytes>=0.46.1, huggingface_hub, etc.
-      bitsandbytes floor is required — Kaggle containers ship an older version.
-      huggingface_hub is installed here so Phase 2 can use hf_hub_download.
+    Phase 1 — Pure-Python deps (~seconds):
+      transformers, peft, bitsandbytes>=0.46.1, huggingface_hub, etc.
 
-    Phase 2 — Hub wheel install (fast, ~seconds):
-      Downloads pre-built causal-conv1d and mamba-ssm wheels from WeirdRunner/Ouroboros
-      using the HF token from Kaggle Secrets / env var.
-      Installs with --force-reinstall --no-deps so the exact Hub build is always used.
-      No source compilation. No TORCH_CUDA_ARCH_LIST gymnastics.
+    Phase 2 — Arch-aware Hub wheel install:
+      Detects GPU arch (e.g. sm100). Tries Hub download of the matching
+      arch-encoded wheel (e.g. causal_conv1d-...-sm100.whl). On 404, falls
+      back to source compile with the correct TORCH_CUDA_ARCH_LIST, uploads
+      the result to Hub for future sessions, then installs locally.
+      Over time Hub fills in — after the first session on each GPU arch,
+      subsequent sessions skip compilation entirely.
 
     Phase 3 — Hard functional verification:
-      Imports all 5 symbols + runs a tiny causal_conv1d CUDA op on real tensors.
-      If ANY check fails: prints full ABI fingerprint and calls sys.exit(1).
-      There is intentionally NO fallback to the slow PyTorch path — a broken kernel
-      wastes 500s/step silently and burns the entire session budget undetected.
-      A hard exit here lets Kaggle allocate a fresh container with a compatible GPU.
-
-    To update wheels: run build_wheels_kaggle.py, upload to Hub, update _HUB_WHEEL_FILES.
+      Imports all 5 symbols + runs causal_conv1d CUDA op on real tensors.
+      Prints full ABI fingerprint unconditionally (visible in logs).
+      sys.exit(1) on any failure — no slow-path fallback.
     """
     import importlib as _il
     import torch as _torch
@@ -198,8 +198,8 @@ def _bootstrap() -> None:
     if _r1.returncode != 0:
         print("[bootstrap] WARNING: Phase 1 pip returned non-zero — check output above.")
 
-    # ── Phase 2: Hub wheel install ────────────────────────────────────────────
-    print("[bootstrap] Phase 2: installing Hub wheels...")
+    # ── Phase 2: arch-aware Hub wheel install ─────────────────────────────────
+    print("[bootstrap] Phase 2: arch-aware Hub wheel install...")
     _hf_token = _bootstrap_resolve_token()
     if not _hf_token:
         print("[bootstrap] FATAL: No HF_TOKEN found.")
@@ -207,48 +207,127 @@ def _bootstrap() -> None:
         sys.exit(1)
 
     _il.invalidate_caches()
-    from huggingface_hub import hf_hub_download  # now installed from Phase 1
+    from huggingface_hub import hf_hub_download, HfApi  # installed in Phase 1
+
+    # Detect GPU arch for wheel selection and TORCH_CUDA_ARCH_LIST injection
+    _cc = _torch.cuda.get_device_capability(0) if _torch.cuda.is_available() else (0, 0)
+    _arch_suffix = f"sm{_cc[0]}{_cc[1]}"   # e.g. "sm100", "sm75"
+    _arch_list   = f"{_cc[0]}.{_cc[1]}+PTX"
+    print(f"[bootstrap]   GPU arch: {_arch_suffix}  (TORCH_CUDA_ARCH_LIST={_arch_list} if build needed)")
 
     _wheel_dir = Path("/tmp/ouroboros_wheels")
     _wheel_dir.mkdir(exist_ok=True)
 
-    for _whl_name in _HUB_WHEEL_FILES:
-        print(f"[bootstrap]   Downloading {_whl_name} ...")
+    for _base in _HUB_WHEEL_BASES:
+        _hub_filename   = f"{_base}-{_arch_suffix}.whl"   # arch-encoded Hub name
+        _local_filename = f"{_base}.whl"                   # standard name for pip
+        _local_path     = _wheel_dir / _local_filename
+
+        # ── Try Hub download first ───────────────────────────────────────────
+        _downloaded = False
         try:
-            _local = hf_hub_download(
+            _dl = hf_hub_download(
                 repo_id=_HUB_REPO_ID,
-                filename=_whl_name,
+                filename=_hub_filename,
                 token=_hf_token,
                 local_dir=str(_wheel_dir),
             )
-        except Exception as _e:
-            print(f"[bootstrap] FATAL: Could not download {_whl_name}: {_e}")
-            print( "[bootstrap]        Upload a compatible wheel with build_wheels_kaggle.py.")
-            sys.exit(1)
+            # hf_hub_download saves under the Hub filename; copy to standard pip name
+            shutil.copy2(_dl, str(_local_path))
+            print(f"[bootstrap]   Downloaded {_hub_filename} ✓")
+            _downloaded = True
+        except Exception as _dl_err:
+            print(f"[bootstrap]   {_hub_filename} not on Hub "
+                  f"({type(_dl_err).__name__}). Compiling from source...")
 
+        # ── Fallback: source compile ─────────────────────────────────────────
+        if not _downloaded:
+            # Derive pip spec from base name
+            # e.g. "mamba_ssm-1.2.2-cp312-..." → "mamba-ssm==1.2.2"
+            _parts    = _base.split("-")
+            _pkg_name = _parts[0]
+            _pkg_ver  = _parts[1]
+            _pip_spec = f"{_pkg_name.replace('_', '-')}=={_pkg_ver}"
+
+            _env_vars = os.environ.copy()
+            _env_vars["MAX_JOBS"] = "4"
+            _env_vars["TORCH_CUDA_ARCH_LIST"] = _arch_list
+
+            print(f"[bootstrap]   Building {_pip_spec} "
+                  f"(TORCH_CUDA_ARCH_LIST={_arch_list}) ...")
+            _build_result = subprocess.run(
+                [sys.executable, "-m", "pip", "wheel", _pip_spec,
+                 "--no-build-isolation", "--no-deps",
+                 "-w", str(_wheel_dir), "--verbose"],
+                env=_env_vars, check=False,
+            )
+            if _build_result.returncode != 0:
+                print(f"[bootstrap] FATAL: Source build failed for {_pip_spec}.")
+                print("[bootstrap]        Run build_wheels_kaggle.py manually and "
+                      "capture stderr: python build_wheels_kaggle.py 2>&1 | tee build.log")
+                sys.exit(1)
+
+            # Find the built standard-named wheel (exclude any arch-encoded files)
+            _found = [
+                f for f in _wheel_dir.glob(f"{_pkg_name}*.whl")
+                if not any(f.name.endswith(f"-{s}.whl") for s in _KNOWN_ARCH_SUFFIXES)
+            ]
+            if not _found:
+                print(f"[bootstrap] FATAL: pip wheel succeeded but no .whl found "
+                      f"for {_pkg_name}.")
+                sys.exit(1)
+            _built_whl = max(_found, key=lambda p: p.stat().st_mtime)
+
+            # Copy to standard local name (may already match)
+            if _built_whl.resolve() != _local_path.resolve():
+                shutil.copy2(str(_built_whl), str(_local_path))
+
+            print(f"[bootstrap]   Build succeeded: {_built_whl.name}")
+
+            # Upload arch-encoded copy to Hub so future sessions skip this build
+            _arch_whl_path = _wheel_dir / _hub_filename
+            shutil.copy2(str(_local_path), str(_arch_whl_path))
+            try:
+                _api = HfApi(token=_hf_token)
+                _api.create_repo(repo_id=_HUB_REPO_ID, repo_type="model",
+                                 private=True, exist_ok=True, token=_hf_token)
+                _api.upload_file(
+                    path_or_fileobj=str(_arch_whl_path),
+                    path_in_repo=_hub_filename,
+                    repo_id=_HUB_REPO_ID,
+                    repo_type="model",
+                    token=_hf_token,
+                    commit_message=f"Add wheel: {_hub_filename}",
+                )
+                print(f"[bootstrap]   Uploaded {_hub_filename} to Hub ✓ "
+                      f"(future sessions on {_arch_suffix} skip compilation)")
+            except Exception as _up_err:
+                print(f"[bootstrap]   [warn] Hub upload failed: {_up_err}")
+                print(f"[bootstrap]          Continuing with local wheel. "
+                      f"Re-run to retry upload.")
+
+        # ── pip install (always uses standard local name) ─────────────────────
         _r = subprocess.run(
             [sys.executable, "-m", "pip", "install",
-             "--force-reinstall", "--no-deps", _local],
+             "--force-reinstall", "--no-deps", str(_local_path)],
             check=False,
         )
         if _r.returncode != 0:
-            print(f"[bootstrap] FATAL: pip install failed for {_whl_name}.")
+            print(f"[bootstrap] FATAL: pip install failed for {_local_filename}.")
             sys.exit(1)
-        print(f"[bootstrap]   Installed {_whl_name} ✓")
+        print(f"[bootstrap]   Installed {_local_filename} ✓")
 
     # ── Phase 3: hard functional verification ────────────────────────────────
     print("[bootstrap] Phase 3: verifying mamba fast path (symbol + CUDA op)...")
 
-    # Print ABI fingerprint unconditionally — visible in logs for future debugging
     try:
         _gpu_name = _torch.cuda.get_device_name(0) if _torch.cuda.is_available() else "no-gpu"
-        _cc = _torch.cuda.get_device_capability(0) if _torch.cuda.is_available() else (0, 0)
         print(f"[bootstrap]   ABI fingerprint: "
-              f"GPU={_gpu_name} sm_{_cc[0]}{_cc[1]} | "
+              f"GPU={_gpu_name} {_arch_suffix} | "
               f"CUDA={_torch.version.cuda} | "
               f"PyTorch={_torch.__version__} | "
               f"Python=cp{sys.version_info.major}{sys.version_info.minor}")
-        print(f"[bootstrap]   Wheels: {_HUB_WHEEL_FILES}")
+        print(f"[bootstrap]   Wheel bases: {_HUB_WHEEL_BASES}")
     except Exception:
         pass
 
@@ -257,11 +336,6 @@ def _bootstrap() -> None:
         print("[bootstrap] Mamba fast path: ACTIVE ✓ — ~5s/step expected.")
     except Exception as _ve:
         print(f"\n[bootstrap] FATAL: Mamba fast path verification FAILED: {_ve}")
-        print( "[bootstrap]        Root cause is almost certainly a Python API mismatch:")
-        print( "[bootstrap]        mamba_ssm 2.x removed selective_state_update from the 1.x")
-        print( "[bootstrap]        import path that transformers Jamba checks.")
-        print( "[bootstrap]        Required: mamba_ssm-1.2.2 on Hub. Currently installed version")
-        print( "[bootstrap]        may be 2.x. Run build_wheels_kaggle.py on T4 to rebuild.")
         print( "[bootstrap]        Exiting now (no slow-path fallback — 500s/step is unusable).")
         sys.exit(1)
 
@@ -379,10 +453,6 @@ def _unwrap_peft_model(model):
 
 
 def _get_backbone(model):
-    """
-    Robustly retrieve the backbone module that accepts input_ids / inputs_embeds and
-    returns last_hidden_state.
-    """
     base = _unwrap_peft_model(model)
     candidates = [
         getattr(model, "model", None),
@@ -400,11 +470,6 @@ def _get_backbone(model):
 
 
 def _get_embed_tokens(model):
-    """
-    Robustly retrieve embed_tokens regardless of PEFT wrapping depth.
-    Jamba Reasoning 3B: model.model.embed_tokens
-    After PEFT wrap:    base_model.model.embed_tokens or base_model.model.model.embed_tokens
-    """
     backbone = _get_backbone(model)
     if getattr(backbone, "embed_tokens", None) is not None:
         return backbone.embed_tokens
@@ -645,18 +710,6 @@ def load_model_and_tokenizer(
     args: argparse.Namespace,
     device: torch.device,
 ) -> Tuple[nn.Module, Any, int, int]:
-    """
-    Load Jamba Reasoning 3B with QLoRA (--use_4bit) or standard LoRA.
-
-    Returns (model, tokenizer, d_model, lat_token_id).
-
-    Key implementation notes:
-    - attn_implementation: tries flash_attention_2, falls back to 'eager'
-    - use_mamba_kernels: probed at runtime; False only set when probe fails
-    - <|lat|> token: added if absent; embed_tokens resized accordingly
-    - device_map: pinned to the local process GPU when using torchrun
-    - amp dtype: bfloat16 when supported, else float16 on CUDA (T4-safe)
-    """
     is_main = _is_main_process()
     rank = _rank()
     amp_dtype = _amp_dtype(device)
@@ -679,12 +732,10 @@ def load_model_and_tokenizer(
     if is_main:
         print(f"  <|lat|> token id: {lat_token_id}  vocab: {len(tokenizer)}")
 
-    # Determine attn_implementation with fallback
     attn_impl = "eager"
     if device.type == "cuda":
         try:
             import flash_attn  # noqa: F401
-
             attn_impl = "flash_attention_2"
             if is_main:
                 print("  flash-attn available: using flash_attention_2")
@@ -703,10 +754,6 @@ def load_model_and_tokenizer(
     if device.type == "cuda":
         load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
 
-    # Probe for mamba CUDA kernels before model load.
-    # Re-uses the same hard verification from _bootstrap() so the check is identical.
-    # If bootstrap passed we expect this to pass too; but it's cheap and catches
-    # edge cases where the session state changed (e.g. import cache was cleared).
     _mamba_fast_path = False
     if device.type == "cuda":
         try:
@@ -721,7 +768,6 @@ def load_model_and_tokenizer(
                 print("         This should not happen if _bootstrap() passed.")
                 print("         Slow PyTorch path forced (~500s/step).")
     else:
-        # Non-CUDA devices: always slow path
         load_kwargs["use_mamba_kernels"] = False
 
     if args.use_4bit:
@@ -752,7 +798,6 @@ def load_model_and_tokenizer(
 
     if args.use_4bit:
         from peft import prepare_model_for_kbit_training
-
         model = prepare_model_for_kbit_training(
             model,
             use_gradient_checkpointing=args.grad_checkpoint,
@@ -780,7 +825,6 @@ def load_model_and_tokenizer(
     if is_main and hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
 
-    # Verify critical paths after PEFT wrap
     _ = _get_embed_tokens(model)
     _ = _get_lm_head(model)
     _ = _get_backbone(model)
@@ -794,16 +838,11 @@ def load_model_and_tokenizer(
     return model, tokenizer, d_model, lat_token_id
 
 
-
 def _download_dataset_from_hub(
     data_dir: Path,
     hf_repo_id: str = "WeirdRunner/Ouroboros",
     hf_config: str = "coconut-v1",
 ) -> None:
-    """
-    Download coconut-v1 from HF Hub and write local train.jsonl / val.jsonl / stats.json.
-    Called automatically when local files are missing.
-    """
     try:
         from datasets import load_dataset as hf_load_dataset
     except ImportError:
@@ -883,10 +922,6 @@ def load_canonical_dataset(
     data_dir: Path,
     max_samples: Optional[int],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Load train.jsonl, val.jsonl, and stats.json.
-    If local files are missing, auto-downloads from HF Hub (WeirdRunner/Ouroboros, coconut-v1).
-    """
     train_path = data_dir / "train.jsonl"
     val_path   = data_dir / "val.jsonl"
     stats_path = data_dir / "stats.json"
@@ -958,20 +993,6 @@ def build_sample_at_stage(
     lat_token_id: int,
     max_seq_len: int,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Build a tokenized Coconut sample for curriculum stage k.
-
-    Sequence layout (stage k > 0):
-        [Q_ids] [lat_id * min(k, n_steps)] [S_{k+1}_ids ... S_n_ids] [answer_ids + eos]
-
-    Labels:
-        -100  for Q positions and latent positions
-        token ids  for remaining steps and answer (supervised)
-
-    Stage 0 (k=0): no latent slots; labels on ALL steps + answer.
-    Truncation: supervised tail is truncated if total > max_seq_len.
-    Returns None if < 4 supervised tokens remain after truncation.
-    """
     question = str(sample.get("question", "")).strip()
     if not question:
         return None
@@ -1024,7 +1045,6 @@ def build_sample_at_stage(
 
 
 def collate_stage_k(samples: List[Dict[str, Any]], pad_id: int) -> Dict[str, torch.Tensor]:
-    """Pad a micro-batch to the longest example."""
     max_len = max(s["full_ids"].size(0) for s in samples)
     batch_size = len(samples)
     input_ids = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
@@ -1189,24 +1209,7 @@ def coconut_forward(
     args: argparse.Namespace,
     step_in_phase: int,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    Coconut forward pass for curriculum stage k.
-
-    Stage 0 (k=0): standard forward pass. No prefix passes, no latent injection.
-
-    Stage k > 0:
-      Phase A: embed all tokens.
-      Phase B: per-sample sequential prefix passes for each latent slot.
-               Pass j: prefix = Q + latents[0..j-1].
-               Extract h_j = last hidden state at prefix end.
-               CRITICAL: assert last_hidden_state is not None.
-               Patch embedding at latent slot j with h_j.
-      Phase C: full forward over patched sequence. CE on supervised positions.
-      Phase D: DGAC gate regularization if --use_halt_gate.
-
-    All passes use use_cache=False. Caching causes shape mismatches with patched embeddings.
-    """
-    del stage_k  # stage is encoded via n_latents per sample
+    del stage_k
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     labels = batch["labels"].to(device)
@@ -1298,7 +1301,6 @@ def normalize_pred(text: str) -> str:
     return last_line.strip(" .,:;!*")
 
 
-
 @torch.no_grad()
 def evaluate_stage(
     model,
@@ -1310,11 +1312,6 @@ def evaluate_stage(
     args: argparse.Namespace,
     halt_gate: Optional[HaltGate] = None,
 ) -> Tuple[float, float]:
-    """
-    Compute val CE and exact-match accuracy at stage k using live weights.
-    torch.cuda.empty_cache() called before to avoid OOM.
-    Returns (val_ce, val_acc). Accuracy is primary for best-ckpt selection.
-    """
     _maybe_empty_cuda_cache()
     model.eval()
     if halt_gate is not None:
@@ -1330,7 +1327,6 @@ def evaluate_stage(
     amp_dtype = _amp_dtype(device)
     batch_size = max(int(args.val_batch_size), 1)
 
-    # CE pass
     for start in range(0, len(val_samples), batch_size):
         batch_raw = val_samples[start : start + batch_size]
         built = [
@@ -1354,7 +1350,6 @@ def evaluate_stage(
         ce_numer += float(loss.item()) * valid_tokens
         ce_denom += valid_tokens
 
-    # Accuracy pass (cap at 200 samples for speed)
     for sample in val_samples[:200]:
         built = build_sample_at_stage(tokenizer, sample, stage_k, lat_token_id, args.max_seq_len)
         if built is None:
@@ -1422,7 +1417,6 @@ def evaluate_stage(
 
 
 def _resolve_hf_token(cli_value: Optional[str]) -> Optional[str]:
-    """CLI > Kaggle Secrets > Colab Secrets > env var."""
     if cli_value:
         return cli_value
     try:
@@ -1449,7 +1443,6 @@ def _hub_upload_checkpoint(
     remote_prefix: str = "runs/stage3",
     timeout_s: float = 300.0,
 ) -> bool:
-    """Upload one checkpoint directory to HF Hub. Fire-and-forget — never raises."""
     try:
         from huggingface_hub import HfApi
     except ImportError:
@@ -1484,7 +1477,6 @@ def _hub_download_checkpoint(
     hf_token: str,
     remote_prefix: str = "runs/stage3",
 ) -> Optional[Path]:
-    """Download a single named checkpoint folder from HF Hub into local_dir."""
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
@@ -1514,7 +1506,6 @@ def _list_hub_stage_checkpoints(
     hf_token: str,
     remote_prefix: str = "runs/stage3",
 ) -> List[Tuple[int, int, str]]:
-    """Return [(stage_k, step, ckpt_name)] sorted newest first."""
     try:
         from huggingface_hub import HfApi
     except ImportError:
@@ -1572,7 +1563,6 @@ def save_checkpoint(
     val_acc: Optional[float],
     tag: str = "",
 ) -> Path:
-    """Save to output_dir/stage_{k}/{tag or checkpoint-{step}}/."""
     stage_dir = output_dir / f"stage_{stage_k}"
     stage_dir.mkdir(parents=True, exist_ok=True)
     name = "best" if tag == "best" else f"checkpoint-{step:07d}"
@@ -1628,7 +1618,6 @@ def load_checkpoint(
     device: torch.device,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """Load checkpoint weights and optional optimizer/scheduler state."""
     state = _read_training_state(ckpt_dir, map_location=device)
     adapter_dir = ckpt_dir / "adapter_model"
     if adapter_dir.exists():
@@ -1641,7 +1630,6 @@ def load_checkpoint(
                 continue
             if fname.endswith(".safetensors"):
                 from safetensors.torch import load_file
-
                 weights = load_file(str(fpath))
             else:
                 weights = torch.load(fpath, map_location=device)
@@ -1728,7 +1716,6 @@ def build_optimizer_and_scheduler(
 
 
 def make_timeout_checker(args: argparse.Namespace, rank: int):
-    """Returns callable → True when session is within graceful exit buffer."""
     session_start = time.perf_counter()
     timeout_limit_s  = args.session_timeout_hours * 3600.0
     timeout_buffer_s = args.graceful_exit_buffer_minutes * 60.0
@@ -1759,11 +1746,6 @@ def find_latest_resume_checkpoint(
     hf_repo_id: str = "WeirdRunner/Ouroboros",
     hf_stage_subdir: str = "runs/stage3",
 ) -> Optional[Path]:
-    """
-    Find the latest in-progress checkpoint.
-    Search order: local output_dir first, then HF Hub fallback.
-    'best' checkpoints skipped so reruns prefer the freshest resumable state.
-    """
     best_path: Optional[Path] = None
     best_key:  Optional[Tuple[int, int, int, int]] = None
 
@@ -1803,7 +1785,6 @@ def find_latest_resume_checkpoint(
 
     hub_candidates = _list_hub_stage_checkpoints(hf_repo_id, hf_token, hf_stage_subdir)
     hub_candidates = [(k, s, n) for k, s, n in hub_candidates if not n.endswith("/best")]
-
     hub_resume_dir = output_dir / ".hub_resume"
 
     for stage_k, step, rel_name in hub_candidates:
@@ -1928,7 +1909,6 @@ def _best_state_for_stage(stage_dir: Path) -> Tuple[float, float, Optional[Path]
     return val_acc, val_ce, best_dir
 
 
-
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -1995,7 +1975,6 @@ def main() -> None:
             hf_repo_id=getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros"),
             hf_stage_subdir=getattr(args, "hf_stage_subdir", "runs/stage3"),
         )
-
         if resume_path is not None and is_main:
             print(f"  [resume] discovered latest checkpoint: {resume_path}")
 
