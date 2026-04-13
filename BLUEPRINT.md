@@ -33,45 +33,16 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 
 ### Part 0.1 — Immediate Next Actions (ordered)
 
-1. **Fix `_bootstrap()` in `jamba_coconut_finetune.py`** — TWO required changes:
-
-   **Fix A (easy, confirmed):** Pin bitsandbytes version floor:
-   ```python
-   # BEFORE
-   "bitsandbytes",
-   # AFTER
-   "bitsandbytes>=0.46.1",
+1. **Run `build_wheels_kaggle.py` (patched, as-is) on a Kaggle session that gets T4:**
    ```
-
-   **Fix B (critical, mamba_ssm still not installing):** The source build runs (~30 min) but the module is absent post-install. Root cause unclear — build stderr was in truncated log. Two changes needed:
-   - Inject `TORCH_CUDA_ARCH_LIST` into the environment before the pip subprocess call (same logic as `build_wheels_kaggle.py`'s `_build_env_vars()`)
-   - Capture build stderr to a file so the next session can diagnose the exact failure
-
-   Proposed `_bootstrap()` approach:
-   ```python
-   import torch, subprocess, sys, os
-   def _bootstrap():
-       env = os.environ.copy()
-       env["MAX_JOBS"] = "4"
-       if torch.cuda.is_available():
-           major, minor = torch.cuda.get_device_capability(0)
-           env["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}+PTX"
-           print(f"[bootstrap] TORCH_CUDA_ARCH_LIST={env['TORCH_CUDA_ARCH_LIST']}")
-       packages = [
-           "transformers>=4.54.0", "peft", "datasets", "tqdm", "wandb",
-           "bitsandbytes>=0.46.1", "accelerate", "huggingface_hub",
-           "mamba-ssm==1.2.2", "causal-conv1d>=1.4.0",
-       ]
-       result = subprocess.run(
-           [sys.executable, "-m", "pip", "install", "-q",
-            "--no-build-isolation", *packages],
-           env=env, check=False,
-       )
-       ...
+   python build_wheels_kaggle.py --hf_token YOUR_TOKEN
    ```
-   Note: `torch.cuda` must be importable before `_bootstrap()` runs. Since torch is pre-installed in the Kaggle container, this is safe.
+   This will compile causal_conv1d + mamba_ssm==1.2.2 with `TORCH_CUDA_ARCH_LIST=7.5+PTX`.
+   sm_75+PTX is forward-JIT compatible with A100/H100/Blackwell — no further rebuilds needed.
+   Upload will overwrite Hub with the correct wheels.
+   After success, `_HUB_WHEEL_FILES` in `jamba_coconut_finetune.py` already points to correct names.
 
-2. **Smoke test** (after fixes above):
+2. **Smoke test** (after build above):
    ```
    python jamba_coconut_finetune.py \
      --data_dir data/coconut_v1 --use_4bit \
@@ -79,7 +50,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
      --max_seq_len 1024 --max_grad_norm 0.3 \
      --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
    ```
-   Must see `mamba CUDA kernels: OK` and `val_acc > 0` to proceed.
+   Must see `Mamba fast path: ACTIVE ✓` in output.
 
 3. **K=0→K_max curriculum** on Kaggle Dual T4 with `torchrun --nproc_per_node=2`
 
@@ -101,8 +72,9 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | Exploding gradients at k≥2 | `--max_grad_norm 0.3` ✅ |
 | Wheel/ABI mismatch | Retired wheel workflow; `_bootstrap()` self-installs ✅ |
 | mamba-ssm 2.x API | Pinned to `mamba-ssm==1.2.2` ✅ |
-| **bitsandbytes < 0.46.1 in container** | **`"bitsandbytes>=0.46.1"` in `_bootstrap()` 🔴 NOT YET APPLIED** |
-| **mamba_ssm source build silently fails** | **Inject `TORCH_CUDA_ARCH_LIST` + capture stderr in `_bootstrap()` 🔴 NOT YET APPLIED** |
+| **mamba_ssm 2.x deleted selective_state_update from 1.x path** | **`_HUB_WHEEL_FILES` updated to `mamba_ssm-1.2.2-*`. Need to build 1.2.2 wheel on T4. 🔴 PENDING BUILD** |
+| **causal_conv1d Hub wheel compiled for sm_120 only (Blackwell)** | **Rebuild on T4 (sm_75+PTX → forward-JIT on all newer GPUs). 🔴 PENDING BUILD** |
+| **`build_wheels_kaggle.py` never run with patched arch injection** | **Run it. This is the only remaining action. 🔴 PENDING** |
 
 One item still requires empirical verification during smoke test:
 - `inputs_embeds` → `last_hidden_state` path for Jamba Reasoning 3B **with fast Mamba kernels active**

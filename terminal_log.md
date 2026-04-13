@@ -5,6 +5,43 @@
 
 ---
 
+## Stage 3 — Hub Wheel Session (Kaggle T4, 2026-04-13)
+**Script:** `jamba_coconut_finetune.py` (Hub-wheel bootstrap)
+**Status:** 🔴 FAILED — two root causes now confirmed with certainty
+
+**ABI fingerprint (verbatim, line 52):**
+```
+GPU=Tesla T4 sm_75 | CUDA=12.8 | PyTorch=2.10.0+cu128 | Python=cp312
+```
+
+**Key events (verbatim):**
+```
+34.1s  [bootstrap] Phase 1: pure-Python deps...
+63.9s  Successfully installed mamba-ssm-2.3.1
+64.3s  [bootstrap]   ABI fingerprint: GPU=Tesla T4 sm_75 | CUDA=12.8 | PyTorch=2.10.0+cu128 | Python=cp312
+95.8s  FATAL: cannot import name 'selective_state_update' from
+       'mamba_ssm.ops.selective_scan_interface'
+       (/usr/local/lib/python3.12/dist-packages/mamba_ssm/ops/selective_scan_interface.py)
+```
+
+**Root cause 1 — Python API breaking change (confirmed):**
+Error is on a `.py` file, not `.so`. CUDA extension loaded fine (31-second gap = `.so` init).
+`selective_state_update` was **deleted** from `mamba_ssm.ops.selective_scan_interface` in 2.x.
+transformers Jamba still checks the 1.x path. Hub has 2.3.1 → broken everywhere regardless of GPU.
+
+**Root cause 2 — causal_conv1d arch mismatch (confirmed, masked by root cause 1):**
+Hub wheel built on Blackwell (`sm_120+PTX`). sm_120 PTX cannot be JIT'd on sm_75 (T4) — PTX forward
+compat only goes UP to newer GPUs, not down. The CUDA op test would have caught this next.
+
+**Why prior build failures don't prove building is broken:**
+Both failed with UNPATCHED code (no ARCH_LIST injection). The patched `build_wheels_kaggle.py`
+has NEVER been run. There is zero data from a patched run.
+
+**Fix:** Run `build_wheels_kaggle.py` (patched, as-is) on T4. `_HUB_WHEEL_FILES` updated to
+`mamba_ssm-1.2.2-cp312-cp312-linux_x86_64.whl` in `jamba_coconut_finetune.py`.
+
+---
+
 ## Stage 3 — Smoke Test Attempt 2 (Kaggle, 2026-04-13)
 **Script:** `jamba_coconut_finetune.py`  **Hardware:** Kaggle GPU (exact GPU unknown)
 **Status:** 🔴 CRASHED — bitsandbytes version too old; mamba_ssm source build silently failed again

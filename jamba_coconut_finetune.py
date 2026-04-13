@@ -80,7 +80,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # Build new ones with build_wheels_kaggle.py whenever CUDA/PyTorch/Python changes.
 _HUB_WHEEL_FILES = [
     "causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl",
-    "mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl",
+    "mamba_ssm-1.2.2-cp312-cp312-linux_x86_64.whl",  # 2.x removed selective_state_update from 1.x path
 ]
 _HUB_REPO_ID = "WeirdRunner/Ouroboros"
 
@@ -257,9 +257,11 @@ def _bootstrap() -> None:
         print("[bootstrap] Mamba fast path: ACTIVE ✓ — ~5s/step expected.")
     except Exception as _ve:
         print(f"\n[bootstrap] FATAL: Mamba fast path verification FAILED: {_ve}")
-        print( "[bootstrap]        The installed Hub wheels are ABI-incompatible with this container.")
-        print( "[bootstrap]        Action: run build_wheels_kaggle.py in this exact session,")
-        print( "                   upload new wheels to Hub, update _HUB_WHEEL_FILES, re-run.")
+        print( "[bootstrap]        Root cause is almost certainly a Python API mismatch:")
+        print( "[bootstrap]        mamba_ssm 2.x removed selective_state_update from the 1.x")
+        print( "[bootstrap]        import path that transformers Jamba checks.")
+        print( "[bootstrap]        Required: mamba_ssm-1.2.2 on Hub. Currently installed version")
+        print( "[bootstrap]        may be 2.x. Run build_wheels_kaggle.py on T4 to rebuild.")
         print( "[bootstrap]        Exiting now (no slow-path fallback — 500s/step is unusable).")
         sys.exit(1)
 
