@@ -20,7 +20,10 @@ References:
   Jamba Reasoning 3B (AI21, ai21labs/AI21-Jamba-Reasoning-3B, Oct 2025)
 
 Install:
-  Self-contained. _bootstrap() runs on every startup:
+  Self-contained. _bootstrap() runs on every startup.
+  Under torchrun, Phase 1/2 are DDP-coordinated so rank 0 performs the shared
+  pip / wheel install once while the other ranks wait; process-local shims and
+  fast-path verification still run on every rank after the shared install.
     Phase 1: pure-Python deps (transformers, peft, bitsandbytes>=0.46.1, huggingface_hub, ...)
     Phase 2: arch-aware Hub wheel install.
              Detects current GPU (e.g. sm100), tries to download the matching
@@ -270,28 +273,72 @@ def _bootstrap_verify_fast_path() -> bool:
     return True
 
 
-def _bootstrap() -> None:
+def _bootstrap_env_rank() -> int:
+    try:
+        return int(os.environ.get("RANK", "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bootstrap_env_world_size() -> int:
+    try:
+        return max(int(os.environ.get("WORLD_SIZE", "1")), 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _bootstrap_env_local_rank() -> int:
+    raw = os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bootstrap_launch_key() -> str:
+    import hashlib as _hashlib
+
+    launch_components = [
+        os.environ.get("TORCHELASTIC_RUN_ID", ""),
+        os.environ.get("MASTER_ADDR", ""),
+        os.environ.get("MASTER_PORT", ""),
+        os.environ.get("WORLD_SIZE", "1"),
+        str(Path(__file__).resolve()) if "__file__" in globals() else "interactive",
+        sys.executable,
+        ",".join(_HUB_WHEEL_BASES),
+    ]
+    raw = "|".join(launch_components)
+    return _hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _bootstrap_sync_paths() -> Tuple[Path, Path, Path]:
+    root = Path("/tmp/ouroboros_bootstrap_sync") / _bootstrap_launch_key()
+    return root, root / "install.ok.json", root / "install.failed.txt"
+
+
+def _bootstrap_prepare_local_cuda_device(_torch) -> None:
+    if not _torch.cuda.is_available():
+        return
+    local_rank = _bootstrap_env_local_rank()
+    device_count = _torch.cuda.device_count()
+    if device_count <= 0:
+        return
+    device_index = local_rank if 0 <= local_rank < device_count else 0
+    _torch.cuda.set_device(device_index)
+
+
+def _bootstrap_shared_install_phases() -> None:
     """
-    Install all dependencies before any third-party imports.
+    Run the filesystem-mutating install phases once per launch.
 
-    Phase 1 — Pure-Python deps (~seconds):
-      transformers, peft, bitsandbytes>=0.46.1, huggingface_hub, etc.
-
-    Phase 2 — Arch-aware Hub wheel install:
-      Detects GPU arch (e.g. sm100). Tries Hub download of the matching
-      arch-encoded wheel (e.g. causal_conv1d-...-sm100.whl). On 404, falls
-      back to source compile with the correct TORCH_CUDA_ARCH_LIST, uploads
-      the result to Hub for future sessions, then installs locally.
-      Over time Hub fills in — after the first session on each GPU arch,
-      subsequent sessions skip compilation entirely.
-
-    Phase 3 — Hard functional verification:
-      Imports all 5 symbols + runs causal_conv1d CUDA op on real tensors.
-      Prints full ABI fingerprint unconditionally (visible in logs).
-      sys.exit(1) on any failure — no slow-path fallback.
+    These phases touch the shared Python environment (pip install / wheel
+    download / optional source build / local wheel install) and therefore must
+    not race across DDP ranks.
     """
     import importlib as _il
     import torch as _torch
+
+    _bootstrap_prepare_local_cuda_device(_torch)
 
     # ── Phase 1: pure-Python deps ─────────────────────────────────────────────
     print("[bootstrap] Phase 1: pure-Python deps...")
@@ -324,7 +371,7 @@ def _bootstrap() -> None:
     from huggingface_hub import hf_hub_download, HfApi  # installed in Phase 1
 
     # Detect GPU arch for wheel selection and TORCH_CUDA_ARCH_LIST injection
-    _cc = _torch.cuda.get_device_capability(0) if _torch.cuda.is_available() else (0, 0)
+    _cc = _torch.cuda.get_device_capability() if _torch.cuda.is_available() else (0, 0)
     _arch_suffix = f"sm{_cc[0]}{_cc[1]}"   # e.g. "sm100", "sm75"
     _arch_list   = f"{_cc[0]}.{_cc[1]}+PTX"
     print(f"[bootstrap]   GPU arch: {_arch_suffix}  (TORCH_CUDA_ARCH_LIST={_arch_list} if build needed)")
@@ -435,6 +482,90 @@ def _bootstrap() -> None:
             sys.exit(1)
         print(f"[bootstrap]   Installed {_local_filename} ✓")
 
+
+def _bootstrap_wait_for_shared_install() -> None:
+    world_size = _bootstrap_env_world_size()
+    if world_size <= 1:
+        _bootstrap_shared_install_phases()
+        return
+
+    rank = _bootstrap_env_rank()
+    root, success_path, failure_path = _bootstrap_sync_paths()
+    root.mkdir(parents=True, exist_ok=True)
+
+    if rank == 0:
+        if success_path.exists():
+            print("[bootstrap] DDP guard: shared install already completed for this launch.")
+            return
+        failure_path.unlink(missing_ok=True)
+        print("[bootstrap] DDP guard: rank 0 performing shared bootstrap install; other ranks will wait.")
+        try:
+            _bootstrap_shared_install_phases()
+        except BaseException:
+            import traceback as _traceback
+
+            failure_path.write_text(_traceback.format_exc(), encoding="utf-8")
+            raise
+        else:
+            success_path.write_text(
+                json.dumps(
+                    {
+                        "rank": rank,
+                        "completed_at": time.time(),
+                        "python": sys.executable,
+                        "wheel_bases": _HUB_WHEEL_BASES,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print("[bootstrap] DDP guard: shared bootstrap install complete.")
+        return
+
+    prefix = f"[bootstrap][rank={rank}]"
+    print(f"{prefix} Waiting for rank 0 shared bootstrap install...")
+    deadline = time.time() + (2 * 60 * 60)
+    while True:
+        if success_path.exists():
+            print(f"{prefix} Shared bootstrap install ready; continuing with local shims.")
+            return
+        if failure_path.exists():
+            failure_text = failure_path.read_text(encoding="utf-8", errors="replace").strip()
+            print(f"{prefix} FATAL: rank 0 shared bootstrap install failed.")
+            if failure_text:
+                print(failure_text)
+            sys.exit(1)
+        if time.time() > deadline:
+            print(f"{prefix} FATAL: timed out waiting for rank 0 shared bootstrap install.")
+            sys.exit(1)
+        time.sleep(2.0)
+
+
+def _bootstrap_process_local_finalize() -> None:
+    """
+    Run the process-local bootstrap phases on every rank.
+
+    These phases patch Python module state inside the current interpreter and
+    optionally verify the fast path on the current CUDA device, so they cannot
+    be shared across processes even though the package installation is shared.
+    """
+    import importlib as _il
+    import torch as _torch
+
+    rank = _bootstrap_env_rank()
+    verbose = _bootstrap_env_world_size() == 1 or rank == 0
+    prefix = "[bootstrap]" if rank == 0 else f"[bootstrap][rank={rank}]"
+
+    def _info(message: str) -> None:
+        if verbose:
+            print(f"{prefix} {message}")
+
+    def _always(message: str) -> None:
+        print(f"{prefix} {message}")
+
+    _bootstrap_prepare_local_cuda_device(_torch)
+    _il.invalidate_caches()
+
     # ── Phase 2.5: transformers / mamba_ssm compatibility shim ──────────────
     # Apply this before the first mamba_ssm import so legacy generation-name
     # lookups resolve cleanly during kernel export patching.
@@ -463,46 +594,111 @@ def _bootstrap() -> None:
                     setattr(_tg_mod, _old, _repl)
                     _patched.append(_old)
         if _patched:
-            print(f"[bootstrap] Shim: patched {len(_patched)} removed transformers.generation names ✓")
+            _info(f"Shim: patched {len(_patched)} removed transformers.generation names ✓")
         else:
-            print("[bootstrap] Shim: all generation names present (no patch needed)")
+            _info("Shim: all generation names present (no patch needed)")
     except ImportError:
         pass
     except Exception as _shim_err:
-        print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
-        print("[bootstrap]          mamba_ssm import may fail at Phase 3 verification.")
+        _always(f"WARNING: transformers shim failed: {_shim_err}")
+        _always("         mamba_ssm import may fail at Phase 3 verification.")
 
     # ── Phase 2.6: export kernel symbols for transformers Jamba loader ──────
     try:
         _patched_exports = _patch_kernel_top_level_exports()
         if _patched_exports:
-            print("[bootstrap] Kernel export shim:", ", ".join(_patched_exports), "✓")
+            _info("Kernel export shim: " + ", ".join(_patched_exports) + " ✓")
         else:
-            print("[bootstrap] Kernel export shim: already aligned")
+            _info("Kernel export shim: already aligned")
     except Exception as _kernel_patch_err:
-        print(f"[bootstrap] WARNING: kernel export shim failed: {_kernel_patch_err}")
+        _always(f"WARNING: kernel export shim failed: {_kernel_patch_err}")
 
     # ── Phase 3: hard functional verification ────────────────────────────────
-    print("[bootstrap] Phase 3: verifying mamba fast path (symbol + CUDA op)...")
+    _info("Phase 3: verifying mamba fast path (symbol + CUDA op)...")
 
     try:
-        _gpu_name = _torch.cuda.get_device_name(0) if _torch.cuda.is_available() else "no-gpu"
-        print(f"[bootstrap]   ABI fingerprint: "
-              f"GPU={_gpu_name} {_arch_suffix} | "
-              f"CUDA={_torch.version.cuda} | "
-              f"PyTorch={_torch.__version__} | "
-              f"Python=cp{sys.version_info.major}{sys.version_info.minor}")
-        print(f"[bootstrap]   Wheel bases: {_HUB_WHEEL_BASES}")
+        current_device = _torch.cuda.current_device() if _torch.cuda.is_available() else None
+        _cc = _torch.cuda.get_device_capability(current_device) if current_device is not None else (0, 0)
+        _arch_suffix = f"sm{_cc[0]}{_cc[1]}"
+        _gpu_name = _torch.cuda.get_device_name(current_device) if current_device is not None else "no-gpu"
+        _info(
+            f"  ABI fingerprint: GPU={_gpu_name} {_arch_suffix} | "
+            f"CUDA={_torch.version.cuda} | "
+            f"PyTorch={_torch.__version__} | "
+            f"Python=cp{sys.version_info.major}{sys.version_info.minor}"
+        )
+        _info(f"  Wheel bases: {_HUB_WHEEL_BASES}")
     except Exception:
         pass
 
     try:
         _bootstrap_verify_fast_path()
-        print("[bootstrap] Mamba fast path: ACTIVE ✓ — profile step time empirically.")
+        _info("Mamba fast path: ACTIVE ✓ — profile step time empirically.")
     except Exception as _ve:
-        print(f"\n[bootstrap] FATAL: Mamba fast path verification FAILED: {_ve}")
-        print( "[bootstrap]        Exiting now (no slow-path fallback — 500s/step is unusable).")
+        _always(f"FATAL: Mamba fast path verification FAILED: {_ve}")
+        _always("         Exiting now (no slow-path fallback — 500s/step is unusable).")
         sys.exit(1)
+
+
+def _bootstrap_run_local_finalize_padded() -> None:
+    """
+    Run process-local finalize on every rank, then wait for all ranks to finish.
+
+    This prevents one rank from entering main() and hanging in
+    init_process_group() while another rank has already died during bootstrap.
+    """
+    world_size = _bootstrap_env_world_size()
+    if world_size <= 1:
+        _bootstrap_process_local_finalize()
+        return
+
+    rank = _bootstrap_env_rank()
+    prefix = "[bootstrap]" if rank == 0 else f"[bootstrap][rank={rank}]"
+    root, _, _ = _bootstrap_sync_paths()
+    phase_dir = root / "local_finalize"
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    ok_path = phase_dir / f"rank_{rank}.ok"
+    fail_path = phase_dir / f"rank_{rank}.failed.txt"
+    ok_path.unlink(missing_ok=True)
+    fail_path.unlink(missing_ok=True)
+
+    try:
+        _bootstrap_process_local_finalize()
+    except BaseException:
+        import traceback as _traceback
+
+        fail_path.write_text(_traceback.format_exc(), encoding="utf-8")
+        raise
+    else:
+        ok_path.write_text(str(time.time()), encoding="utf-8")
+
+    deadline = time.time() + (30 * 60)
+    while True:
+        failure_files = sorted(phase_dir.glob("rank_*.failed.txt"))
+        if failure_files:
+            failure_text = failure_files[0].read_text(encoding="utf-8", errors="replace").strip()
+            print(f"{prefix} FATAL: bootstrap local finalize failed on {failure_files[0].name}.")
+            if failure_text:
+                print(failure_text)
+            sys.exit(1)
+        if len(list(phase_dir.glob("rank_*.ok"))) >= world_size:
+            return
+        if time.time() > deadline:
+            print(f"{prefix} FATAL: timed out waiting for all ranks to finish bootstrap local finalize.")
+            sys.exit(1)
+        time.sleep(1.0)
+
+
+def _bootstrap() -> None:
+    """
+    Install all dependencies before any third-party imports.
+
+    Shared filesystem-mutating phases (pip install / wheel install) are run
+    once per torchrun launch, while interpreter-local shims and fast-path
+    verification run on every rank.
+    """
+    _bootstrap_wait_for_shared_install()
+    _bootstrap_run_local_finalize_padded()
 
 
 _bootstrap()
