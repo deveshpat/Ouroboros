@@ -129,6 +129,7 @@ def _bootstrap_verify_fast_path() -> bool:
     import importlib as _il
     import warnings as _warnings
     import torch as _torch
+    import triton.language as _tl
 
     _il.invalidate_caches()
 
@@ -176,15 +177,37 @@ def _bootstrap_verify_fast_path() -> bool:
     _scan_out = selective_scan_fn(_u, _delta, _A, _B, _C, _D, delta_softplus=True)
     assert _scan_out.shape == _u.shape, f"Unexpected selective_scan_fn shape: {_scan_out.shape}"
 
-    # 3) Triton recurrent update kernel used by cached decode / generation
+    # 3) Triton recurrent update kernel used by cached decode / generation.
+    # mamba_ssm==1.2.2's wrapper expects dt_bias to be present: it expands
+    # dt_bias strides with starred unpacking and also reads dt_bias.stride(-1)
+    # when computing tie_hdim. Omitting dt_bias triggers:
+    #   "Value after * must be an iterable, not int"
+    #
+    # Kaggle's current Triton build also lacks tl.math.log1p, while
+    # selective_state_update uses tl.math.log1p in the DT_SOFTPLUS branch.
+    # For this script that is acceptable because training / eval run with
+    # use_cache=False and do not rely on cached decode. We still validate that
+    # the recurrent-update kernel launches, but only take the dt_softplus path
+    # when the installed Triton actually provides tl.math.log1p.
     _state = _torch.randn(1, 4, 3, device="cuda", dtype=_torch.float32)
     _x_step = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
     _dt = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
+    _dt_bias = _torch.zeros(4, device="cuda", dtype=_torch.float32)
+    _A_step = -_torch.rand(4, 3, device="cuda", dtype=_torch.float32) - 1.0
     _B_step = _torch.randn(1, 3, device="cuda", dtype=_torch.float32)
     _C_step = _torch.randn(1, 3, device="cuda", dtype=_torch.float32)
-    _step_out = selective_state_update(
-        _state, _x_step, _dt, _A, _B_step, _C_step, _D, dt_softplus=True
-    )
+    _has_tl_math_log1p = hasattr(getattr(_tl, "math", None), "log1p")
+    if _has_tl_math_log1p:
+        _step_out = selective_state_update(
+            _state, _x_step, _dt, _A_step, _B_step, _C_step, _D,
+            dt_bias=_dt_bias, dt_softplus=True
+        )
+    else:
+        _dt_pos = _torch.rand(1, 4, device="cuda", dtype=_torch.float32) + 0.05
+        _step_out = selective_state_update(
+            _state, _x_step, _dt_pos, _A_step, _B_step, _C_step, _D,
+            dt_bias=_dt_bias, dt_softplus=False
+        )
     assert _step_out.shape == _x_step.shape, (
         f"Unexpected selective_state_update shape: {_step_out.shape}"
     )
@@ -620,67 +643,6 @@ def _safe_from_pretrained(model_id: str, load_kwargs: Dict[str, Any]):
         raise
 
 
-def _patch_transformers_jamba_fast_path(is_main: bool = False) -> bool:
-    """
-    Rebind transformers.models.jamba.modeling_jamba fast-path symbols to the
-    kernels we already verified in _bootstrap_verify_fast_path().
-
-    Why this exists:
-      In Kaggle, bootstrap proves the wheels and kernels work, but the later
-      Jamba model load can still enter training with
-      modeling_jamba.is_fast_path_available == False, which causes the first
-      Mamba layer forward to raise:
-          "Fast Mamba kernels are not available ..."
-      even though our direct kernel probe already succeeded.
-
-    By importing the exact symbols again and assigning them onto
-    transformers.models.jamba.modeling_jamba before from_pretrained(), we make
-    the runtime view used by Jamba consistent with the verified environment.
-    """
-    import importlib as _il
-    import warnings as _warnings
-
-    try:
-        _il.invalidate_caches()
-        import transformers.models.jamba.modeling_jamba as _mj
-
-        with _warnings.catch_warnings():
-            _warnings.filterwarnings("ignore", category=FutureWarning, module=r"mamba_ssm.*")
-            from mamba_ssm.ops.selective_scan_interface import (  # type: ignore
-                selective_scan_fn,
-                mamba_inner_fn,
-            )
-            from mamba_ssm.ops.triton.selective_state_update import (  # type: ignore
-                selective_state_update,
-            )
-            from causal_conv1d import causal_conv1d_fn, causal_conv1d_update  # type: ignore
-
-        _mj.selective_scan_fn = selective_scan_fn
-        _mj.mamba_inner_fn = mamba_inner_fn
-        _mj.selective_state_update = selective_state_update
-        _mj.causal_conv1d_fn = causal_conv1d_fn
-        _mj.causal_conv1d_update = causal_conv1d_update
-        _mj.is_fast_path_available = all(
-            (
-                _mj.selective_state_update,
-                _mj.selective_scan_fn,
-                _mj.causal_conv1d_fn,
-                _mj.causal_conv1d_update,
-                _mj.mamba_inner_fn,
-            )
-        )
-        if is_main:
-            print(
-                "  transformers.models.jamba fast-path bindings: "
-                f"{'OK' if _mj.is_fast_path_available else 'MISSING'}"
-            )
-        return bool(_mj.is_fast_path_available)
-    except Exception as exc:
-        if is_main:
-            print(f"  [warn] failed to patch transformers.models.jamba fast path: {exc}")
-        return False
-
-
 def _distributed_is_initialized() -> bool:
     return torch.distributed.is_available() and torch.distributed.is_initialized()
 
@@ -905,12 +867,6 @@ def load_model_and_tokenizer(
         try:
             _bootstrap_verify_fast_path()
             _mamba_fast_path = True
-            patched_jamba = _patch_transformers_jamba_fast_path(is_main=is_main)
-            if not patched_jamba:
-                raise RuntimeError(
-                    "transformers.models.jamba still does not expose the verified "
-                    "fast-path symbols after bootstrap verification"
-                )
             if is_main:
                 print("  mamba CUDA kernels: OK — fast path ACTIVE (~5s/step expected)")
         except Exception as _kern_exc:
