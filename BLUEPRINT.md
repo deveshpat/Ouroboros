@@ -17,7 +17,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | 0 | Architecture & Viability (nano) | ✅ COMPLETE |
 | 1 | Pre-training (nano) | ✅ Pipeline test only; retired |
 | 2 | SFT (nano) | 🔴 RETIRED |
-| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 BLOCKED — comprehensive shim applied; apply patch then re-run smoke test |
+| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 SMOKE TEST PASSED — blocked on throughput (113s/step → must batch before full run) |
 | 4 | GRPO on Jamba Reasoning 3B | ⬜ NOT STARTED |
 | 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
 
@@ -32,27 +32,25 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 ### GPU Arch / Hub Wheel Status
 | Arch | causal_conv1d | mamba_ssm |
 |---|---|---|
-| sm75 (T4) | ✅ on Hub | ✅ on Hub |
+| sm75 (T4) | ✅ on Hub — confirmed valid (Session 9) | ✅ on Hub — confirmed valid (Session 9) |
 | sm100 (B100) | ✅ on Hub | ❌ not yet built |
 
 ---
 
 ### Part 0.1 — Immediate Next Actions (ordered)
 
-1. **Apply the comprehensive Phase 1.5 shim** (see Part 0.2) to `jamba_coconut_finetune.py`.
-   Replaces the single-name shim with a full 10-alias patch covering all generation output classes removed in `transformers>=4.44`.
+1. **Fix Phase 2.5/2.6 ordering in `_bootstrap()`** — trivial one-liner swap.
+   Currently Phase 2.5 (`_patch_kernel_top_level_exports`) runs before Phase 2.6 (generation name shim), causing a noisy but harmless WARNING every session because `mamba_ssm` import inside 2.5 hits the unpatched `transformers.generation` names. Move 2.6 before 2.5.
 
-2. **Smoke test** — both sm75 wheels are on Hub, bootstrap will be fast (<30s for wheel install):
-   ```bash
-   python jamba_coconut_finetune.py \
-     --data_dir data/coconut_v1 --use_4bit \
-     --epochs_per_stage 1 --max_stage 2 --max_samples 200 \
-     --max_seq_len 1024 --max_grad_norm 0.3 \
-     --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
-   ```
-   Must see `[bootstrap] Shim: patched N removed transformers.generation names ✓` and `Mamba fast path: ACTIVE ✓`.
+2. **Implement batched forward for Stage 0 (critical throughput fix).**
+   Current bottleneck: `coconut_forward` iterates `for row in range(batch_size)` calling `_forward_single_sample(batch=1)` per row. For `n_latent=0` (Stage 0), no per-sample injection is needed — the full micro-batch can be a single fused backbone call. At `batch=2, accum=8` on a single T4, this means 16 serial `batch=1` backbone calls instead of 8 `batch=2` calls.
+   - Modify `coconut_forward` to detect `stage_k==0` (or `all n_latents==0`) and route to a fully batched forward path
+   - Expected improvement: ~4–8× step time reduction for Stage 0 (dominant stage by epoch count)
+   - Measure actual step time before committing to the full run
 
-3. **If smoke test passes**: K=0→K_max curriculum on Kaggle Dual T4:
+3. **Profile Dual T4 throughput** (after fix #2) with a 500-sample smoke test using `torchrun --nproc_per_node=2`. Confirm step time is ≤30s/step on Dual T4 before launching the full curriculum.
+
+4. **Only then: K=0→K_max curriculum on Kaggle Dual T4:**
    ```bash
    torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
      --data_dir data/coconut_v1 --use_4bit \
@@ -61,9 +59,9 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
      --output_dir runs/stage3_curriculum
    ```
 
-4. **If K=4 gate passes**: claim TRC, run K=10 + DGAC Phase 3.4 on A100.
+5. **If K=4 gate passes**: claim TRC, run K=10 + DGAC Phase 3.4 on A100.
 
-5. **If a sm100 session is allocated**: run `build_wheels_kaggle.py` to cache the mamba_ssm sm100 wheel.
+6. **If a sm100 session is allocated**: run `build_wheels_kaggle.py` to cache the mamba_ssm sm100 wheel.
 
 ---
 
@@ -86,58 +84,14 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | bitsandbytes version floor missing | `bitsandbytes>=0.46.1` in `_bootstrap()` ✅ |
 | causal_conv1d Hub wheel (sm100, sm75) | Built + uploaded for both arches ✅ |
 | mamba_ssm 1.2.2 PyPI sdist is a 35kB stub | pip spec changed to `git+https://github.com/state-spaces/mamba.git@v1.2.2` ✅ |
-| `GreedySearchDecoderOnlyOutput` removed in `transformers>=4.44` | Partial shim applied in prior session ✅ |
-| **`SampleDecoderOnlyOutput` (and 9 other generation output classes) removed in `transformers>=4.44`; mamba_ssm 1.2.2 imports them all** | **Fix: replace single-name shim with comprehensive 10-alias patch. See exact code below. ✅ PATCHED 2026-04-14** |
+| `GreedySearchDecoderOnlyOutput` + 9 other generation classes removed in `transformers>=4.44` | Comprehensive 10-alias shim in Phase 2.6 ✅ |
+| Verifier called `causal_conv1d_fn` with wrong weight shape `(dim, 1, width)` | Fixed to `(dim, width)` ✅ |
+| Verifier used wrong import path for `selective_state_update` | Fixed to `mamba_ssm.ops.triton.selective_state_update` ✅ |
+| **Phase 2.5 runs before Phase 2.6 → noisy WARNING every session** | **Fix: swap Phase 2.5/2.6 ordering in `_bootstrap()`. Cosmetic only — Phase 3 passes regardless.** |
+| **`coconut_forward` iterates per-sample at batch=1 even when `n_latent=0`** | **Fix: batched forward path for stage 0. Critical — 113s/step observed; full run infeasible without this.** |
 
-**Exact code change — replace the entire Phase 1.5 block in `_bootstrap()` in `jamba_coconut_finetune.py`:**
-
-```python
-    # ── Phase 1.5: transformers / mamba_ssm compatibility shim ───────────────
-    # mamba_ssm 1.2.2 imports multiple generation output class names that were
-    # removed in transformers>=4.44 (GreedySearch*, Sample*, BeamSearch*, etc.).
-    # Backfill ALL removed names as aliases for their modern replacements in
-    # one pass so we never debug one missing name per session.
-    try:
-        import importlib as _il2
-        _il2.invalidate_caches()
-        import transformers.generation as _tg_mod
-
-        # Full mapping: removed name → replacement class in transformers>=4.44
-        _GENERATION_COMPAT_ALIASES = {
-            # Decoder-only
-            "GreedySearchDecoderOnlyOutput":      "GenerateDecoderOnlyOutput",
-            "SampleDecoderOnlyOutput":            "GenerateDecoderOnlyOutput",
-            "ContrastiveSearchDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
-            "BeamSearchDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
-            "BeamSampleDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
-            # Encoder-decoder (mamba_ssm may import these for seq2seq completeness)
-            "GreedySearchEncoderDecoderOutput":      "GenerateEncoderDecoderOutput",
-            "SampleEncoderDecoderOutput":            "GenerateEncoderDecoderOutput",
-            "ContrastiveSearchEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
-            "BeamSearchEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
-            "BeamSampleEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
-        }
-        _patched = []
-        for _old, _new in _GENERATION_COMPAT_ALIASES.items():
-            if getattr(_tg_mod, _old, None) is None:
-                _repl = getattr(_tg_mod, _new, None)
-                if _repl is not None:
-                    setattr(_tg_mod, _old, _repl)
-                    _patched.append(_old)
-        if _patched:
-            print(f"[bootstrap] Shim: patched {len(_patched)} removed "
-                  f"transformers.generation names ✓")
-        else:
-            print("[bootstrap] Shim: all generation names present (no patch needed)")
-    except ImportError:
-        pass  # transformers not yet importable; Phase 1 likely failed above
-    except Exception as _shim_err:
-        print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
-        print("[bootstrap]          mamba_ssm import may fail at Phase 3 verification.")
-```
-
-One item still requires empirical verification during smoke test:
-- `inputs_embeds` → `last_hidden_state` path for Jamba Reasoning 3B **with fast Mamba kernels active**
+**One item still requires empirical verification during profiling run:**
+- `inputs_embeds` → `last_hidden_state` path for Jamba Reasoning 3B **with fast Mamba kernels active** at stage k≥1
 
 ---
 
@@ -174,6 +128,7 @@ Context     : 256K tokens
 | `--max_grad_norm` | 0.3 for k≥2 stages |
 | Session timeout | `--session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20` |
 | val_batch_size | 1 |
+| Stage 0 forward pass | **PENDING DECISION** — implement batched forward for n_latent=0; profile before committing to full run batch_size |
 
 ---
 
@@ -181,8 +136,10 @@ Context     : 256K tokens
 
 | Question | Status |
 |---|---|
-| Does `inputs_embeds` → `last_hidden_state` work with Jamba + fast Mamba kernels active? | 🟡 VERIFY next smoke test |
+| Does `inputs_embeds` → `last_hidden_state` work with Jamba + fast Mamba kernels active? | 🟡 VERIFY at stage k≥1 |
 | DGAC Phase 3.4: does halt_step distribute across K≥2 after training? | 🔴 OPEN — primary research validation |
+| What is actual Dual T4 step time after batching fix? Is ≤30s/step achievable? | 🔴 OPEN — must profile before full run |
+| Can stage k>0 latent injection be batched (pad q_lens)? What speedup? | 🔴 OPEN — secondary optimization |
 
 ---
 
@@ -197,8 +154,9 @@ Context     : 256K tokens
 | `prepare_sft_dataset.py` | 2 | ✅ DONE | sft-mix-v1 cached; not reused for Coconut |
 | `train_sft.py` | 2 | ✅ PATCHED | Retired |
 | `prepare_coconut_dataset.py` | 3 | ✅ DONE | coconut-v1 on Hub confirmed (36906/1940 samples) |
-| `jamba_coconut_finetune.py` | 3 | 🟡 NEEDS PATCH | Replace Phase 1.5 shim with comprehensive 10-alias version (Part 0.2) |
+| `jamba_coconut_finetune.py` | 3 | 🟡 NEEDS 2 PATCHES | (1) swap Phase 2.5/2.6 ordering; (2) batched forward for stage 0 |
 | `build_wheels_kaggle.py` | 3 | ✅ DONE | git+https fix applied; sm75 + sm100 causal_conv1d on Hub; sm75 mamba_ssm on Hub |
+| `kaggle-utils.ipynb` | 3 | ✅ UP TO DATE | Smoke test cell confirmed working (Session 9) |
 
 ---
 
@@ -244,8 +202,8 @@ output_dir/
 
 | Phase | Platform | Estimate |
 |---|---|---|
-| Smoke test | Kaggle T4 | ~10 min (wheels cached) |
-| Stage 0→10 | Kaggle Dual T4, QLoRA + DDP | ~4-8h per session |
+| Throughput profiling (500-sample, batching fix) | Kaggle Dual T4 | ~30 min |
+| Stage 0→10 curriculum | Kaggle Dual T4, QLoRA + DDP | TBD — re-estimate after profiling |
 | Phase 3.4 (DGAC) | TRC A100 80GB | ~6-8h |
 | Phase 4 (GRPO) | TRC A100 80GB | ~8-12h |
 
@@ -264,4 +222,7 @@ output_dir/
 | Kaggle GPU arch unpredictable | `TORCH_CUDA_ARCH_LIST` auto-injected from `torch.cuda.get_device_capability()` |
 | bitsandbytes not upgraded | `bitsandbytes>=0.46.1` in bootstrap |
 | mamba-ssm 1.2.2 PyPI sdist is a 35kB stub | Use `git+https://github.com/state-spaces/mamba.git@v1.2.2`. ~20h GPU quota lost. |
-| **Single-name shim → one removed class fixed per session** | **Comprehensive 10-alias shim covering the entire removed generation output family. Never patch one name at a time.** |
+| Single-name generation shim → one removed class fixed per session | Comprehensive 10-alias shim. Never patch one name at a time. |
+| Verifier weight shape wrong → false negative on valid wheels | Always verify kernel call signatures against public API docs before writing test inputs |
+| **Per-sample loop at batch=1 even for stage 0 → 113s/step, full run infeasible** | **Implement batched forward path for `n_latent=0`; profile on Dual T4 before committing to full run** |
+| **"~5s/step" estimate was for small/nano model** | **Re-estimate wall-clock time empirically on target hardware before planning session budgets** |
