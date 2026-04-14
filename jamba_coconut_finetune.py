@@ -242,12 +242,16 @@ def _bootstrap() -> None:
 
         # ── Fallback: source compile ─────────────────────────────────────────
         if not _downloaded:
-            # Derive pip spec from base name
-            # e.g. "mamba_ssm-1.2.2-cp312-..." → "mamba-ssm==1.2.2"
             _parts    = _base.split("-")
             _pkg_name = _parts[0]
             _pkg_ver  = _parts[1]
-            _pip_spec = f"{_pkg_name.replace('_', '-')}=={_pkg_ver}"
+            # mamba_ssm PyPI sdist (35kB) is a stub — CUDA source files
+            # (selective_scan.cpp etc.) are omitted from the PyPI release.
+            # The full source lives only on GitHub. Use git+https to get it.
+            if _pkg_name == "mamba_ssm":
+                _pip_spec = f"git+https://github.com/state-spaces/mamba.git@v{_pkg_ver}"
+            else:
+                _pip_spec = f"{_pkg_name.replace('_', '-')}=={_pkg_ver}"
 
             _env_vars = os.environ.copy()
             _env_vars["MAX_JOBS"] = "4"
