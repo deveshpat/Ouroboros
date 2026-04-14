@@ -199,25 +199,49 @@ def _bootstrap() -> None:
         print("[bootstrap] WARNING: Phase 1 pip returned non-zero — check output above.")
 
     # ── Phase 1.5: transformers / mamba_ssm compatibility shim ───────────────
-    # mamba_ssm 1.2.2 imports GreedySearchDecoderOnlyOutput from transformers.generation.
-    # This class was removed in transformers>=4.44. We backfill it so mamba_ssm
-    # imports cleanly while we keep modern transformers for Jamba.
+    # mamba_ssm 1.2.2 imports multiple generation output class names that were
+    # removed in transformers>=4.44 (GreedySearch*, Sample*, BeamSearch*, etc.).
+    # Backfill ALL removed names as aliases for their modern replacements in
+    # one pass so we never debug one missing name per session.
     try:
         import importlib as _il2
         _il2.invalidate_caches()
         import transformers.generation as _tg_mod
-        _tg_mod.GreedySearchDecoderOnlyOutput   # already present — nothing to do
-    except AttributeError:
-        try:
-            from transformers.generation.utils import GenerateDecoderOnlyOutput as _GDO
-            _tg_mod.GreedySearchDecoderOnlyOutput = _GDO
-            print("[bootstrap] Shim: GreedySearchDecoderOnlyOutput -> GenerateDecoderOnlyOutput ✓")
-        except Exception as _shim_err:
-            print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
-            print("[bootstrap]          mamba_ssm import may fail at Phase 3 verification.")
-    except ImportError:
-        pass  # transformers not yet importable; Phase 1 failed — handled above
 
+        # Full mapping: removed name → replacement class in transformers>=4.44
+        _GENERATION_COMPAT_ALIASES = {
+            # Decoder-only
+            "GreedySearchDecoderOnlyOutput":      "GenerateDecoderOnlyOutput",
+            "SampleDecoderOnlyOutput":            "GenerateDecoderOnlyOutput",
+            "ContrastiveSearchDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
+            "BeamSearchDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
+            "BeamSampleDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
+            # Encoder-decoder (mamba_ssm may import these for seq2seq completeness)
+            "GreedySearchEncoderDecoderOutput":      "GenerateEncoderDecoderOutput",
+            "SampleEncoderDecoderOutput":            "GenerateEncoderDecoderOutput",
+            "ContrastiveSearchEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
+            "BeamSearchEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
+            "BeamSampleEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
+        }
+        _patched = []
+        for _old, _new in _GENERATION_COMPAT_ALIASES.items():
+            if getattr(_tg_mod, _old, None) is None:
+                _repl = getattr(_tg_mod, _new, None)
+                if _repl is not None:
+                    setattr(_tg_mod, _old, _repl)
+                    _patched.append(_old)
+        if _patched:
+            print(f"[bootstrap] Shim: patched {len(_patched)} removed "
+                  f"transformers.generation names ✓")
+        else:
+            print("[bootstrap] Shim: all generation names present (no patch needed)")
+    except ImportError:
+        pass  # transformers not yet importable; Phase 1 likely failed above
+    except Exception as _shim_err:
+        print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
+        print("[bootstrap]          mamba_ssm import may fail at Phase 3 verification.")
+
+  
     # ── Phase 2: arch-aware Hub wheel install ─────────────────────────────────
     print("[bootstrap] Phase 2: arch-aware Hub wheel install...")
     _hf_token = _bootstrap_resolve_token()
