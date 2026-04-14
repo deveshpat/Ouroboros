@@ -45,7 +45,6 @@ Run (Phase 3.1 through 3.K, Kaggle Dual GPU):
   !torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
     --data_dir data/coconut_v1 --use_4bit \
     --epochs_per_stage 3 --max_stage 10 --batch_size 2 --grad_accum 8 \
-    --max_grad_norm 0.3 \
     --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
     --output_dir runs/stage3_curriculum
 
@@ -436,8 +435,8 @@ def _bootstrap() -> None:
         print(f"[bootstrap]   Installed {_local_filename} ✓")
 
     # ── Phase 2.5: transformers / mamba_ssm compatibility shim ──────────────
-    # Apply this before the first mamba_ssm import so legacy generation-name
-    # lookups resolve cleanly during kernel export patching.
+    # Apply this AFTER installing the kernel wheels so importing transformers
+    # cannot observe a half-configured mamba stack.
     try:
         import importlib as _il2
         _il2.invalidate_caches()
@@ -498,7 +497,7 @@ def _bootstrap() -> None:
 
     try:
         _bootstrap_verify_fast_path()
-        print("[bootstrap] Mamba fast path: ACTIVE ✓ — profile step time empirically.")
+        print("[bootstrap] Mamba fast path: ACTIVE ✓ — ~5s/step expected.")
     except Exception as _ve:
         print(f"\n[bootstrap] FATAL: Mamba fast path verification FAILED: {_ve}")
         print( "[bootstrap]        Exiting now (no slow-path fallback — 500s/step is unusable).")
@@ -804,13 +803,6 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _stage_grad_clip_norm(args: argparse.Namespace, stage_k: int) -> float:
-    clip_norm = float(args.max_grad_norm)
-    if stage_k >= 2:
-        return min(clip_norm, 0.3)
-    return clip_norm
-
-
 def _add_bool_arg(parser: argparse.ArgumentParser, name: str, default: bool, help_text: str) -> None:
     action = getattr(argparse, "BooleanOptionalAction", None)
     if action is not None:
@@ -871,12 +863,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--warmup_steps", type=int, default=50)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument(
-        "--max_grad_norm",
-        type=float,
-        default=1.0,
-        help="Base gradient clip norm. Stages k>=2 are additionally capped at 0.3.",
-    )
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
     _add_bool_arg(parser, "--grad_checkpoint", True, "Enable gradient checkpointing.")
     parser.add_argument("--seed", type=int, default=42)
 
@@ -1000,7 +987,7 @@ def load_model_and_tokenizer(
             _bootstrap_verify_fast_path()
             _mamba_fast_path = True
             if is_main:
-                print("  mamba CUDA kernels: OK — fast path ACTIVE (profile step time empirically)")
+                print("  mamba CUDA kernels: OK — fast path ACTIVE (~5s/step expected)")
         except Exception as _kern_exc:
             load_kwargs["use_mamba_kernels"] = False
             if is_main:
@@ -1327,35 +1314,6 @@ def _compute_ce_sum_and_count(logits: torch.Tensor, labels: torch.Tensor) -> Tup
     return ce_sum, n_valid
 
 
-def _forward_batched_stage0(
-    model,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    labels: torch.Tensor,
-    device: torch.device,
-    amp_dtype: torch.dtype,
-) -> Dict[str, Any]:
-    backbone = _get_backbone(model)
-    lm_head_fn = _get_lm_head(model)
-
-    with _autocast_ctx(device, amp_dtype):
-        outputs = backbone(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-        hidden = _extract_last_hidden_state(outputs, "stage 0 batched forward")
-        logits = lm_head_fn(hidden).float()
-
-    ce_sum, n_valid = _compute_ce_sum_and_count(logits, labels)
-    ce_value = float(ce_sum.item() / max(n_valid, 1))
-    return {
-        "ce_sum": ce_sum,
-        "n_valid": n_valid,
-        "ce": ce_value,
-        "ponder": None,
-        "diversity": None,
-        "halt_step_mean": None,
-        "lambda1": 0.0,
-    }
-
-
 def _forward_single_sample(
     model,
     input_ids: torch.Tensor,
@@ -1374,14 +1332,21 @@ def _forward_single_sample(
     lm_head_fn = _get_lm_head(model)
 
     if n_latent == 0:
-        return _forward_batched_stage0(
-            model=model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            device=device,
-            amp_dtype=amp_dtype,
-        )
+        with _autocast_ctx(device, amp_dtype):
+            outputs = backbone(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            hidden = _extract_last_hidden_state(outputs, "stage 0 forward")
+            logits = lm_head_fn(hidden).float()
+        ce_sum, n_valid = _compute_ce_sum_and_count(logits, labels)
+        ce_value = float(ce_sum.item() / max(n_valid, 1))
+        return {
+            "ce_sum": ce_sum,
+            "n_valid": n_valid,
+            "ce": ce_value,
+            "ponder": None,
+            "diversity": None,
+            "halt_step_mean": None,
+            "lambda1": 0.0,
+        }
 
     with _autocast_ctx(device, amp_dtype):
         all_embeds = embed_fn(input_ids)
@@ -1479,6 +1444,7 @@ def coconut_forward(
     args: argparse.Namespace,
     step_in_phase: int,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    del stage_k
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     labels = batch["labels"].to(device)
@@ -1486,22 +1452,6 @@ def coconut_forward(
     n_latents = batch["n_latents"].to(device)
     batch_size = int(input_ids.size(0))
     amp_dtype = _amp_dtype(device)
-
-    all_n_latents_zero = stage_k == 0 or bool(torch.all(n_latents == 0).item())
-    if all_n_latents_zero:
-        result = _forward_batched_stage0(
-            model=model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            device=device,
-            amp_dtype=amp_dtype,
-        )
-        if result["n_valid"] == 0:
-            zero = torch.zeros((), device=device, requires_grad=True)
-            return zero, {"ce": 0.0}
-        ce = result["ce_sum"] / result["n_valid"]
-        return ce, {"ce": float(ce.item())}
 
     ce_sum_total = torch.zeros((), device=device, dtype=torch.float32)
     n_valid_total = 0
@@ -2489,10 +2439,7 @@ def main() -> None:
                         all_reduce_gradients(trainable_params, world_size)
 
                     grad_norm = float(
-                        torch.nn.utils.clip_grad_norm_(
-                            trainable_params,
-                            _stage_grad_clip_norm(args, stage_k),
-                        )
+                        torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
                     )
                     optimizer.step()
                     scheduler.step()
