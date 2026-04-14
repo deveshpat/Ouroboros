@@ -176,14 +176,24 @@ def _bootstrap_verify_fast_path() -> bool:
     _scan_out = selective_scan_fn(_u, _delta, _A, _B, _C, _D, delta_softplus=True)
     assert _scan_out.shape == _u.shape, f"Unexpected selective_scan_fn shape: {_scan_out.shape}"
 
-    # 3) Triton recurrent update kernel used by cached decode / generation
+    # 3) Triton recurrent update kernel used by cached decode / generation.
+    # mamba_ssm==1.2.2's wrapper expects dt_bias to be present: the function
+    # expands dt_bias strides with starred unpacking and also reads
+    # dt_bias.stride(-1) when computing tie_hdim. Omitting dt_bias triggers
+    # the exact runtime seen on Kaggle:
+    #   "Value after * must be an iterable, not int"
+    # even though the CUDA kernel itself is fine. Match the upstream test shape
+    # contract by passing an explicit dt_bias tensor.
     _state = _torch.randn(1, 4, 3, device="cuda", dtype=_torch.float32)
     _x_step = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
     _dt = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
+    _dt_bias = _torch.rand(4, device="cuda", dtype=_torch.float32) - 4.0
+    _A_step = -_torch.rand(4, 3, device="cuda", dtype=_torch.float32) - 1.0
     _B_step = _torch.randn(1, 3, device="cuda", dtype=_torch.float32)
     _C_step = _torch.randn(1, 3, device="cuda", dtype=_torch.float32)
     _step_out = selective_state_update(
-        _state, _x_step, _dt, _A, _B_step, _C_step, _D, dt_softplus=True
+        _state, _x_step, _dt, _A_step, _B_step, _C_step, _D,
+        dt_bias=_dt_bias, dt_softplus=True
     )
     assert _step_out.shape == _x_step.shape, (
         f"Unexpected selective_state_update shape: {_step_out.shape}"
