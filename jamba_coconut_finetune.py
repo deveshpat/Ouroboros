@@ -114,22 +114,10 @@ def _bootstrap_resolve_token() -> Optional[str]:
     return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
 
-def _bootstrap_verify_fast_path() -> bool:
-    """
-    Hard verification of the Jamba Mamba fast path:
-      1. Import the exact 5 symbols that transformers.models.jamba checks.
-      2. Assert none are None (catches API / packaging mismatches).
-      3. Run tiny real CUDA/Triton ops for causal_conv1d, selective_scan_fn,
-         and selective_state_update.
-
-    Important: selective_state_update lives in
-    mamba_ssm.ops.triton.selective_state_update in mamba_ssm==1.2.2, not in
-    selective_scan_interface.
-    """
+def _load_mamba_fast_path_symbols() -> Dict[str, Any]:
+    """Load the exact fast-path symbols Jamba expects, via the stable submodule paths."""
     import importlib as _il
     import warnings as _warnings
-    import torch as _torch
-    import triton.language as _tl
 
     _il.invalidate_caches()
 
@@ -144,13 +132,78 @@ def _bootstrap_verify_fast_path() -> bool:
         )
         from causal_conv1d import causal_conv1d_fn, causal_conv1d_update  # type: ignore
 
-    _syms = {
-        "selective_scan_fn":      selective_scan_fn,
+    return {
+        "selective_scan_fn": selective_scan_fn,
         "selective_state_update": selective_state_update,
-        "mamba_inner_fn":         mamba_inner_fn,
-        "causal_conv1d_fn":       causal_conv1d_fn,
-        "causal_conv1d_update":   causal_conv1d_update,
+        "mamba_inner_fn": mamba_inner_fn,
+        "causal_conv1d_fn": causal_conv1d_fn,
+        "causal_conv1d_update": causal_conv1d_update,
     }
+
+
+def _patch_kernel_top_level_exports() -> List[str]:
+    """
+    Export the fast-path symbols on the top-level packages.
+
+    Older / current Jamba implementations in transformers resolve kernels from
+    top-level modules (for example via lazy_load_kernel("mamba-ssm")) and look
+    for attributes such as ``selective_state_update`` directly on ``mamba_ssm``.
+    The upstream mamba_ssm==1.2.2 package exposes that symbol only from the
+    Triton submodule, so Jamba can incorrectly conclude that the fast path is
+    unavailable even though the compiled kernels import and execute correctly.
+    """
+    import importlib as _il
+
+    patched: List[str] = []
+    symbols = _load_mamba_fast_path_symbols()
+
+    mamba_ssm = _il.import_module("mamba_ssm")
+    causal_conv1d = _il.import_module("causal_conv1d")
+
+    mamba_exports = {
+        "selective_scan_fn": symbols["selective_scan_fn"],
+        "selective_state_update": symbols["selective_state_update"],
+        "mamba_inner_fn": symbols["mamba_inner_fn"],
+    }
+    conv_exports = {
+        "causal_conv1d_fn": symbols["causal_conv1d_fn"],
+        "causal_conv1d_update": symbols["causal_conv1d_update"],
+    }
+
+    for name, value in mamba_exports.items():
+        if getattr(mamba_ssm, name, None) is not value:
+            setattr(mamba_ssm, name, value)
+            patched.append(f"mamba_ssm.{name}")
+    for name, value in conv_exports.items():
+        if getattr(causal_conv1d, name, None) is not value:
+            setattr(causal_conv1d, name, value)
+            patched.append(f"causal_conv1d.{name}")
+
+    return patched
+
+
+def _bootstrap_verify_fast_path() -> bool:
+    """
+    Hard verification of the Jamba Mamba fast path:
+      1. Import the exact 5 symbols that transformers.models.jamba checks.
+      2. Assert none are None (catches API / packaging mismatches).
+      3. Run tiny real CUDA/Triton ops for causal_conv1d, selective_scan_fn,
+         and selective_state_update.
+
+    Important: selective_state_update lives in
+    mamba_ssm.ops.triton.selective_state_update in mamba_ssm==1.2.2, not in
+    selective_scan_interface.
+    """
+    import torch as _torch
+    import triton.language as _tl
+
+    _syms = _load_mamba_fast_path_symbols()
+    selective_scan_fn = _syms["selective_scan_fn"]
+    selective_state_update = _syms["selective_state_update"]
+    mamba_inner_fn = _syms["mamba_inner_fn"]
+    causal_conv1d_fn = _syms["causal_conv1d_fn"]
+    causal_conv1d_update = _syms["causal_conv1d_update"]
+
     _none = [k for k, v in _syms.items() if v is None]
     if _none:
         raise ImportError(
@@ -258,50 +311,6 @@ def _bootstrap() -> None:
     if _r1.returncode != 0:
         print("[bootstrap] WARNING: Phase 1 pip returned non-zero — check output above.")
 
-    # ── Phase 1.5: transformers / mamba_ssm compatibility shim ───────────────
-    # mamba_ssm 1.2.2 imports multiple generation output class names that were
-    # removed in transformers>=4.44 (GreedySearch*, Sample*, BeamSearch*, etc.).
-    # Backfill ALL removed names as aliases for their modern replacements in
-    # one pass so we never debug one missing name per session.
-    try:
-        import importlib as _il2
-        _il2.invalidate_caches()
-        import transformers.generation as _tg_mod
-
-        # Full mapping: removed name → replacement class in transformers>=4.44
-        _GENERATION_COMPAT_ALIASES = {
-            # Decoder-only
-            "GreedySearchDecoderOnlyOutput":      "GenerateDecoderOnlyOutput",
-            "SampleDecoderOnlyOutput":            "GenerateDecoderOnlyOutput",
-            "ContrastiveSearchDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
-            "BeamSearchDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
-            "BeamSampleDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
-            # Encoder-decoder (mamba_ssm may import these for seq2seq completeness)
-            "GreedySearchEncoderDecoderOutput":      "GenerateEncoderDecoderOutput",
-            "SampleEncoderDecoderOutput":            "GenerateEncoderDecoderOutput",
-            "ContrastiveSearchEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
-            "BeamSearchEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
-            "BeamSampleEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
-        }
-        _patched = []
-        for _old, _new in _GENERATION_COMPAT_ALIASES.items():
-            if getattr(_tg_mod, _old, None) is None:
-                _repl = getattr(_tg_mod, _new, None)
-                if _repl is not None:
-                    setattr(_tg_mod, _old, _repl)
-                    _patched.append(_old)
-        if _patched:
-            print(f"[bootstrap] Shim: patched {len(_patched)} removed "
-                  f"transformers.generation names ✓")
-        else:
-            print("[bootstrap] Shim: all generation names present (no patch needed)")
-    except ImportError:
-        pass  # transformers not yet importable; Phase 1 likely failed above
-    except Exception as _shim_err:
-        print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
-        print("[bootstrap]          mamba_ssm import may fail at Phase 3 verification.")
-
-  
     # ── Phase 2: arch-aware Hub wheel install ─────────────────────────────────
     print("[bootstrap] Phase 2: arch-aware Hub wheel install...")
     _hf_token = _bootstrap_resolve_token()
@@ -424,6 +433,53 @@ def _bootstrap() -> None:
             print(f"[bootstrap] FATAL: pip install failed for {_local_filename}.")
             sys.exit(1)
         print(f"[bootstrap]   Installed {_local_filename} ✓")
+
+    # ── Phase 2.5: export kernel symbols for transformers Jamba loader ──────
+    try:
+        _patched_exports = _patch_kernel_top_level_exports()
+        if _patched_exports:
+            print("[bootstrap] Kernel export shim:", ", ".join(_patched_exports), "✓")
+        else:
+            print("[bootstrap] Kernel export shim: already aligned")
+    except Exception as _kernel_patch_err:
+        print(f"[bootstrap] WARNING: kernel export shim failed: {_kernel_patch_err}")
+
+    # ── Phase 2.6: transformers / mamba_ssm compatibility shim ──────────────
+    # Apply this AFTER installing the kernel wheels so importing transformers
+    # cannot observe a half-configured mamba stack.
+    try:
+        import importlib as _il2
+        _il2.invalidate_caches()
+        import transformers.generation as _tg_mod
+
+        _GENERATION_COMPAT_ALIASES = {
+            "GreedySearchDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
+            "SampleDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
+            "ContrastiveSearchDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
+            "BeamSearchDecoderOnlyOutput": "GenerateBeamDecoderOnlyOutput",
+            "BeamSampleDecoderOnlyOutput": "GenerateBeamDecoderOnlyOutput",
+            "GreedySearchEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
+            "SampleEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
+            "ContrastiveSearchEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
+            "BeamSearchEncoderDecoderOutput": "GenerateBeamEncoderDecoderOutput",
+            "BeamSampleEncoderDecoderOutput": "GenerateBeamEncoderDecoderOutput",
+        }
+        _patched = []
+        for _old, _new in _GENERATION_COMPAT_ALIASES.items():
+            if getattr(_tg_mod, _old, None) is None:
+                _repl = getattr(_tg_mod, _new, None)
+                if _repl is not None:
+                    setattr(_tg_mod, _old, _repl)
+                    _patched.append(_old)
+        if _patched:
+            print(f"[bootstrap] Shim: patched {len(_patched)} removed transformers.generation names ✓")
+        else:
+            print("[bootstrap] Shim: all generation names present (no patch needed)")
+    except ImportError:
+        pass
+    except Exception as _shim_err:
+        print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
+        print("[bootstrap]          mamba_ssm import may fail at Phase 3 verification.")
 
     # ── Phase 3: hard functional verification ────────────────────────────────
     print("[bootstrap] Phase 3: verifying mamba fast path (symbol + CUDA op)...")
@@ -623,6 +679,69 @@ def _maybe_apply_chat_template(tokenizer, question: str) -> str:
             print("  [warn] tokenizer.apply_chat_template failed; using plain prompt fallback.")
             _CHAT_TEMPLATE_WARNED = True
         return f"User: {question}\nAssistant: "
+
+
+def _patch_transformers_jamba_fast_path_globals() -> bool:
+    """
+    Patch transformers.models.jamba.modeling_jamba module globals so the
+    runtime fast-path check sees the verified kernel symbols.
+    """
+    try:
+        import importlib as _il
+        _il.invalidate_caches()
+        import transformers.models.jamba.modeling_jamba as _jamba_mod
+        symbols = _load_mamba_fast_path_symbols()
+        changed = False
+        for name, value in symbols.items():
+            if getattr(_jamba_mod, name, None) is not value:
+                setattr(_jamba_mod, name, value)
+                changed = True
+        is_available = all(symbols.values())
+        if getattr(_jamba_mod, "is_fast_path_available", None) != is_available:
+            _jamba_mod.is_fast_path_available = is_available
+            changed = True
+        return is_available
+    except Exception:
+        return False
+
+
+def _probe_jamba_runtime_fast_path(model, device: torch.device, amp_dtype: torch.dtype) -> None:
+    """
+    Run a tiny real forward pass immediately after model load.
+
+    This catches the Kaggle notebook failure mode where bootstrap proves the
+    kernels work, but Jamba still reports them unavailable during the first
+    training step because its module globals were resolved incorrectly.
+    """
+    if device.type != "cuda":
+        return
+
+    backbone = _get_backbone(model)
+    probe_ids = torch.tensor([[1, 2]], dtype=torch.long, device=device)
+    probe_mask = torch.ones_like(probe_ids, dtype=torch.bool, device=device)
+
+    def _run_once() -> None:
+        with torch.no_grad():
+            with _autocast_ctx(device, amp_dtype):
+                outputs = backbone(input_ids=probe_ids, attention_mask=probe_mask, use_cache=False)
+                _ = _extract_last_hidden_state(outputs, "post-load Jamba runtime probe")
+        torch.cuda.synchronize()
+
+    try:
+        _run_once()
+    except ValueError as exc:
+        if "Fast Mamba kernels are not available" not in str(exc):
+            raise
+        if _is_main_process():
+            print("  [warn] Jamba runtime probe hit stale fast-path globals; patching transformers Jamba module and retrying once.")
+        if not _patch_transformers_jamba_fast_path_globals():
+            raise SystemExit(
+                "Jamba runtime probe failed and transformers Jamba globals could not be refreshed. "
+                "This environment would fall back to an unusably slow path."
+            ) from exc
+        _run_once()
+        if _is_main_process():
+            print("  [ok] Jamba runtime probe passed after fast-path refresh.")
 
 
 def _safe_from_pretrained(model_id: str, load_kwargs: Dict[str, Any]):
@@ -891,8 +1010,16 @@ def load_model_and_tokenizer(
     if is_main:
         print(f"Loading model: {args.model_id}")
         print(f"  device={device} amp_dtype={str(amp_dtype).replace('torch.', '')}")
+
+    if _mamba_fast_path:
+        _patch_transformers_jamba_fast_path_globals()
+
     model = _safe_from_pretrained(args.model_id, load_kwargs)
     model.config.use_cache = False
+
+    if _mamba_fast_path:
+        _patch_transformers_jamba_fast_path_globals()
+        _probe_jamba_runtime_fast_path(model, device, amp_dtype)
 
     embed_module = _get_embed_tokens(model)
     if hasattr(embed_module, "num_embeddings"):
