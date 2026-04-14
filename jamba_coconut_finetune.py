@@ -198,6 +198,26 @@ def _bootstrap() -> None:
     if _r1.returncode != 0:
         print("[bootstrap] WARNING: Phase 1 pip returned non-zero — check output above.")
 
+    # ── Phase 1.5: transformers / mamba_ssm compatibility shim ───────────────
+    # mamba_ssm 1.2.2 imports GreedySearchDecoderOnlyOutput from transformers.generation.
+    # This class was removed in transformers>=4.44. We backfill it so mamba_ssm
+    # imports cleanly while we keep modern transformers for Jamba.
+    try:
+        import importlib as _il2
+        _il2.invalidate_caches()
+        import transformers.generation as _tg_mod
+        _tg_mod.GreedySearchDecoderOnlyOutput   # already present — nothing to do
+    except AttributeError:
+        try:
+            from transformers.generation.utils import GenerateDecoderOnlyOutput as _GDO
+            _tg_mod.GreedySearchDecoderOnlyOutput = _GDO
+            print("[bootstrap] Shim: GreedySearchDecoderOnlyOutput -> GenerateDecoderOnlyOutput ✓")
+        except Exception as _shim_err:
+            print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
+            print("[bootstrap]          mamba_ssm import may fail at Phase 3 verification.")
+    except ImportError:
+        pass  # transformers not yet importable; Phase 1 failed — handled above
+
     # ── Phase 2: arch-aware Hub wheel install ─────────────────────────────────
     print("[bootstrap] Phase 2: arch-aware Hub wheel install...")
     _hf_token = _bootstrap_resolve_token()
