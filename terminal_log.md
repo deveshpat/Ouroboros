@@ -5,6 +5,53 @@
 
 ---
 
+## Wheel Build Session 5 — sm75 (Kaggle T4, 2026-04-14)
+**Script:** `jamba_coconut_finetune.py` (bootstrap, git+https fix applied)
+**Status:** 🔴 FAILED — new blocker: `GreedySearchDecoderOnlyOutput` removed from `transformers>=4.44`
+
+**GPU confirmed: sm_75 (Tesla T4)**
+**ABI:** PyTorch=2.10.0+cu128 | Python=cp312 | CUDA=12.8
+**Session duration:** 2661s (~44 min)
+
+**mamba_ssm wheel:** ✅ Built from git+https source, uploaded to Hub for sm75.
+
+**Bootstrap Phase 3 failure (verbatim):**
+```
+[bootstrap]   Installed mamba-ssm-1.2.2-cp312-cp312-linux_x86_64.whl ✓
+[bootstrap] Phase 3: verifying mamba fast path (symbol + CUDA op)...
+[bootstrap]   ABI fingerprint: GPU=Tesla T4 sm75 | CUDA=12.8 | PyTorch=2.10.0+cu128 | Python=cp312
+[bootstrap] FATAL: Mamba fast path verification FAILED: cannot import name
+    'GreedySearchDecoderOnlyOutput' from 'transformers.generation'
+    (/usr/local/lib/python3.12/dist-packages/transformers/generation/__init__.py)
+[bootstrap]     Exiting now (no slow-path fallback — 500s/step is unusable).
+```
+
+**Root cause (confirmed):**
+`mamba_ssm==1.2.2` internally imports `GreedySearchDecoderOnlyOutput` (in `mamba_ssm/utils/generation.py`). This class was removed in `transformers>=4.44`. Bootstrap installs `transformers>=4.54.0` for Jamba — the import fails before any CUDA op is even attempted. The built wheel itself is correct; the missing symbol is a pure-Python API removal.
+
+**Fix applied (2026-04-14):**
+Add a Phase 1.5 compatibility shim in `_bootstrap()` (in `jamba_coconut_finetune.py` only — `build_wheels_kaggle.py` unaffected). Shim backfills `GreedySearchDecoderOnlyOutput` as an alias for `GenerateDecoderOnlyOutput` (the replacement class in modern transformers) so mamba_ssm 1.2.2 imports cleanly:
+
+```python
+    # Phase 1.5: transformers / mamba_ssm compatibility shim
+    try:
+        import transformers.generation as _tg_mod
+        _tg_mod.GreedySearchDecoderOnlyOutput   # already present — nothing to do
+    except AttributeError:
+        from transformers.generation.utils import GenerateDecoderOnlyOutput as _GDO
+        _tg_mod.GreedySearchDecoderOnlyOutput = _GDO
+        print("[bootstrap] Shim: GreedySearchDecoderOnlyOutput -> GenerateDecoderOnlyOutput ✓")
+```
+
+**Hub wheel status after this session:**
+- `causal_conv1d-1.6.1-cp312-cp312-linux_x86_64-sm75.whl` ✅ on Hub
+- `mamba_ssm-1.2.2-cp312-cp312-linux_x86_64-sm75.whl` ✅ on Hub
+- `causal_conv1d-1.6.1-cp312-cp312-linux_x86_64-sm100.whl` ✅ on Hub (Session 3)
+
+**Next action:** Apply Phase 1.5 shim, re-run smoke test. Both wheels now cached on Hub — next session bootstrap time <30s for sm75.
+
+---
+
 ## Wheel Build Session 4 — sm75 (Kaggle T4, 2026-04-14)
 **Script:** `jamba_coconut_finetune.py` (bootstrap source-build path)
 **Status:** 🔴 FAILED — mamba_ssm PyPI sdist is a 35kB stub (missing CUDA source files)
@@ -14,45 +61,26 @@
 
 **causal_conv1d:** Built from source and uploaded to Hub for sm75 ✓
 
-**mamba_ssm source build failure (verbatim key excerpt from image 8/9):**
+**mamba_ssm source build failure (verbatim key excerpt):**
 ```
-[bootstrap]   mamba_ssm-1.2.2-cp312-cp312-linux_x86_64-sm75.whl not on Hub (RemoteEntryNotFoundError). Compiling from source...
+[bootstrap]   mamba_ssm-1.2.2-cp312-cp312-linux_x86_64-sm75.whl not on Hub
+    (RemoteEntryNotFoundError). Compiling from source...
 [bootstrap]   Building mamba-ssm==1.2.2 (TORCH_CUDA_ARCH_LIST=7.5+PTX) ...
-Downloading mamba-ssm-1.2.2.tar.gz (35 kB)
 ninja: error: '/tmp/.../csrc/selective_scan/selective_scan.cpp', needed by
   '.../csrc/selective_scan_interface.o', missing and no known rule to make it
-RuntimeError: Error compiling objects for extension
-subprocess.CalledProcessError: Command '['ninja', '-v', '-j', '4']' returned non-zero exit status 1.
-ERROR: Failed building wheel for mamba-ssm
 [bootstrap] FATAL: Source build failed for mamba-ssm==1.2.2.
-            Run build_wheels_kaggle.py manually and capture stderr: python build_wheels_kaggle.py 2>&1 | tee build.log
 ```
 
-**Root cause (confirmed definitively):**
-The mamba-ssm 1.2.2 PyPI sdist is a 35kB stub. It contains only Python metadata and setup.py — the CUDA source files (`selective_scan.cpp`, `selective_scan_interface.cu`, etc.) were never included in the PyPI release. They exist only on GitHub at the v1.2.2 tag. This is why every source-build attempt fails: there is literally nothing to compile.
+**Root cause:** mamba-ssm 1.2.2 PyPI sdist is a 35kB stub — CUDA source files absent from PyPI release.
 
-**Fix applied (2026-04-14):**
-- `jamba_coconut_finetune.py` `_bootstrap()`: mamba_ssm source-build pip spec changed from `"mamba-ssm==1.2.2"` to `"git+https://github.com/state-spaces/mamba.git@v1.2.2"`
-- `build_wheels_kaggle.py`: `MAMBA_SSM_VERSION` changed from `"mamba-ssm==1.2.2"` to `"git+https://github.com/state-spaces/mamba.git@v1.2.2"`
-
-**Kaggle GPU quota remaining:** 9h 36m of 30h (image 11 — ~20h 24m consumed on wheel debugging).
-
-**Next action:** Run `build_wheels_kaggle.py` once on a fresh GPU session with the fix. This will build from full GitHub source, upload sm75 wheel to Hub. After that, bootstrap will download the wheel in <30s.
+**Fix applied (2026-04-14):** Source-build spec changed from `"mamba-ssm==1.2.2"` to `"git+https://github.com/state-spaces/mamba.git@v1.2.2"` in both `jamba_coconut_finetune.py` `_bootstrap()` and `build_wheels_kaggle.py`.
 
 ---
 
 ## Wheel Build Session 3 + Bootstrap Attempt (Kaggle sm_100, 2026-04-13)
-**Scripts:** `build_wheels_kaggle.py` (build) → `jamba_coconut_finetune.py` (bootstrap)
 **Status:** 🟡 PARTIAL — causal_conv1d ✅  mamba_ssm ❌ (404 on Hub)
 
 **GPU confirmed: sm_100 (Blackwell B100)**
-
-**causal_conv1d ptxas output (verbatim sample):**
-```
-ptxas info    : Compiling entry function '..._bwd_kernel...' for 'sm_100'
-ptxas info    : Used 168 registers, used 1 barriers, 37728 bytes smem
-ptxas info    : Compile time = 460.955 ms
-```
 
 **Bootstrap phase 2 (verbatim):**
 ```
@@ -63,17 +91,10 @@ ptxas info    : Compile time = 460.955 ms
          404 Client Error. Entry Not Found.
 ```
 
-**Root cause (now understood):** mamba_ssm build failed silently in build session — the PyPI sdist was used, which is a 35kB stub.
-
 ---
 
 ## Stage 3 — Hub Wheel Session (Kaggle T4, 2026-04-13)
 **Status:** 🔴 FAILED — mamba-ssm 2.3.1 API mismatch + causal_conv1d arch mismatch
-
-**ABI fingerprint (verbatim):**
-```
-GPU=Tesla T4 sm_75 | CUDA=12.8 | PyTorch=2.10.0+cu128 | Python=cp312
-```
 
 **Key events (verbatim):**
 ```
@@ -81,8 +102,6 @@ GPU=Tesla T4 sm_75 | CUDA=12.8 | PyTorch=2.10.0+cu128 | Python=cp312
 95.8s  FATAL: cannot import name 'selective_state_update' from
        'mamba_ssm.ops.selective_scan_interface'
 ```
-
-**Root cause:** mamba-ssm 2.x moved `selective_state_update` to Triton path; breaks `_bootstrap_verify_fast_path()`.
 
 ---
 
@@ -103,11 +122,6 @@ GPU=Tesla T4 sm_75 | CUDA=12.8 | PyTorch=2.10.0+cu128 | Python=cp312
 
 ---
 
-## Post-Smoke-Test Audit (2026-04-12)
-**Status:** ✅ Root causes identified. Patches ready.
-
----
-
 ## Stage 3 — Smoke Test (Kaggle Dual T4, 2026-04-11)
 **Status:** ✅ COMPLETED — 3 stages ran. Two training bugs found.
 
@@ -121,10 +135,8 @@ Stage 2/2  S2E0: ce=1.464  gn=36.926               ← EXPLODING GRAD
 
 **Generation samples (verbatim):**
 ```
--- Generation @ step 2 stage=1 --
 Q: What is the capital of Japan?
 A: The answer is straightforward: the capital is Tokyo.  [k_actual=1 uwr=0.506]
--- Generation @ step 3 stage=2 --
 Q: What is the capital of Japan?
 A: ,aemic for Japan. </think> about the question...Wait is a term for furniture.  [k_actual=2 uwr=0.296]
 Mean UWR: 0.290

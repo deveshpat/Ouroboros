@@ -17,7 +17,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | 0 | Architecture & Viability (nano) | ✅ COMPLETE |
 | 1 | Pre-training (nano) | ✅ Pipeline test only; retired |
 | 2 | SFT (nano) | 🔴 RETIRED |
-| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 BLOCKED — awaiting one clean build_wheels_kaggle.py run with git+https fix |
+| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 BLOCKED — Phase 1.5 shim needs applying; both sm75 wheels now on Hub |
 | 4 | GRPO on Jamba Reasoning 3B | ⬜ NOT STARTED |
 | 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
 
@@ -29,25 +29,20 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 - **median_steps=10  mean=10.42  max=16**
 - **`--max_stage=10` for all production runs**
 
-### GPU Arch Confirmed
-- Kaggle T4: **sm_75** (most sessions)
-- Kaggle Blackwell: **sm_100** (B100, allocated occasionally)
-- `TORCH_CUDA_ARCH_LIST` injection auto-detects correctly in both scripts
+### GPU Arch / Hub Wheel Status
+| Arch | causal_conv1d | mamba_ssm |
+|---|---|---|
+| sm_75 (T4) | ✅ on Hub | ✅ on Hub |
+| sm_100 (B100) | ✅ on Hub | ❌ not yet built |
 
 ---
 
 ### Part 0.1 — Immediate Next Actions (ordered)
 
-1. **Apply the two-line fix to both scripts (see Part 0.2 — Resolved Blockers)**
+1. **Apply Phase 1.5 shim to `jamba_coconut_finetune.py`** (see Part 0.2):
+   Add the `GreedySearchDecoderOnlyOutput` compatibility shim in `_bootstrap()` after Phase 1.
 
-2. **Build + upload mamba_ssm-1.2.2 wheel on Kaggle (whichever GPU you get):**
-   ```bash
-   python build_wheels_kaggle.py --hf_token YOUR_TOKEN 2>&1 | tee build.log
-   ```
-   Expected outcome: full GitHub source cloned, compiled for current arch, wheel uploaded to Hub.
-   After success: future bootstrap sessions skip compilation entirely.
-
-3. **Smoke test** (after mamba_ssm wheel is on Hub):
+2. **Smoke test** — both sm75 wheels are on Hub, bootstrap will be fast (<30s for wheel install):
    ```bash
    python jamba_coconut_finetune.py \
      --data_dir data/coconut_v1 --use_4bit \
@@ -55,11 +50,22 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
      --max_seq_len 1024 --max_grad_norm 0.3 \
      --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
    ```
-   Must see `Mamba fast path: ACTIVE ✓` in output.
+   Must see `Mamba fast path: ACTIVE ✓` and `[bootstrap] Shim: GreedySearchDecoderOnlyOutput -> GenerateDecoderOnlyOutput ✓` in output.
 
-4. **K=0→K_max curriculum** on Kaggle Dual T4 with `torchrun --nproc_per_node=2`
+3. **If smoke test passes**: K=0→K_max curriculum on Kaggle Dual T4:
+   ```bash
+   torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
+     --data_dir data/coconut_v1 --use_4bit \
+     --epochs_per_stage 3 --max_stage 10 --batch_size 2 --grad_accum 8 \
+     --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
+     --output_dir runs/stage3_curriculum
+   ```
 
-5. **If K=4 gate passes**: claim TRC, run K=10 + DGAC Phase 3.4 on A100
+4. **If K=4 gate passes**: claim TRC, run K=10 + DGAC Phase 3.4 on A100.
+
+5. **If a sm_100 session is allocated**: run `build_wheels_kaggle.py` to cache the mamba_ssm sm100 wheel.
+
+---
 
 ### Part 0.2 — Pre-flight Blockers
 
@@ -79,35 +85,32 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | mamba-ssm 2.x API | Pinned to `mamba-ssm==1.2.2` ✅ |
 | bitsandbytes version floor missing | `bitsandbytes>=0.46.1` in `_bootstrap()` ✅ |
 | causal_conv1d Hub wheel (sm_100, sm_75) | Built + uploaded for both arches ✅ |
-| **mamba_ssm 1.2.2 PyPI sdist is a 35kB stub — CUDA source files absent** | **Fix: change source-build pip spec from `"mamba-ssm==1.2.2"` to `"git+https://github.com/state-spaces/mamba.git@v1.2.2"` in `_bootstrap()` and `build_wheels_kaggle.py`. PyPI has only Python metadata; GitHub has full source. ✅ PATCHED 2026-04-14** |
+| mamba_ssm 1.2.2 PyPI sdist is a 35kB stub | pip spec changed to `git+https://github.com/state-spaces/mamba.git@v1.2.2` in both scripts ✅ |
+| **`GreedySearchDecoderOnlyOutput` removed in `transformers>=4.44`; mamba_ssm 1.2.2 imports it internally — bootstrap Phase 3 fails** | **Fix: Phase 1.5 shim in `_bootstrap()` backfills the removed name as alias for `GenerateDecoderOnlyOutput`. `build_wheels_kaggle.py` unaffected. ✅ PATCHED 2026-04-14** |
 
-**Exact code changes (both files):**
+**Exact code change — `jamba_coconut_finetune.py` only:**
 
-`jamba_coconut_finetune.py` — in `_bootstrap()`, source-build fallback block:
+Insert after Phase 1 `subprocess.run(...)` warning block, before Phase 2:
+
 ```python
-# Find these lines:
-_parts    = _base.split("-")
-_pkg_name = _parts[0]
-_pkg_ver  = _parts[1]
-_pip_spec = f"{_pkg_name.replace('_', '-')}=={_pkg_ver}"
-
-# Replace with:
-_parts    = _base.split("-")
-_pkg_name = _parts[0]
-_pkg_ver  = _parts[1]
-# mamba_ssm PyPI sdist (35kB) omits CUDA source files. Use git+https for full source.
-if _pkg_name == "mamba_ssm":
-    _pip_spec = f"git+https://github.com/state-spaces/mamba.git@v{_pkg_ver}"
-else:
-    _pip_spec = f"{_pkg_name.replace('_', '-')}=={_pkg_ver}"
-```
-
-`build_wheels_kaggle.py` — line 3:
-```python
-# OLD:
-MAMBA_SSM_VERSION  = "mamba-ssm==1.2.2"
-# NEW:
-MAMBA_SSM_VERSION  = "git+https://github.com/state-spaces/mamba.git@v1.2.2"
+    # ── Phase 1.5: transformers / mamba_ssm compatibility shim ───────────────
+    # mamba_ssm 1.2.2 imports GreedySearchDecoderOnlyOutput from transformers.generation.
+    # Removed in transformers>=4.44. Backfill as alias for GenerateDecoderOnlyOutput
+    # so mamba_ssm imports cleanly while we keep modern transformers for Jamba.
+    try:
+        import importlib as _il2
+        _il2.invalidate_caches()
+        import transformers.generation as _tg_mod
+        _tg_mod.GreedySearchDecoderOnlyOutput   # already present — nothing to do
+    except AttributeError:
+        try:
+            from transformers.generation.utils import GenerateDecoderOnlyOutput as _GDO
+            _tg_mod.GreedySearchDecoderOnlyOutput = _GDO
+            print("[bootstrap] Shim: GreedySearchDecoderOnlyOutput -> GenerateDecoderOnlyOutput ✓")
+        except Exception as _shim_err:
+            print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
+    except ImportError:
+        pass  # transformers not yet importable; Phase 1 likely failed above
 ```
 
 One item still requires empirical verification during smoke test:
@@ -143,7 +146,7 @@ Context     : 256K tokens
 | `attn_implementation` | Runtime detection: flash_attention_2 if available, else eager |
 | `use_mamba_kernels` | Runtime probe; only False on ImportError |
 | mamba-ssm version | **1.2.2 from GitHub source** (`git+https://github.com/state-spaces/mamba.git@v1.2.2`) |
-| mamba install strategy | `_bootstrap()` downloads pre-built arch wheels from Hub; falls back to git+https source build; uploads result to Hub for future sessions |
+| mamba install strategy | `_bootstrap()` downloads pre-built arch wheels from Hub; falls back to git+https source build; uploads result to Hub; shim backfills removed transformers API |
 | `--max_seq_len` | 1024 |
 | `--max_grad_norm` | 0.3 for k≥2 stages |
 | Session timeout | `--session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20` |
@@ -171,8 +174,8 @@ Context     : 256K tokens
 | `prepare_sft_dataset.py` | 2 | ✅ DONE | sft-mix-v1 cached; not reused for Coconut |
 | `train_sft.py` | 2 | ✅ PATCHED | Retired |
 | `prepare_coconut_dataset.py` | 3 | ✅ DONE | coconut-v1 on Hub confirmed (36906/1940 samples) |
-| `jamba_coconut_finetune.py` | 3 | 🟡 PATCHED | git+https fix applied; needs one clean build run |
-| `build_wheels_kaggle.py` | 3 | 🟡 PATCHED | git+https fix applied; run once to cache sm75/sm100 wheels |
+| `jamba_coconut_finetune.py` | 3 | 🟡 NEEDS PATCH | Phase 1.5 shim must be applied; then smoke test |
+| `build_wheels_kaggle.py` | 3 | ✅ DONE | git+https fix applied; sm75 + sm100 causal_conv1d on Hub; sm75 mamba_ssm on Hub |
 
 ---
 
@@ -218,8 +221,7 @@ output_dir/
 
 | Phase | Platform | Estimate |
 |---|---|---|
-| Wheel build (one-time) | Kaggle any GPU | ~20-30 min; then cached on Hub forever |
-| Smoke test | Kaggle T4 | ~10 min once wheel is on Hub |
+| Smoke test | Kaggle T4 | ~10 min (wheels cached) |
 | Stage 0→10 | Kaggle Dual T4, QLoRA + DDP | ~4-8h per session |
 | Phase 3.4 (DGAC) | TRC A100 80GB | ~6-8h |
 | Phase 4 (GRPO) | TRC A100 80GB | ~8-12h |
@@ -238,4 +240,5 @@ output_dir/
 | mamba-ssm 2.x broke fast path | Pinned to 1.2.2 |
 | Kaggle GPU arch unpredictable | `TORCH_CUDA_ARCH_LIST` auto-injected from `torch.cuda.get_device_capability()` |
 | bitsandbytes not upgraded | `bitsandbytes>=0.46.1` in bootstrap |
-| **mamba-ssm 1.2.2 PyPI sdist is a 35kB stub** | **Use `git+https://github.com/state-spaces/mamba.git@v1.2.2` for source build — never `pip install mamba-ssm==1.2.2` from PyPI directly. ~20h of GPU quota lost to this.** |
+| mamba-ssm 1.2.2 PyPI sdist is a 35kB stub | Use `git+https://github.com/state-spaces/mamba.git@v1.2.2` — never `pip install mamba-ssm==1.2.2` from PyPI. ~20h GPU quota lost. |
+| **`GreedySearchDecoderOnlyOutput` removed in transformers>=4.44; mamba_ssm 1.2.2 imports it** | **Phase 1.5 shim in `_bootstrap()`: backfill as alias for `GenerateDecoderOnlyOutput`. One-liner fix, do not pin transformers.** |
