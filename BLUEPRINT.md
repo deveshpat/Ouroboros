@@ -17,7 +17,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | 0 | Architecture & Viability (nano) | ✅ COMPLETE |
 | 1 | Pre-training (nano) | ✅ Pipeline test only; retired |
 | 2 | SFT (nano) | 🔴 RETIRED |
-| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 BLOCKED — Phase 1.5 shim needs applying; both sm75 wheels now on Hub |
+| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 BLOCKED — comprehensive shim applied; apply patch then re-run smoke test |
 | 4 | GRPO on Jamba Reasoning 3B | ⬜ NOT STARTED |
 | 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
 
@@ -32,15 +32,15 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 ### GPU Arch / Hub Wheel Status
 | Arch | causal_conv1d | mamba_ssm |
 |---|---|---|
-| sm_75 (T4) | ✅ on Hub | ✅ on Hub |
-| sm_100 (B100) | ✅ on Hub | ❌ not yet built |
+| sm75 (T4) | ✅ on Hub | ✅ on Hub |
+| sm100 (B100) | ✅ on Hub | ❌ not yet built |
 
 ---
 
 ### Part 0.1 — Immediate Next Actions (ordered)
 
-1. **Apply Phase 1.5 shim to `jamba_coconut_finetune.py`** (see Part 0.2):
-   Add the `GreedySearchDecoderOnlyOutput` compatibility shim in `_bootstrap()` after Phase 1.
+1. **Apply the comprehensive Phase 1.5 shim** (see Part 0.2) to `jamba_coconut_finetune.py`.
+   Replaces the single-name shim with a full 10-alias patch covering all generation output classes removed in `transformers>=4.44`.
 
 2. **Smoke test** — both sm75 wheels are on Hub, bootstrap will be fast (<30s for wheel install):
    ```bash
@@ -50,7 +50,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
      --max_seq_len 1024 --max_grad_norm 0.3 \
      --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
    ```
-   Must see `Mamba fast path: ACTIVE ✓` and `[bootstrap] Shim: GreedySearchDecoderOnlyOutput -> GenerateDecoderOnlyOutput ✓` in output.
+   Must see `[bootstrap] Shim: patched N removed transformers.generation names ✓` and `Mamba fast path: ACTIVE ✓`.
 
 3. **If smoke test passes**: K=0→K_max curriculum on Kaggle Dual T4:
    ```bash
@@ -63,7 +63,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 
 4. **If K=4 gate passes**: claim TRC, run K=10 + DGAC Phase 3.4 on A100.
 
-5. **If a sm_100 session is allocated**: run `build_wheels_kaggle.py` to cache the mamba_ssm sm100 wheel.
+5. **If a sm100 session is allocated**: run `build_wheels_kaggle.py` to cache the mamba_ssm sm100 wheel.
 
 ---
 
@@ -84,33 +84,56 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | Wheel/ABI mismatch | Retired wheel workflow; `_bootstrap()` self-installs ✅ |
 | mamba-ssm 2.x API | Pinned to `mamba-ssm==1.2.2` ✅ |
 | bitsandbytes version floor missing | `bitsandbytes>=0.46.1` in `_bootstrap()` ✅ |
-| causal_conv1d Hub wheel (sm_100, sm_75) | Built + uploaded for both arches ✅ |
-| mamba_ssm 1.2.2 PyPI sdist is a 35kB stub | pip spec changed to `git+https://github.com/state-spaces/mamba.git@v1.2.2` in both scripts ✅ |
-| **`GreedySearchDecoderOnlyOutput` removed in `transformers>=4.44`; mamba_ssm 1.2.2 imports it internally — bootstrap Phase 3 fails** | **Fix: Phase 1.5 shim in `_bootstrap()` backfills the removed name as alias for `GenerateDecoderOnlyOutput`. `build_wheels_kaggle.py` unaffected. ✅ PATCHED 2026-04-14** |
+| causal_conv1d Hub wheel (sm100, sm75) | Built + uploaded for both arches ✅ |
+| mamba_ssm 1.2.2 PyPI sdist is a 35kB stub | pip spec changed to `git+https://github.com/state-spaces/mamba.git@v1.2.2` ✅ |
+| `GreedySearchDecoderOnlyOutput` removed in `transformers>=4.44` | Partial shim applied in prior session ✅ |
+| **`SampleDecoderOnlyOutput` (and 9 other generation output classes) removed in `transformers>=4.44`; mamba_ssm 1.2.2 imports them all** | **Fix: replace single-name shim with comprehensive 10-alias patch. See exact code below. ✅ PATCHED 2026-04-14** |
 
-**Exact code change — `jamba_coconut_finetune.py` only:**
-
-Insert after Phase 1 `subprocess.run(...)` warning block, before Phase 2:
+**Exact code change — replace the entire Phase 1.5 block in `_bootstrap()` in `jamba_coconut_finetune.py`:**
 
 ```python
     # ── Phase 1.5: transformers / mamba_ssm compatibility shim ───────────────
-    # mamba_ssm 1.2.2 imports GreedySearchDecoderOnlyOutput from transformers.generation.
-    # Removed in transformers>=4.44. Backfill as alias for GenerateDecoderOnlyOutput
-    # so mamba_ssm imports cleanly while we keep modern transformers for Jamba.
+    # mamba_ssm 1.2.2 imports multiple generation output class names that were
+    # removed in transformers>=4.44 (GreedySearch*, Sample*, BeamSearch*, etc.).
+    # Backfill ALL removed names as aliases for their modern replacements in
+    # one pass so we never debug one missing name per session.
     try:
         import importlib as _il2
         _il2.invalidate_caches()
         import transformers.generation as _tg_mod
-        _tg_mod.GreedySearchDecoderOnlyOutput   # already present — nothing to do
-    except AttributeError:
-        try:
-            from transformers.generation.utils import GenerateDecoderOnlyOutput as _GDO
-            _tg_mod.GreedySearchDecoderOnlyOutput = _GDO
-            print("[bootstrap] Shim: GreedySearchDecoderOnlyOutput -> GenerateDecoderOnlyOutput ✓")
-        except Exception as _shim_err:
-            print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
+
+        # Full mapping: removed name → replacement class in transformers>=4.44
+        _GENERATION_COMPAT_ALIASES = {
+            # Decoder-only
+            "GreedySearchDecoderOnlyOutput":      "GenerateDecoderOnlyOutput",
+            "SampleDecoderOnlyOutput":            "GenerateDecoderOnlyOutput",
+            "ContrastiveSearchDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
+            "BeamSearchDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
+            "BeamSampleDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
+            # Encoder-decoder (mamba_ssm may import these for seq2seq completeness)
+            "GreedySearchEncoderDecoderOutput":      "GenerateEncoderDecoderOutput",
+            "SampleEncoderDecoderOutput":            "GenerateEncoderDecoderOutput",
+            "ContrastiveSearchEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
+            "BeamSearchEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
+            "BeamSampleEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
+        }
+        _patched = []
+        for _old, _new in _GENERATION_COMPAT_ALIASES.items():
+            if getattr(_tg_mod, _old, None) is None:
+                _repl = getattr(_tg_mod, _new, None)
+                if _repl is not None:
+                    setattr(_tg_mod, _old, _repl)
+                    _patched.append(_old)
+        if _patched:
+            print(f"[bootstrap] Shim: patched {len(_patched)} removed "
+                  f"transformers.generation names ✓")
+        else:
+            print("[bootstrap] Shim: all generation names present (no patch needed)")
     except ImportError:
         pass  # transformers not yet importable; Phase 1 likely failed above
+    except Exception as _shim_err:
+        print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
+        print("[bootstrap]          mamba_ssm import may fail at Phase 3 verification.")
 ```
 
 One item still requires empirical verification during smoke test:
@@ -146,7 +169,7 @@ Context     : 256K tokens
 | `attn_implementation` | Runtime detection: flash_attention_2 if available, else eager |
 | `use_mamba_kernels` | Runtime probe; only False on ImportError |
 | mamba-ssm version | **1.2.2 from GitHub source** (`git+https://github.com/state-spaces/mamba.git@v1.2.2`) |
-| mamba install strategy | `_bootstrap()` downloads pre-built arch wheels from Hub; falls back to git+https source build; uploads result to Hub; shim backfills removed transformers API |
+| mamba install strategy | `_bootstrap()` downloads pre-built arch wheels from Hub; falls back to git+https source build; uploads result to Hub; shim backfills ALL removed transformers generation output class names in one pass |
 | `--max_seq_len` | 1024 |
 | `--max_grad_norm` | 0.3 for k≥2 stages |
 | Session timeout | `--session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20` |
@@ -174,7 +197,7 @@ Context     : 256K tokens
 | `prepare_sft_dataset.py` | 2 | ✅ DONE | sft-mix-v1 cached; not reused for Coconut |
 | `train_sft.py` | 2 | ✅ PATCHED | Retired |
 | `prepare_coconut_dataset.py` | 3 | ✅ DONE | coconut-v1 on Hub confirmed (36906/1940 samples) |
-| `jamba_coconut_finetune.py` | 3 | 🟡 NEEDS PATCH | Phase 1.5 shim must be applied; then smoke test |
+| `jamba_coconut_finetune.py` | 3 | 🟡 NEEDS PATCH | Replace Phase 1.5 shim with comprehensive 10-alias version (Part 0.2) |
 | `build_wheels_kaggle.py` | 3 | ✅ DONE | git+https fix applied; sm75 + sm100 causal_conv1d on Hub; sm75 mamba_ssm on Hub |
 
 ---
@@ -240,5 +263,5 @@ output_dir/
 | mamba-ssm 2.x broke fast path | Pinned to 1.2.2 |
 | Kaggle GPU arch unpredictable | `TORCH_CUDA_ARCH_LIST` auto-injected from `torch.cuda.get_device_capability()` |
 | bitsandbytes not upgraded | `bitsandbytes>=0.46.1` in bootstrap |
-| mamba-ssm 1.2.2 PyPI sdist is a 35kB stub | Use `git+https://github.com/state-spaces/mamba.git@v1.2.2` — never `pip install mamba-ssm==1.2.2` from PyPI. ~20h GPU quota lost. |
-| **`GreedySearchDecoderOnlyOutput` removed in transformers>=4.44; mamba_ssm 1.2.2 imports it** | **Phase 1.5 shim in `_bootstrap()`: backfill as alias for `GenerateDecoderOnlyOutput`. One-liner fix, do not pin transformers.** |
+| mamba-ssm 1.2.2 PyPI sdist is a 35kB stub | Use `git+https://github.com/state-spaces/mamba.git@v1.2.2`. ~20h GPU quota lost. |
+| **Single-name shim → one removed class fixed per session** | **Comprehensive 10-alias shim covering the entire removed generation output family. Never patch one name at a time.** |
