@@ -158,8 +158,11 @@ def _bootstrap_verify_fast_path() -> bool:
         )
 
     # 1) CUDA depthwise conv kernel
+    # causal_conv1d_fn expects weight shaped (dim, width), not Conv1d's
+    # grouped-kernel shape (dim, 1, width). Passing the 3D shape triggers:
+    #   "weight must have shape (dim, width)"
     _x = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
-    _w = _torch.randn(4, 1, 4, device="cuda", dtype=_torch.float32)
+    _w = _torch.randn(4, 4, device="cuda", dtype=_torch.float32)
     _out = causal_conv1d_fn(_x, _w)
     assert _out.shape == _x.shape, f"Unexpected causal_conv1d_fn shape: {_out.shape}"
 
