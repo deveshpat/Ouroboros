@@ -1,3 +1,42 @@
+## Kaggle Utils Session 7 — sm75 (Kaggle T4, 2026-04-14)
+**Script:** `jamba_coconut_finetune.py` launched from `kaggle-utils.ipynb` Cell 5
+**Status:** 🟡 PATCH READY — latest blocker is a verifier bug, not yet a proven bad sm75 wheel
+
+**Notebook output (verbatim key excerpt):**
+```
+[bootstrap] Shim: patched 10 removed transformers.generation names ✓
+[bootstrap] Phase 2: arch-aware Hub wheel install...
+[bootstrap]   GPU arch: sm75  (TORCH_CUDA_ARCH_LIST=7.5+PTX if build needed)
+[bootstrap]   Downloaded causal_conv1d-1.6.1-cp312-cp312-linux_x86_64-sm75.whl ✓
+[bootstrap]   Installed causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl ✓
+[bootstrap]   Downloaded mamba_ssm-1.2.2-cp312-cp312-linux_x86_64-sm75.whl ✓
+[bootstrap]   Installed mamba_ssm-1.2.2-cp312-cp312-linux_x86_64.whl ✓
+[bootstrap] Phase 3: verifying mamba fast path (symbol + CUDA op)...
+[bootstrap]   ABI fingerprint: GPU=Tesla T4 sm75 | CUDA=12.8 | PyTorch=2.10.0+cu128 | Python=cp312
+[bootstrap] FATAL: Mamba fast path verification FAILED: cannot import name 'selective_state_update' from 'mamba_ssm.ops.selective_scan_interface'
+[bootstrap]        Exiting now (no slow-path fallback — 500s/step is unusable).
+```
+
+**Corrected diagnosis:**
+- The comprehensive transformers shim worked. The notebook shows `patched 10 removed transformers.generation names ✓`.
+- Both sm75 wheels downloaded and installed from Hub successfully before Phase 3 failed.
+- The current blocker is the verifier itself: it imported `selective_state_update` from `mamba_ssm.ops.selective_scan_interface`.
+- For Jamba fast path, the correct split is:
+  - `mamba_inner_fn`, `selective_scan_fn` from `mamba_ssm.ops.selective_scan_interface`
+  - `selective_state_update` from `mamba_ssm.ops.triton.selective_state_update`
+- Therefore the notebook run does **not** yet prove the sm75 `mamba_ssm` wheel is bad.
+
+**Fix prepared locally:**
+- Patched `jamba_coconut_finetune_patched.py`:
+  - retains the 10-alias transformers compatibility shim
+  - corrects the Phase 3 verifier import path for `selective_state_update`
+  - strengthens fast-path verification with real tiny CUDA/Triton ops
+  - adds explicit pure-Python dependency installs for `einops` and `safetensors`
+
+**Next action:** Replace `jamba_coconut_finetune.py` with the patched version and rerun the smoke test before any wheel rebuild.
+
+---
+
 # terminal_log.md — Project Ouroboros
 **Newest first. Verbatim excerpts only — no hallucinated numbers.**
 **Purpose: session outcomes, key metrics, bugs found/fixed, generation samples.**

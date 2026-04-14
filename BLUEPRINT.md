@@ -17,7 +17,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | 0 | Architecture & Viability (nano) | ✅ COMPLETE |
 | 1 | Pre-training (nano) | ✅ Pipeline test only; retired |
 | 2 | SFT (nano) | 🔴 RETIRED |
-| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 BLOCKED — comprehensive shim applied; apply patch then re-run smoke test |
+| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 BLOCKED — comprehensive shim works; fast-path verifier import path was wrong; replace script with patched version and re-run smoke test |
 | 4 | GRPO on Jamba Reasoning 3B | ⬜ NOT STARTED |
 | 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
 
@@ -39,10 +39,11 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 
 ### Part 0.1 — Immediate Next Actions (ordered)
 
-1. **Apply the comprehensive Phase 1.5 shim** (see Part 0.2) to `jamba_coconut_finetune.py`.
-   Replaces the single-name shim with a full 10-alias patch covering all generation output classes removed in `transformers>=4.44`.
+1. **Replace `jamba_coconut_finetune.py` with the patched version**.
+   Keep the comprehensive Phase 1.5 10-alias transformers shim, but also fix Phase 3 verification so `selective_state_update` is imported from `mamba_ssm.ops.triton.selective_state_update` rather than `mamba_ssm.ops.selective_scan_interface`.
 
-2. **Smoke test** — both sm75 wheels are on Hub, bootstrap will be fast (<30s for wheel install):
+2. **Re-run the smoke test immediately — do not rebuild the sm75 wheel yet.**
+   The latest Kaggle notebook run shows the 10-name shim worked and both sm75 wheels installed successfully; the observed failure is now the verifier's wrong import path, so the wheel is not yet proven bad.
    ```bash
    python jamba_coconut_finetune.py \
      --data_dir data/coconut_v1 --use_4bit \
@@ -50,9 +51,12 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
      --max_seq_len 1024 --max_grad_norm 0.3 \
      --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
    ```
-   Must see `[bootstrap] Shim: patched N removed transformers.generation names ✓` and `Mamba fast path: ACTIVE ✓`.
+   Expected bootstrap evidence now:
+   - `[bootstrap] Shim: patched 10 removed transformers.generation names ✓`
+   - wheels install from Hub on sm75
+   - `Mamba fast path: ACTIVE ✓`
 
-3. **If smoke test passes**: K=0→K_max curriculum on Kaggle Dual T4:
+3. **If the corrected smoke test passes**: run the K=0→K_max curriculum on Kaggle Dual T4.
    ```bash
    torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
      --data_dir data/coconut_v1 --use_4bit \
@@ -61,11 +65,11 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
      --output_dir runs/stage3_curriculum
    ```
 
-4. **If K=4 gate passes**: claim TRC, run K=10 + DGAC Phase 3.4 on A100.
+4. **If the corrected smoke test still fails inside a real CUDA/Triton op**: treat that as the first actual wheel-health failure and add Phase 2.5 auto-heal logic (purge + source rebuild + re-upload) before retrying.
 
-5. **If a sm100 session is allocated**: run `build_wheels_kaggle.py` to cache the mamba_ssm sm100 wheel.
+5. **If K=4 gate passes**: claim TRC, then run K=10 + DGAC Phase 3.4 on A100.
 
----
+6. **If an sm100 session is allocated**: run `build_wheels_kaggle.py` to cache the `mamba_ssm` sm100 wheel.
 
 ### Part 0.2 — Pre-flight Blockers
 
@@ -88,6 +92,8 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | mamba_ssm 1.2.2 PyPI sdist is a 35kB stub | pip spec changed to `git+https://github.com/state-spaces/mamba.git@v1.2.2` ✅ |
 | `GreedySearchDecoderOnlyOutput` removed in `transformers>=4.44` | Partial shim applied in prior session ✅ |
 | **`SampleDecoderOnlyOutput` (and 9 other generation output classes) removed in `transformers>=4.44`; mamba_ssm 1.2.2 imports them all** | **Fix: replace single-name shim with comprehensive 10-alias patch. See exact code below. ✅ PATCHED 2026-04-14** |
+| **`_bootstrap_verify_fast_path()` imported `selective_state_update` from the wrong module** | **Fix: import it from `mamba_ssm.ops.triton.selective_state_update`, keep `selective_scan_fn` / `mamba_inner_fn` from `mamba_ssm.ops.selective_scan_interface`, and verify with real tiny CUDA/Triton ops. ✅ PATCHED LOCAL 2026-04-14** |
+| **sm75 Hub wheel was suspected broken after notebook Cell 5** | **Status corrected: latest evidence only proves the verifier import path was wrong. Do not rebuild the wheel unless the corrected verifier fails a real kernel op. ✅ DIAGNOSIS UPDATED 2026-04-14** |
 
 **Exact code change — replace the entire Phase 1.5 block in `_bootstrap()` in `jamba_coconut_finetune.py`:**
 
@@ -138,6 +144,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 
 One item still requires empirical verification during smoke test:
 - `inputs_embeds` → `last_hidden_state` path for Jamba Reasoning 3B **with fast Mamba kernels active**
+- **Important:** the current notebook failure no longer supports the conclusion that the sm75 `mamba_ssm` wheel is broken; rerun with the corrected verifier first.
 
 ---
 
@@ -182,6 +189,7 @@ Context     : 256K tokens
 | Question | Status |
 |---|---|
 | Does `inputs_embeds` → `last_hidden_state` work with Jamba + fast Mamba kernels active? | 🟡 VERIFY next smoke test |
+| Does the sm75 Hub `mamba_ssm` wheel pass the corrected fast-path verifier and tiny runtime ops? | 🟡 VERIFY next smoke test |
 | DGAC Phase 3.4: does halt_step distribute across K≥2 after training? | 🔴 OPEN — primary research validation |
 
 ---
@@ -197,7 +205,8 @@ Context     : 256K tokens
 | `prepare_sft_dataset.py` | 2 | ✅ DONE | sft-mix-v1 cached; not reused for Coconut |
 | `train_sft.py` | 2 | ✅ PATCHED | Retired |
 | `prepare_coconut_dataset.py` | 3 | ✅ DONE | coconut-v1 on Hub confirmed (36906/1940 samples) |
-| `jamba_coconut_finetune.py` | 3 | 🟡 NEEDS PATCH | Replace Phase 1.5 shim with comprehensive 10-alias version (Part 0.2) |
+| `jamba_coconut_finetune.py` | 3 | 🟡 NEEDS REPLACEMENT | Current local version must be replaced with the patched file that keeps the 10-alias shim and fixes the Phase 3 verifier import path |
+| `jamba_coconut_finetune_patched.py` | 3 | ✅ PATCHED LOCAL | Corrected `selective_state_update` import path, retained comprehensive 10-alias shim, and strengthened fast-path verification |
 | `build_wheels_kaggle.py` | 3 | ✅ DONE | git+https fix applied; sm75 + sm100 causal_conv1d on Hub; sm75 mamba_ssm on Hub |
 
 ---
