@@ -116,25 +116,32 @@ def _bootstrap_resolve_token() -> Optional[str]:
 
 def _bootstrap_verify_fast_path() -> bool:
     """
-    Hard verification of the mamba fast path:
-      1. Import all 5 symbols transformers' Jamba checks.
-      2. Assert none are None (catches mamba-ssm 2.x silent API mismatch).
-      3. Run a tiny causal_conv1d CUDA op on real tensors to catch ABI mismatches
-         that pass the import check but crash on first kernel invocation.
+    Hard verification of the Jamba Mamba fast path:
+      1. Import the exact 5 symbols that transformers.models.jamba checks.
+      2. Assert none are None (catches API / packaging mismatches).
+      3. Run tiny real CUDA/Triton ops for causal_conv1d, selective_scan_fn,
+         and selective_state_update.
 
-    Returns True only if all three checks pass.
+    Important: selective_state_update lives in
+    mamba_ssm.ops.triton.selective_state_update in mamba_ssm==1.2.2, not in
+    selective_scan_interface.
     """
     import importlib as _il
+    import warnings as _warnings
     import torch as _torch
 
     _il.invalidate_caches()
 
-    from mamba_ssm.ops.selective_scan_interface import (  # type: ignore
-        selective_scan_fn,
-        selective_state_update,
-        mamba_inner_fn,
-    )
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update  # type: ignore
+    with _warnings.catch_warnings():
+        _warnings.filterwarnings("ignore", category=FutureWarning, module=r"mamba_ssm.*")
+        from mamba_ssm.ops.selective_scan_interface import (  # type: ignore
+            selective_scan_fn,
+            mamba_inner_fn,
+        )
+        from mamba_ssm.ops.triton.selective_state_update import (  # type: ignore
+            selective_state_update,
+        )
+        from causal_conv1d import causal_conv1d_fn, causal_conv1d_update  # type: ignore
 
     _syms = {
         "selective_scan_fn":      selective_scan_fn,
@@ -146,14 +153,39 @@ def _bootstrap_verify_fast_path() -> bool:
     _none = [k for k, v in _syms.items() if v is None]
     if _none:
         raise ImportError(
-            f"Symbols are None — API mismatch (mamba-ssm 2.x Triton-path issue?): {_none}"
+            "Fast-path symbols imported but resolved to None: "
+            f"{_none}. This usually means an API / ABI mismatch."
         )
 
-    # Real tensor op through causal_conv1d CUDA kernel — catches silent ABI breaks
+    # 1) CUDA depthwise conv kernel
     _x = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
     _w = _torch.randn(4, 1, 4, device="cuda", dtype=_torch.float32)
     _out = causal_conv1d_fn(_x, _w)
-    assert _out.shape == _x.shape, f"Unexpected output shape: {_out.shape}"
+    assert _out.shape == _x.shape, f"Unexpected causal_conv1d_fn shape: {_out.shape}"
+
+    # 2) selective_scan CUDA extension used by full-sequence Mamba blocks
+    _u = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
+    _delta = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
+    _A = _torch.randn(4, 3, device="cuda", dtype=_torch.float32)
+    _B = _torch.randn(1, 3, 8, device="cuda", dtype=_torch.float32)
+    _C = _torch.randn(1, 3, 8, device="cuda", dtype=_torch.float32)
+    _D = _torch.randn(4, device="cuda", dtype=_torch.float32)
+    _scan_out = selective_scan_fn(_u, _delta, _A, _B, _C, _D, delta_softplus=True)
+    assert _scan_out.shape == _u.shape, f"Unexpected selective_scan_fn shape: {_scan_out.shape}"
+
+    # 3) Triton recurrent update kernel used by cached decode / generation
+    _state = _torch.randn(1, 4, 3, device="cuda", dtype=_torch.float32)
+    _x_step = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
+    _dt = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
+    _B_step = _torch.randn(1, 3, device="cuda", dtype=_torch.float32)
+    _C_step = _torch.randn(1, 3, device="cuda", dtype=_torch.float32)
+    _step_out = selective_state_update(
+        _state, _x_step, _dt, _A, _B_step, _C_step, _D, dt_softplus=True
+    )
+    assert _step_out.shape == _x_step.shape, (
+        f"Unexpected selective_state_update shape: {_step_out.shape}"
+    )
+
     _torch.cuda.synchronize()
     return True
 
@@ -192,7 +224,9 @@ def _bootstrap() -> None:
          "wandb",
          "bitsandbytes>=0.46.1",
          "accelerate",
-         "huggingface_hub"],
+         "huggingface_hub",
+         "einops",
+         "safetensors"],
         check=False,
     )
     if _r1.returncode != 0:
