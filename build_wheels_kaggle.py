@@ -47,7 +47,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-MAMBA_SSM_VERSION  = "mamba-ssm==1.2.2"
+MAMBA_SSM_VERSION  = "git+https://github.com/state-spaces/mamba.git@v1.2.2"
 CAUSAL_CONV1D_SPEC = "causal-conv1d>=1.4.0"
 
 # All known arch suffixes — used to filter out arch-encoded files during glob
