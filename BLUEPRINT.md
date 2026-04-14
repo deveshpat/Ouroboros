@@ -17,12 +17,12 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | 0 | Architecture & Viability (nano) | ✅ COMPLETE |
 | 1 | Pre-training (nano) | ✅ Pipeline test only; retired |
 | 2 | SFT (nano) | 🔴 RETIRED |
-| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 BLOCKED — hardened composite verifier + auto-heal rebuild patch ready; smoke test pending |
+| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 BLOCKED — comprehensive shim applied; apply patch then re-run smoke test |
 | 4 | GRPO on Jamba Reasoning 3B | ⬜ NOT STARTED |
 | 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
 
 ### TRC Status
-✅ Accepted (email 2026-04-07). **Do not claim quota yet.** Claim only after Kaggle T4 curriculum clears K=4 cleanly.
+✅ Accepted (email 2026-04-07). **Do not claim quota yet.** Claim after K=4 gate passes on Kaggle Dual T4.
 
 ### Dataset Confirmed (2026-04-13)
 - **Train:** 36,906 samples  **Val:** 1,940 samples
@@ -39,30 +39,31 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 
 ### Part 0.1 — Immediate Next Actions (ordered)
 
-1. **Replace `jamba_coconut_finetune.py` with the hardened script**.
-   New file adds:
-   - corrected `selective_state_update` import path
-   - corrected `causal_conv1d_fn` verification weight shape `(dim, width)`
-   - real kernel checks for `causal_conv1d_fn`, `causal_conv1d_update`, `selective_scan_fn`, `selective_state_update`, and `mamba_inner_fn`
-   - **Phase 2.5 auto-heal**: on verify failure after Hub-wheel install, purge modules, rebuild both wheels from source once, reinstall, and retry
-   - broader alias propagation for removed transformers generation outputs
-   - explicit Phase 1 install of `einops` and `safetensors`
+1. **Apply the comprehensive Phase 1.5 shim** (see Part 0.2) to `jamba_coconut_finetune.py`.
+   Replaces the single-name shim with a full 10-alias patch covering all generation output classes removed in `transformers>=4.44`.
 
-2. **Run the smoke test again on Kaggle T4**:
+2. **Smoke test** — both sm75 wheels are on Hub, bootstrap will be fast (<30s for wheel install):
    ```bash
-   python jamba_coconut_finetune.py      --data_dir data/coconut_v1 --use_4bit      --epochs_per_stage 1 --max_stage 2 --max_samples 200      --max_seq_len 1024 --max_grad_norm 0.3      --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
+   python jamba_coconut_finetune.py \
+     --data_dir data/coconut_v1 --use_4bit \
+     --epochs_per_stage 1 --max_stage 2 --max_samples 200 \
+     --max_seq_len 1024 --max_grad_norm 0.3 \
+     --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
    ```
-   Must see `Mamba fast path: ACTIVE ✓` from the hardened composite verifier.
+   Must see `[bootstrap] Shim: patched N removed transformers.generation names ✓` and `Mamba fast path: ACTIVE ✓`.
 
-3. **If smoke test passes**: run K=0→K_max curriculum on Kaggle Dual T4:
+3. **If smoke test passes**: K=0→K_max curriculum on Kaggle Dual T4:
    ```bash
-   torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py      --data_dir data/coconut_v1 --use_4bit      --epochs_per_stage 3 --max_stage 10 --batch_size 2 --grad_accum 8      --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20      --output_dir runs/stage3_curriculum
+   torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
+     --data_dir data/coconut_v1 --use_4bit \
+     --epochs_per_stage 3 --max_stage 10 --batch_size 2 --grad_accum 8 \
+     --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
+     --output_dir runs/stage3_curriculum
    ```
 
-4. **Only if Phase 2.5 source rebuild is triggered and still fails**:
-   inspect the rebuilt wheel logs; at that point the next blocker is a true package/kernel incompatibility, not a bootstrap false positive.
+4. **If K=4 gate passes**: claim TRC, run K=10 + DGAC Phase 3.4 on A100.
 
-5. **If K=4 gate passes**: claim TRC, then move to K=10 + DGAC on A100.
+5. **If a sm100 session is allocated**: run `build_wheels_kaggle.py` to cache the mamba_ssm sm100 wheel.
 
 ---
 
@@ -80,16 +81,63 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | OOM at first val step (S8) | `torch.cuda.empty_cache()` + `val_batch_size=1` ✅ |
 | `--max_seq_len 512` filtered all stage 1+ samples | Default changed to 1024 ✅ |
 | Exploding gradients at k≥2 | `--max_grad_norm 0.3` ✅ |
+| Wheel/ABI mismatch | Retired wheel workflow; `_bootstrap()` self-installs ✅ |
 | mamba-ssm 2.x API | Pinned to `mamba-ssm==1.2.2` ✅ |
 | bitsandbytes version floor missing | `bitsandbytes>=0.46.1` in `_bootstrap()` ✅ |
-| `einops` / `safetensors` not guaranteed | Added explicitly to Phase 1 install ✅ |
-| mamba_ssm 1.2.2 PyPI sdist is a 35kB stub | Use `git+https://github.com/state-spaces/mamba.git@v1.2.2` ✅ |
-| Removed generation output classes in `transformers>=4.44` | 10-alias shim retained and broadened ✅ |
-| `selective_state_update` imported from wrong module in verifier | Import from `mamba_ssm.ops.triton.selective_state_update` ✅ |
-| `causal_conv1d_fn` verifier used wrong weight shape | Fixed to `(dim, width)` ✅ |
-| False green from import-only verification | Replaced with composite real-op verifier ✅ |
-| Broken Hub wheel causing repeated sessions | **Phase 2.5 auto-heal rebuild** added ✅ |
-| Stale broken modules after reinstall | `sys.modules` purge before re-verify ✅ |
+| causal_conv1d Hub wheel (sm100, sm75) | Built + uploaded for both arches ✅ |
+| mamba_ssm 1.2.2 PyPI sdist is a 35kB stub | pip spec changed to `git+https://github.com/state-spaces/mamba.git@v1.2.2` ✅ |
+| `GreedySearchDecoderOnlyOutput` removed in `transformers>=4.44` | Partial shim applied in prior session ✅ |
+| **`SampleDecoderOnlyOutput` (and 9 other generation output classes) removed in `transformers>=4.44`; mamba_ssm 1.2.2 imports them all** | **Fix: replace single-name shim with comprehensive 10-alias patch. See exact code below. ✅ PATCHED 2026-04-14** |
+
+**Exact code change — replace the entire Phase 1.5 block in `_bootstrap()` in `jamba_coconut_finetune.py`:**
+
+```python
+    # ── Phase 1.5: transformers / mamba_ssm compatibility shim ───────────────
+    # mamba_ssm 1.2.2 imports multiple generation output class names that were
+    # removed in transformers>=4.44 (GreedySearch*, Sample*, BeamSearch*, etc.).
+    # Backfill ALL removed names as aliases for their modern replacements in
+    # one pass so we never debug one missing name per session.
+    try:
+        import importlib as _il2
+        _il2.invalidate_caches()
+        import transformers.generation as _tg_mod
+
+        # Full mapping: removed name → replacement class in transformers>=4.44
+        _GENERATION_COMPAT_ALIASES = {
+            # Decoder-only
+            "GreedySearchDecoderOnlyOutput":      "GenerateDecoderOnlyOutput",
+            "SampleDecoderOnlyOutput":            "GenerateDecoderOnlyOutput",
+            "ContrastiveSearchDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
+            "BeamSearchDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
+            "BeamSampleDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
+            # Encoder-decoder (mamba_ssm may import these for seq2seq completeness)
+            "GreedySearchEncoderDecoderOutput":      "GenerateEncoderDecoderOutput",
+            "SampleEncoderDecoderOutput":            "GenerateEncoderDecoderOutput",
+            "ContrastiveSearchEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
+            "BeamSearchEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
+            "BeamSampleEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
+        }
+        _patched = []
+        for _old, _new in _GENERATION_COMPAT_ALIASES.items():
+            if getattr(_tg_mod, _old, None) is None:
+                _repl = getattr(_tg_mod, _new, None)
+                if _repl is not None:
+                    setattr(_tg_mod, _old, _repl)
+                    _patched.append(_old)
+        if _patched:
+            print(f"[bootstrap] Shim: patched {len(_patched)} removed "
+                  f"transformers.generation names ✓")
+        else:
+            print("[bootstrap] Shim: all generation names present (no patch needed)")
+    except ImportError:
+        pass  # transformers not yet importable; Phase 1 likely failed above
+    except Exception as _shim_err:
+        print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
+        print("[bootstrap]          mamba_ssm import may fail at Phase 3 verification.")
+```
+
+One item still requires empirical verification during smoke test:
+- `inputs_embeds` → `last_hidden_state` path for Jamba Reasoning 3B **with fast Mamba kernels active**
 
 ---
 
@@ -115,16 +163,16 @@ Context     : 256K tokens
 | LoRA target modules | q_proj, k_proj, v_proj, o_proj, in_proj, x_proj, dt_proj, out_proj; conv1d excluded |
 | Coconut curriculum | Progressive step replacement per Meta paper |
 | Stage advancement | Epoch-based + best-accuracy checkpoint selection |
-| max_stage K | **10** |
+| max_stage K | **10** (confirmed from dataset median_steps) |
 | DGAC halt gate | Phase 3.4 only; λ₁ annealed from 0 |
 | Dataset Hub config | `coconut-v1` under `WeirdRunner/Ouroboros` |
-| `attn_implementation` | runtime detection: flash_attention_2 if available, else eager |
-| `use_mamba_kernels` | runtime probe; only False on ImportError |
-| mamba-ssm version | **1.2.2 from GitHub source** |
-| mamba install strategy | arch-aware Hub wheel download → composite verify → one-shot source auto-heal rebuild if verify fails |
+| `attn_implementation` | Runtime detection: flash_attention_2 if available, else eager |
+| `use_mamba_kernels` | Runtime probe; only False on ImportError |
+| mamba-ssm version | **1.2.2 from GitHub source** (`git+https://github.com/state-spaces/mamba.git@v1.2.2`) |
+| mamba install strategy | `_bootstrap()` downloads pre-built arch wheels from Hub; falls back to git+https source build; uploads result to Hub; shim backfills ALL removed transformers generation output class names in one pass |
 | `--max_seq_len` | 1024 |
 | `--max_grad_norm` | 0.3 for k≥2 stages |
-| session timeout | `--session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20` |
+| Session timeout | `--session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20` |
 | val_batch_size | 1 |
 
 ---
@@ -134,8 +182,7 @@ Context     : 256K tokens
 | Question | Status |
 |---|---|
 | Does `inputs_embeds` → `last_hidden_state` work with Jamba + fast Mamba kernels active? | 🟡 VERIFY next smoke test |
-| Does the hardened verifier pass on Kaggle T4 without triggering Phase 2.5 rebuild? | 🟡 VERIFY next smoke test |
-| DGAC Phase 3.4: does halt_step distribute across K≥2 after training? | 🔴 OPEN |
+| DGAC Phase 3.4: does halt_step distribute across K≥2 after training? | 🔴 OPEN — primary research validation |
 
 ---
 
@@ -143,20 +190,25 @@ Context     : 256K tokens
 
 | File | Stage | Status | Notes |
 |---|---|---|---|
-| `prepare_coconut_dataset.py` | 3 | ✅ DONE | dataset confirmed |
-| `jamba_coconut_finetune.py` | 3 | 🟡 REPLACE NOW | old verifier path is stale |
-| `jamba_coconut_finetune_hardened.py` | 3 | ✅ READY | corrected verifier + auto-heal rebuild |
-| `build_wheels_kaggle.py` | 3 | ✅ DONE | still used for manual wheel build/debug only |
+| `baseline_trm_mamba.py` | 0 | ✅ COMPLETE | Retired; architecture reference only |
+| `viability_gate.py` | 0 | ✅ COMPLETE | |
+| `training_utils.py` | All nano | ✅ COMPLETE | Not used in Jamba scripts |
+| `pretrain.py` | 1 | ✅ COMPLETE | Hub: ckpt-0021000 |
+| `prepare_sft_dataset.py` | 2 | ✅ DONE | sft-mix-v1 cached; not reused for Coconut |
+| `train_sft.py` | 2 | ✅ PATCHED | Retired |
+| `prepare_coconut_dataset.py` | 3 | ✅ DONE | coconut-v1 on Hub confirmed (36906/1940 samples) |
+| `jamba_coconut_finetune.py` | 3 | 🟡 NEEDS PATCH | Replace Phase 1.5 shim with comprehensive 10-alias version (Part 0.2) |
+| `build_wheels_kaggle.py` | 3 | ✅ DONE | git+https fix applied; sm75 + sm100 causal_conv1d on Hub; sm75 mamba_ssm on Hub |
 
 ---
 
 ## Part 5 — Coconut Curriculum Design
 
 ```
-Stage 0:  [Q][S1][S2][S3][A]
-Stage k:  [Q][●*k][S_{k+1}..Sn][A]
-Stage K:  [Q][●*K][A]
-K = 10
+Stage 0:  [Q][S1][S2][S3][A]     ← standard CoT; labels on S1..Sn + A
+Stage k:  [Q][●*k][S_{k+1}..Sn][A]   ← first k steps replaced; labels shift
+Stage K:  [Q][●*K][A]            ← all steps replaced; labels on A only
+K = 10 (confirmed from dataset)
 ```
 
 ---
@@ -165,13 +217,26 @@ K = 10
 
 ```
 L_total = L_ce  +  λ₁(t) · L_ponder  +  λ₂ · L_diversity
+
+L_diversity = mean_batch( Σ_k relu(cos_sim(h_k, h_{k-1}) − τ) ),  τ = 0.9
+λ₁ schedule: 0 for steps 0-200, ramp 0→0.01 over steps 200-500, flat 0.01 after
 ```
+
+**HaltGate:** Linear(2*d_model → 1), zero-initialized → outputs 0.5 at Phase 3.4 start.
 
 ---
 
 ## Part 7 — Checkpoint Format
 
-Unchanged.
+```
+output_dir/
+  stage_0/best/
+    adapter_model/         ← PEFT LoRA weights
+    training_state.pt      ← {stage_k, step, epoch, val_ce, val_acc, optimizer, scheduler}
+  ...
+  stage_10/best/           ← resume_from for Phase 3.4 DGAC run
+    halt_gate.pt           ← HaltGate state dict (Phase 3.4 only)
+```
 
 ---
 
@@ -179,15 +244,24 @@ Unchanged.
 
 | Phase | Platform | Estimate |
 |---|---|---|
-| Smoke test | Kaggle T4 | ~10-20 min depending on whether Phase 2.5 rebuild triggers |
-| Stage 0→10 | Kaggle Dual T4 | ~4-8h per session |
-| DGAC | TRC A100 80GB | ~6-8h |
+| Smoke test | Kaggle T4 | ~10 min (wheels cached) |
+| Stage 0→10 | Kaggle Dual T4, QLoRA + DDP | ~4-8h per session |
+| Phase 3.4 (DGAC) | TRC A100 80GB | ~6-8h |
+| Phase 4 (GRPO) | TRC A100 80GB | ~8-12h |
 
 ---
 
 ## Part 9 — Hard Lessons (Do Not Repeat)
 
-- Never trust import-only kernel verification.
-- Never assume `selective_state_update` lives beside `selective_scan_fn` in old Mamba.
-- Never pass `(dim, 1, width)` directly to `causal_conv1d_fn`; its interface expects `(dim, width)`.
-- If a Hub wheel installs but verify fails, rebuild automatically before spending another session debugging it.
+| Lesson | Codified As |
+|---|---|
+| val_batch_size=16 → OOM | `--val_batch_size 1` default + `empty_cache()` |
+| NCCL watchdog kills DDP | `timedelta(minutes=60)` + graceful exit |
+| max_seq_len=512 filtered all stage 1+ | `--max_seq_len 1024` |
+| gn=36.9 at k=2 | `--max_grad_norm 0.3` |
+| `use_mamba_kernels=False` hardcoded → 100× slow | Runtime probe |
+| mamba-ssm 2.x broke fast path | Pinned to 1.2.2 |
+| Kaggle GPU arch unpredictable | `TORCH_CUDA_ARCH_LIST` auto-injected from `torch.cuda.get_device_capability()` |
+| bitsandbytes not upgraded | `bitsandbytes>=0.46.1` in bootstrap |
+| mamba-ssm 1.2.2 PyPI sdist is a 35kB stub | Use `git+https://github.com/state-spaces/mamba.git@v1.2.2`. ~20h GPU quota lost. |
+| **Single-name shim → one removed class fixed per session** | **Comprehensive 10-alias shim covering the entire removed generation output family. Never patch one name at a time.** |

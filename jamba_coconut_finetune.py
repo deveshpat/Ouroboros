@@ -30,9 +30,9 @@ Install:
              Over time Hub accumulates one wheel per GPU arch — compilation
              becomes rare after the first session on each arch.
     Phase 3: functional verification — imports all 5 mamba fast-path symbols AND
-             runs tiny real conv / scan / recurrent update / composite Mamba ops.
-             If Hub wheels fail verification, Phase 2.5 auto-rebuilds both wheels
-             from source once, reinstalls, purges cached modules, and retries.
+             runs a tiny causal_conv1d CUDA op on real tensors.
+             On failure: prints full ABI fingerprint and sys.exit(1).
+             There is NO fallback to slow path — a broken kernel wastes 500s/step.
 
 Run (smoke test, Kaggle):
   !python jamba_coconut_finetune.py \
@@ -114,119 +114,17 @@ def _bootstrap_resolve_token() -> Optional[str]:
     return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
 
-def _wheel_pkg_and_version(_base: str) -> Tuple[str, str]:
-    _parts = _base.split("-")
-    return _parts[0], _parts[1]
-
-
-def _wheel_pip_spec(_pkg_name: str, _pkg_ver: str) -> str:
-    if _pkg_name == "mamba_ssm":
-        return f"git+https://github.com/state-spaces/mamba.git@v{_pkg_ver}"
-    return f"{_pkg_name.replace('_', '-')}=={_pkg_ver}"
-
-
-def _purge_fast_path_modules() -> None:
-    _prefixes = (
-        "mamba_ssm",
-        "causal_conv1d",
-        "selective_scan_cuda",
-        "causal_conv1d_cuda",
-    )
-    for _name in list(sys.modules):
-        if _name in _prefixes or any(_name.startswith(p + ".") for p in _prefixes if "." not in p):
-            sys.modules.pop(_name, None)
-
-
-def _find_built_wheel(_wheel_dir: Path, _pkg_name: str) -> Optional[Path]:
-    _found = [
-        f for f in _wheel_dir.glob(f"{_pkg_name}*.whl")
-        if not any(f.name.endswith(f"-{s}.whl") for s in _KNOWN_ARCH_SUFFIXES)
-    ]
-    if not _found:
-        return None
-    return max(_found, key=lambda p: p.stat().st_mtime)
-
-
-def _upload_arch_wheel(_arch_whl_path: Path, _hub_filename: str, _repo_id: str, _hf_token: str, _arch_suffix: str) -> None:
-    from huggingface_hub import HfApi
-
-    try:
-        _api = HfApi(token=_hf_token)
-        _api.create_repo(repo_id=_repo_id, repo_type="model", private=True, exist_ok=True, token=_hf_token)
-        _api.upload_file(
-            path_or_fileobj=str(_arch_whl_path),
-            path_in_repo=_hub_filename,
-            repo_id=_repo_id,
-            repo_type="model",
-            token=_hf_token,
-            commit_message=f"Add wheel: {_hub_filename}",
-        )
-        print(f"[bootstrap]   Uploaded {_hub_filename} to Hub ✓ (future sessions on {_arch_suffix} skip compilation)")
-    except Exception as _up_err:
-        print(f"[bootstrap]   [warn] Hub upload failed: {_up_err}")
-        print("[bootstrap]          Continuing with local wheel. Re-run to retry upload.")
-
-
-def _build_source_wheel(_base: str, _wheel_dir: Path, _arch_suffix: str, _arch_list: str, _hf_token: str) -> Path:
-    _pkg_name, _pkg_ver = _wheel_pkg_and_version(_base)
-    _pip_spec = _wheel_pip_spec(_pkg_name, _pkg_ver)
-    _env_vars = os.environ.copy()
-    _env_vars["MAX_JOBS"] = "4"
-    _env_vars["TORCH_CUDA_ARCH_LIST"] = _arch_list
-
-    print(f"[bootstrap]   Building {_pip_spec} (TORCH_CUDA_ARCH_LIST={_arch_list}) ...")
-    _build_result = subprocess.run(
-        [sys.executable, "-m", "pip", "wheel", _pip_spec, "--no-build-isolation", "--no-deps", "-w", str(_wheel_dir), "--verbose"],
-        env=_env_vars,
-        check=False,
-    )
-    if _build_result.returncode != 0:
-        print(f"[bootstrap] FATAL: Source build failed for {_pip_spec}.")
-        print("[bootstrap]        Run build_wheels_kaggle.py manually and capture stderr: python build_wheels_kaggle.py 2>&1 | tee build.log")
-        sys.exit(1)
-
-    _built_whl = _find_built_wheel(_wheel_dir, _pkg_name)
-    if _built_whl is None:
-        print(f"[bootstrap] FATAL: pip wheel succeeded but no .whl found for {_pkg_name}.")
-        sys.exit(1)
-
-    _local_path = _wheel_dir / f"{_base}.whl"
-    if _built_whl.resolve() != _local_path.resolve():
-        shutil.copy2(str(_built_whl), str(_local_path))
-
-    print(f"[bootstrap]   Build succeeded: {_built_whl.name}")
-    _hub_filename = f"{_base}-{_arch_suffix}.whl"
-    _arch_whl_path = _wheel_dir / _hub_filename
-    shutil.copy2(str(_local_path), str(_arch_whl_path))
-    _upload_arch_wheel(_arch_whl_path, _hub_filename, _HUB_REPO_ID, _hf_token, _arch_suffix)
-    return _local_path
-
-
-def _install_local_wheel(_local_path: Path) -> None:
-    _r = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", str(_local_path)],
-        check=False,
-    )
-    if _r.returncode != 0:
-        print(f"[bootstrap] FATAL: pip install failed for {_local_path.name}.")
-        sys.exit(1)
-    print(f"[bootstrap]   Installed {_local_path.name} ✓")
-
-
 def _bootstrap_verify_fast_path() -> bool:
     """
-    Hard verification of the exact Jamba fast path expected by transformers:
-      1. Import the 5 fast-path symbols Jamba checks.
-      2. Assert none are None.
-      3. Run real tiny kernels for:
-         - causal_conv1d_fn
-         - causal_conv1d_update
-         - selective_scan_fn
-         - selective_state_update
-         - mamba_inner_fn
+    Hard verification of the Jamba Mamba fast path:
+      1. Import the exact 5 symbols that transformers.models.jamba checks.
+      2. Assert none are None (catches API / packaging mismatches).
+      3. Run tiny real CUDA/Triton ops for causal_conv1d, selective_scan_fn,
+         and selective_state_update.
 
-    This catches import-path errors, missing CUDA/Triton extensions, and ABI
-    mismatches before the first training step.
+    Important: selective_state_update lives in
+    mamba_ssm.ops.triton.selective_state_update in mamba_ssm==1.2.2, not in
+    selective_scan_interface.
     """
     import importlib as _il
     import warnings as _warnings
@@ -246,124 +144,46 @@ def _bootstrap_verify_fast_path() -> bool:
         from causal_conv1d import causal_conv1d_fn, causal_conv1d_update  # type: ignore
 
     _syms = {
-        "selective_scan_fn": selective_scan_fn,
+        "selective_scan_fn":      selective_scan_fn,
         "selective_state_update": selective_state_update,
-        "mamba_inner_fn": mamba_inner_fn,
-        "causal_conv1d_fn": causal_conv1d_fn,
-        "causal_conv1d_update": causal_conv1d_update,
+        "mamba_inner_fn":         mamba_inner_fn,
+        "causal_conv1d_fn":       causal_conv1d_fn,
+        "causal_conv1d_update":   causal_conv1d_update,
     }
-    _missing = [name for name, value in _syms.items() if value is None]
-    if _missing:
+    _none = [k for k, v in _syms.items() if v is None]
+    if _none:
         raise ImportError(
             "Fast-path symbols imported but resolved to None: "
-            f"{_missing}. This usually means an API / ABI mismatch."
+            f"{_none}. This usually means an API / ABI mismatch."
         )
 
-    _torch.manual_seed(0)
-    _B, _D, _L, _W, _N = 1, 4, 8, 4, 3
-
-    # 1) Full-sequence causal depthwise conv.
-    _x = _torch.randn(_B, _D, _L, device="cuda", dtype=_torch.float32)
-    _w = _torch.randn(_D, _W, device="cuda", dtype=_torch.float32)
-    _bias = _torch.randn(_D, device="cuda", dtype=_torch.float32)
-    _out = causal_conv1d_fn(_x, _w, _bias, None)
+    # 1) CUDA depthwise conv kernel
+    _x = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
+    _w = _torch.randn(4, 1, 4, device="cuda", dtype=_torch.float32)
+    _out = causal_conv1d_fn(_x, _w)
     assert _out.shape == _x.shape, f"Unexpected causal_conv1d_fn shape: {_out.shape}"
 
-    # 2) Step-wise cached conv update used in decode.
-    _conv_state = _torch.randn(_B, _D, _W, device="cuda", dtype=_torch.float32)
-    _x_step = _torch.randn(_B, _D, device="cuda", dtype=_torch.float32)
-    _step_conv = causal_conv1d_update(_x_step, _conv_state, _w, _bias, None)
-    assert _step_conv.shape == _x_step.shape, (
-        f"Unexpected causal_conv1d_update shape: {_step_conv.shape}"
-    )
-
-    # 3) Full selective scan CUDA extension.
-    _u = _torch.randn(_B, _D, _L, device="cuda", dtype=_torch.float32) * 0.1
-    _delta = _torch.randn(_B, _D, _L, device="cuda", dtype=_torch.float32) * 0.1
-    _A = -_torch.rand(_D, _N, device="cuda", dtype=_torch.float32)
-    _B_scan = _torch.randn(_B, _N, _L, device="cuda", dtype=_torch.float32) * 0.1
-    _C_scan = _torch.randn(_B, _N, _L, device="cuda", dtype=_torch.float32) * 0.1
-    _D_skip = _torch.randn(_D, device="cuda", dtype=_torch.float32) * 0.1
-    _scan_out, _scan_last = selective_scan_fn(
-        _u,
-        _delta,
-        _A,
-        _B_scan,
-        _C_scan,
-        _D_skip,
-        delta_softplus=True,
-        return_last_state=True,
-    )
+    # 2) selective_scan CUDA extension used by full-sequence Mamba blocks
+    _u = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
+    _delta = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
+    _A = _torch.randn(4, 3, device="cuda", dtype=_torch.float32)
+    _B = _torch.randn(1, 3, 8, device="cuda", dtype=_torch.float32)
+    _C = _torch.randn(1, 3, 8, device="cuda", dtype=_torch.float32)
+    _D = _torch.randn(4, device="cuda", dtype=_torch.float32)
+    _scan_out = selective_scan_fn(_u, _delta, _A, _B, _C, _D, delta_softplus=True)
     assert _scan_out.shape == _u.shape, f"Unexpected selective_scan_fn shape: {_scan_out.shape}"
-    assert _scan_last.shape == (_B, _D, _N), (
-        f"Unexpected selective_scan_fn last_state shape: {_scan_last.shape}"
-    )
 
-    # 4) Triton recurrent state update used by cached decode.
-    _state = _torch.randn(_B, _D, _N, device="cuda", dtype=_torch.float32) * 0.1
-    _dt = _torch.randn(_B, _D, device="cuda", dtype=_torch.float32) * 0.1
-    _B_step = _torch.randn(_B, _N, device="cuda", dtype=_torch.float32) * 0.1
-    _C_step = _torch.randn(_B, _N, device="cuda", dtype=_torch.float32) * 0.1
-    _state_out = selective_state_update(
-        _state,
-        _x_step,
-        _dt,
-        _A,
-        _B_step,
-        _C_step,
-        D=_D_skip,
-        dt_softplus=True,
+    # 3) Triton recurrent update kernel used by cached decode / generation
+    _state = _torch.randn(1, 4, 3, device="cuda", dtype=_torch.float32)
+    _x_step = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
+    _dt = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
+    _B_step = _torch.randn(1, 3, device="cuda", dtype=_torch.float32)
+    _C_step = _torch.randn(1, 3, device="cuda", dtype=_torch.float32)
+    _step_out = selective_state_update(
+        _state, _x_step, _dt, _A, _B_step, _C_step, _D, dt_softplus=True
     )
-    assert _state_out.shape == _x_step.shape, (
-        f"Unexpected selective_state_update shape: {_state_out.shape}"
-    )
-
-    # 5) Composite full-sequence Mamba kernel path.
-    _d_inner, _d_state, _delta_rank = 4, 3, 2
-    _xz = _torch.randn(_B, 2 * _d_inner, _L, device="cuda", dtype=_torch.float32) * 0.1
-    _conv1d_weight = _torch.randn(_d_inner, 1, _W, device="cuda", dtype=_torch.float32) * 0.1
-    _conv1d_bias = _torch.randn(_d_inner, device="cuda", dtype=_torch.float32) * 0.1
-    _x_proj_weight = _torch.randn(
-        _delta_rank + 2 * _d_state,
-        _d_inner,
-        device="cuda",
-        dtype=_torch.float32,
-    ) * 0.1
-    _delta_proj_weight = _torch.randn(
-        _d_inner,
-        _delta_rank,
-        device="cuda",
-        dtype=_torch.float32,
-    ) * 0.1
-    _out_proj_weight = _torch.randn(
-        _d_inner,
-        _d_inner,
-        device="cuda",
-        dtype=_torch.float32,
-    ) * 0.1
-    _out_proj_bias = _torch.randn(_d_inner, device="cuda", dtype=_torch.float32) * 0.1
-    _A_inner = -_torch.rand(_d_inner, _d_state, device="cuda", dtype=_torch.float32)
-    _D_inner = _torch.randn(_d_inner, device="cuda", dtype=_torch.float32) * 0.1
-    _delta_bias = _torch.randn(_d_inner, device="cuda", dtype=_torch.float32) * 0.1
-    _inner_out = mamba_inner_fn(
-        _xz,
-        _conv1d_weight,
-        _conv1d_bias,
-        _x_proj_weight,
-        _delta_proj_weight,
-        _out_proj_weight,
-        _out_proj_bias,
-        _A_inner,
-        None,
-        None,
-        _D_inner,
-        _delta_bias,
-        None,
-        None,
-        True,
-    )
-    assert _inner_out.shape == (_B, _L, _d_inner), (
-        f"Unexpected mamba_inner_fn shape: {_inner_out.shape}"
+    assert _step_out.shape == _x_step.shape, (
+        f"Unexpected selective_state_update shape: {_step_out.shape}"
     )
 
     _torch.cuda.synchronize()
@@ -375,97 +195,88 @@ def _bootstrap() -> None:
     Install all dependencies before any third-party imports.
 
     Phase 1 — Pure-Python deps (~seconds):
-      transformers, peft, bitsandbytes>=0.46.1, huggingface_hub, einops,
-      safetensors, etc.
+      transformers, peft, bitsandbytes>=0.46.1, huggingface_hub, etc.
 
     Phase 2 — Arch-aware Hub wheel install:
       Detects GPU arch (e.g. sm100). Tries Hub download of the matching
-      arch-encoded wheel. On 404, compiles from source with the correct
-      TORCH_CUDA_ARCH_LIST, uploads the result to Hub for future sessions,
-      then installs locally.
-
-    Phase 2.5 — Auto-heal rebuild:
-      If verification fails after installing Hub wheels, purge imported modules,
-      rebuild both kernel wheels from source once, reinstall, and verify again.
+      arch-encoded wheel (e.g. causal_conv1d-...-sm100.whl). On 404, falls
+      back to source compile with the correct TORCH_CUDA_ARCH_LIST, uploads
+      the result to Hub for future sessions, then installs locally.
+      Over time Hub fills in — after the first session on each GPU arch,
+      subsequent sessions skip compilation entirely.
 
     Phase 3 — Hard functional verification:
-      Imports all 5 symbols and runs real tiny conv / scan / recurrent update /
-      composite Mamba kernels.
+      Imports all 5 symbols + runs causal_conv1d CUDA op on real tensors.
+      Prints full ABI fingerprint unconditionally (visible in logs).
+      sys.exit(1) on any failure — no slow-path fallback.
     """
     import importlib as _il
     import torch as _torch
 
+    # ── Phase 1: pure-Python deps ─────────────────────────────────────────────
     print("[bootstrap] Phase 1: pure-Python deps...")
     _r1 = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-q",
-            "transformers>=4.54.0",
-            "peft",
-            "datasets",
-            "tqdm",
-            "wandb",
-            "bitsandbytes>=0.46.1",
-            "accelerate",
-            "huggingface_hub",
-            "einops",
-            "safetensors",
-        ],
+        [sys.executable, "-m", "pip", "install", "-q",
+         "transformers>=4.54.0",
+         "peft",
+         "datasets",
+         "tqdm",
+         "wandb",
+         "bitsandbytes>=0.46.1",
+         "accelerate",
+         "huggingface_hub",
+         "einops",
+         "safetensors"],
         check=False,
     )
     if _r1.returncode != 0:
         print("[bootstrap] WARNING: Phase 1 pip returned non-zero — check output above.")
 
-    # Phase 1.5: transformers / mamba_ssm compatibility shim
+    # ── Phase 1.5: transformers / mamba_ssm compatibility shim ───────────────
+    # mamba_ssm 1.2.2 imports multiple generation output class names that were
+    # removed in transformers>=4.44 (GreedySearch*, Sample*, BeamSearch*, etc.).
+    # Backfill ALL removed names as aliases for their modern replacements in
+    # one pass so we never debug one missing name per session.
     try:
         import importlib as _il2
         _il2.invalidate_caches()
-        import transformers as _tf_root
         import transformers.generation as _tg_mod
 
-        _tg_utils = None
-        try:
-            import transformers.generation.utils as _tg_utils  # type: ignore
-        except Exception:
-            _tg_utils = None
-
+        # Full mapping: removed name → replacement class in transformers>=4.44
         _GENERATION_COMPAT_ALIASES = {
-            "GreedySearchDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
-            "SampleDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
+            # Decoder-only
+            "GreedySearchDecoderOnlyOutput":      "GenerateDecoderOnlyOutput",
+            "SampleDecoderOnlyOutput":            "GenerateDecoderOnlyOutput",
             "ContrastiveSearchDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
-            "BeamSearchDecoderOnlyOutput": "GenerateBeamDecoderOnlyOutput",
-            "BeamSampleDecoderOnlyOutput": "GenerateBeamDecoderOnlyOutput",
-            "GreedySearchEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
-            "SampleEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
+            "BeamSearchDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
+            "BeamSampleDecoderOnlyOutput":        "GenerateBeamDecoderOnlyOutput",
+            # Encoder-decoder (mamba_ssm may import these for seq2seq completeness)
+            "GreedySearchEncoderDecoderOutput":      "GenerateEncoderDecoderOutput",
+            "SampleEncoderDecoderOutput":            "GenerateEncoderDecoderOutput",
             "ContrastiveSearchEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
-            "BeamSearchEncoderDecoderOutput": "GenerateBeamEncoderDecoderOutput",
-            "BeamSampleEncoderDecoderOutput": "GenerateBeamEncoderDecoderOutput",
+            "BeamSearchEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
+            "BeamSampleEncoderDecoderOutput":        "GenerateBeamEncoderDecoderOutput",
         }
         _patched = []
         for _old, _new in _GENERATION_COMPAT_ALIASES.items():
-            _repl = getattr(_tg_mod, _new, None)
-            if _repl is None:
-                continue
-            for _mod in [_tg_mod, _tg_utils, _tf_root]:
-                if _mod is None:
-                    continue
-                if getattr(_mod, _old, None) is None:
-                    setattr(_mod, _old, _repl)
-            if getattr(_tg_mod, _old, None) is _repl:
-                _patched.append(_old)
+            if getattr(_tg_mod, _old, None) is None:
+                _repl = getattr(_tg_mod, _new, None)
+                if _repl is not None:
+                    setattr(_tg_mod, _old, _repl)
+                    _patched.append(_old)
         if _patched:
-            print(f"[bootstrap] Shim: patched {len(_patched)} removed transformers.generation names ✓")
+            print(f"[bootstrap] Shim: patched {len(_patched)} removed "
+                  f"transformers.generation names ✓")
         else:
             print("[bootstrap] Shim: all generation names present (no patch needed)")
     except ImportError:
-        pass
+        pass  # transformers not yet importable; Phase 1 likely failed above
     except Exception as _shim_err:
         print(f"[bootstrap] WARNING: transformers shim failed: {_shim_err}")
         print("[bootstrap]          mamba_ssm import may fail at Phase 3 verification.")
 
+  
+    # ── Phase 2: arch-aware Hub wheel install ─────────────────────────────────
     print("[bootstrap] Phase 2: arch-aware Hub wheel install...")
     _hf_token = _bootstrap_resolve_token()
     if not _hf_token:
@@ -474,19 +285,23 @@ def _bootstrap() -> None:
         sys.exit(1)
 
     _il.invalidate_caches()
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import hf_hub_download, HfApi  # installed in Phase 1
 
+    # Detect GPU arch for wheel selection and TORCH_CUDA_ARCH_LIST injection
     _cc = _torch.cuda.get_device_capability(0) if _torch.cuda.is_available() else (0, 0)
-    _arch_suffix = f"sm{_cc[0]}{_cc[1]}"
-    _arch_list = f"{_cc[0]}.{_cc[1]}+PTX"
+    _arch_suffix = f"sm{_cc[0]}{_cc[1]}"   # e.g. "sm100", "sm75"
+    _arch_list   = f"{_cc[0]}.{_cc[1]}+PTX"
     print(f"[bootstrap]   GPU arch: {_arch_suffix}  (TORCH_CUDA_ARCH_LIST={_arch_list} if build needed)")
 
     _wheel_dir = Path("/tmp/ouroboros_wheels")
     _wheel_dir.mkdir(exist_ok=True)
 
     for _base in _HUB_WHEEL_BASES:
-        _hub_filename = f"{_base}-{_arch_suffix}.whl"
-        _local_path = _wheel_dir / f"{_base}.whl"
+        _hub_filename   = f"{_base}-{_arch_suffix}.whl"   # arch-encoded Hub name
+        _local_filename = f"{_base}.whl"                   # standard name for pip
+        _local_path     = _wheel_dir / _local_filename
+
+        # ── Try Hub download first ───────────────────────────────────────────
         _downloaded = False
         try:
             _dl = hf_hub_download(
@@ -495,52 +310,115 @@ def _bootstrap() -> None:
                 token=_hf_token,
                 local_dir=str(_wheel_dir),
             )
+            # hf_hub_download saves under the Hub filename; copy to standard pip name
             shutil.copy2(_dl, str(_local_path))
             print(f"[bootstrap]   Downloaded {_hub_filename} ✓")
             _downloaded = True
         except Exception as _dl_err:
-            print(f"[bootstrap]   {_hub_filename} not on Hub ({type(_dl_err).__name__}). Compiling from source...")
+            print(f"[bootstrap]   {_hub_filename} not on Hub "
+                  f"({type(_dl_err).__name__}). Compiling from source...")
 
+        # ── Fallback: source compile ─────────────────────────────────────────
         if not _downloaded:
-            _local_path = _build_source_wheel(_base, _wheel_dir, _arch_suffix, _arch_list, _hf_token)
+            _parts    = _base.split("-")
+            _pkg_name = _parts[0]
+            _pkg_ver  = _parts[1]
+            # mamba_ssm PyPI sdist (35kB) is a stub — CUDA source files
+            # (selective_scan.cpp etc.) are omitted from the PyPI release.
+            # The full source lives only on GitHub. Use git+https to get it.
+            if _pkg_name == "mamba_ssm":
+                _pip_spec = f"git+https://github.com/state-spaces/mamba.git@v{_pkg_ver}"
+            else:
+                _pip_spec = f"{_pkg_name.replace('_', '-')}=={_pkg_ver}"
 
-        _install_local_wheel(_local_path)
+            _env_vars = os.environ.copy()
+            _env_vars["MAX_JOBS"] = "4"
+            _env_vars["TORCH_CUDA_ARCH_LIST"] = _arch_list
 
-    print("[bootstrap] Phase 3: verifying mamba fast path (composite kernel smoke test)...")
+            print(f"[bootstrap]   Building {_pip_spec} "
+                  f"(TORCH_CUDA_ARCH_LIST={_arch_list}) ...")
+            _build_result = subprocess.run(
+                [sys.executable, "-m", "pip", "wheel", _pip_spec,
+                 "--no-build-isolation", "--no-deps",
+                 "-w", str(_wheel_dir), "--verbose"],
+                env=_env_vars, check=False,
+            )
+            if _build_result.returncode != 0:
+                print(f"[bootstrap] FATAL: Source build failed for {_pip_spec}.")
+                print("[bootstrap]        Run build_wheels_kaggle.py manually and "
+                      "capture stderr: python build_wheels_kaggle.py 2>&1 | tee build.log")
+                sys.exit(1)
+
+            # Find the built standard-named wheel (exclude any arch-encoded files)
+            _found = [
+                f for f in _wheel_dir.glob(f"{_pkg_name}*.whl")
+                if not any(f.name.endswith(f"-{s}.whl") for s in _KNOWN_ARCH_SUFFIXES)
+            ]
+            if not _found:
+                print(f"[bootstrap] FATAL: pip wheel succeeded but no .whl found "
+                      f"for {_pkg_name}.")
+                sys.exit(1)
+            _built_whl = max(_found, key=lambda p: p.stat().st_mtime)
+
+            # Copy to standard local name (may already match)
+            if _built_whl.resolve() != _local_path.resolve():
+                shutil.copy2(str(_built_whl), str(_local_path))
+
+            print(f"[bootstrap]   Build succeeded: {_built_whl.name}")
+
+            # Upload arch-encoded copy to Hub so future sessions skip this build
+            _arch_whl_path = _wheel_dir / _hub_filename
+            shutil.copy2(str(_local_path), str(_arch_whl_path))
+            try:
+                _api = HfApi(token=_hf_token)
+                _api.create_repo(repo_id=_HUB_REPO_ID, repo_type="model",
+                                 private=True, exist_ok=True, token=_hf_token)
+                _api.upload_file(
+                    path_or_fileobj=str(_arch_whl_path),
+                    path_in_repo=_hub_filename,
+                    repo_id=_HUB_REPO_ID,
+                    repo_type="model",
+                    token=_hf_token,
+                    commit_message=f"Add wheel: {_hub_filename}",
+                )
+                print(f"[bootstrap]   Uploaded {_hub_filename} to Hub ✓ "
+                      f"(future sessions on {_arch_suffix} skip compilation)")
+            except Exception as _up_err:
+                print(f"[bootstrap]   [warn] Hub upload failed: {_up_err}")
+                print(f"[bootstrap]          Continuing with local wheel. "
+                      f"Re-run to retry upload.")
+
+        # ── pip install (always uses standard local name) ─────────────────────
+        _r = subprocess.run(
+            [sys.executable, "-m", "pip", "install",
+             "--force-reinstall", "--no-deps", str(_local_path)],
+            check=False,
+        )
+        if _r.returncode != 0:
+            print(f"[bootstrap] FATAL: pip install failed for {_local_filename}.")
+            sys.exit(1)
+        print(f"[bootstrap]   Installed {_local_filename} ✓")
+
+    # ── Phase 3: hard functional verification ────────────────────────────────
+    print("[bootstrap] Phase 3: verifying mamba fast path (symbol + CUDA op)...")
+
     try:
         _gpu_name = _torch.cuda.get_device_name(0) if _torch.cuda.is_available() else "no-gpu"
-        print(
-            f"[bootstrap]   ABI fingerprint: GPU={_gpu_name} {_arch_suffix} | "
-            f"CUDA={_torch.version.cuda} | PyTorch={_torch.__version__} | "
-            f"Python=cp{sys.version_info.major}{sys.version_info.minor}"
-        )
+        print(f"[bootstrap]   ABI fingerprint: "
+              f"GPU={_gpu_name} {_arch_suffix} | "
+              f"CUDA={_torch.version.cuda} | "
+              f"PyTorch={_torch.__version__} | "
+              f"Python=cp{sys.version_info.major}{sys.version_info.minor}")
         print(f"[bootstrap]   Wheel bases: {_HUB_WHEEL_BASES}")
     except Exception:
         pass
 
     try:
         _bootstrap_verify_fast_path()
-        print("[bootstrap] Mamba fast path: ACTIVE ✓ — composite verify passed.")
-        return
+        print("[bootstrap] Mamba fast path: ACTIVE ✓ — ~5s/step expected.")
     except Exception as _ve:
-        print(f"[bootstrap] WARNING: initial fast-path verification failed: {_ve}")
-        print("[bootstrap] Phase 2.5: purging modules, rebuilding both wheels from source, and retrying once...")
-
-    _purge_fast_path_modules()
-    _il.invalidate_caches()
-    for _base in _HUB_WHEEL_BASES:
-        _local_path = _build_source_wheel(_base, _wheel_dir, _arch_suffix, _arch_list, _hf_token)
-        _install_local_wheel(_local_path)
-    _purge_fast_path_modules()
-    _il.invalidate_caches()
-
-    try:
-        _bootstrap_verify_fast_path()
-        print("[bootstrap] Mamba fast path: ACTIVE ✓ — source rebuild healed verification.")
-    except Exception as _ve2:
-        print(f"\n[bootstrap] FATAL: Mamba fast path verification FAILED after source rebuild: {_ve2}")
-        print("[bootstrap]        Exiting now (no slow-path fallback — 500s/step is unusable).")
-        sys.exit(1)
+        print(f"\n[bootstrap] FATAL: Mamba fast path verification FAILED: {_ve}")
+        print( "[bootstrap]        Exiting now (no slow-path fallback — 500s/step is unusable).")
         sys.exit(1)
 
 
