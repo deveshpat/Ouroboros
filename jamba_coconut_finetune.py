@@ -1509,6 +1509,7 @@ def collate_stage_k(samples: List[Dict[str, Any]], pad_id: int) -> Dict[str, tor
         "labels": labels,
         "q_lens": q_lens,
         "n_latents": n_latents,
+        "pad_id": torch.tensor(int(pad_id), dtype=torch.long),
     }
 
 
@@ -1552,13 +1553,90 @@ def _forward_batched_stage0(
     }
 
 
-def _forward_single_sample(
+def _build_padded_prefix_batch(
+    patched: torch.Tensor,
+    active_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    pad_embed: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    max_prefix_len = int(prefix_lens.max().item())
+    prefix_embeds = patched[active_indices, :max_prefix_len, :].clone()
+    prefix_positions = torch.arange(max_prefix_len, device=patched.device).unsqueeze(0)
+    prefix_mask = prefix_positions < prefix_lens.unsqueeze(1)
+    if max_prefix_len > 0:
+        pad_value = pad_embed.to(device=patched.device, dtype=prefix_embeds.dtype).view(1, 1, -1)
+        prefix_embeds = torch.where(prefix_mask.unsqueeze(-1), prefix_embeds, pad_value)
+    return prefix_embeds, prefix_mask
+
+
+def _compute_batched_halt_metrics(
+    hidden_sequences: List[List[torch.Tensor]],
+    n_latents: torch.Tensor,
+    halt_gate: HaltGate,
+    device: torch.device,
+    args: argparse.Namespace,
+    step_in_phase: int,
+) -> Optional[Dict[str, Any]]:
+    lam1 = compute_dgac_lambda1(
+        step_in_phase,
+        args.dgac_warmup_steps,
+        args.dgac_ramp_steps,
+        args.dgac_lambda_ponder_max,
+    )
+    one = torch.ones(1, device=device, dtype=torch.float32)
+    ponder_terms: List[torch.Tensor] = []
+    diversity_terms: List[torch.Tensor] = []
+    halt_terms: List[torch.Tensor] = []
+
+    for row, hidden_at_q_end in enumerate(hidden_sequences):
+        if len(hidden_at_q_end) < 2:
+            continue
+
+        ponder = torch.zeros(1, device=device, dtype=torch.float32)
+        div_loss = torch.zeros(1, device=device, dtype=torch.float32)
+        remainder = one.clone()
+        halt_steps = torch.zeros(1, device=device, dtype=torch.float32)
+
+        for idx in range(1, len(hidden_at_q_end)):
+            h_curr = hidden_at_q_end[idx].to(dtype=torch.float32)
+            h_prev = hidden_at_q_end[idx - 1].to(dtype=torch.float32)
+            halt_prob = halt_gate(h_curr, h_prev)
+            ponder = ponder + remainder
+            if idx < len(hidden_at_q_end) - 1:
+                remainder = remainder * (1.0 - halt_prob)
+            div_loss = div_loss + F.relu(F.cosine_similarity(h_curr, h_prev, dim=-1) - args.dgac_tau)
+            with torch.no_grad():
+                halted = (halt_prob > args.halt_threshold) & (halt_steps == 0)
+                halt_steps = torch.where(halted, torch.full_like(halt_steps, float(idx)), halt_steps)
+
+        halt_steps = torch.where(
+            halt_steps == 0,
+            torch.full_like(halt_steps, float(int(n_latents[row].item()))),
+            halt_steps,
+        )
+        ponder_terms.append(ponder.mean())
+        diversity_terms.append(div_loss.mean())
+        halt_terms.append(halt_steps.mean())
+
+    if not diversity_terms:
+        return None
+
+    return {
+        "ponder": torch.stack(ponder_terms).mean(),
+        "diversity": torch.stack(diversity_terms).mean(),
+        "halt_step_mean": torch.stack(halt_terms).mean(),
+        "lambda1": lam1,
+    }
+
+
+def _forward_batched_latent(
     model,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     labels: torch.Tensor,
-    q_len: int,
-    n_latent: int,
+    q_lens: torch.Tensor,
+    n_latents: torch.Tensor,
+    pad_id: torch.Tensor,
     device: torch.device,
     halt_gate: Optional[HaltGate],
     args: argparse.Namespace,
@@ -1569,46 +1647,59 @@ def _forward_single_sample(
     embed_fn = _get_embed_tokens(model)
     lm_head_fn = _get_lm_head(model)
 
-    if n_latent == 0:
-        return _forward_batched_stage0(
-            model=model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            device=device,
-            amp_dtype=amp_dtype,
-        )
-
     with _autocast_ctx(device, amp_dtype):
         all_embeds = embed_fn(input_ids)
+        pad_embed = embed_fn(pad_id.view(1)).squeeze(0)
     patched = all_embeds.clone()
-    hidden_at_q_end: List[torch.Tensor] = []
 
-    for j in range(n_latent):
-        prefix_len = q_len + j
-        prefix_embeds = patched[:, :prefix_len, :]
-        prefix_mask = attention_mask[:, :prefix_len]
+    batch_size = int(input_ids.size(0))
+    hidden_sequences: Optional[List[List[torch.Tensor]]] = (
+        [[] for _ in range(batch_size)] if halt_gate is not None else None
+    )
+
+    max_n_latent = int(n_latents.max().item())
+    for latent_step in range(max_n_latent):
+        active_indices = (n_latents > latent_step).nonzero(as_tuple=False).flatten()
+        if active_indices.numel() == 0:
+            break
+
+        prefix_lens = q_lens[active_indices] + latent_step
+        prefix_embeds, prefix_mask = _build_padded_prefix_batch(
+            patched=patched,
+            active_indices=active_indices,
+            prefix_lens=prefix_lens,
+            pad_embed=pad_embed,
+        )
         with _autocast_ctx(device, amp_dtype):
             outputs = backbone(
                 inputs_embeds=prefix_embeds,
                 attention_mask=prefix_mask,
                 use_cache=False,
             )
-        hidden = _extract_last_hidden_state(outputs, "coconut prefix pass")
-        h_j = hidden[:, -1:, :]
-        if halt_gate is not None:
-            hidden_at_q_end.append(h_j.squeeze(1))
-        inject_pos = q_len + j
-        if inject_pos >= patched.size(1):
-            break
-        patched = torch.cat(
-            [patched[:, :inject_pos, :], h_j, patched[:, inject_pos + 1 :, :]],
-            dim=1,
-        )
+        hidden = _extract_last_hidden_state(outputs, f"coconut prefix pass latent_step={latent_step}")
+        last_positions = prefix_lens - 1
+        h_step = hidden[torch.arange(active_indices.numel(), device=device), last_positions, :]
+
+        inject_pos = q_lens[active_indices] + latent_step
+        valid_inject = inject_pos < patched.size(1)
+        if not bool(torch.all(valid_inject).item()):
+            active_indices = active_indices[valid_inject]
+            inject_pos = inject_pos[valid_inject]
+            h_step = h_step[valid_inject]
+            if active_indices.numel() == 0:
+                continue
+
+        if hidden_sequences is not None:
+            for local_idx, sample_idx in enumerate(active_indices.tolist()):
+                hidden_sequences[sample_idx].append(h_step[local_idx : local_idx + 1])
+
+        patched_next = patched.clone()
+        patched_next[active_indices, inject_pos, :] = h_step.to(dtype=patched_next.dtype)
+        patched = patched_next
 
     with _autocast_ctx(device, amp_dtype):
         outputs = backbone(inputs_embeds=patched, attention_mask=attention_mask, use_cache=False)
-        hidden = _extract_last_hidden_state(outputs, "coconut full forward")
+        hidden = _extract_last_hidden_state(outputs, "coconut batched full forward")
         logits = lm_head_fn(hidden).float()
 
     ce_sum, n_valid = _compute_ce_sum_and_count(logits, labels)
@@ -1623,46 +1714,21 @@ def _forward_single_sample(
         "lambda1": 0.0,
     }
 
-    if halt_gate is None or len(hidden_at_q_end) < 2:
+    if halt_gate is None or hidden_sequences is None:
         return result
 
-    lam1 = compute_dgac_lambda1(
-        step_in_phase,
-        args.dgac_warmup_steps,
-        args.dgac_ramp_steps,
-        args.dgac_lambda_ponder_max,
+    halt_metrics = _compute_batched_halt_metrics(
+        hidden_sequences=hidden_sequences,
+        n_latents=n_latents,
+        halt_gate=halt_gate,
+        device=device,
+        args=args,
+        step_in_phase=step_in_phase,
     )
-    one = torch.ones(1, device=device, dtype=torch.float32)
-    ponder = torch.zeros(1, device=device, dtype=torch.float32)
-    div_loss = torch.zeros(1, device=device, dtype=torch.float32)
-    remainder = one.clone()
-    halt_steps = torch.zeros(1, device=device, dtype=torch.float32)
+    if halt_metrics is None:
+        return result
 
-    for idx in range(1, len(hidden_at_q_end)):
-        h_curr = hidden_at_q_end[idx].to(dtype=torch.float32)
-        h_prev = hidden_at_q_end[idx - 1].to(dtype=torch.float32)
-        halt_prob = halt_gate(h_curr, h_prev)
-        ponder = ponder + remainder
-        if idx < len(hidden_at_q_end) - 1:
-            remainder = remainder * (1.0 - halt_prob)
-        div_loss = div_loss + F.relu(F.cosine_similarity(h_curr, h_prev, dim=-1) - args.dgac_tau)
-        with torch.no_grad():
-            halted = (halt_prob > args.halt_threshold) & (halt_steps == 0)
-            halt_steps = torch.where(halted, torch.full_like(halt_steps, float(idx)), halt_steps)
-
-    halt_steps = torch.where(
-        halt_steps == 0,
-        torch.full_like(halt_steps, float(n_latent)),
-        halt_steps,
-    )
-    result.update(
-        {
-            "ponder": ponder.mean(),
-            "diversity": div_loss.mean(),
-            "halt_step_mean": halt_steps.mean(),
-            "lambda1": lam1,
-        }
-    )
+    result.update(halt_metrics)
     return result
 
 
@@ -1680,7 +1746,7 @@ def coconut_forward(
     labels = batch["labels"].to(device)
     q_lens = batch["q_lens"].to(device)
     n_latents = batch["n_latents"].to(device)
-    batch_size = int(input_ids.size(0))
+    pad_id = batch["pad_id"].to(device)
     amp_dtype = _amp_dtype(device)
 
     all_n_latents_zero = stage_k == 0 or bool(torch.all(n_latents == 0).item())
@@ -1693,71 +1759,38 @@ def coconut_forward(
             device=device,
             amp_dtype=amp_dtype,
         )
-        if result["n_valid"] == 0:
-            zero = torch.zeros((), device=device, requires_grad=True)
-            return zero, {"ce": 0.0}
-        ce = result["ce_sum"] / result["n_valid"]
-        return ce, {"ce": float(ce.item())}
-
-    ce_sum_total = torch.zeros((), device=device, dtype=torch.float32)
-    n_valid_total = 0
-    ponder_terms: List[torch.Tensor] = []
-    diversity_terms: List[torch.Tensor] = []
-    halt_terms: List[torch.Tensor] = []
-
-    for row in range(batch_size):
-        seq_len = int(attention_mask[row].sum().item())
-        if seq_len < 2:
-            continue
-        result = _forward_single_sample(
+    else:
+        result = _forward_batched_latent(
             model=model,
-            input_ids=input_ids[row : row + 1, :seq_len],
-            attention_mask=attention_mask[row : row + 1, :seq_len],
-            labels=labels[row : row + 1, :seq_len],
-            q_len=int(q_lens[row].item()),
-            n_latent=int(n_latents[row].item()),
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            q_lens=q_lens,
+            n_latents=n_latents,
+            pad_id=pad_id,
             device=device,
             halt_gate=halt_gate,
             args=args,
             step_in_phase=step_in_phase,
             amp_dtype=amp_dtype,
         )
-        if result["n_valid"] == 0:
-            continue
-        ce_sum_total = ce_sum_total + result["ce_sum"]
-        n_valid_total += int(result["n_valid"])
-        if result["ponder"] is not None:
-            ponder_terms.append(result["ponder"])
-        if result["diversity"] is not None:
-            diversity_terms.append(result["diversity"])
-        if result["halt_step_mean"] is not None:
-            halt_terms.append(result["halt_step_mean"])
 
-    if n_valid_total == 0:
+    if result["n_valid"] == 0:
         zero = torch.zeros((), device=device, requires_grad=True)
         return zero, {"ce": 0.0}
 
-    ce = ce_sum_total / n_valid_total
+    ce = result["ce_sum"] / result["n_valid"]
     total_loss = ce
     metrics: Dict[str, float] = {"ce": float(ce.item())}
 
-    if halt_gate is not None and diversity_terms:
-        lam1 = compute_dgac_lambda1(
-            step_in_phase,
-            args.dgac_warmup_steps,
-            args.dgac_ramp_steps,
-            args.dgac_lambda_ponder_max,
-        )
-        ponder_mean = torch.stack(ponder_terms).mean() if ponder_terms else torch.zeros((), device=device)
-        diversity_mean = torch.stack(diversity_terms).mean()
-        halt_mean = torch.stack(halt_terms).mean() if halt_terms else torch.zeros((), device=device)
-        total_loss = total_loss + lam1 * ponder_mean + args.dgac_lambda_diversity * diversity_mean
+    if halt_gate is not None and result["diversity"] is not None:
+        total_loss = total_loss + result["lambda1"] * result["ponder"] + args.dgac_lambda_diversity * result["diversity"]
         metrics.update(
             {
-                "ponder": float(ponder_mean.item()),
-                "diversity": float(diversity_mean.item()),
-                "halt_step_mean": float(halt_mean.item()),
-                "lambda1": float(lam1),
+                "ponder": float(result["ponder"].item()),
+                "diversity": float(result["diversity"].item()),
+                "halt_step_mean": float(result["halt_step_mean"].item()),
+                "lambda1": float(result["lambda1"]),
             }
         )
 
