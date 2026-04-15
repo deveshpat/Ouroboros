@@ -5,6 +5,23 @@
 
 ---
 
+## Audit — Code vs Blueprint (2026-04-15)
+
+**Finding 1: Batched latent injection for k≥1 is already implemented.**
+
+Blueprint incorrectly marked `_forward_batched_latent` + `_build_padded_prefix_batch` as PENDING. Audit of `jamba_coconut_finetune.py` confirms both functions are fully implemented and correct:
+
+- `_build_padded_prefix_batch`: takes `active_indices`, computes `max_prefix_len = prefix_lens.max()`, creates `prefix_mask = positions < prefix_lens.unsqueeze(1)`, applies `pad_embed` via `torch.where`. ✅
+- `_forward_batched_latent`: for each `latent_step`, collects `active_indices = (n_latents > latent_step).nonzero()`, computes `prefix_lens = q_lens[active_indices] + latent_step`, runs a **single batched backbone call** on all active samples. ✅
+
+No code changes needed. Blueprint updated to reflect actual state.
+
+**Finding 2: Stage 0 skip — decided NO, 1 epoch sufficient.**
+
+See Blueprint Part 2 for full rationale. Summary: Stage 0 is LoRA domain adaptation + Coconut curriculum anchor, not CoT capability acquisition. Cannot be skipped even for a strong reasoning model. 1 epoch is sufficient (CE 0.517→0.343 over 629 steps; val_acc=0.40 after 12 steps shows fast learning).
+
+---
+
 ## Session 11 — Dual T4 DDP, Full Curriculum Run (2026-04-15) 🟡 IN PROGRESS (resumed)
 **Script:** `jamba_coconut_finetune.py`
 **Command:**
@@ -15,7 +32,7 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
   --output_dir runs/stage3_curriculum
 ```
-**Status:** 🟡 Stage 0/10 — epoch 0 at step 629/2307 when timed out. Checkpoint saved. Auto-resume on next session.
+**Status:** 🟡 Stage 0/10 — epoch 0 at step 629/2307 when timed out. Checkpoint saved. Next session resumes with batch_size=4, stage_0_epochs=1.
 
 **Training metrics (verbatim log — key steps only):**
 ```
@@ -47,13 +64,12 @@ S0E0:  27%|██▏     | 629/2307 [10:40:33<27:54:04, 59.86s/it, ce=0.361, gn=
 ================================================================
 ```
 
-**Analysis:** CE loss healthy — trending from 0.517 → 0.343 over 629 steps with no gradient explosions (gn stable at 0.11–0.30). However, at 60s/step, Stage 0 at 3 epochs = ~115h total. Critical throughput decision required before next session (see Blueprint Part 0.1 action #5).
+**Analysis:** CE loss healthy — trending from 0.517 → 0.343 over 629 steps. At 60s/step, Stage 0 at 3 epochs = ~115h. Decision: reduce to 1 epoch + batch_size=4. Next command (see Blueprint Part 0.1 action #5).
 
 ---
 
 ## Session 10 — Dual T4 DDP, Profile/Smoke Test (2026-04-15) ✅ COMPLETE
 **Script:** `jamba_coconut_finetune.py` (with Phase 2.5/2.6 swap + batched stage-0 forward)
-**Output dir:** `runs/profile_dual_t4`
 **Status:** ✅ Stage 0/0 COMPLETE — 12 steps, val_acc=0.4000
 
 **Bootstrap confirmation (from screenshot — verbatim):**
@@ -62,13 +78,7 @@ S0E0:  27%|██▏     | 629/2307 [10:40:33<27:54:04, 59.86s/it, ce=0.361, gn=
 [bootstrap] Kernel export shim: mamba_ssm.selective_state_update ✓
 [bootstrap] Mamba fast path: ACTIVE ✓
 ```
-Phase 2.5/2.6 swap **confirmed** — generation shim now runs before kernel export patch. No WARNING this session.
 
-**Training (from screenshot):**
-```
-Stage 0/0  (CoT warmup)
-Epochs: 1  Steps/epoch: 12  Total: 12
-```
 Step times: 23–37s/it (average ~30s/step) on Dual T4, batched stage-0 forward, 200 samples.
 
 **Validation (verbatim):**
@@ -93,21 +103,12 @@ A: ...3x = 21 - 6 = 15. Then divide by 3: x = 15/3 = 5...  [k_actual=0 uwr=0.623
 Mean UWR: 0.538
 ```
 
-All 5 generations factually correct. val_acc=0.4000 after only 12 steps indicates fast learning.
-
-**Stage completion (verbatim):**
-```
-[stage] Stage 0 done. Best acc=0.4000. Loading best ckpt before advancing.
-[resume] step=12 epoch=0 stage_k=0 val_acc=0.4
-Curriculum complete. Stages: [0]  Global steps: 12
-```
-
-**Key finding:** Batched stage-0 forward gives ~30s/step on Dual T4 with 200 samples (vs 113s/step single T4 without fix). Full dataset (36,906 samples) shows 60s/step — confirms dataset I/O contributes ~30s overhead per step at this scale.
+All 5 generations factually correct. val_acc=0.4000 after only 12 steps — fast LoRA adaptation confirmed.
 
 ---
 
 ## Session 9 — sm75 (Kaggle Single T4, 2026-04-14) ✅ FIRST SUCCESSFUL SMOKE TEST
-**Script:** `jamba_coconut_finetune.py` (all Session 8 fixes applied)
+**Script:** `jamba_coconut_finetune.py`
 **Status:** ✅ Stage 0 COMPLETE — Stage 1 timeout (as expected at 1.5h budget)
 
 **Bootstrap output (verbatim):**
@@ -120,35 +121,14 @@ Curriculum complete. Stages: [0]  Global steps: 12
 [bootstrap] Shim: patched 10 removed transformers.generation names ✓
 [bootstrap] Mamba fast path: ACTIVE ✓ — ~5s/step expected.
 ```
-Note: WARNING present here (Phase 2.5 before 2.6). Fixed in Session 10.
-
-**Training output (verbatim):**
-```
-trainable params: 26,851,328 || all params: 3,056,191,360 || trainable%: 0.8786
-d_model=2560  layers=28
-
-Stage 0/2  (CoT warmup)
-Epochs: 1  Steps/epoch: 12  Total: 12
-
-S0E0: 100%|████████████████| 12/12 [22:06<00:00, 110.54s/it, ce=0.615, gn=0.224]
-  [val] s=0 ep=0 val_ce=0.5430 val_acc=0.2000
-  [best] stage=0 new best acc=0.2000
-```
 
 **Step time observed: ~113s/step** (single T4, no batching fix, Stage 0).
-
-**Stage 1 timeout (expected):**
-```
-  [timeout] 1.40h elapsed - 6.0 min remaining (< 20 min buffer).
-  [timeout] saving emergency checkpoint at step 12 ...
-  Session budget exhausted - checkpoint saved.
-```
 
 ---
 
 ## Sessions 4–8 — sm75 (Kaggle T4, 2026-04-14)
 - Session 8: `causal_conv1d_fn` weight shape `(dim, 1, width)` → fixed to `(dim, width)` ✅
-- Session 7: `selective_state_update` wrong import path → fixed to `mamba_ssm.ops.triton.selective_state_update` ✅
+- Session 7: `selective_state_update` wrong import path → fixed ✅
 - Session 6: single-name generation shim insufficient → comprehensive 10-alias shim ✅
 - Session 5: `GreedySearchDecoderOnlyOutput` missing → led to single-name shim (insufficient)
 - Session 4: mamba_ssm PyPI sdist is 35kB stub → fixed by `git+https://github.com/state-spaces/mamba.git@v1.2.2`
