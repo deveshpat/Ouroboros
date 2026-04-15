@@ -10,14 +10,14 @@
 ### What this project is
 Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Jamba Reasoning 3B). The Mamba SSM recurrent state acts as compressed scratch-memory across K latent thought passes, bypassing token generation during reasoning. Core mechanism from Meta's Coconut (arXiv:2412.06769), extended with DGAC (Diversity-Gated Adaptive Coconut) — our novel anti-collapse halt gate.
 
-### Strategic Status (Updated 2026-04-14)
+### Strategic Status (Updated 2026-04-15)
 
 | Stage | Name | Status |
 |---|---|---|
 | 0 | Architecture & Viability (nano) | ✅ COMPLETE |
 | 1 | Pre-training (nano) | ✅ Pipeline test only; retired |
 | 2 | SFT (nano) | 🔴 RETIRED |
-| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 SMOKE TEST PASSED — blocked on throughput (113s/step → must batch before full run) |
+| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 ACTIVE — Stage 0 epoch 0 at step 629/2307. Resume ready. Blocked on throughput (~60s/step on Dual T4; ~115h for stage 0 alone). |
 | 4 | GRPO on Jamba Reasoning 3B | ⬜ NOT STARTED |
 | 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
 
@@ -32,25 +32,20 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 ### GPU Arch / Hub Wheel Status
 | Arch | causal_conv1d | mamba_ssm |
 |---|---|---|
-| sm75 (T4) | ✅ on Hub — confirmed valid (Session 9) | ✅ on Hub — confirmed valid (Session 9) |
+| sm75 (T4) | ✅ on Hub | ✅ on Hub |
 | sm100 (B100) | ✅ on Hub | ❌ not yet built |
 
 ---
 
 ### Part 0.1 — Immediate Next Actions (ordered)
 
-1. **Fix Phase 2.5/2.6 ordering in `_bootstrap()`** — trivial one-liner swap.
-   Currently Phase 2.5 (`_patch_kernel_top_level_exports`) runs before Phase 2.6 (generation name shim), causing a noisy but harmless WARNING every session because `mamba_ssm` import inside 2.5 hits the unpatched `transformers.generation` names. Move 2.6 before 2.5.
+1. **[DONE] Phase 2.5/2.6 ordering swap** — Confirmed fixed. Screenshot shows correct order: generation shim runs before kernel export patch. No more WARNING per session.
 
-2. **Implement batched forward for Stage 0 (critical throughput fix).**
-   Current bottleneck: `coconut_forward` iterates `for row in range(batch_size)` calling `_forward_single_sample(batch=1)` per row. For `n_latent=0` (Stage 0), no per-sample injection is needed — the full micro-batch can be a single fused backbone call. At `batch=2, accum=8` on a single T4, this means 16 serial `batch=1` backbone calls instead of 8 `batch=2` calls.
-   - Modify `coconut_forward` to detect `stage_k==0` (or `all n_latents==0`) and route to a fully batched forward path
-   - Expected improvement: ~4–8× step time reduction for Stage 0 (dominant stage by epoch count)
-   - Measure actual step time before committing to the full run
+2. **[DONE] Batched forward for Stage 0** — Confirmed working. Profile run (Dual T4, 200 samples) shows ~30s/step vs 113s/step before. Full run shows ~60s/step (2× overhead from full dataset I/O).
 
-3. **Profile Dual T4 throughput** (after fix #2) with a 500-sample smoke test using `torchrun --nproc_per_node=2`. Confirm step time is ≤30s/step on Dual T4 before launching the full curriculum.
+3. **[DONE] Profile Dual T4 throughput** — Profile run completed: `val_acc=0.4000` after 12 steps, all generations correct, Mean UWR=0.538. Batching fix is valid.
 
-4. **Only then: K=0→K_max curriculum on Kaggle Dual T4:**
+4. **[IN PROGRESS] Resume Stage 0 full curriculum run:**
    ```bash
    torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
      --data_dir data/coconut_v1 --use_4bit \
@@ -58,10 +53,32 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
      --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
      --output_dir runs/stage3_curriculum
    ```
+   Auto-resumes from `runs/stage3_curriculum/stage_0/checkpoint-0000629`.
+   Stage 0 epoch 0 at step 629/2307. CE trending: 0.517 → 0.343 over 629 steps. ✅ Healthy.
 
-5. **If K=4 gate passes**: claim TRC, run K=10 + DGAC Phase 3.4 on A100.
+5. **[CRITICAL — DECIDE BEFORE NEXT SESSION] Resolve Stage 0 throughput crisis:**
+   At 60s/step on Dual T4:
+   - Stage 0 (3 epochs, 6921 steps) ≈ 115 hours ≈ 10 Kaggle sessions
+   - Stages 1–10 will be **slower** (per-sample latent loops, no batching)
+   - Total curriculum ≈ hundreds of hours on T4
 
-6. **If a sm100 session is allocated**: run `build_wheels_kaggle.py` to cache the mamba_ssm sm100 wheel.
+   **Three options — pick one:**
+
+   | Option | Action | Tradeoff |
+   |---|---|---|
+   | A — Reduce epochs | `--stage_0_epochs 1 --epochs_per_stage 1` | Faster (38h for stage 0); may underfit |
+   | B — Larger batch | `--batch_size 4` on Dual T4 (QLoRA 4-bit should fit in 2×16GB) | ~2× throughput; test OOM first |
+   | C — Claim TRC now | Move stage 0 to A100 80GB; skip remaining T4 sessions | Cleanest; requires K=4 gate (not yet reached) |
+
+   **Recommended path:** Run option B first (1 session to test `--batch_size 4` OOM behaviour), then combine A+B for remaining sessions, then claim TRC at K=4.
+
+6. **Batch latent injection for stages k>0** (secondary optimization — implement before advancing past stage 0):
+   - Pad `q_lens` across samples in micro-batch; run single fused backbone call per latent step
+   - Expected 2–4× speedup for stages k≥1 which currently iterate per-sample
+
+7. **After K=4 gate passes**: claim TRC, run K=10 + DGAC Phase 3.4 on A100.
+
+8. **If a sm100 session is allocated**: run `build_wheels_kaggle.py` to cache mamba_ssm sm100 wheel.
 
 ---
 
@@ -87,10 +104,12 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | `GreedySearchDecoderOnlyOutput` + 9 other generation classes removed in `transformers>=4.44` | Comprehensive 10-alias shim in Phase 2.6 ✅ |
 | Verifier called `causal_conv1d_fn` with wrong weight shape `(dim, 1, width)` | Fixed to `(dim, width)` ✅ |
 | Verifier used wrong import path for `selective_state_update` | Fixed to `mamba_ssm.ops.triton.selective_state_update` ✅ |
-| **Phase 2.5 runs before Phase 2.6 → noisy WARNING every session** | **Fix: swap Phase 2.5/2.6 ordering in `_bootstrap()`. Cosmetic only — Phase 3 passes regardless.** |
-| **`coconut_forward` iterates per-sample at batch=1 even when `n_latent=0`** | **Fix: batched forward path for stage 0. Critical — 113s/step observed; full run infeasible without this.** |
+| **Phase 2.5 ran before Phase 2.6 → noisy WARNING every session** | **✅ FIXED — phases swapped; confirmed in Session 10 screenshot** |
+| **`coconut_forward` iterates per-sample at batch=1 even when `n_latent=0`** | **✅ FIXED — batched stage-0 forward path implemented; ~30s/step on Dual T4 profile run** |
+| **Stage 0 full-dataset run at 60s/step → 115h total** | **🔴 OPEN — must decide epoch reduction or batch_size increase before next session** |
+| **Stages k≥1 have no batching → will be slower than stage 0** | **🔴 OPEN — batch latent injection (pad q_lens) needed before advancing past stage 0** |
 
-**One item still requires empirical verification during profiling run:**
+**One item still requires empirical verification during training run:**
 - `inputs_embeds` → `last_hidden_state` path for Jamba Reasoning 3B **with fast Mamba kernels active** at stage k≥1
 
 ---
@@ -122,13 +141,15 @@ Context     : 256K tokens
 | Dataset Hub config | `coconut-v1` under `WeirdRunner/Ouroboros` |
 | `attn_implementation` | Runtime detection: flash_attention_2 if available, else eager |
 | `use_mamba_kernels` | Runtime probe; only False on ImportError |
-| mamba-ssm version | **1.2.2 from GitHub source** (`git+https://github.com/state-spaces/mamba.git@v1.2.2`) |
-| mamba install strategy | `_bootstrap()` downloads pre-built arch wheels from Hub; falls back to git+https source build; uploads result to Hub; shim backfills ALL removed transformers generation output class names in one pass |
+| mamba-ssm version | **1.2.2 from GitHub source** |
+| mamba install strategy | `_bootstrap()` downloads pre-built arch wheels from Hub; falls back to git+https |
 | `--max_seq_len` | 1024 |
 | `--max_grad_norm` | 0.3 for k≥2 stages |
 | Session timeout | `--session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20` |
 | val_batch_size | 1 |
-| Stage 0 forward pass | **PENDING DECISION** — implement batched forward for n_latent=0; profile before committing to full run batch_size |
+| Stage 0 forward pass | ✅ Batched — single fused backbone call per micro-batch when `n_latent=0` |
+| Stage k≥1 forward pass | **PENDING** — per-sample loop; batched latent injection needed |
+| epochs_per_stage | **PENDING DECISION** — currently 3; may reduce to 1 based on throughput vs convergence |
 
 ---
 
@@ -138,8 +159,9 @@ Context     : 256K tokens
 |---|---|
 | Does `inputs_embeds` → `last_hidden_state` work with Jamba + fast Mamba kernels active? | 🟡 VERIFY at stage k≥1 |
 | DGAC Phase 3.4: does halt_step distribute across K≥2 after training? | 🔴 OPEN — primary research validation |
-| What is actual Dual T4 step time after batching fix? Is ≤30s/step achievable? | 🔴 OPEN — must profile before full run |
-| Can stage k>0 latent injection be batched (pad q_lens)? What speedup? | 🔴 OPEN — secondary optimization |
+| Can stage k>0 latent injection be batched (pad q_lens)? What speedup? | 🔴 OPEN — implement before advancing past stage 0 |
+| Will `--batch_size 4` OOM on Dual T4 with QLoRA 4-bit? | 🔴 OPEN — test in one session before committing |
+| Is 1 epoch per stage sufficient for convergence? (val_acc=0.4 after 12 steps suggests yes) | 🟡 MONITOR — watch val_acc after stage 0 epoch 0 completes |
 
 ---
 
@@ -151,12 +173,12 @@ Context     : 256K tokens
 | `viability_gate.py` | 0 | ✅ COMPLETE | |
 | `training_utils.py` | All nano | ✅ COMPLETE | Not used in Jamba scripts |
 | `pretrain.py` | 1 | ✅ COMPLETE | Hub: ckpt-0021000 |
-| `prepare_sft_dataset.py` | 2 | ✅ DONE | sft-mix-v1 cached; not reused for Coconut |
+| `prepare_sft_dataset.py` | 2 | ✅ DONE | sft-mix-v1 cached; not reused |
 | `train_sft.py` | 2 | ✅ PATCHED | Retired |
-| `prepare_coconut_dataset.py` | 3 | ✅ DONE | coconut-v1 on Hub confirmed (36906/1940 samples) |
-| `jamba_coconut_finetune.py` | 3 | 🟡 NEEDS 2 PATCHES | (1) swap Phase 2.5/2.6 ordering; (2) batched forward for stage 0 |
-| `build_wheels_kaggle.py` | 3 | ✅ DONE | git+https fix applied; sm75 + sm100 causal_conv1d on Hub; sm75 mamba_ssm on Hub |
-| `kaggle-utils.ipynb` | 3 | ✅ UP TO DATE | Smoke test cell confirmed working (Session 9) |
+| `prepare_coconut_dataset.py` | 3 | ✅ DONE | coconut-v1 on Hub confirmed |
+| `jamba_coconut_finetune.py` | 3 | 🟡 ACTIVE | Phase 2.5/2.6 swap ✅. Batched stage-0 ✅. Batched stage k≥1 🔴 PENDING. |
+| `build_wheels_kaggle.py` | 3 | ✅ DONE | sm75 + sm100 causal_conv1d on Hub; sm75 mamba_ssm on Hub |
+| `kaggle-utils.ipynb` | 3 | ✅ UP TO DATE | Profile run + full curriculum run launched |
 
 ---
 
@@ -196,16 +218,18 @@ output_dir/
     halt_gate.pt           ← HaltGate state dict (Phase 3.4 only)
 ```
 
+Current live checkpoint: `runs/stage3_curriculum/stage_0/checkpoint-0000629`
+
 ---
 
 ## Part 8 — Compute Plan
 
 | Phase | Platform | Estimate |
 |---|---|---|
-| Throughput profiling (500-sample, batching fix) | Kaggle Dual T4 | ~30 min |
-| Stage 0→10 curriculum | Kaggle Dual T4, QLoRA + DDP | TBD — re-estimate after profiling |
-| Phase 3.4 (DGAC) | TRC A100 80GB | ~6-8h |
-| Phase 4 (GRPO) | TRC A100 80GB | ~8-12h |
+| Stage 0 (full, 3 epochs) | Kaggle Dual T4 | ~115h at 60s/step ≈ 10 sessions. **Reduce to 1 epoch (~38h, 3 sessions) if val_acc is adequate after epoch 0.** |
+| Stages 1–10 (after batching fix for k≥1) | Kaggle Dual T4 | TBD — re-estimate after batched latent injection implemented |
+| Phase 3.4 (DGAC) | TRC A100 80GB | ~6–8h |
+| Phase 4 (GRPO) | TRC A100 80GB | ~8–12h |
 
 ---
 
@@ -219,10 +243,12 @@ output_dir/
 | gn=36.9 at k=2 | `--max_grad_norm 0.3` |
 | `use_mamba_kernels=False` hardcoded → 100× slow | Runtime probe |
 | mamba-ssm 2.x broke fast path | Pinned to 1.2.2 |
-| Kaggle GPU arch unpredictable | `TORCH_CUDA_ARCH_LIST` auto-injected from `torch.cuda.get_device_capability()` |
+| Kaggle GPU arch unpredictable | `TORCH_CUDA_ARCH_LIST` auto-injected |
 | bitsandbytes not upgraded | `bitsandbytes>=0.46.1` in bootstrap |
 | mamba-ssm 1.2.2 PyPI sdist is a 35kB stub | Use `git+https://github.com/state-spaces/mamba.git@v1.2.2`. ~20h GPU quota lost. |
 | Single-name generation shim → one removed class fixed per session | Comprehensive 10-alias shim. Never patch one name at a time. |
-| Verifier weight shape wrong → false negative on valid wheels | Always verify kernel call signatures against public API docs before writing test inputs |
-| **Per-sample loop at batch=1 even for stage 0 → 113s/step, full run infeasible** | **Implement batched forward path for `n_latent=0`; profile on Dual T4 before committing to full run** |
-| **"~5s/step" estimate was for small/nano model** | **Re-estimate wall-clock time empirically on target hardware before planning session budgets** |
+| Verifier weight shape wrong → false negative on valid wheels | Always verify kernel call signatures before writing test inputs |
+| **Per-sample loop at batch=1 for stage 0 → 113s/step, full run infeasible** | **Batched forward path for `n_latent=0` ✅ fixed; ~30s/step on Dual T4** |
+| **"~5s/step" estimate was for nano model** | **Re-estimate wall-clock empirically on target hardware before planning budgets** |
+| **Profile run (200 samples) shows 30s/step; full run (36906) shows 60s/step** | **Dataset I/O overhead is real. Always profile at full scale before planning session counts.** |
+| **Stage 0 alone will take ~115h at default 3 epochs_per_stage** | **Decide epoch reduction before next session. val_acc=0.4 after 12 steps suggests 1 epoch may suffice.** |
