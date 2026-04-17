@@ -1864,7 +1864,7 @@ def evaluate_stage(
         ce_numer += float(loss.item()) * valid_tokens
         ce_denom += valid_tokens
 
-    for sample in val_samples[:200]:
+    for sample in val_samples[:50]:
         built = build_sample_at_stage(tokenizer, sample, stage_k, lat_token_id, args.max_seq_len)
         if built is None:
             continue
@@ -2764,6 +2764,30 @@ def main() -> None:
                     break
 
                 if is_main:
+                  # Skip val/gen if session budget is nearly exhausted
+                  if check_timeout():
+                    tqdm.write(f"  [timeout] Skipping val/gen at epoch {epoch} — insufficient time.") 
+                    barrier()
+                    break
+    
+                   # Pre-val checkpoint: preserves epoch training even if val is killed
+
+                   save_checkpoint(
+                       output_dir=output_dir,
+                       step=global_step,
+                       epoch=epoch,
+                       step_in_epoch=steps_per_epoch - 1,
+                       step_in_phase=step_in_phase,
+                       stage_k=stage_k,
+                       model=model,
+                       halt_gate=halt_gate,
+                       optimizer=optimizer,
+                       scheduler=scheduler,
+                       args=args,
+                       val_ce=None,
+                       val_acc=None,
+                    )
+    
                     val_ce, val_acc = evaluate_stage(
                         model=model,
                         val_samples=val_samples,
@@ -2832,7 +2856,8 @@ def main() -> None:
                 break
 
             if is_main and args.gen_every_stage:
-                run_generation_callback(
+               if not check_timeout():
+                  run_generation_callback(
                     model=model,
                     tokenizer=tokenizer,
                     halt_gate=halt_gate if args.use_halt_gate else None,
@@ -2841,7 +2866,9 @@ def main() -> None:
                     args=args,
                     step=global_step,
                     wandb_run=wandb_run,
-                )
+                  )
+               else:
+                  tqdm.write(f"  [timeout] Skipping gen callback — insufficient time.")
 
             barrier()
 
