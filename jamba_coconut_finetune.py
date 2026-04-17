@@ -79,6 +79,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", str(4 * 3600))  # match init_process_group
+os.environ.setdefault("NCCL_TIMEOUT", str(4 * 3600))
 
 
 # ── Hub wheel config ──────────────────────────────────────────────────────────
@@ -1079,6 +1081,16 @@ def parse_args() -> argparse.Namespace:
     # Session timeout (MANDATORY for Kaggle)
     parser.add_argument("--session_timeout_hours", type=float, default=11.0)
     parser.add_argument("--graceful_exit_buffer_minutes", type=float, default=20.0)
+    parser.add_argument(
+        "--val_skip_buffer_minutes",
+        type=float,
+        default=60.0,
+        help=(
+            "Skip val+gen if remaining session time is below this threshold (minutes). "
+            "With DDP val on Dual T4 (val_batch_size=2, 50 acc samples), val takes ~37min. "
+            "Default 60min provides a 23min safety margin."
+        ),
+    )
 
     # Hub checkpoint sync
     parser.add_argument("--push_to_hub", action="store_true",
@@ -1826,23 +1838,35 @@ def evaluate_stage(
     args: argparse.Namespace,
     halt_gate: Optional[HaltGate] = None,
 ) -> Tuple[float, float]:
+    """
+    Runs on ALL DDP ranks. Each rank processes its interleaved shard of val_samples,
+    then all-reduces CE and accuracy counts. Eliminates idle-rank NCCL hangs and
+    halves wall-clock val time on Dual T4.
+    """
     _maybe_empty_cuda_cache()
     model.eval()
     if halt_gate is not None:
         halt_gate.eval()
+
+    rank = _rank()
+    world_size = _world_size()
     pad_id = tokenizer.pad_token_id or 0
-    ce_numer = 0.0
-    ce_denom = 0
-    n_correct = 0
-    n_total = 0
     embed_fn = _get_embed_tokens(model)
     lm_head_fn = _get_lm_head(model)
     backbone = _get_backbone(model)
     amp_dtype = _amp_dtype(device)
     batch_size = max(int(args.val_batch_size), 1)
 
-    for start in range(0, len(val_samples), batch_size):
-        batch_raw = val_samples[start : start + batch_size]
+    # ── CE loop — interleaved sharding across ranks ───────────────────────────
+    # Interleaved (stride=world_size) is slightly better than contiguous slicing
+    # because it naturally load-balances variable-length sequences.
+    local_val_samples = val_samples[rank::world_size]
+
+    ce_numer = 0.0
+    ce_denom = 0
+
+    for start in range(0, len(local_val_samples), batch_size):
+        batch_raw = local_val_samples[start : start + batch_size]
         built = [
             build_sample_at_stage(tokenizer, sample, stage_k, lat_token_id, args.max_seq_len)
             for sample in batch_raw
@@ -1864,7 +1888,21 @@ def evaluate_stage(
         ce_numer += float(loss.item()) * valid_tokens
         ce_denom += valid_tokens
 
-    for sample in val_samples[:50]:
+    # All-reduce CE across ranks
+    if _distributed_is_initialized():
+        ce_tensor = torch.tensor([ce_numer, float(ce_denom)], device=device, dtype=torch.float64)
+        torch.distributed.all_reduce(ce_tensor, op=torch.distributed.ReduceOp.SUM)
+        ce_numer = ce_tensor[0].item()
+        ce_denom = int(ce_tensor[1].item())
+
+    # ── Accuracy loop — interleaved shard of first 50 val samples ─────────────
+    acc_samples = val_samples[:50]
+    local_acc_samples = acc_samples[rank::world_size]
+
+    n_correct = 0
+    n_total = 0
+
+    for sample in local_acc_samples:
         built = build_sample_at_stage(tokenizer, sample, stage_k, lat_token_id, args.max_seq_len)
         if built is None:
             continue
@@ -1924,9 +1962,17 @@ def evaluate_stage(
             n_correct += 1
         n_total += 1
 
+    # All-reduce accuracy across ranks
+    if _distributed_is_initialized():
+        acc_tensor = torch.tensor([n_correct, n_total], device=device, dtype=torch.long)
+        torch.distributed.all_reduce(acc_tensor, op=torch.distributed.ReduceOp.SUM)
+        n_correct = int(acc_tensor[0].item())
+        n_total = int(acc_tensor[1].item())
+
     model.train()
     if halt_gate is not None:
         halt_gate.train()
+
     return ce_numer / max(ce_denom, 1), n_correct / max(n_total, 1)
 
 
@@ -2440,7 +2486,7 @@ def main() -> None:
         torch.distributed.init_process_group(
             backend=backend,
             init_method="env://",
-            timeout=timedelta(minutes=60),
+            timeout=timedelta(hours=4),  # all-reduces at end of DDP val still need headroom
         )
 
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
@@ -2452,6 +2498,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    session_start = time.perf_counter()  # authoritative start time for val_skip_buffer check
 
     hf_token = _resolve_hf_token(getattr(args, "hf_token", None))
     args._resolved_hf_token = hf_token
@@ -2577,6 +2624,7 @@ def main() -> None:
     local_bs = args.batch_size // world_size if distributed else args.batch_size
     check_timeout = make_timeout_checker(args, rank)
     timeout_triggered = False
+    val_budget_triggered = False
 
     try:
         for stage_k in stages:
@@ -2630,6 +2678,8 @@ def main() -> None:
                 print("=" * 64)
 
             timeout_triggered = False
+            stage_val_budget_triggered = False
+            val_budget_exhausted = False
             for epoch in range(stage_start_epoch, n_epochs):
                 rng = random.Random(args.seed + stage_k * 100_003 + epoch)
                 perm = list(range(len(train_samples)))
@@ -2639,6 +2689,7 @@ def main() -> None:
                 if halt_gate is not None:
                     halt_gate.train()
                 optimizer.zero_grad(set_to_none=True)
+                val_budget_exhausted = False
 
                 start_step      = stage_start_step_in_epoch + 1 if epoch == stage_start_epoch else 0
                 remaining_steps = max(steps_per_epoch - start_step, 0)
@@ -2763,15 +2814,42 @@ def main() -> None:
                 if timeout_triggered:
                     break
 
+                # ── Val skip check (rank 0 decides; broadcast result) ─────────
                 if is_main:
-                    # Skip val/gen if session budget is nearly exhausted
-                    if check_timeout():
-                       tqdm.write(f"  [timeout] Skipping val/gen at epoch {epoch} — insufficient time.") 
-                       barrier()
-                       break
-    
-                    # Pre-val checkpoint: preserves epoch training even if val is killed
+                    _elapsed = time.perf_counter() - session_start
+                    _remaining_min = (args.session_timeout_hours * 3600 - _elapsed) / 60.0
+                    val_budget_exhausted = check_timeout() or (_remaining_min < args.val_skip_buffer_minutes)
+                    if val_budget_exhausted:
+                        tqdm.write(
+                            f"  [timeout] Skipping val/gen at epoch {epoch} — "
+                            f"{_remaining_min:.0f}min remaining "
+                            f"(< {args.val_skip_buffer_minutes:.0f}min val budget)."
+                        )
+                        save_checkpoint(
+                            output_dir=output_dir,
+                            step=global_step,
+                            epoch=epoch,
+                            step_in_epoch=steps_per_epoch - 1,
+                            step_in_phase=step_in_phase,
+                            stage_k=stage_k,
+                            model=model,
+                            halt_gate=halt_gate,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            args=args,
+                            val_ce=None,
+                            val_acc=None,
+                        )
 
+                # Broadcast skip decision so all ranks agree
+                val_budget_exhausted = broadcast_bool(val_budget_exhausted, device)
+                if val_budget_exhausted:
+                    stage_val_budget_triggered = True
+                    barrier()
+                    break
+
+                # ── Pre-val checkpoint (rank 0 only) ─────────────────────────
+                if is_main:
                     save_checkpoint(
                         output_dir=output_dir,
                         step=global_step,
@@ -2787,17 +2865,21 @@ def main() -> None:
                         val_ce=None,
                         val_acc=None,
                     )
-    
-                    val_ce, val_acc = evaluate_stage(
-                        model=model,
-                        val_samples=val_samples,
-                        tokenizer=tokenizer,
-                        lat_token_id=lat_token_id,
-                        stage_k=stage_k,
-                        device=device,
-                        args=args,
-                        halt_gate=halt_gate if args.use_halt_gate else None,
-                    )
+
+                # ── DDP val — all ranks participate ──────────────────────────
+                val_ce, val_acc = evaluate_stage(
+                    model=model,
+                    val_samples=val_samples,
+                    tokenizer=tokenizer,
+                    lat_token_id=lat_token_id,
+                    stage_k=stage_k,
+                    device=device,
+                    args=args,
+                    halt_gate=halt_gate if args.use_halt_gate else None,
+                )
+
+                # ── Post-val logging and checkpointing (rank 0 only) ─────────
+                if is_main:
                     tqdm.write(
                         f"  [val] s={stage_k} ep={epoch} "
                         f"val_ce={val_ce:.4f} val_acc={val_acc:.4f}"
@@ -2852,11 +2934,12 @@ def main() -> None:
 
                 barrier()
 
-            if timeout_triggered:
+            if timeout_triggered or stage_val_budget_triggered:
+                val_budget_triggered = val_budget_triggered or stage_val_budget_triggered
                 break
 
             if is_main and args.gen_every_stage:
-               if not check_timeout():
+               if not (check_timeout() or val_budget_exhausted):
                   run_generation_callback(
                     model=model,
                     tokenizer=tokenizer,
@@ -2894,8 +2977,14 @@ def main() -> None:
 
         if is_main:
             print("\n" + "=" * 64)
-            if timeout_triggered:
-                print("  [timeout] Session budget exhausted - checkpoint saved.")
+            if timeout_triggered or val_budget_triggered:
+                if val_budget_triggered and not timeout_triggered:
+                    print(
+                        "  [timeout] Remaining session time fell below "
+                        f"--val_skip_buffer_minutes ({args.val_skip_buffer_minutes:.0f} min) - checkpoint saved."
+                    )
+                else:
+                    print("  [timeout] Session budget exhausted - checkpoint saved.")
                 print("  Re-run the same command with the same --output_dir to auto-resume.")
             else:
                 print(f"  Curriculum complete. Stages: {stages}  Global steps: {global_step}")
