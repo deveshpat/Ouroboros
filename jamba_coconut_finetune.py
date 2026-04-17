@@ -2764,28 +2764,28 @@ def main() -> None:
                     break
 
                 if is_main:
-                  # Skip val/gen if session budget is nearly exhausted
-                  if check_timeout():
-                    tqdm.write(f"  [timeout] Skipping val/gen at epoch {epoch} — insufficient time.") 
-                    barrier()
-                    break
+                    # Skip val/gen if session budget is nearly exhausted
+                    if check_timeout():
+                       tqdm.write(f"  [timeout] Skipping val/gen at epoch {epoch} — insufficient time.") 
+                       barrier()
+                       break
     
                    # Pre-val checkpoint: preserves epoch training even if val is killed
 
                    save_checkpoint(
-                       output_dir=output_dir,
-                       step=global_step,
-                       epoch=epoch,
-                       step_in_epoch=steps_per_epoch - 1,
-                       step_in_phase=step_in_phase,
-                       stage_k=stage_k,
-                       model=model,
-                       halt_gate=halt_gate,
-                       optimizer=optimizer,
-                       scheduler=scheduler,
-                       args=args,
-                       val_ce=None,
-                       val_acc=None,
+                        output_dir=output_dir,
+                        step=global_step,
+                        epoch=epoch,
+                        step_in_epoch=steps_per_epoch - 1,
+                        step_in_phase=step_in_phase,
+                        stage_k=stage_k,
+                        model=model,
+                        halt_gate=halt_gate,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        args=args,
+                        val_ce=None,
+                        val_acc=None,
                     )
     
                     val_ce, val_acc = evaluate_stage(
