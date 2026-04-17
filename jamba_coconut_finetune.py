@@ -2770,9 +2770,9 @@ def main() -> None:
                        barrier()
                        break
     
-                   # Pre-val checkpoint: preserves epoch training even if val is killed
+                    # Pre-val checkpoint: preserves epoch training even if val is killed
 
-                   save_checkpoint(
+                    save_checkpoint(
                         output_dir=output_dir,
                         step=global_step,
                         epoch=epoch,
