@@ -102,29 +102,6 @@ The `barrier()` call is critical — rank 1 must not attempt to read a checkpoin
 
 ---
 
-## Change 3 — Update `kaggle-utils.ipynb` Cell 5 command
-
-Replace the current Cell 5 torchrun command with:
-
-```bash
-!torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
-  --data_dir data/coconut_v1 --use_4bit \
-  --stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 \
-  --batch_size 4 --grad_accum 8 \
-  --val_batch_size 2 \
-  --val_skip_buffer_minutes 60 \
-  --no-gen_every_stage \
-  --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
-  --push_to_hub \
-  --output_dir runs/stage3_curriculum
-```
-
-Key changes vs. previous command:
-- Added `--push_to_hub` (was missing; caused silent no-upload)
-- Added `--no-gen_every_stage` (make explicit; gen ran unintentionally in sessions 13/14)
-
----
-
 ## Verification checklist (run at next session start)
 
 ```
