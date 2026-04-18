@@ -2,6 +2,7 @@
 
 > **Thread-resume header. Read Part 0 first in any new session.**
 > **DRY Guidelines:** Session details live in `terminal_log.md`. Blueprint holds decisions, architecture, status, and next actions only.
+> **Source of truth:** If docs and `.py`/`.ipynb` files ever disagree, the Python/notebook file takes precedence. Update docs (next steps, resolved decisions, hard lessons) to reflect reality.
 
 ---
 
@@ -17,13 +18,13 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | 0 | Architecture & Viability (nano) | ✅ COMPLETE |
 | 1 | Pre-training (nano) | ✅ Pipeline test only; retired |
 | 2 | SFT (nano) | 🔴 RETIRED |
-| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 ACTIVE — Stage 0 val COMPLETE (ce=0.4041, acc=0.0222). Stage 1 IN PROGRESS: ~143/1154 steps, ce=0.41, step_time=~162s/step. **Perf patch applied — next session will confirm FP16 speedup.** |
+| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 ACTIVE — Stage 0 val COMPLETE (ce=0.4041, acc=0.0222). Stage 1 IN PROGRESS: step=1338 saved, ~184/1154 steps done. **FP16 patch confirmed: ~41s/step (~4× speedup over pre-patch 162s/step).** |
 | 4 | GRPO on Jamba Reasoning 3B | ⬜ NOT STARTED |
 | 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
 
 ### TRC Status
 ✅ Accepted (email 2026-04-07).  
-⚠️ **REVISED CLAIM TIMING:** Stages 1–10 on Dual T4 = ~880 GPU-hours (infeasible). **Claim TRC immediately after Stage 1 completes.** Run stages 2–10 on A100.
+⚠️ **REVISED CLAIM TIMING:** Claim TRC immediately after Stage 1 completes. Run stages 2–10 on A100.
 
 ### Dataset
 - **Train:** 36,906 samples  **Val:** 1,940 samples
@@ -47,26 +48,28 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 5. **[DONE]** Stage 0 training to completion ✅ (checkpoint-0001154)
 6. **[DONE]** NCCL + val timeout fixes ✅ (Session 13 confirmed val succeeded)
 7. **[DONE]** Stage 0 val ✅ (ce=0.4041, acc=0.0222, DDP val ~2h21m)
-8. **[DONE]** Stage 1 training started ✅ (~162s/step confirmed empirically)
-9. **[DONE]** Performance patches applied ✅ (see Part 2 — Resolved Decisions)
+8. **[DONE]** Stage 1 training started ✅
+9. **[DONE]** FP16 patch confirmed ✅ (~41s/step empirical, ~4× speedup)
 
-10. **[NEXT SESSION] Resume Stage 1 with perf patches active:**
+10. **[NEXT SESSION] Apply hub+prune fix, then resume Stage 1:**
+
+    See `AGENT_PROMPT_hub_prune_fix.md` for the code changes. Once applied:
     ```bash
     torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
       --data_dir data/coconut_v1 --use_4bit \
       --stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 \
       --batch_size 4 --grad_accum 8 \
       --val_batch_size 2 \
-      --val_skip_buffer_minutes 120 \
+      --val_skip_buffer_minutes 60 \
       --no-gen_every_stage \
       --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
+      --push_to_hub \
       --output_dir runs/stage3_curriculum
     ```
-    - Startup log **must** show: `[GPU] Tesla T4  cc=sm75  VRAM=15GB  amp_dtype=float16`
-    - If `amp_dtype=bfloat16` appears → patch did NOT apply; abort and re-deploy
-    - Profile step time at steps 1–5 (tqdm rate). Target: <100s/step
-    - If step time does not improve to <130s within 10 steps, add profiler call (see below)
-    - Auto-resumes from latest Stage 1 checkpoint
+    - Startup log **must** show: `[GPU] Tesla T4  cc=sm75  VRAM=16GB  amp_dtype=float16`
+    - On session start: all local checkpoints pushed to Hub, then all pruned except resume checkpoint
+    - Profile step time at steps 1–5. Target: ~41s/step (FP16 confirmed)
+    - Auto-resumes from `stage_1/checkpoint-0001338`
 
 11. **After Stage 1 completes:** Claim TRC. Move stages 2–10 to A100.
 
@@ -76,7 +79,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 
 ---
 
-### Part 0.1.1 — Profiler snippet (use if step time does not improve after FP16 patch)
+### Part 0.1.1 — Profiler snippet (use if step time regresses)
 
 ```python
 # Temporary diagnostic — add inside the micro-step loop, run for 1 step, then remove
@@ -103,11 +106,13 @@ print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 | mamba-ssm 2.x API | Pinned to 1.2.2 ✅ |
 | Val decode time (200 samples → 5+hrs) | Cap at 50 samples ✅ |
 | NCCL watchdog (60min) kills DDP val | `timedelta(hours=4)` + `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC` ✅ |
-| Val skip threshold used wrong buffer | `--val_skip_buffer_minutes 120` ✅ |
-| **BF16 on T4 uses FP32 compute paths** | ✅ FIXED — `_amp_dtype` now gates BF16 on cc≥(8,0); T4 uses FP16 |
+| Val skip threshold used wrong buffer | `--val_skip_buffer_minutes 60` (actual default in use) ✅ |
+| **BF16 on T4 uses FP32 compute paths** | ✅ FIXED — `_amp_dtype` gates BF16 on cc≥(8,0); T4 uses FP16 |
 | **GC wastes 20–40% on A100** | ✅ FIXED — auto-disabled at VRAM≥40GB |
-| **`_amp_dtype` called in hot loop repeatedly** | ✅ FIXED — `@functools.lru_cache(maxsize=None)` applied; `get_device_capability` called once per device per process |
-| **Prefix re-computation at Stage k** | 🟡 FUTURE — Cache Mamba state at q_len within each forward pass. Implement before Stage 5 on A100. |
+| **`_amp_dtype` called in hot loop repeatedly** | ✅ FIXED — `@functools.lru_cache(maxsize=None)` |
+| **`--push_to_hub` never passed → hub upload never fires** | 🔴 ADD to command — see Part 0.1 #10 |
+| **`prune_epoch_checkpoints` only fires after successful val; scoped per-stage only** | 🔴 Fix in `AGENT_PROMPT_hub_prune_fix.md` |
+| **Prefix re-computation at Stage k** | 🟡 FUTURE — Cache Mamba state at q_len. Implement before Stage 5 on A100. |
 
 ---
 
@@ -139,19 +144,19 @@ d_model     : 2560   (confirmed Session 13)
 | Session timeout | `--session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20` |
 | val_batch_size | **2** |
 | val accuracy samples | **50** (capped from 200) |
-| val skip threshold | **`--val_skip_buffer_minutes 120`** |
+| val skip threshold | **`--val_skip_buffer_minutes 60`** (empirical; 120 was never in the actual command) |
 | NCCL init_process_group timeout | **`timedelta(hours=4)`** |
 | Stage 0 forward pass | ✅ Batched — single fused backbone call per micro-batch |
 | Stage k≥1 forward pass | ✅ `_forward_batched_latent()` |
 | epochs_per_stage | **1 for all stages** |
 | batch_size | **4** |
 | Stage 0 skip | **NO** — domain adaptation. 1 epoch sufficient. |
-| gen_every_stage | **`--no-gen_every_stage`** in production |
+| gen_every_stage | **`--no-gen_every_stage`** in production (was omitted in sessions 13/14, gen ran at stage 0 end) |
 | DDP val strategy | All ranks participate (interleaved shard) |
 | TRC claim timing | **After Stage 1 completes** |
-| amp_dtype on T4 (sm75) | ✅ **FP16** — `_amp_dtype` gates on `cc >= (8, 0)`. `bnb_4bit_compute_dtype` inherits this automatically. |
+| amp_dtype on T4 (sm75) | ✅ **FP16** — confirmed empirical: `amp_dtype=float16`, ~41s/step |
 | amp_dtype on A100+ (sm80+) | ✅ **BF16** — native BF16 tensor cores available |
-| `_amp_dtype` hot-loop overhead | ✅ `@functools.lru_cache(maxsize=None)` — `get_device_capability` called once per device per process lifetime |
+| `_amp_dtype` hot-loop overhead | ✅ `@functools.lru_cache(maxsize=None)` |
 | Gradient checkpointing | ✅ **Auto-disabled at VRAM≥40GB** (A100). Mandatory on T4. |
 
 ---
@@ -161,8 +166,7 @@ d_model     : 2560   (confirmed Session 13)
 | Question | Status |
 |---|---|
 | Does `inputs_embeds` → `last_hidden_state` work with Jamba + fast Mamba kernels at k≥1? | 🟢 CONFIRMED at Stage 1 (ce=0.41, training progressing) |
-| What is step time at Stage 1 on Dual T4? | 🟢 **~162s/step** pre-patch (empirical). |
-| Does FP16 patch reduce step time materially on T4? | 🟡 **VERIFY NEXT SESSION.** GPU-side theoretical: ~4–8× on matmul ops. End-to-end realistic: 1.5–2.5× (Python overhead, kernel launch, etc.). Target: <100s/step. Do NOT assume 3–5× end-to-end. |
+| What is step time at Stage 1 post-FP16 patch? | 🟢 **~41s/step** (empirical, Session 14). ~4× speedup over pre-patch. |
 | DGAC Phase 3.4: does halt_step distribute across K≥2 after training? | 🔴 OPEN — primary research validation |
 | Prefix re-computation optimization (Mamba state caching) | 🟡 OPEN — implement before Stage 5 on A100. ~3× additional speedup at Stage 10. |
 | Is 1 epoch per stage sufficient for convergence? | 🟡 MONITOR — Stage 1 ce trajectory healthy so far |
@@ -172,38 +176,34 @@ d_model     : 2560   (confirmed Session 13)
 
 ## Part 4 — Performance Analysis
 
-### Step-time model (empirical, pre-patch)
+### Step-time model (empirical)
 
 ```
-t(k) ≈ 137 + 25k  seconds/step   [BF16/FP32 paths on T4, pre-patch]
+Pre-patch BF16/FP32 on T4:
+  t_bf16(k) ≈ 137 + 25k  seconds/step
+  Stage 0: 137s  Stage 1: 162s  Stage 5: 262s  Stage 10: 387s
 
-Stage 0 : 137s  (confirmed)
-Stage 1 : 162s  (confirmed)
-Stage 5 : 262s
-Stage 10: 387s
+Post-patch FP16 on T4 (CONFIRMED Session 14):
+  t_fp16(k) ≈ 34 + 6k  seconds/step   [estimated from Stage 1 empirical = 41s]
+  Stage 0: ~34s  Stage 1: ~41s ✓  Stage 5: ~64s  Stage 10: ~94s
+  Speedup: ~4× end-to-end (beats conservative 1.5–2.5× prediction)
 ```
 
-### Expected post-patch (FP16 on T4)
-
-Theoretical GPU-side speedup: ~4–8× on matmul-bound layers (FP16 tensor cores vs FP32 fallback).
-End-to-end speedup: **1.5–2.5×** (bounded by Python data prep, NCCL, kernel launch overhead which do NOT benefit from dtype change).
-
-**Verify empirically next session.** Do not update the step-time model until confirmed.
-
-| Platform | Condition | Steps 1–10 total | Feasible? |
+| Platform | Condition | Stages 1–10 total | Feasible? |
 |---|---|---|---|
 | Dual T4 | BF16/FP32 paths (pre-patch) | ~880h | ❌ No |
-| Dual T4 | FP16 patch (1.5–2.5× gain) | ~350–580h | ❌ No |
-| A100 80GB | BF16 native + no GC (~4–6× vs T4 FP16) | ~60–150h | ✅ Yes |
+| Dual T4 | FP16 patch (confirmed ~4× gain) | ~220h | ❌ Marginal |
+| A100 80GB | BF16 native + no GC (~4–6× vs T4 FP16) | ~40–55h | ✅ Yes |
 
-**Conclusion unchanged:** FP16 fix buys time for Stage 1 on T4. A100 required for stages 2–10.
+**Conclusion:** FP16 fix meaningfully extends Stage 1 on T4. A100 still required for stages 2–10.
+
+### Disk usage concern (Kaggle)
+Kaggle `/kaggle/working/` ≈ 20GB. Each LoRA checkpoint ≈ 1.5–2GB. With timeout saves every ~10h and no prune-on-timeout, disk fills after ~2–3 stages. Must push-then-prune on session start (see `AGENT_PROMPT_hub_prune_fix.md`).
 
 ### Known future optimization (Mamba state caching at Stage k)
-
 Re-processing positions `0..q_len-1` in every prefix pass at Stage k wastes compute.
-Caching Mamba recurrent state at `q_len` within each micro-step forward gives ~3.1× at Stage 10.
-Requires `use_cache=True` (incompatible with GC → safe on A100 after GC is disabled).
-Implement before Stage 5.
+Caching Mamba recurrent state at `q_len` gives ~3.1× at Stage 10.
+Requires `use_cache=True` → incompatible with GC → safe on A100. Implement before Stage 5.
 
 ---
 
@@ -211,9 +211,10 @@ Implement before Stage 5.
 
 | File | Stage | Status | Notes |
 |---|---|---|---|
-| `jamba_coconut_finetune.py` | 3 | ✅ PATCHED | FP16 fix + lru_cache + auto-GC disable + GPU log. Ready for next session. |
-| `kaggle-utils.ipynb` | 3 | ✅ UP TO DATE | Cell 5 command unchanged (no new CLI args) |
-| `AGENT_PROMPT_perf_fix.md` | 3 | ✅ APPLIED | All 3 changes applied + lru_cache addendum |
+| `jamba_coconut_finetune.py` | 3 | ✅ FP16 PATCHED | Hub+prune fix pending (see agent prompt) |
+| `kaggle-utils.ipynb` | 3 | 🟡 NEEDS UPDATE | Add `--push_to_hub` and `--no-gen_every_stage` to Cell 5 command |
+| `AGENT_PROMPT_hub_prune_fix.md` | 3 | 🔴 NEW — apply next session | Hub push + global prune fix |
+| `AGENT_PROMPT_perf_fix.md` | 3 | ✅ APPLIED | FP16 + lru_cache + auto-GC disable |
 | `AGENT_PROMPT_nccl_val_fix.md` | 3 | ✅ APPLIED | Session 13 confirmed |
 | `prepare_coconut_dataset.py` | 3 | ✅ DONE | coconut-v1 on Hub |
 | `build_wheels_kaggle.py` | 3 | ✅ DONE | sm75 wheels on Hub |
@@ -252,7 +253,7 @@ output_dir/
     checkpoint-0001154/
     best/                  ← acc=0.0222 ce=0.4041
   stage_1/
-    checkpoint-XXXXXXX/    ← in progress
+    checkpoint-0001338/    ← emergency timeout save (no val_ce/val_acc)
     best/
   stage_k/best/
     adapter_model/
@@ -266,8 +267,8 @@ output_dir/
 
 | Phase | Platform | Estimate |
 |---|---|---|
-| Stage 1 (in progress) | Kaggle Dual T4 | ~350–580h remaining pre-patch; target <200h post-patch |
-| Stages 2–10 | TRC A100 80GB | ~60–150h total |
+| Stage 1 (in progress) | Kaggle Dual T4 | ~970 steps remaining × 41s ≈ 11h (1–2 sessions) |
+| Stages 2–10 | TRC A100 80GB | ~40–55h total |
 | Phase 3.4 (DGAC) | TRC A100 80GB | ~6–8h |
 | Phase 4 (GRPO) | TRC A100 80GB | ~8–12h |
 
@@ -291,10 +292,12 @@ output_dir/
 | Val with no KV cache at 200 samples → 5.5h decode loop | Cap at 50 |
 | Timeout checker only fires inside training step loop | Pre-val checkpoint save + timeout check before val entry |
 | `timedelta(minutes=60)` kills rank 1 during val | `timedelta(hours=4)` + env var |
-| `graceful_exit_buffer=20min` used as val skip threshold | `--val_skip_buffer_minutes 120` separate arg |
-| `torch.cuda.is_bf16_supported()` returns True on sm75 (CUDA 12 soft emulation) | `_amp_dtype` now checks `cc >= (8, 0)` for native BF16 |
+| `graceful_exit_buffer=20min` used as val skip threshold | `--val_skip_buffer_minutes 60` separate arg |
+| `torch.cuda.is_bf16_supported()` returns True on sm75 (CUDA 12 soft emulation) | `_amp_dtype` checks `cc >= (8, 0)` |
 | GC mandatory on T4 but wastes 20–40% on A100 | Auto-disable GC at VRAM≥40GB |
-| `_amp_dtype` called in hot loop — `get_device_capability` repeated unnecessarily | `@functools.lru_cache(maxsize=None)` applied; O(1) after first call |
-| Theoretical GPU speedup ≠ end-to-end speedup | FP16 patch: 4–8× GPU-side, 1.5–2.5× end-to-end. Always verify empirically. |
-| Stage k step time scales as ~137+25k s — stages 2–10 take ~880h on T4 | Claim TRC after Stage 1 |
-| Rank 0 running val solo → idle rank 1 hits NCCL barrier → watchdog fires | DDP val: all ranks participate with interleaved sharding |
+| `_amp_dtype` called in hot loop repeatedly | `@functools.lru_cache(maxsize=None)` |
+| Conservative 1.5–2.5× end-to-end FP16 speedup estimate; actual was ~4× | Always verify empirically; FP16 on T4 is more impactful than expected |
+| `--push_to_hub` never added to command → hub upload silently never fires | Add flag explicitly; absence of errors ≠ uploads happening |
+| `prune_epoch_checkpoints` scoped per-stage; only called after successful val → disk fills on timeout sessions | Global prune + hub push must happen on session startup |
+| Blueprint showed `--val_skip_buffer_minutes 120` but actual command used 60; doc lagged behind `.py` | Python/notebook files take precedence — update docs to match code, not vice versa |
+| `--no-gen_every_stage` omitted from session 13/14 commands; gen ran unexpectedly | Keep flag explicit in production command |
