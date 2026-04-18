@@ -97,6 +97,9 @@ _KNOWN_ARCH_SUFFIXES = [
 ]
 
 
+# NOTE: _bootstrap_resolve_token() and _resolve_hf_token() are intentionally
+# separate. The bootstrap version runs before any third-party imports; the
+# main version runs after argument parsing and can honor a CLI override. Keep both.
 def _bootstrap_resolve_token() -> Optional[str]:
     """Resolve HF token before huggingface_hub is imported as a library."""
     try:
@@ -1151,21 +1154,11 @@ def load_model_and_tokenizer(
     if device.type == "cuda":
         load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
 
-    _mamba_fast_path = False
-    if device.type == "cuda":
-        try:
-            _bootstrap_verify_fast_path()
-            _mamba_fast_path = True
-            if is_main:
-                print("  mamba CUDA kernels: OK — fast path ACTIVE (profile step time empirically)")
-        except Exception as _kern_exc:
-            load_kwargs["use_mamba_kernels"] = False
-            if is_main:
-                print(f"  [WARN] mamba CUDA kernels unavailable: {_kern_exc}")
-                print("         This should not happen if _bootstrap() passed.")
-                print("         Slow PyTorch path forced (~500s/step).")
-    else:
+    _mamba_fast_path = device.type == "cuda"
+    if not _mamba_fast_path:
         load_kwargs["use_mamba_kernels"] = False
+    elif is_main:
+        print("  mamba CUDA kernels: fast path ACTIVE (verified at bootstrap)")
 
     if args.use_4bit:
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -2424,6 +2417,65 @@ def _best_state_for_stage(stage_dir: Path) -> Tuple[float, float, Optional[Path]
     return val_acc, val_ce, best_dir
 
 
+def startup_hub_sync_and_prune(
+    output_dir: Path,
+    resume_path: Optional[Path],
+    hf_token: str,
+    hf_repo_id: str,
+    hf_stage_subdir: str,
+) -> None:
+    """
+    Called once at session start (rank 0 only, before training).
+    1. Upload every local checkpoint that exists to Hub (best + numbered).
+    2. Delete all local numbered checkpoints EXCEPT the one we are resuming from.
+       Always preserve best/ dirs.
+
+    This prevents Kaggle disk overflow across sessions. Upload failures are
+    logged, but local pruning still follows the keep policy so stale numbered
+    checkpoints do not accumulate across sessions.
+    """
+    if not _is_main_process():
+        return
+
+    all_ckpts: List[Tuple[Path, bool]] = []  # (path, is_resume)
+    if output_dir.exists():
+        for stage_dir in sorted(output_dir.iterdir()):
+            if _parse_stage_dir_name(stage_dir.name) is None or not stage_dir.is_dir():
+                continue
+            for ckpt in sorted(stage_dir.iterdir()):
+                if not ckpt.is_dir():
+                    continue
+                if not (ckpt / "training_state.pt").exists():
+                    continue
+                is_resume = resume_path is not None and ckpt.resolve() == resume_path.resolve()
+                all_ckpts.append((ckpt, is_resume))
+
+    if not all_ckpts:
+        print("  [startup] No local checkpoints found; nothing to sync/prune.")
+        return
+
+    print(f"  [startup] Found {len(all_ckpts)} local checkpoint(s). Uploading to Hub before pruning...")
+    for ckpt, is_resume in all_ckpts:
+        stage_dir_name = ckpt.parent.name
+        remote_prefix = f"{hf_stage_subdir.strip('/')}/{stage_dir_name}"
+        ok = _hub_upload_checkpoint(ckpt, hf_repo_id, hf_token, remote_prefix=remote_prefix)
+        resume_marker = "  (resume)" if is_resume else ""
+        status = "✓" if ok else "✗ (upload failed)"
+        print(f"  [startup]   {stage_dir_name}/{ckpt.name}{resume_marker}  {status}")
+
+    pruned = 0
+    for ckpt, is_resume in all_ckpts:
+        if ckpt.name == "best":
+            continue
+        if is_resume:
+            continue
+        shutil.rmtree(ckpt, ignore_errors=True)
+        print(f"  [startup]   pruned {ckpt.parent.name}/{ckpt.name}")
+        pruned += 1
+
+    print(f"  [startup] Sync+prune complete. Pruned {pruned} checkpoint(s) locally.")
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -2498,6 +2550,16 @@ def main() -> None:
         if is_main:
             print(f"  [warn] resume checkpoint not found: {resume_path}")
         resume_path = None
+
+    if hf_token and getattr(args, "push_to_hub", False) and is_main:
+        startup_hub_sync_and_prune(
+            output_dir=output_dir,
+            resume_path=resume_path,
+            hf_token=hf_token,
+            hf_repo_id=getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros"),
+            hf_stage_subdir=getattr(args, "hf_stage_subdir", "runs/stage3"),
+        )
+    barrier()
 
     model, tokenizer, d_model, lat_token_id = load_model_and_tokenizer(args, device)
     pad_id = tokenizer.pad_token_id or 0
