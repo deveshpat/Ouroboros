@@ -61,6 +61,7 @@ Run (Phase 3.4, DGAC gate, from Stage K best checkpoint):
 
 import argparse
 import contextlib
+import functools
 import json
 import math
 import os
@@ -84,17 +85,12 @@ os.environ.setdefault("NCCL_TIMEOUT", str(4 * 3600))
 
 
 # ── Hub wheel config ──────────────────────────────────────────────────────────
-# Base names without arch suffix. Arch (e.g. "-sm100") is resolved at runtime
-# from the current GPU and appended before the Hub lookup.
-# To update a package version: change the stem here and rebuild with
-# build_wheels_kaggle.py on any GPU — that session's arch gets cached on Hub.
 _HUB_WHEEL_BASES = [
     "causal_conv1d-1.6.1-cp312-cp312-linux_x86_64",
-    "mamba_ssm-1.2.2-cp312-cp312-linux_x86_64",  # 2.x removed selective_state_update from 1.x path
+    "mamba_ssm-1.2.2-cp312-cp312-linux_x86_64",
 ]
 _HUB_REPO_ID = "WeirdRunner/Ouroboros"
 
-# All known arch suffixes — used to strip them during glob
 _KNOWN_ARCH_SUFFIXES = [
     "sm70", "sm72", "sm75", "sm80", "sm86", "sm87", "sm89",
     "sm90", "sm100", "sm120", "smunknown",
@@ -195,10 +191,6 @@ def _bootstrap_verify_fast_path() -> bool:
       2. Assert none are None (catches API / packaging mismatches).
       3. Run tiny real CUDA/Triton ops for causal_conv1d, selective_scan_fn,
          and selective_state_update.
-
-    Important: selective_state_update lives in
-    mamba_ssm.ops.triton.selective_state_update in mamba_ssm==1.2.2, not in
-    selective_scan_interface.
     """
     import torch as _torch
     import triton.language as _tl
@@ -217,16 +209,11 @@ def _bootstrap_verify_fast_path() -> bool:
             f"{_none}. This usually means an API / ABI mismatch."
         )
 
-    # 1) CUDA depthwise conv kernel
-    # causal_conv1d_fn expects weight shaped (dim, width), not Conv1d's
-    # grouped-kernel shape (dim, 1, width). Passing the 3D shape triggers:
-    #   "weight must have shape (dim, width)"
     _x = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
     _w = _torch.randn(4, 4, device="cuda", dtype=_torch.float32)
     _out = causal_conv1d_fn(_x, _w)
     assert _out.shape == _x.shape, f"Unexpected causal_conv1d_fn shape: {_out.shape}"
 
-    # 2) selective_scan CUDA extension used by full-sequence Mamba blocks
     _u = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
     _delta = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
     _A = _torch.randn(4, 3, device="cuda", dtype=_torch.float32)
@@ -236,18 +223,6 @@ def _bootstrap_verify_fast_path() -> bool:
     _scan_out = selective_scan_fn(_u, _delta, _A, _B, _C, _D, delta_softplus=True)
     assert _scan_out.shape == _u.shape, f"Unexpected selective_scan_fn shape: {_scan_out.shape}"
 
-    # 3) Triton recurrent update kernel used by cached decode / generation.
-    # mamba_ssm==1.2.2's wrapper expects dt_bias to be present: it expands
-    # dt_bias strides with starred unpacking and also reads dt_bias.stride(-1)
-    # when computing tie_hdim. Omitting dt_bias triggers:
-    #   "Value after * must be an iterable, not int"
-    #
-    # Kaggle's current Triton build also lacks tl.math.log1p, while
-    # selective_state_update uses tl.math.log1p in the DT_SOFTPLUS branch.
-    # For this script that is acceptable because training / eval run with
-    # use_cache=False and do not rely on cached decode. We still validate that
-    # the recurrent-update kernel launches, but only take the dt_softplus path
-    # when the installed Triton actually provides tl.math.log1p.
     _state = _torch.randn(1, 4, 3, device="cuda", dtype=_torch.float32)
     _x_step = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
     _dt = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
@@ -332,17 +307,12 @@ def _bootstrap_prepare_local_cuda_device(_torch) -> None:
 def _bootstrap_shared_install_phases() -> None:
     """
     Run the filesystem-mutating install phases once per launch.
-
-    These phases touch the shared Python environment (pip install / wheel
-    download / optional source build / local wheel install) and therefore must
-    not race across DDP ranks.
     """
     import importlib as _il
     import torch as _torch
 
     _bootstrap_prepare_local_cuda_device(_torch)
 
-    # ── Phase 1: pure-Python deps ─────────────────────────────────────────────
     print("[bootstrap] Phase 1: pure-Python deps...")
     _r1 = subprocess.run(
         [sys.executable, "-m", "pip", "install", "-q",
@@ -361,7 +331,6 @@ def _bootstrap_shared_install_phases() -> None:
     if _r1.returncode != 0:
         print("[bootstrap] WARNING: Phase 1 pip returned non-zero — check output above.")
 
-    # ── Phase 2: arch-aware Hub wheel install ─────────────────────────────────
     print("[bootstrap] Phase 2: arch-aware Hub wheel install...")
     _hf_token = _bootstrap_resolve_token()
     if not _hf_token:
@@ -372,9 +341,8 @@ def _bootstrap_shared_install_phases() -> None:
     _il.invalidate_caches()
     from huggingface_hub import hf_hub_download, HfApi  # installed in Phase 1
 
-    # Detect GPU arch for wheel selection and TORCH_CUDA_ARCH_LIST injection
     _cc = _torch.cuda.get_device_capability() if _torch.cuda.is_available() else (0, 0)
-    _arch_suffix = f"sm{_cc[0]}{_cc[1]}"   # e.g. "sm100", "sm75"
+    _arch_suffix = f"sm{_cc[0]}{_cc[1]}"
     _arch_list   = f"{_cc[0]}.{_cc[1]}+PTX"
     print(f"[bootstrap]   GPU arch: {_arch_suffix}  (TORCH_CUDA_ARCH_LIST={_arch_list} if build needed)")
 
@@ -382,11 +350,10 @@ def _bootstrap_shared_install_phases() -> None:
     _wheel_dir.mkdir(exist_ok=True)
 
     for _base in _HUB_WHEEL_BASES:
-        _hub_filename   = f"{_base}-{_arch_suffix}.whl"   # arch-encoded Hub name
-        _local_filename = f"{_base}.whl"                   # standard name for pip
+        _hub_filename   = f"{_base}-{_arch_suffix}.whl"
+        _local_filename = f"{_base}.whl"
         _local_path     = _wheel_dir / _local_filename
 
-        # ── Try Hub download first ───────────────────────────────────────────
         _downloaded = False
         try:
             _dl = hf_hub_download(
@@ -395,7 +362,6 @@ def _bootstrap_shared_install_phases() -> None:
                 token=_hf_token,
                 local_dir=str(_wheel_dir),
             )
-            # hf_hub_download saves under the Hub filename; copy to standard pip name
             shutil.copy2(_dl, str(_local_path))
             print(f"[bootstrap]   Downloaded {_hub_filename} ✓")
             _downloaded = True
@@ -403,14 +369,10 @@ def _bootstrap_shared_install_phases() -> None:
             print(f"[bootstrap]   {_hub_filename} not on Hub "
                   f"({type(_dl_err).__name__}). Compiling from source...")
 
-        # ── Fallback: source compile ─────────────────────────────────────────
         if not _downloaded:
             _parts    = _base.split("-")
             _pkg_name = _parts[0]
             _pkg_ver  = _parts[1]
-            # mamba_ssm PyPI sdist (35kB) is a stub — CUDA source files
-            # (selective_scan.cpp etc.) are omitted from the PyPI release.
-            # The full source lives only on GitHub. Use git+https to get it.
             if _pkg_name == "mamba_ssm":
                 _pip_spec = f"git+https://github.com/state-spaces/mamba.git@v{_pkg_ver}"
             else:
@@ -430,11 +392,8 @@ def _bootstrap_shared_install_phases() -> None:
             )
             if _build_result.returncode != 0:
                 print(f"[bootstrap] FATAL: Source build failed for {_pip_spec}.")
-                print("[bootstrap]        Run build_wheels_kaggle.py manually and "
-                      "capture stderr: python build_wheels_kaggle.py 2>&1 | tee build.log")
                 sys.exit(1)
 
-            # Find the built standard-named wheel (exclude any arch-encoded files)
             _found = [
                 f for f in _wheel_dir.glob(f"{_pkg_name}*.whl")
                 if not any(f.name.endswith(f"-{s}.whl") for s in _KNOWN_ARCH_SUFFIXES)
@@ -445,13 +404,11 @@ def _bootstrap_shared_install_phases() -> None:
                 sys.exit(1)
             _built_whl = max(_found, key=lambda p: p.stat().st_mtime)
 
-            # Copy to standard local name (may already match)
             if _built_whl.resolve() != _local_path.resolve():
                 shutil.copy2(str(_built_whl), str(_local_path))
 
             print(f"[bootstrap]   Build succeeded: {_built_whl.name}")
 
-            # Upload arch-encoded copy to Hub so future sessions skip this build
             _arch_whl_path = _wheel_dir / _hub_filename
             shutil.copy2(str(_local_path), str(_arch_whl_path))
             try:
@@ -470,10 +427,7 @@ def _bootstrap_shared_install_phases() -> None:
                       f"(future sessions on {_arch_suffix} skip compilation)")
             except Exception as _up_err:
                 print(f"[bootstrap]   [warn] Hub upload failed: {_up_err}")
-                print(f"[bootstrap]          Continuing with local wheel. "
-                      f"Re-run to retry upload.")
 
-        # ── pip install (always uses standard local name) ─────────────────────
         _r = subprocess.run(
             [sys.executable, "-m", "pip", "install",
              "--force-reinstall", "--no-deps", str(_local_path)],
@@ -505,7 +459,6 @@ def _bootstrap_wait_for_shared_install() -> None:
             _bootstrap_shared_install_phases()
         except BaseException:
             import traceback as _traceback
-
             failure_path.write_text(_traceback.format_exc(), encoding="utf-8")
             raise
         else:
@@ -546,10 +499,6 @@ def _bootstrap_wait_for_shared_install() -> None:
 def _bootstrap_process_local_finalize() -> None:
     """
     Run the process-local bootstrap phases on every rank.
-
-    These phases patch Python module state inside the current interpreter and
-    optionally verify the fast path on the current CUDA device, so they cannot
-    be shared across processes even though the package installation is shared.
     """
     import importlib as _il
     import torch as _torch
@@ -568,9 +517,6 @@ def _bootstrap_process_local_finalize() -> None:
     _bootstrap_prepare_local_cuda_device(_torch)
     _il.invalidate_caches()
 
-    # ── Phase 2.5: transformers / mamba_ssm compatibility shim ──────────────
-    # Apply this before the first mamba_ssm import so legacy generation-name
-    # lookups resolve cleanly during kernel export patching.
     try:
         import importlib as _il2
         _il2.invalidate_caches()
@@ -603,9 +549,7 @@ def _bootstrap_process_local_finalize() -> None:
         pass
     except Exception as _shim_err:
         _always(f"WARNING: transformers shim failed: {_shim_err}")
-        _always("         mamba_ssm import may fail at Phase 3 verification.")
 
-    # ── Phase 2.6: export kernel symbols for transformers Jamba loader ──────
     try:
         _patched_exports = _patch_kernel_top_level_exports()
         if _patched_exports:
@@ -615,7 +559,6 @@ def _bootstrap_process_local_finalize() -> None:
     except Exception as _kernel_patch_err:
         _always(f"WARNING: kernel export shim failed: {_kernel_patch_err}")
 
-    # ── Phase 3: hard functional verification ────────────────────────────────
     _info("Phase 3: verifying mamba fast path (symbol + CUDA op)...")
 
     try:
@@ -643,12 +586,6 @@ def _bootstrap_process_local_finalize() -> None:
 
 
 def _bootstrap_run_local_finalize_padded() -> None:
-    """
-    Run process-local finalize on every rank, then wait for all ranks to finish.
-
-    This prevents one rank from entering main() and hanging in
-    init_process_group() while another rank has already died during bootstrap.
-    """
     world_size = _bootstrap_env_world_size()
     if world_size <= 1:
         _bootstrap_process_local_finalize()
@@ -668,7 +605,6 @@ def _bootstrap_run_local_finalize_padded() -> None:
         _bootstrap_process_local_finalize()
     except BaseException:
         import traceback as _traceback
-
         fail_path.write_text(_traceback.format_exc(), encoding="utf-8")
         raise
     else:
@@ -694,10 +630,6 @@ def _bootstrap_run_local_finalize_padded() -> None:
 def _bootstrap() -> None:
     """
     Install all dependencies before any third-party imports.
-
-    Shared filesystem-mutating phases (pip install / wheel install) are run
-    once per torchrun launch, while interpreter-local shims and fast-path
-    verification run on every rank.
     """
     _bootstrap_wait_for_shared_install()
     _bootstrap_run_local_finalize_padded()
@@ -782,11 +714,25 @@ def _maybe_empty_cuda_cache() -> None:
         torch.cuda.empty_cache()
 
 
+@functools.lru_cache(maxsize=None)
 def _amp_dtype(device: torch.device) -> torch.dtype:
+    """
+    Select autocast dtype based on hardware capability.
+
+    BF16 requires native tensor core support (sm80+ / Ampere).
+    On sm75 (T4) and earlier, torch.cuda.is_bf16_supported() returns True under
+    CUDA 12 due to software emulation, but matrix multiplications fall back to
+    FP32 paths (~8 TFLOPS) rather than FP16 tensor cores (~65 TFLOPS on T4).
+
+    lru_cache: result is memoised per device — safe because the GPU assigned to
+    each rank never changes within a process lifetime. Avoids repeated
+    get_device_capability() calls in the hot training loop.
+    """
     if device.type == "cuda":
-        if torch.cuda.is_bf16_supported():
+        cc = torch.cuda.get_device_capability(device)
+        if cc >= (8, 0):  # Ampere+ (A100, H100, RTX 3090+): native BF16 tensor cores
             return torch.bfloat16
-        return torch.float16
+        return torch.float16  # T4 (sm75), V100 (sm70): FP16 tensor cores; BF16 is FP32 fallback
     return torch.float32
 
 
@@ -905,13 +851,6 @@ def _patch_transformers_jamba_fast_path_globals() -> bool:
 
 
 def _probe_jamba_runtime_fast_path(model, device: torch.device, amp_dtype: torch.dtype) -> None:
-    """
-    Run a tiny real forward pass immediately after model load.
-
-    This catches the Kaggle notebook failure mode where bootstrap proves the
-    kernels work, but Jamba still reports them unavailable during the first
-    training step because its module globals were resolved incorrectly.
-    """
     if device.type != "cuda":
         return
 
@@ -1162,6 +1101,16 @@ def load_model_and_tokenizer(
     rank = _rank()
     amp_dtype = _amp_dtype(device)
 
+    # ── [perf] Prominent GPU capability log — visible every session ──────────
+    if is_main and device.type == "cuda":
+        _cc = torch.cuda.get_device_capability(device)
+        _gpu_name = torch.cuda.get_device_name(device)
+        _vram_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
+        print(
+            f"  [GPU] {_gpu_name}  cc=sm{_cc[0]}{_cc[1]}  "
+            f"VRAM={_vram_gb:.0f}GB  amp_dtype={str(amp_dtype).replace('torch.', '')}"
+        )
+
     if args.use_4bit and device.type != "cuda":
         raise SystemExit("--use_4bit requires CUDA + bitsandbytes.")
 
@@ -1251,6 +1200,19 @@ def load_model_and_tokenizer(
         if is_main:
             print(f"  Resizing embed_tokens: {embed_size} -> {len(tokenizer)}")
         model.resize_token_embeddings(len(tokenizer))
+
+    # ── [perf] Auto-disable gradient checkpointing on high-VRAM GPUs ────────
+    # GC is mandatory on T4 (16GB) to avoid OOM at k>=2, but wastes 20-40%
+    # compute on A100 (80GB) where the full model fits in VRAM without recomputation.
+    if args.grad_checkpoint and device.type == "cuda":
+        total_vram_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
+        if total_vram_gb >= 40.0:
+            args.grad_checkpoint = False
+            if is_main:
+                print(
+                    f"  [perf] {total_vram_gb:.0f}GB VRAM detected: "
+                    "disabling gradient checkpointing (not needed, saves ~20-40%)."
+                )
 
     if args.use_4bit:
         from peft import prepare_model_for_kbit_training
@@ -1840,8 +1802,7 @@ def evaluate_stage(
 ) -> Tuple[float, float]:
     """
     Runs on ALL DDP ranks. Each rank processes its interleaved shard of val_samples,
-    then all-reduces CE and accuracy counts. Eliminates idle-rank NCCL hangs and
-    halves wall-clock val time on Dual T4.
+    then all-reduces CE and accuracy counts.
     """
     _maybe_empty_cuda_cache()
     model.eval()
@@ -1857,9 +1818,6 @@ def evaluate_stage(
     amp_dtype = _amp_dtype(device)
     batch_size = max(int(args.val_batch_size), 1)
 
-    # ── CE loop — interleaved sharding across ranks ───────────────────────────
-    # Interleaved (stride=world_size) is slightly better than contiguous slicing
-    # because it naturally load-balances variable-length sequences.
     local_val_samples = val_samples[rank::world_size]
 
     ce_numer = 0.0
@@ -1888,14 +1846,12 @@ def evaluate_stage(
         ce_numer += float(loss.item()) * valid_tokens
         ce_denom += valid_tokens
 
-    # All-reduce CE across ranks
     if _distributed_is_initialized():
         ce_tensor = torch.tensor([ce_numer, float(ce_denom)], device=device, dtype=torch.float64)
         torch.distributed.all_reduce(ce_tensor, op=torch.distributed.ReduceOp.SUM)
         ce_numer = ce_tensor[0].item()
         ce_denom = int(ce_tensor[1].item())
 
-    # ── Accuracy loop — interleaved shard of first 50 val samples ─────────────
     acc_samples = val_samples[:50]
     local_acc_samples = acc_samples[rank::world_size]
 
@@ -1962,7 +1918,6 @@ def evaluate_stage(
             n_correct += 1
         n_total += 1
 
-    # All-reduce accuracy across ranks
     if _distributed_is_initialized():
         acc_tensor = torch.tensor([n_correct, n_total], device=device, dtype=torch.long)
         torch.distributed.all_reduce(acc_tensor, op=torch.distributed.ReduceOp.SUM)
@@ -2486,7 +2441,7 @@ def main() -> None:
         torch.distributed.init_process_group(
             backend=backend,
             init_method="env://",
-            timeout=timedelta(hours=4),  # all-reduces at end of DDP val still need headroom
+            timeout=timedelta(hours=4),
         )
 
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
@@ -2498,7 +2453,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    session_start = time.perf_counter()  # authoritative start time for val_skip_buffer check
+    session_start = time.perf_counter()
 
     hf_token = _resolve_hf_token(getattr(args, "hf_token", None))
     args._resolved_hf_token = hf_token
@@ -2814,7 +2769,6 @@ def main() -> None:
                 if timeout_triggered:
                     break
 
-                # ── Val skip check (rank 0 decides; broadcast result) ─────────
                 if is_main:
                     _elapsed = time.perf_counter() - session_start
                     _remaining_min = (args.session_timeout_hours * 3600 - _elapsed) / 60.0
@@ -2841,14 +2795,12 @@ def main() -> None:
                             val_acc=None,
                         )
 
-                # Broadcast skip decision so all ranks agree
                 val_budget_exhausted = broadcast_bool(val_budget_exhausted, device)
                 if val_budget_exhausted:
                     stage_val_budget_triggered = True
                     barrier()
                     break
 
-                # ── Pre-val checkpoint (rank 0 only) ─────────────────────────
                 if is_main:
                     save_checkpoint(
                         output_dir=output_dir,
@@ -2866,7 +2818,6 @@ def main() -> None:
                         val_acc=None,
                     )
 
-                # ── DDP val — all ranks participate ──────────────────────────
                 val_ce, val_acc = evaluate_stage(
                     model=model,
                     val_samples=val_samples,
@@ -2878,7 +2829,6 @@ def main() -> None:
                     halt_gate=halt_gate if args.use_halt_gate else None,
                 )
 
-                # ── Post-val logging and checkpointing (rank 0 only) ─────────
                 if is_main:
                     tqdm.write(
                         f"  [val] s={stage_k} ep={epoch} "
