@@ -61,7 +61,6 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
       --batch_size 4 --grad_accum 8 \
       --val_batch_size 2 \
       --val_skip_buffer_minutes 60 \
-      --no-gen_every_stage \
       --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
       --push_to_hub \
       --output_dir runs/stage3_curriculum
@@ -151,7 +150,7 @@ d_model     : 2560   (confirmed Session 13)
 | epochs_per_stage | **1 for all stages** |
 | batch_size | **4** |
 | Stage 0 skip | **NO** — domain adaptation. 1 epoch sufficient. |
-| gen_every_stage | **`--no-gen_every_stage`** in production (was omitted in sessions 13/14, gen ran at stage 0 end) |
+| gen_every_stage | **`--no-gen_every_stage`** in production (was omitted in sessions 13/14, gen ran at stage 0 end) <--- Intentional, as only takes 5 mins |
 | DDP val strategy | All ranks participate (interleaved shard) |
 | TRC claim timing | **After Stage 1 completes** |
 | amp_dtype on T4 (sm75) | ✅ **FP16** — confirmed empirical: `amp_dtype=float16`, ~41s/step |
@@ -212,7 +211,7 @@ Requires `use_cache=True` → incompatible with GC → safe on A100. Implement b
 | File | Stage | Status | Notes |
 |---|---|---|---|
 | `jamba_coconut_finetune.py` | 3 | ✅ FP16 PATCHED | Hub+prune fix pending (see agent prompt) |
-| `kaggle-utils.ipynb` | 3 | 🟡 NEEDS UPDATE | Add `--push_to_hub` and `--no-gen_every_stage` to Cell 5 command |
+| `kaggle-utils.ipynb` | 3 | 🟡 NEEDS UPDATE | Add `--push_to_hub` to Cell 5 command |
 | `AGENT_PROMPT_hub_prune_fix.md` | 3 | 🔴 NEW — apply next session | Hub push + global prune fix |
 | `AGENT_PROMPT_perf_fix.md` | 3 | ✅ APPLIED | FP16 + lru_cache + auto-GC disable |
 | `AGENT_PROMPT_nccl_val_fix.md` | 3 | ✅ APPLIED | Session 13 confirmed |
@@ -300,4 +299,3 @@ output_dir/
 | `--push_to_hub` never added to command → hub upload silently never fires | Add flag explicitly; absence of errors ≠ uploads happening |
 | `prune_epoch_checkpoints` scoped per-stage; only called after successful val → disk fills on timeout sessions | Global prune + hub push must happen on session startup |
 | Blueprint showed `--val_skip_buffer_minutes 120` but actual command used 60; doc lagged behind `.py` | Python/notebook files take precedence — update docs to match code, not vice versa |
-| `--no-gen_every_stage` omitted from session 13/14 commands; gen ran unexpectedly | Keep flag explicit in production command |
