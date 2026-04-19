@@ -26,19 +26,31 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install huggingface_hub safetensors torch requests
+          pip install huggingface_hub safetensors torch requests wandb
 
       - name: Run coordinator
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          HF_TOKEN:          ${{ secrets.HF_TOKEN }}
+          WANDB_KEY:         ${{ secrets.WANDB_KEY }}
+          KAGGLE_USERNAME_A: ${{ secrets.KAGGLE_USERNAME_A }}
+          KAGGLE_KEY_A:      ${{ secrets.KAGGLE_KEY_A }}
+          KAGGLE_USERNAME_B: ${{ secrets.KAGGLE_USERNAME_B }}
+          KAGGLE_KEY_B:      ${{ secrets.KAGGLE_KEY_B }}
+          KAGGLE_USERNAME_C: ${{ secrets.KAGGLE_USERNAME_C }}
+          KAGGLE_KEY_C:      ${{ secrets.KAGGLE_KEY_C }}
         run: |
           python diloco_coordinator.py \
-            --hf_token "$HF_TOKEN" \
-            --repo_id "WeirdRunner/Ouroboros" \
-            --min_workers 2 \
-            --outer_lr 0.7 \
-            --kaggle_username "$KAGGLE_USERNAME" \
-            --kaggle_key "$KAGGLE_KEY" \
+            --hf_token          "$HF_TOKEN" \
+            --repo_id           "WeirdRunner/Ouroboros" \
+            --min_workers       2 \
+            --outer_lr          0.7 \
+            --wandb_key         "$WANDB_KEY" \
+            --wandb_project     "ouroboros-stage3-jamba" \
+            --wandb_entity      "devesh-patel0922-weirdrunner" \
+            --kaggle_username_a "$KAGGLE_USERNAME_A" \
+            --kaggle_key_a      "$KAGGLE_KEY_A" \
+            --kaggle_username_b "$KAGGLE_USERNAME_B" \
+            --kaggle_key_b      "$KAGGLE_KEY_B" \
+            --kaggle_username_c "$KAGGLE_USERNAME_C" \
+            --kaggle_key_c      "$KAGGLE_KEY_C" \
             --total_train_samples 36906
