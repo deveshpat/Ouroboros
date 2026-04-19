@@ -2466,8 +2466,6 @@ def startup_hub_sync_and_prune(
 
     pruned = 0
     for ckpt, is_resume in all_ckpts:
-        if ckpt.name == "best":
-            continue
         if is_resume:
             continue
         shutil.rmtree(ckpt, ignore_errors=True)
