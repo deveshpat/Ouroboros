@@ -9,18 +9,24 @@ Usage:
         --repo_id WeirdRunner/Ouroboros \
         --min_workers 2 \
         --outer_lr 0.7 \
-        --kaggle_username "$KAGGLE_USERNAME" \
-        --kaggle_key "$KAGGLE_KEY"
+        --wandb_key "$WANDB_KEY" \
+        --wandb_project "ouroboros-stage3-jamba" \
+        --wandb_entity "devesh-patel0922-weirdrunner" \
+        --kaggle_username_a "$KAGGLE_USERNAME_A" \
+        --kaggle_key_a "$KAGGLE_KEY_A" \
+        --kaggle_username_b "$KAGGLE_USERNAME_B" \
+        --kaggle_key_b "$KAGGLE_KEY_B" \
+        --kaggle_username_c "$KAGGLE_USERNAME_C" \
+        --kaggle_key_c "$KAGGLE_KEY_C"
 """
 
 import argparse
 import json
-import os
 import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -28,6 +34,14 @@ import requests
 ROUND_STATE_PATH = "diloco_state/round_state.json"
 ANCHOR_PREFIX = "diloco_state/anchor"
 WORKER_IDS = ["A", "B", "C"]
+# Maps worker ID -> owning Kaggle username and kernel slug.
+# All three accounts run their own copy of kaggle-utils (no separate notebooks).
+# Slug format: {owner_username}/kaggle-utils
+WORKER_KAGGLE_SLUGS: Dict[str, Tuple[str, str]] = {
+    "A": ("weirdrunner", "weirdrunner/kaggle-utils"),
+    "B": ("weirdrunner007", "weirdrunner007/kaggle-utils"),
+    "C": ("weirdrunner008", "weirdrunner008/kaggle-utils"),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,10 +50,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo_id", default="WeirdRunner/Ouroboros")
     parser.add_argument("--min_workers", type=int, default=2)
     parser.add_argument("--outer_lr", type=float, default=0.7)
-    parser.add_argument("--kaggle_username", default=None)
-    parser.add_argument("--kaggle_key", default=None)
+    # Per-worker Kaggle credentials (each account can only trigger its own notebook)
+    parser.add_argument(
+        "--kaggle_username_a",
+        default=None,
+        help="Kaggle username for Worker A. Required to auto-trigger worker A.",
+    )
+    parser.add_argument("--kaggle_key_a", default=None, help="Kaggle API key for Worker A.")
+    parser.add_argument("--kaggle_username_b", default=None, help="Kaggle username for Worker B.")
+    parser.add_argument("--kaggle_key_b", default=None, help="Kaggle API key for Worker B.")
+    parser.add_argument("--kaggle_username_c", default=None, help="Kaggle username for Worker C.")
+    parser.add_argument("--kaggle_key_c", default=None, help="Kaggle API key for Worker C.")
+    # W&B
+    parser.add_argument(
+        "--wandb_key",
+        default=None,
+        help="W&B API key. If omitted, coordinator skips W&B logging.",
+    )
+    parser.add_argument("--wandb_project", default="ouroboros-stage3-jamba")
+    parser.add_argument("--wandb_entity", default="devesh-patel0922-weirdrunner")
     parser.add_argument("--total_train_samples", type=int, default=36906)
     return parser.parse_args()
+
 
 
 def hub_download_json(repo_id: str, path: str, token: str) -> Optional[Dict]:
@@ -160,26 +192,36 @@ def save_and_upload_anchor(
 
 
 
-def trigger_kaggle_workers(kaggle_username: Optional[str], kaggle_key: Optional[str]) -> None:
+def trigger_kaggle_workers(
+    kaggle_creds: Dict[str, Tuple[Optional[str], Optional[str]]],
+) -> None:
     """
-    Trigger all three worker Kaggle notebooks via Kaggle API.
-    Notebooks must be pre-configured with 'Run on API trigger' enabled.
-    Kernel slugs: {username}/ouroboros-worker-a, worker-b, worker-c
-    """
-    if not kaggle_username or not kaggle_key:
-        print("[coordinator] No Kaggle credentials - workers must be triggered manually.")
-        return
+    Trigger each worker's Kaggle notebook using that worker's own credentials.
 
-    for worker_id in ["a", "b", "c"]:
-        slug = f"{kaggle_username}/ouroboros-worker-{worker_id}"
+    Kaggle's /run API authenticates as the notebook owner; cross-account triggers
+    return 403. Each worker therefore has its own credential pair stored as
+    separate GitHub secrets.
+    """
+    for worker_id in WORKER_IDS:
+        username, key = kaggle_creds.get(worker_id, (None, None))
+        _, slug = WORKER_KAGGLE_SLUGS[worker_id]
+
+        if not username or not key:
+            print(
+                f"[coordinator] No credentials for Worker {worker_id} ({slug}) - "
+                "skipping automatic trigger. Start this worker manually."
+            )
+            continue
+
         url = f"https://www.kaggle.com/api/v1/kernels/{slug}/run"
         try:
-            resp = requests.post(url, auth=(kaggle_username, kaggle_key), json={}, timeout=60)
+            resp = requests.post(url, auth=(username, key), json={}, timeout=60)
         except requests.RequestException as exc:
             print(f"[coordinator] WARNING: Failed to trigger {slug}: {exc}")
             continue
+
         if resp.status_code == 200:
-            print(f"[coordinator] Triggered worker {worker_id.upper()}: {slug}")
+            print(f"[coordinator] Triggered Worker {worker_id}: {slug}")
         else:
             print(
                 f"[coordinator] WARNING: Failed to trigger {slug}: "
@@ -271,7 +313,7 @@ def main() -> None:
     state = hub_download_json(args.repo_id, ROUND_STATE_PATH, args.hf_token)
     if state is None:
         print("[coordinator] No round_state.json found. Nothing to aggregate.")
-        sys.exit(0)
+        return
 
     stage_k = int(state.get("stage_k", 0))
     round_n = int(state.get("round_n", 0))
@@ -280,92 +322,146 @@ def main() -> None:
 
     print(f"[coordinator] stage={stage_k} round={round_n}")
 
-    ready_workers = collect_ready_workers(args.repo_id, args.hf_token, stage_k, round_n)
-    allowed_workers = maybe_update_insufficient_worker_streak(
-        state=state,
-        repo_id=args.repo_id,
-        token=args.hf_token,
-        ready_workers=ready_workers,
-        min_workers=args.min_workers,
-    )
-    if allowed_workers is None:
-        sys.exit(0)
+    # - W&B coordinator run --------------------------------------------------
+    coordinator_wandb_run = None
+    try:
+        if args.wandb_key:
+            try:
+                import wandb
+                wandb.login(key=args.wandb_key, relogin=True)
+                coordinator_wandb_run = wandb.init(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,
+                    id=f"diloco-coordinator-s{stage_k}",
+                    resume="allow",
+                    name=f"Coordinator | Stage {stage_k}",
+                    config={
+                        "stage_k": stage_k,
+                        "outer_lr": args.outer_lr,
+                        "min_workers": args.min_workers,
+                        "total_train": args.total_train_samples,
+                    },
+                    mode="online",
+                )
+            except Exception as _we:
+                print(f"[coordinator] W&B init failed: {_we}")
 
-    print("[coordinator] Loading anchor weights...")
-    anchor_weights = load_adapter_weights_cpu(args.repo_id, ANCHOR_PREFIX, args.hf_token)
-    anchor_adapter_config = json.loads(
-        hub_download_text(args.repo_id, f"{ANCHOR_PREFIX}/adapter_config.json", args.hf_token)
-    )
-
-    print("[coordinator] Loading worker weights...")
-    worker_weights_list = []
-    worker_samples_list = []
-    for status in allowed_workers:
-        worker_weights_list.append(
-            load_adapter_weights_cpu(args.repo_id, status["weights_path"], args.hf_token)
+        ready_workers = collect_ready_workers(args.repo_id, args.hf_token, stage_k, round_n)
+        allowed_workers = maybe_update_insufficient_worker_streak(
+            state=state,
+            repo_id=args.repo_id,
+            token=args.hf_token,
+            ready_workers=ready_workers,
+            min_workers=args.min_workers,
         )
-        worker_samples_list.append(int(status["samples_seen"]))
+        if allowed_workers is None:
+            return
 
-    print("[coordinator] Aggregating on CPU...")
-    new_anchor = weighted_average_deltas(
-        anchor_weights,
-        worker_weights_list,
-        worker_samples_list,
-        args.outer_lr,
-    )
+        print("[coordinator] Loading anchor weights...")
+        anchor_weights = load_adapter_weights_cpu(args.repo_id, ANCHOR_PREFIX, args.hf_token)
+        anchor_adapter_config = json.loads(
+            hub_download_text(args.repo_id, f"{ANCHOR_PREFIX}/adapter_config.json", args.hf_token)
+        )
 
-    save_and_upload_anchor(
-        new_anchor,
-        anchor_adapter_config,
-        args.repo_id,
-        args.hf_token,
-        message=(
-            f"DiLoCo anchor: stage {stage_k} round {round_n} "
-            f"({len(allowed_workers)} workers, {sum(worker_samples_list)} samples)"
-        ),
-    )
+        print("[coordinator] Loading worker weights...")
+        worker_weights_list = []
+        worker_samples_list = []
+        for status in allowed_workers:
+            worker_weights_list.append(
+                load_adapter_weights_cpu(args.repo_id, status["weights_path"], args.hf_token)
+            )
+            worker_samples_list.append(int(status["samples_seen"]))
 
-    stage_key = str(stage_k)
-    current_stage_samples = int(total_samples_seen.get(stage_key, 0)) + sum(worker_samples_list)
-    total_samples_seen[stage_key] = current_stage_samples
-    print(
-        f"[coordinator] Stage {stage_k} progress: "
-        f"{current_stage_samples}/{args.total_train_samples} samples seen"
-    )
+        print("[coordinator] Aggregating on CPU...")
+        new_anchor = weighted_average_deltas(
+            anchor_weights,
+            worker_weights_list,
+            worker_samples_list,
+            args.outer_lr,
+        )
 
-    stage_complete = current_stage_samples >= args.total_train_samples
-    next_stage_k = stage_k
-    next_round_n = round_n + 1
-    if stage_complete:
-        print(f"[coordinator] Stage {stage_k} COMPLETE. Advancing to stage {stage_k + 1}.")
-        if stage_k not in completed_stages:
-            completed_stages.append(stage_k)
-        completed_stages = sorted(set(completed_stages))
-        next_stage_k = stage_k + 1
-        next_round_n = 0
+        save_and_upload_anchor(
+            new_anchor,
+            anchor_adapter_config,
+            args.repo_id,
+            args.hf_token,
+            message=(
+                f"DiLoCo anchor: stage {stage_k} round {round_n} "
+                f"({len(allowed_workers)} workers, {sum(worker_samples_list)} samples)"
+            ),
+        )
 
-    new_state = {
-        "stage_k": next_stage_k,
-        "round_n": next_round_n,
-        "anchor_path": ANCHOR_PREFIX,
-        "total_samples_seen": total_samples_seen,
-        "completed_stages": completed_stages,
-        "insufficient_worker_rounds": 0,
-        "last_updated": time.time(),
-        "last_round_workers": [status["worker_id"] for status in allowed_workers],
-        "last_round_samples": sum(worker_samples_list),
-    }
-    hub_upload_json(
-        args.repo_id,
-        ROUND_STATE_PATH,
-        new_state,
-        args.hf_token,
-        message=f"Round state update: stage {next_stage_k} round {next_round_n}",
-    )
-    print(f"[coordinator] round_state.json updated: stage={next_stage_k} round={next_round_n}")
+        stage_key = str(stage_k)
+        current_stage_samples = int(total_samples_seen.get(stage_key, 0)) + sum(worker_samples_list)
+        total_samples_seen[stage_key] = current_stage_samples
+        print(
+            f"[coordinator] Stage {stage_k} progress: "
+            f"{current_stage_samples}/{args.total_train_samples} samples seen"
+        )
 
-    trigger_kaggle_workers(args.kaggle_username, args.kaggle_key)
-    print("[coordinator] Done.")
+        stage_complete = current_stage_samples >= args.total_train_samples
+        next_stage_k = stage_k
+        next_round_n = round_n + 1
+        if stage_complete:
+            print(f"[coordinator] Stage {stage_k} COMPLETE. Advancing to stage {stage_k + 1}.")
+            if stage_k not in completed_stages:
+                completed_stages.append(stage_k)
+            completed_stages = sorted(set(completed_stages))
+            next_stage_k = stage_k + 1
+            next_round_n = 0
+
+        if coordinator_wandb_run is not None:
+            import wandb
+            wandb.log(
+                {
+                    "coordinator/round": round_n,
+                    "coordinator/workers_aggregated": len(allowed_workers),
+                    "coordinator/samples_this_round": sum(worker_samples_list),
+                    "coordinator/total_samples_stage": current_stage_samples,
+                    "coordinator/stage_complete": int(stage_complete),
+                    "coordinator/pct_stage_done": round(
+                        current_stage_samples / max(args.total_train_samples, 1) * 100, 1
+                    ),
+                },
+                step=round_n,
+            )
+
+        new_state = {
+            "stage_k": next_stage_k,
+            "round_n": next_round_n,
+            "anchor_path": ANCHOR_PREFIX,
+            "total_samples_seen": total_samples_seen,
+            "completed_stages": completed_stages,
+            "insufficient_worker_rounds": 0,
+            "last_updated": time.time(),
+            "last_round_workers": [status["worker_id"] for status in allowed_workers],
+            "last_round_samples": sum(worker_samples_list),
+        }
+        hub_upload_json(
+            args.repo_id,
+            ROUND_STATE_PATH,
+            new_state,
+            args.hf_token,
+            message=f"Round state update: stage {next_stage_k} round {next_round_n}",
+        )
+        print(f"[coordinator] round_state.json updated: stage={next_stage_k} round={next_round_n}")
+
+        kaggle_creds: Dict[str, Tuple[Optional[str], Optional[str]]] = {
+            "A": (args.kaggle_username_a, args.kaggle_key_a),
+            "B": (args.kaggle_username_b, args.kaggle_key_b),
+            "C": (args.kaggle_username_c, args.kaggle_key_c),
+        }
+        trigger_kaggle_workers(kaggle_creds)
+
+        if coordinator_wandb_run is not None:
+            import wandb
+            wandb.finish()
+            coordinator_wandb_run = None
+        print("[coordinator] Done.")
+    finally:
+        if coordinator_wandb_run is not None:
+            import wandb
+            wandb.finish()
 
 
 if __name__ == "__main__":

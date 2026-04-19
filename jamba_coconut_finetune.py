@@ -708,6 +708,10 @@ GEN_PROMPTS = [
     "Solve for x: 3x + 6 = 21.",
 ]
 
+# Fallback estimated optimiser steps per worker per DiLoCo round.
+# Actual value is computed at runtime in run_diloco_worker().
+_DILOCO_SHARD_STEP_FALLBACK = 385
+
 _LAST_NUM = _re.compile(r"[\d,]+(?:\.\d+)?")
 _CHAT_TEMPLATE_WARNED = False
 
@@ -1141,6 +1145,14 @@ def parse_args() -> argparse.Namespace:
     )
 
     return parser.parse_args()
+
+
+def _wandb_config(args: argparse.Namespace) -> Dict[str, Any]:
+    config = dict(vars(args))
+    for key in ["hf_token", "_resolved_hf_token"]:
+        if key in config and config[key] is not None:
+            config[key] = "***"
+    return config
 
 
 class HaltGate(nn.Module):
@@ -3214,6 +3226,45 @@ def run_diloco_worker(
             print("  [diloco] Regular stage checkpoint Hub sync is disabled in DiLoCo mode; worker uploads go to diloco_state/ only.")
         diloco_download_anchor(model, hf_token, args.diloco_state_repo, anchor_path, device)
     barrier()
+
+    # ── Step-offset (always computed, regardless of W&B mode) ─────────────────
+    shard_step_estimate = math.ceil(
+        len(train_samples) / 3 / max(args.batch_size * args.grad_accum, 1)
+    )
+    if shard_step_estimate <= 0:
+        shard_step_estimate = _DILOCO_SHARD_STEP_FALLBACK
+    global_step_offset = round_n * shard_step_estimate
+
+    # ── W&B init (DiLoCo path only) ──────────────────────────────────────────
+    # Each worker gets one persistent run per stage, resumed across rounds.
+    # Run ID is stable: diloco-{worker}-s{stage_k}  (e.g. "diloco-a-s2")
+    diloco_wandb_run = None
+    if _is_main_process() and args.wandb_mode != "disabled":
+        try:
+            import wandb as _wandb
+            run_id = f"diloco-{args.diloco_worker_id.lower()}-s{stage_k}"
+            diloco_wandb_run = _wandb.init(
+                project=args.wandb_project,
+                id=run_id,
+                resume="allow",
+                name=f"Worker {args.diloco_worker_id} | Stage {stage_k}",
+                config={
+                    **_wandb_config(args),
+                    "stage_k": stage_k,
+                    "round_n": round_n,
+                    "worker_id": args.diloco_worker_id,
+                    "mode": "diloco",
+                    "shard_step_estimate": shard_step_estimate,
+                },
+                mode=args.wandb_mode,
+            )
+            _wandb.log(
+                {"diloco/round": round_n, "diloco/stage": stage_k},
+                step=global_step_offset,
+            )
+        except Exception as _we:
+            print(f"  [diloco] W&B init failed: {_we}")
+
     if _world_size() > 1:
         broadcast_parameters(get_trainable_parameters(model, None), src=0)
         barrier()
@@ -3232,7 +3283,7 @@ def run_diloco_worker(
         )
         if _is_main_process():
             print(f"  [diloco] Pre-training val: stage={stage_k} ce={val_ce:.4f} acc={val_acc:.4f}")
-            if wandb_run is not None:
+            if diloco_wandb_run is not None:
                 import wandb
                 wandb.log(
                     {
@@ -3241,7 +3292,7 @@ def run_diloco_worker(
                         "diloco/stage": stage_k,
                         "diloco/round": round_n,
                     },
-                    step=round_n,
+                    step=global_step_offset,
                 )
     barrier()
 
@@ -3281,7 +3332,7 @@ def run_diloco_worker(
             device=device,
             output_dir=output_dir,
             session_start=session_start,
-            wandb_run=wandb_run,
+            wandb_run=diloco_wandb_run,
             stages=[stage_k],
             curriculum_max_stage=curriculum_max_stage,
             resume_path=None,
@@ -3289,7 +3340,7 @@ def run_diloco_worker(
             resume_stage=stage_k,
             resume_epoch=0,
             resume_step_in_epoch=-1,
-            global_step=0,
+            global_step=global_step_offset,
             step_in_phase=0,
             load_best_between_stages=False,
             run_generation_at_stage_end=False,
@@ -3338,6 +3389,17 @@ def run_diloco_worker(
             f"stage={stage_k} round={round_n} samples_seen={samples_seen_this_round}"
         )
     barrier()
+
+    if diloco_wandb_run is not None:
+        import wandb
+        wandb.log(
+            {
+                "diloco/samples_seen_this_round": samples_seen_this_round,
+                "diloco/round_complete": 1,
+            },
+            step=global_step_offset + shard_step_estimate,
+        )
+        wandb.finish()
 
     return {
         "stage_k": stage_k,
@@ -3393,14 +3455,16 @@ def main() -> None:
         args.push_to_hub = False
 
     wandb_run = None
-    if is_main and args.wandb_mode != "disabled":
+    if is_main and args.wandb_mode != "disabled" and not args.diloco_mode:
+        # Sequential curriculum path: init wandb normally.
+        # DiLoCo path defers init to run_diloco_worker() where stage_k/round_n are known.
         try:
             import wandb
             wandb_run = wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name,
                 mode=args.wandb_mode,
-                config=vars(args),
+                config=_wandb_config(args),
             )
         except ImportError:
             print("[warn] wandb not installed")
