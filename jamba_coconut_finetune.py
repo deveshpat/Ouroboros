@@ -50,6 +50,7 @@ Run (Phase 3.1 through 3.K, Kaggle Dual GPU):
     --epochs_per_stage 3 --max_stage 10 --batch_size 2 --grad_accum 8 \
     --max_grad_norm 0.3 \
     --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
+    --push_to_hub \
     --output_dir runs/stage3_curriculum
 
 Run (Phase 3.4, DGAC gate, from Stage K best checkpoint):
@@ -2112,8 +2113,8 @@ def save_checkpoint(
     repo_id   = getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros")
     subdir    = getattr(args, "hf_stage_subdir", "runs/stage3")
     if push and hf_token and _is_main_process():
-        _hub_upload_checkpoint(ckpt, repo_id, hf_token, remote_prefix=subdir)
-
+      stage_remote_prefix = f"{subdir.strip('/')}/stage_{stage_k}"
+      _hub_upload_checkpoint(ckpt, repo_id, hf_token, remote_prefix=stage_remote_prefix)
     return ckpt
 
 
