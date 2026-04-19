@@ -2,14 +2,14 @@
 
 > **Thread-resume header. Read Part 0 first in any new session.**
 > **DRY Guidelines:** Session details live in `terminal_log.md`. Blueprint holds decisions, architecture, status, and next actions only.
-> **Source of truth:** If docs and `.py`/`.ipynb` files ever disagree, the Python/notebook file takes precedence. Update docs to reflect reality.
+> **Source of truth:** If docs and `.py`/`.ipynb` files ever disagree, the Python/notebook file takes precedence.
 
 ---
 
 ## Part 0 — Quick-Resume Context
 
 ### What this project is
-Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Jamba Reasoning 3B). The Mamba SSM recurrent state acts as compressed scratch-memory across K latent thought passes, bypassing token generation during reasoning. Core mechanism from Meta's Coconut (arXiv:2412.06769), extended with DGAC (Diversity-Gated Adaptive Coconut) — our novel anti-collapse halt gate.
+Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Jamba Reasoning 3B). Mamba SSM recurrent state acts as compressed scratch-memory across K latent thought passes, bypassing token generation during reasoning. Core mechanism from Meta's Coconut (arXiv:2412.06769), extended with DGAC (Diversity-Gated Adaptive Coconut) — our novel anti-collapse halt gate.
 
 ### Strategic Status (Updated 2026-04-19)
 
@@ -26,7 +26,7 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 |---|---|---|
 | Stage 0 (CoT warmup) | ✅ COMPLETE | ce=0.4041, acc=0.0222 |
 | Stage 1 (1 latent pass) | ✅ COMPLETE | ce=0.4912, acc=0.0444 |
-| Stage 2 (2 latent passes) | 🟡 IN PROGRESS — step ~2860/3462 (≈step 564/1154 in epoch) | — |
+| Stage 2 (2 latent passes) | 🟡 IN PROGRESS — 679/1154 steps (59%), checkpoint-0002987 on Hub | — |
 | Stages 3–10 | ⬜ NOT STARTED | — |
 
 | Stage | Name | Status |
@@ -35,8 +35,21 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 | 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
 
 ### TRC Status
-✅ Accepted (email 2026-04-07).
-⚠️ **REVISED CLAIM TIMING:** Claim TRC immediately after Stage 1 completes → **Stage 1 is now COMPLETE. Claim TRC now.**
+✅ Accepted (email 2026-04-07). **TRC grants Cloud TPU quota only — fundamentally incompatible with our CUDA/Mamba stack** (no XLA kernels for mamba_ssm/causal_conv1d; bitsandbytes is CUDA-only). TRC cannot be used for this workload as granted.
+
+**Action pending:** Email trc-support@google.com requesting conversion to A100 GPU-hours or GCP credits applicable to GPU VMs. Draft in `terminal_log.md`.
+
+### Compute Strategy — Three-Account Relay Training
+Three Kaggle accounts (A/B/C) do **sequential relay handoff** via Hub checkpoints. This is NOT parallel DDP — true multi-node DDP is impossible on Kaggle (no public IPs, no inter-container networking). The Hub is the sole communication mechanism.
+
+**Relay rule: never run two accounts simultaneously. Sequential only.**
+
+| Account | Quota Now | Projected Work |
+|---|---|---|
+| A (current) | 8.5h | Stage 2 finish (~6.8h remaining) |
+| B | 30h | Stage 3 (~21.9h) + partial Stage 4 |
+| C | 30h | Remainder of Stage 4 + Stage 5 |
+| Weekly refresh | 90h/week | ~3 weeks total for stages 3–10 |
 
 ### Dataset
 - **Train:** 36,906 samples  **Val:** 1,940 samples
@@ -48,25 +61,23 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
 |---|---|---|
 | sm75 (T4) | ✅ on Hub | ✅ on Hub |
 | sm100 (B100) | ✅ on Hub | ❌ not yet built |
+| sm60 (P100) | ❌ not built | ❌ not built |
+
+**P100 is not viable:** no Tensor Cores (would regress to ~120-150s/step), single GPU (no DDP), sm60 wheels not on Hub. Stick to Dual T4.
 
 ---
 
 ### Part 0.1 — Immediate Next Actions (ordered)
 
-1. **[DONE]** Phase 2.5/2.6 ordering swap ✅
-2. **[DONE]** Batched forward for Stage 0 ✅
-3. **[DONE]** Profile Dual T4 throughput ✅
-4. **[DONE]** Batched latent injection for stages k>0 ✅
-5. **[DONE]** Stage 0 training to completion ✅ (checkpoint-0001154)
-6. **[DONE]** NCCL + val timeout fixes ✅
-7. **[DONE]** Stage 0 val ✅ (ce=0.4041, acc=0.0222)
-8. **[DONE]** Stage 1 training + val ✅ (ce=0.4912, acc=0.0444)
-9. **[DONE]** FP16 patch confirmed ✅ (~41s/step at k=1)
-10. **[DONE]** Hub+prune fix applied and confirmed ✅ (Session 15)
+1–10. **[ALL DONE]** See previous sessions.
 
-11. **[ACTION NOW] Claim TRC** — Stage 1 is complete. Submit TRC claim.
+11. **[ACTION — BEFORE NEXT RUN]** Apply relay path fix to `jamba_coconut_finetune.py`:
+    - See `AGENT_PROMPT_relay_path_fix.md`
+    - One-line change in `save_checkpoint()`: `remote_prefix=subdir` → `remote_prefix=f"{subdir.strip('/')}/stage_{stage_k}"`
+    - **This is relay-blocking.** Account B/C cannot find Hub checkpoints without this fix.
+    - Commit fix to GitHub repo so `kaggle-utils.ipynb` cell 3 (git sync) pulls it automatically.
 
-12. **[NEXT SESSION] Resume Stage 2** (already in progress at step ~2860):
+12. **[Account A — 8.5h remaining]** Finish Stage 2:
     ```bash
     torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
       --data_dir data/coconut_v1 --use_4bit \
@@ -74,30 +85,40 @@ Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Ja
       --batch_size 4 --grad_accum 8 \
       --val_batch_size 2 \
       --val_skip_buffer_minutes 60 \
-      --session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20 \
+      --session_timeout_hours 8.5 --graceful_exit_buffer_minutes 20 \
       --push_to_hub \
       --output_dir runs/stage3_curriculum
     ```
-    - Startup log **must** show: `[GPU] Tesla T4  cc=sm75  VRAM=16GB  amp_dtype=float16`
-    - Auto-resumes from latest stage_2 checkpoint
-    - Stage 2 target step time: **~57s/step** (empirical, Session 15)
-    - Stage 2 remaining: ~590 steps × 57s ≈ 9.3h — expect 1 session + possible timeout
+    - `--session_timeout_hours 8.5` — match actual remaining quota
+    - Auto-resumes from `stage_2/checkpoint-0002987` on Hub
+    - Stage 2 remaining: ~475 steps × ~52s ≈ 6.8h — should complete within this session
 
-13. **On A100 (post-TRC):** Move stages 3–10. Confirm: `[perf] 80GB VRAM detected: disabling gradient checkpointing`
+13. **[Account B — 30h]** Same command with `--session_timeout_hours 11.0`:
+    - No local data, no `--resume_from` needed — Hub scan is automatic
+    - Expected startup: `[resume] No local checkpoints found. Scanning Hub...`
 
-14. **After K=4–5 gate passes on A100:** Integrate DGAC (Phase 3.4).
+14. **[Account C — 30h]** Same as B after B exhausts quota.
 
-15. **[MINOR BUG — low priority]** `save_checkpoint` hub upload uses wrong remote path — missing stage subdir (e.g. uploads to `runs/stage3/checkpoint-0002308` instead of `runs/stage3/stage_1/checkpoint-0002308`). Startup sync corrects this next session. Fix in `save_checkpoint`: pass `f"{subdir}/stage_{stage_k}"` as `remote_prefix`.
+15. **[Weekly rotation]** When all accounts exhaust quota, wait for weekly reset, relay continues.
+
+16. **[Email TRC]** Send draft from `terminal_log.md` — 5 minutes, potentially unlocks A100.
 
 ---
 
-### Part 0.1.1 — Profiler snippet (use if step time regresses)
+### Part 0.1.1 — Relay Handoff Checklist (per account)
 
-```python
-with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
-    loss, metrics = coconut_forward(...)
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-# Confirm: volta_h884gemm (FP16 tensor cores) NOT volta_sgemm (FP32)
+Before starting a new account's session:
+- [ ] Previous account's session fully ended and Hub upload confirmed complete
+- [ ] Path fix applied and committed to GitHub (`AGENT_PROMPT_relay_path_fix.md`)
+- [ ] Cell 3 of `kaggle-utils.ipynb` will git-pull the fix automatically
+- [ ] Command includes `--push_to_hub`
+- [ ] `--session_timeout_hours` set to actual remaining quota for that account
+
+Expected startup log on Account B/C (no local checkpoints):
+```
+  [resume] No local checkpoints found. Scanning Hub...
+  [hub] downloading stage_2/checkpoint-XXXXXXX ...
+  [resume] using stage_2/checkpoint-XXXXXXX as resume checkpoint
 ```
 
 ---
@@ -112,25 +133,25 @@ print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 | No graceful timeout → lost Kaggle work | `make_timeout_checker()` integrated ✅ |
 | `conv1d` in LoRA targets | Explicitly excluded ✅ |
 | OOM at first val step | `empty_cache()` + `val_batch_size=2` ✅ |
-| `--max_seq_len 512` filtered stage 1+ samples | Default changed to 1024 ✅ |
+| `--max_seq_len 512` filtered stage 1+ | Default changed to 1024 ✅ |
 | Exploding gradients at k≥2 | `--max_grad_norm 0.3` ✅ |
 | mamba-ssm 2.x API | Pinned to 1.2.2 ✅ |
-| Val decode time (200 samples → 5+hrs) | Cap at 50 samples ✅ |
+| Val decode time (200 samples) | Cap at 50 samples ✅ |
 | NCCL watchdog (60min) kills DDP val | `timedelta(hours=4)` + `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC` ✅ |
 | Val skip threshold used wrong buffer | `--val_skip_buffer_minutes 60` separate arg ✅ |
 | BF16 on T4 uses FP32 compute paths | `_amp_dtype` checks `cc >= (8, 0)`; T4 uses FP16 ✅ |
-| GC wastes 20–40% on A100 | Auto-disabled at VRAM≥40GB ✅ |
+| GC wastes 20-40% on A100 | Auto-disabled at VRAM≥40GB ✅ |
 | `_amp_dtype` called in hot loop | `@functools.lru_cache(maxsize=None)` ✅ |
-| `--push_to_hub` never passed | ✅ FIXED — added to command; hub+prune confirmed Session 15 |
-| `prune_epoch_checkpoints` only after val; per-stage only | ✅ FIXED — `startup_hub_sync_and_prune` confirmed Session 15 |
-| `save_checkpoint` hub upload missing stage subdir | 🟡 LOW PRIORITY — startup sync corrects it; fix when convenient |
-| Prefix re-computation at Stage k | 🟡 FUTURE — Cache Mamba state at q_len before Stage 5 on A100 |
+| `--push_to_hub` never passed | ✅ FIXED — confirmed Session 15 |
+| `prune_epoch_checkpoints` per-stage only | ✅ FIXED — `startup_hub_sync_and_prune` Session 15 |
+| `save_checkpoint` hub upload missing stage subdir | 🔴 RELAY-BLOCKING — `AGENT_PROMPT_relay_path_fix.md` |
+| Prefix re-computation at Stage k | 🟡 FUTURE — before Stage 5 on A100 |
 
 ---
 
 ## Part 1 — Architecture
 
-### Jamba Reasoning 3B (primary research model)
+### Jamba Reasoning 3B
 ```
 HuggingFace : ai21labs/AI21-Jamba-Reasoning-3B   License: Apache 2.0
 Layers      : 28 total (26 Mamba, 2 Attention) → 13:1 Mamba:Attention ratio
@@ -153,22 +174,20 @@ d_model     : 2560
 | DGAC halt gate | Phase 3.4 only; λ₁ annealed from 0 |
 | `--max_seq_len` | 1024 |
 | `--max_grad_norm` | 0.3 for k≥2 stages |
-| Session timeout | `--session_timeout_hours 11.0 --graceful_exit_buffer_minutes 20` |
+| `--session_timeout_hours` | Set to actual remaining quota per account (not fixed at 11.0) |
 | val_batch_size | **2** |
-| val accuracy samples | **50** (capped from 200) |
+| val accuracy samples | **50** |
 | val skip threshold | **`--val_skip_buffer_minutes 60`** |
-| NCCL init_process_group timeout | **`timedelta(hours=4)`** |
-| Stage 0 forward pass | ✅ Batched — single fused backbone call per micro-batch |
-| Stage k≥1 forward pass | ✅ `_forward_batched_latent()` |
-| epochs_per_stage | **1 for all stages** |
+| NCCL timeout | **`timedelta(hours=4)`** |
+| epochs_per_stage | **1** |
 | batch_size | **4** |
-| Stage 0 skip | **NO** — domain adaptation. 1 epoch sufficient. |
 | DDP val strategy | All ranks participate (interleaved shard) |
-| TRC claim timing | **After Stage 1 completes** → Stage 1 now COMPLETE |
-| amp_dtype on T4 (sm75) | ✅ **FP16** — confirmed ~41s/step (k=1), ~57s/step (k=2) |
+| amp_dtype on T4 (sm75) | ✅ **FP16** — ~41s/step (k=1), ~52-57s/step (k=2) |
 | amp_dtype on A100+ (sm80+) | ✅ **BF16** |
-| Gradient checkpointing | ✅ Auto-disabled at VRAM≥40GB |
-| Hub checkpoint sync | ✅ `startup_hub_sync_and_prune` confirmed working Session 15 |
+| Gradient checkpointing | Auto-disabled at VRAM≥40GB |
+| Multi-account strategy | **Sequential relay via Hub** — NOT parallel DDP (impossible on Kaggle) |
+| TRC quota | **TPU only — incompatible with stack** — email requesting GPU conversion |
+| P100 viability | **No** — no Tensor Cores, single GPU. Dual T4 strictly better. |
 
 ---
 
@@ -176,12 +195,10 @@ d_model     : 2560
 
 | Question | Status |
 |---|---|
-| Does `inputs_embeds` → `last_hidden_state` work at k≥2? | 🟢 CONFIRMED — Stage 2 training, ce healthy ~0.45–0.65 |
-| Step time at Stage 2 post-FP16? | 🟢 **~57s/step** (empirical, Session 15). Model predicted ~46s; actual slightly higher. |
-| DGAC Phase 3.4: halt_step distribution across K≥2? | 🔴 OPEN — primary research validation |
-| Prefix re-computation optimization | 🟡 OPEN — implement before Stage 5 on A100 |
-| Is 1 epoch per stage sufficient for convergence? | 🟡 MONITOR — Stage 2 gn up to 1.9 (pre-clip); CE trending ~0.5 vs Stage 1 ~0.44 |
-| Stage 2 elevated gn (up to ~1.9 pre-clip): instability or transient? | 🟡 MONITOR — max_grad_norm=0.3 clipping correctly; CE not diverging |
+| Stage 2 elevated gn (up to ~1.9 pre-clip): transient? | 🟡 MONITOR — CE not diverging |
+| DGAC Phase 3.4: halt_step distribution across K≥2? | 🔴 OPEN — primary research |
+| Prefix re-computation optimization | 🟡 OPEN — before Stage 5 on A100 |
+| TRC GPU conversion via email? | 🟡 PENDING — draft ready, not sent |
 
 ---
 
@@ -190,37 +207,39 @@ d_model     : 2560
 ### Step-time model (empirical)
 
 ```
-Post-patch FP16 on T4 (CONFIRMED):
-  t_fp16(k) ≈ 34 + ~11.5k  seconds/step  [revised from empirical k=1 and k=2]
-  Stage 0: ~34s  Stage 1: ~41s ✓  Stage 2: ~57s ✓  Stage 5: ~92s  Stage 10: ~149s
+t_fp16(k) ≈ 34 + ~11.5k  seconds/step
 
-  Note: original estimate was 34 + 6k; actual k=2 data (57s) suggests ~11.5s per latent pass.
-  Revising upward; A100 still required for stages 3–10.
+Stage 0: ~34s  Stage 1: ~41s ✓  Stage 2: ~52-57s ✓
+Stage 3: ~69s  Stage 5: ~92s   Stage 10: ~149s  (projected)
 ```
 
-| Platform | Condition | Stages 1–10 total | Feasible? |
-|---|---|---|---|
-| Dual T4 | FP16 patch | ~550h (revised) | ❌ No |
-| A100 80GB | BF16 native + no GC (~4–6× vs T4 FP16) | ~90–140h | ✅ Yes |
+### Stage hours on Dual T4 + 3-account relay
 
-**Conclusion:** A100 required for stages 3–10. Stage 2 is finishable on T4 (~1–2 sessions).
+| Stage | Est. Hours | Account |
+|---|---|---|
+| 2 (remaining ~475 steps) | ~6.8h | A (8.5h quota) |
+| 3 | ~21.9h | B (30h quota) |
+| 4 | ~25.7h | B remainder + C |
+| 5 | ~29.3h | C remainder + reset |
+| 6–10 | ~201h | Weekly resets |
+| **Stages 3–10 total** | **~278h** | **~3.1 weeks at 90h/week** |
 
-### Disk usage (Kaggle)
-Hub+prune confirmed working. Each session: all local checkpoints pushed to Hub, all except resume pruned. Disk stays bounded.
+A100 (if TRC converts): ~5× faster → ~55h → ~2 days.
 
 ---
 
 ## Part 5 — File Registry
 
-| File | Stage | Status | Notes |
-|---|---|---|---|
-| `jamba_coconut_finetune.py` | 3 | ✅ Hub+prune CONFIRMED | Minor bug: `save_checkpoint` remote path missing stage subdir |
-| `kaggle-utils.ipynb` | 3 | ✅ CURRENT | Cell 5 has `--push_to_hub`; confirmed working |
-| `AGENT_PROMPT_hub_prune_fix.md` | 3 | ✅ APPLIED & CONFIRMED | Session 15 |
-| `AGENT_PROMPT_perf_fix.md` | 3 | ✅ APPLIED | FP16 + lru_cache + auto-GC disable |
-| `AGENT_PROMPT_nccl_val_fix.md` | 3 | ✅ APPLIED | Session 13 confirmed |
-| `prepare_coconut_dataset.py` | 3 | ✅ DONE | coconut-v1 on Hub |
-| `build_wheels_kaggle.py` | 3 | ✅ DONE | sm75 wheels on Hub |
+| File | Status | Notes |
+|---|---|---|
+| `jamba_coconut_finetune.py` | 🔴 NEEDS PATH FIX | Relay-blocking bug in `save_checkpoint` |
+| `kaggle-utils.ipynb` | ✅ CURRENT | Cell 5 has `--push_to_hub`; git-pull in cell 3 gets fix |
+| `AGENT_PROMPT_relay_path_fix.md` | ✅ READY | One-line fix, apply before Account B |
+| `AGENT_PROMPT_hub_prune_fix.md` | ✅ APPLIED | Session 15 confirmed |
+| `AGENT_PROMPT_perf_fix.md` | ✅ APPLIED | FP16 + lru_cache + auto-GC |
+| `AGENT_PROMPT_nccl_val_fix.md` | ✅ APPLIED | Session 13 confirmed |
+| `prepare_coconut_dataset.py` | ✅ DONE | coconut-v1 on Hub |
+| `build_wheels_kaggle.py` | ✅ DONE | sm75 wheels on Hub |
 
 ---
 
@@ -241,7 +260,7 @@ K = 10
 L_total = L_ce  +  λ₁(t) · L_ponder  +  λ₂ · L_diversity
 
 L_diversity = mean_batch( Σ_k relu(cos_sim(h_k, h_{k-1}) − τ) ),  τ = 0.9
-λ₁ schedule: 0 for steps 0-200, ramp 0→0.01 over steps 200-500, flat 0.01 after
+λ₁ schedule: 0 for steps 0-200, ramp 0→0.01 over steps 200-500, flat after
 ```
 
 **HaltGate:** Linear(2*d_model → 1), zero-initialized → outputs 0.5 at Phase 3.4 start.
@@ -252,19 +271,19 @@ L_diversity = mean_batch( Σ_k relu(cos_sim(h_k, h_{k-1}) − τ) ),  τ = 0.9
 
 ```
 output_dir/
-  stage_0/
-    checkpoint-0001154/
-    best/                  ← acc=0.0222 ce=0.4041
-  stage_1/
-    checkpoint-0002308/
-    best/                  ← acc=0.0444 ce=0.4912
+  stage_0/best/             ← acc=0.0222 ce=0.4041
+  stage_1/best/             ← acc=0.0444 ce=0.4912
   stage_2/
-    checkpoint-XXXXXXX/    ← in progress
+    checkpoint-0002987/     ← in progress (679/1154 steps)
     best/
   stage_k/best/
     adapter_model/
-    training_state.pt      ← {stage_k, step, epoch, step_in_epoch, val_ce, val_acc, optimizer, scheduler}
-    halt_gate.pt           ← Phase 3.4 only
+    training_state.pt
+    halt_gate.pt            ← Phase 3.4 only
+
+Hub (after path fix applied):
+  WeirdRunner/Ouroboros/runs/stage3/stage_{k}/checkpoint-XXXXXXX/
+  WeirdRunner/Ouroboros/runs/stage3/stage_{k}/best/
 ```
 
 ---
@@ -273,10 +292,12 @@ output_dir/
 
 | Phase | Platform | Estimate |
 |---|---|---|
-| Stage 2 (in progress, ~590 steps remaining) | Kaggle Dual T4 | ~590 × 57s ≈ 9.3h (1–2 sessions) |
-| Stages 3–10 | TRC A100 80GB | ~90–140h total (revised) |
-| Phase 3.4 (DGAC) | TRC A100 80GB | ~6–8h |
-| Phase 4 (GRPO) | TRC A100 80GB | ~8–12h |
+| Stage 2 finish | Account A (8.5h) | ~6.8h ✅ fits |
+| Stage 3 | Account B (30h) | ~21.9h ✅ fits |
+| Stages 4–5 | Account B+C | ~55h |
+| Stages 6–10 | Weekly relay resets | ~223h |
+| Phase 3.4 (DGAC) | After Stage 10 | ~6–8h |
+| Phase 4 (GRPO) | After DGAC | ~8–12h |
 
 ---
 
@@ -284,27 +305,21 @@ output_dir/
 
 | Lesson | Codified As |
 |---|---|
-| val_batch_size=16 → OOM | `--val_batch_size 2` default |
-| NCCL watchdog kills DDP | `timedelta(hours=4)` + `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC` |
+| val_batch_size=16 → OOM | `--val_batch_size 2` |
+| NCCL watchdog kills DDP | `timedelta(hours=4)` + env var |
 | max_seq_len=512 filtered stage 1+ | `--max_seq_len 1024` |
 | gn=36.9 at k=2 | `--max_grad_norm 0.3` |
 | mamba-ssm 2.x broke fast path | Pinned to 1.2.2 |
-| mamba-ssm 1.2.2 PyPI sdist is a 35kB stub | `git+https://github.com/state-spaces/mamba.git@v1.2.2` |
-| Single-name generation shim insufficient | Comprehensive 10-alias shim |
-| Per-sample loop at batch=1 for stage 0 → 113s/step | Batched forward path |
-| Profile run (200 samples) shows 30s/step; full run shows 137s/step | Always profile at full scale |
-| Blueprint marked stage k≥1 batching as PENDING but code already had it | Audit .py before marking blockers |
-| Stage 0 skip tempting for capable base model | Stage 0 is domain adaptation |
-| Val with no KV cache at 200 samples → 5.5h | Cap at 50 |
-| Timeout checker only fires inside training step loop | Pre-val checkpoint save + timeout check before val |
-| `timedelta(minutes=60)` kills rank 1 during val | `timedelta(hours=4)` + env var |
-| `graceful_exit_buffer=20min` used as val skip threshold | `--val_skip_buffer_minutes 60` separate arg |
-| `torch.cuda.is_bf16_supported()` True on sm75 (soft emulation) | `_amp_dtype` checks `cc >= (8, 0)` |
-| GC mandatory on T4 but wastes 20–40% on A100 | Auto-disable at VRAM≥40GB |
-| `_amp_dtype` called in hot loop | `@functools.lru_cache(maxsize=None)` |
-| Conservative 1.5–2.5× FP16 speedup; actual ~4× | Always verify empirically |
-| `--push_to_hub` never added → hub upload silently never fires | Add flag explicitly |
-| `prune_epoch_checkpoints` per-stage only; skipped on timeout | `startup_hub_sync_and_prune` at session start |
-| Blueprint showed `--val_skip_buffer_minutes 120` but code used 60 | Python/notebook files take precedence |
-| Step-time model t_fp16(k) ≈ 34 + 6k was too optimistic | Empirical k=2 = 57s → ~11.5s per latent pass |
-| `save_checkpoint` hub upload missing stage subdir in remote path | Startup sync corrects it; fix `remote_prefix` in `save_checkpoint` |
+| mamba-ssm PyPI sdist is 35kB stub | `git+https://...@v1.2.2` |
+| Per-sample loop → 113s/step | Batched forward path |
+| Val at 200 samples → 5.5h | Cap at 50 |
+| `is_bf16_supported()` True on sm75 (emulation) | `_amp_dtype` checks `cc >= (8, 0)` |
+| GC wastes 20-40% on A100 | Auto-disable at VRAM≥40GB |
+| `--push_to_hub` never added → silent no-op | Add flag explicitly |
+| `prune_epoch_checkpoints` per-stage only | `startup_hub_sync_and_prune` at session start |
+| Step-time model `34 + 6k` too optimistic | Empirical k=2 → ~11.5s/latent pass |
+| `save_checkpoint` remote_prefix missing stage subdir | 🔴 RELAY-BLOCKING — fix before Account B |
+| "Parallel sessions" misread as multi-node DDP | Impossible on Kaggle — Hub relay only |
+| TRC assumed to give GPU access | TPU-only — incompatible with CUDA/Mamba stack |
+| P100 assumed better than T4 | No Tensor Cores, single GPU — strictly worse |
+| `--session_timeout_hours` fixed at 11.0 | Set to actual remaining quota per account |
