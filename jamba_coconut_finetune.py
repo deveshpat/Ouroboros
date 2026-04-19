@@ -379,25 +379,42 @@ def _bootstrap_shared_install_phases() -> None:
     _wheel_dir = Path("/tmp/ouroboros_wheels")
     _wheel_dir.mkdir(exist_ok=True)
 
+    _kaggle_wheel_dir = Path("/kaggle/input/ouroboros-cache/wheels")
+    _kaggle_wheel_cache_active = _arch_suffix == "sm75" and _kaggle_wheel_dir.exists()
+    if _kaggle_wheel_cache_active:
+        print("[bootstrap]   Kaggle dataset wheel cache detected for sm75 fast path ✓")
+    elif _kaggle_wheel_dir.exists():
+        print(f"[bootstrap]   Kaggle dataset wheel cache present but skipped on {_arch_suffix} (sm75-only cache)")
+
     for _base in _HUB_WHEEL_BASES:
         _hub_filename   = f"{_base}-{_arch_suffix}.whl"
         _local_filename = f"{_base}.whl"
         _local_path     = _wheel_dir / _local_filename
 
         _downloaded = False
-        try:
-            _dl = hf_hub_download(
-                repo_id=_HUB_REPO_ID,
-                filename=_hub_filename,
-                token=_hf_token,
-                local_dir=str(_wheel_dir),
-            )
-            shutil.copy2(_dl, str(_local_path))
-            print(f"[bootstrap]   Downloaded {_hub_filename} ✓")
-            _downloaded = True
-        except Exception as _dl_err:
-            print(f"[bootstrap]   {_hub_filename} not on Hub "
-                  f"({type(_dl_err).__name__}). Compiling from source...")
+        if _kaggle_wheel_cache_active:
+            _pkg_prefix = _base.split("-")[0]
+            _matches = list(_kaggle_wheel_dir.glob(f"{_pkg_prefix}*.whl"))
+            if _matches:
+                _kaggle_whl = max(_matches, key=lambda p: p.stat().st_mtime)
+                shutil.copy2(str(_kaggle_whl), str(_local_path))
+                print(f"[bootstrap]   Loaded {_local_path.name} from Kaggle dataset cache ✓")
+                _downloaded = True
+
+        if not _downloaded:
+            try:
+                _dl = hf_hub_download(
+                    repo_id=_HUB_REPO_ID,
+                    filename=_hub_filename,
+                    token=_hf_token,
+                    local_dir=str(_wheel_dir),
+                )
+                shutil.copy2(_dl, str(_local_path))
+                print(f"[bootstrap]   Downloaded {_hub_filename} ✓")
+                _downloaded = True
+            except Exception as _dl_err:
+                print(f"[bootstrap]   {_hub_filename} not on Hub "
+                      f"({type(_dl_err).__name__}). Compiling from source...")
 
         if not _downloaded:
             _parts    = _base.split("-")
