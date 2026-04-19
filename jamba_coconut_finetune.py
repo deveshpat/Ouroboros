@@ -64,6 +64,7 @@ import argparse
 import contextlib
 import functools
 import json
+import importlib
 import math
 import os
 import random
@@ -98,27 +99,52 @@ _KNOWN_ARCH_SUFFIXES = [
 ]
 
 
-# NOTE: _bootstrap_resolve_token() and _resolve_hf_token() are intentionally
-# separate. The bootstrap version runs before any third-party imports; the
-# main version runs after argument parsing and can honor a CLI override. Keep both.
-def _bootstrap_resolve_token() -> Optional[str]:
-    """Resolve HF token before huggingface_hub is imported as a library."""
-    try:
-        from kaggle_secrets import UserSecretsClient
-        tok = UserSecretsClient().get_secret("HF_TOKEN")
+
+
+def _resolve_hf_token_common(cli_value: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve HF token without importing heavy third-party ML libraries.
+
+    Resolution order:
+      1. Explicit CLI override
+      2. Kaggle secret HF_TOKEN
+      3. Colab userdata HF_TOKEN
+      4. HF_TOKEN / HUGGINGFACE_HUB_TOKEN env vars
+    """
+    if cli_value:
+        return cli_value
+
+    def _maybe_get_kaggle_secret() -> Optional[str]:
+        try:
+            mod = importlib.import_module("kaggle_secrets")
+            client_cls = getattr(mod, "UserSecretsClient", None)
+            if client_cls is None:
+                return None
+            tok = client_cls().get_secret("HF_TOKEN")
+            return tok or None
+        except Exception:
+            return None
+
+    def _maybe_get_colab_secret() -> Optional[str]:
+        try:
+            colab_mod = importlib.import_module("google.colab")
+            userdata = getattr(colab_mod, "userdata", None)
+            if userdata is None:
+                return None
+            tok = userdata.get("HF_TOKEN")
+            return tok or None
+        except Exception:
+            return None
+
+    for resolver in (_maybe_get_kaggle_secret, _maybe_get_colab_secret):
+        tok = resolver()
         if tok:
             return tok
-    except Exception:
-        pass
-    try:
-        from google.colab import userdata as _cu
-        tok = _cu.get("HF_TOKEN")
-        if tok:
-            return tok
-    except Exception:
-        pass
     return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
+
+def _bootstrap_resolve_token() -> Optional[str]:
+    return _resolve_hf_token_common()
 
 def _load_mamba_fast_path_symbols() -> Dict[str, Any]:
     """Load the exact fast-path symbols Jamba expects, via the stable submodule paths."""
@@ -765,54 +791,74 @@ def _unwrap_peft_model(model):
     return model
 
 
+
+
+def _cache_model_lookup(model, cache_name: str, resolver):
+    cached = getattr(model, cache_name, None)
+    if cached is not None:
+        return cached
+    resolved = resolver()
+    setattr(model, cache_name, resolved)
+    return resolved
+
+
+
+
 def _get_backbone(model):
-    base = _unwrap_peft_model(model)
-    candidates = [
-        getattr(model, "model", None),
-        getattr(base, "model", None),
-        getattr(getattr(base, "model", None), "model", None),
-    ]
-    for cand in candidates:
-        if cand is not None and hasattr(cand, "forward") and hasattr(cand, "embed_tokens"):
-            return cand
-    raise AttributeError(
-        "Cannot locate backbone model. Inspect:\n"
-        "  print(type(model))\n"
-        "  print([n for n, _ in model.named_modules()][:40])"
-    )
+    def _resolve():
+        base = _unwrap_peft_model(model)
+        candidates = [
+            getattr(model, "model", None),
+            getattr(base, "model", None),
+            getattr(getattr(base, "model", None), "model", None),
+        ]
+        for cand in candidates:
+            if cand is not None and hasattr(cand, "forward") and hasattr(cand, "embed_tokens"):
+                return cand
+        raise AttributeError(
+            "Cannot locate backbone model. Inspect:\n"
+            "  print(type(model))\n"
+            "  print([n for n, _ in model.named_modules()][:40])"
+        )
+
+    return _cache_model_lookup(model, "_ouro_cache_backbone", _resolve)
 
 
 def _get_embed_tokens(model):
-    backbone = _get_backbone(model)
-    if getattr(backbone, "embed_tokens", None) is not None:
-        return backbone.embed_tokens
+    def _resolve():
+        backbone = _get_backbone(model)
+        if getattr(backbone, "embed_tokens", None) is not None:
+            return backbone.embed_tokens
 
-    base = _unwrap_peft_model(model)
-    for obj in [model, base]:
-        if obj is None:
-            continue
-        try:
-            emb = obj.get_input_embeddings()
-            if emb is not None:
-                return emb
-        except Exception:
-            continue
-    raise AttributeError(
-        "Cannot locate embed_tokens. Inspect:\n"
-        "  print([n for n, _ in model.named_modules()][:40])"
-    )
+        base = _unwrap_peft_model(model)
+        for obj in [model, base]:
+            if obj is None:
+                continue
+            try:
+                emb = obj.get_input_embeddings()
+                if emb is not None:
+                    return emb
+            except Exception:
+                continue
+        raise AttributeError(
+            "Cannot locate embed_tokens. Inspect:\n"
+            "  print([n for n, _ in model.named_modules()][:40])"
+        )
 
+    return _cache_model_lookup(model, "_ouro_cache_embed_tokens", _resolve)
 
 def _get_lm_head(model):
-    base = _unwrap_peft_model(model)
-    for obj in [model, base, getattr(base, "model", None)]:
-        if obj is None:
-            continue
-        head = getattr(obj, "lm_head", None)
-        if head is not None:
-            return head
-    raise AttributeError("Cannot locate lm_head. Inspect model.named_modules().")
+    def _resolve():
+        base = _unwrap_peft_model(model)
+        for obj in [model, base, getattr(base, "model", None)]:
+            if obj is None:
+                continue
+            head = getattr(obj, "lm_head", None)
+            if head is not None:
+                return head
+        raise AttributeError("Cannot locate lm_head. Inspect model.named_modules().")
 
+    return _cache_model_lookup(model, "_ouro_cache_lm_head", _resolve)
 
 def _maybe_apply_chat_template(tokenizer, question: str) -> str:
     global _CHAT_TEMPLATE_WARNED
@@ -933,6 +979,14 @@ def broadcast_bool(value: bool, device: torch.device) -> bool:
     return bool(tensor.item())
 
 
+def _ddp_sum(values: List[float], device: torch.device) -> List[float]:
+    if not _distributed_is_initialized() or _world_size() <= 1:
+        return [float(v) for v in values]
+    tensor = torch.tensor(values, device=device, dtype=torch.float64)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+    return tensor.tolist()
+
+
 def barrier() -> None:
     if _distributed_is_initialized() and _world_size() > 1:
         torch.distributed.barrier()
@@ -1044,6 +1098,22 @@ def parse_args() -> argparse.Namespace:
         help="HF model repo to sync checkpoints to.")
     parser.add_argument("--hf_stage_subdir", default="runs/stage3",
         help="Remote subdirectory inside the HF repo for Stage 3 checkpoints.")
+
+    # DiLoCo
+    parser.add_argument("--diloco_mode", action="store_true",
+        help="Enable DiLoCo parallel training mode.")
+    parser.add_argument("--diloco_worker_id", default=None, choices=["A", "B", "C"],
+        help="This worker's identity. Required when --diloco_mode is set.")
+    parser.add_argument("--diloco_outer_lr", type=float, default=0.7,
+        help="Outer SGD learning rate for DiLoCo aggregation. Default: 0.7 (DiLoCo paper).")
+    parser.add_argument("--diloco_min_workers", type=int, default=2,
+        help="Minimum workers needed for coordinator to aggregate (default: 2 of 3).")
+    parser.add_argument("--diloco_state_repo", default="WeirdRunner/Ouroboros",
+        help="HF Hub repo used as shared state store.")
+    parser.add_argument("--diloco_signal_repo", default="deveshpat/Ouroboros",
+        help="GitHub repo to push coordinator trigger signals to.")
+    parser.add_argument("--diloco_run_val", action="store_true",
+        help="Run val pass before training begins (used by the first worker of a new stage).")
 
     # I/O
     parser.add_argument("--resume_from", type=str, default=None)
@@ -1492,54 +1562,147 @@ def _compute_ce_sum_and_count(logits: torch.Tensor, labels: torch.Tensor) -> Tup
     return ce_sum, n_valid
 
 
-def _forward_batched_stage0(
-    model,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    labels: torch.Tensor,
-    device: torch.device,
-    amp_dtype: torch.dtype,
-) -> Dict[str, Any]:
-    backbone = _get_backbone(model)
-    lm_head_fn = _get_lm_head(model)
-
-    with _autocast_ctx(device, amp_dtype):
-        outputs = backbone(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-        hidden = _extract_last_hidden_state(outputs, "stage 0 batched forward")
-        logits = lm_head_fn(hidden).float()
-
-    ce_sum, n_valid = _compute_ce_sum_and_count(logits, labels)
-    ce_value = float(ce_sum.item() / max(n_valid, 1))
-    return {
-        "ce_sum": ce_sum,
-        "n_valid": n_valid,
-        "ce": ce_value,
-        "ponder": None,
-        "diversity": None,
-        "halt_step_mean": None,
-        "lambda1": 0.0,
-    }
-
-
-def _build_padded_prefix_batch(
-    patched: torch.Tensor,
-    active_indices: torch.Tensor,
-    prefix_lens: torch.Tensor,
+def _build_question_context(
+    all_embeds: torch.Tensor,
+    q_lens: torch.Tensor,
     pad_embed: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    max_prefix_len = int(prefix_lens.max().item())
-    prefix_embeds = patched[active_indices, :max_prefix_len, :].clone()
-    prefix_positions = torch.arange(max_prefix_len, device=patched.device).unsqueeze(0)
-    prefix_mask = prefix_positions < prefix_lens.unsqueeze(1)
-    if max_prefix_len > 0:
-        pad_value = pad_embed.to(device=patched.device, dtype=prefix_embeds.dtype).view(1, 1, -1)
-        prefix_embeds = torch.where(prefix_mask.unsqueeze(-1), prefix_embeds, pad_value)
-    return prefix_embeds, prefix_mask
+    batch_size = int(all_embeds.size(0))
+    if q_lens.numel() == 0:
+        empty_ctx = all_embeds.new_empty((batch_size, 0, all_embeds.size(-1)))
+        empty_mask = torch.zeros((batch_size, 0), dtype=torch.bool, device=all_embeds.device)
+        return empty_ctx, empty_mask
+
+    max_q_len = int(q_lens.max().item())
+    if max_q_len <= 0:
+        empty_ctx = all_embeds.new_empty((batch_size, 0, all_embeds.size(-1)))
+        empty_mask = torch.zeros((batch_size, 0), dtype=torch.bool, device=all_embeds.device)
+        return empty_ctx, empty_mask
+
+    ctx = all_embeds[:, :max_q_len, :].clone()
+    positions = torch.arange(max_q_len, device=all_embeds.device).unsqueeze(0)
+    ctx_mask = positions < q_lens.unsqueeze(1)
+    pad_value = pad_embed.to(device=all_embeds.device, dtype=ctx.dtype).view(1, 1, -1)
+    ctx = torch.where(ctx_mask.unsqueeze(-1), ctx, pad_value)
+    return ctx, ctx_mask
+
+
+def _run_latent_passes(
+    model,
+    ctx: torch.Tensor,
+    ctx_mask: torch.Tensor,
+    n_latent,
+    halt_gate: Optional[HaltGate],
+    args: argparse.Namespace,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, Any]:
+    backbone = _get_backbone(model)
+
+    if isinstance(n_latent, int):
+        target_steps = torch.full((ctx.size(0),), int(n_latent), device=device, dtype=torch.long)
+        scalar_input = True
+    elif isinstance(n_latent, torch.Tensor):
+        target_steps = n_latent.to(device=device, dtype=torch.long).view(-1)
+        scalar_input = False
+    else:
+        target_steps = torch.tensor(list(n_latent), device=device, dtype=torch.long)
+        scalar_input = False
+
+    batch_size = int(ctx.size(0))
+    actual_k = torch.zeros(batch_size, dtype=torch.long, device=device)
+    prev_hidden = ctx.new_zeros((batch_size, ctx.size(-1)))
+    halted = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    max_steps = int(target_steps.max().item()) if target_steps.numel() > 0 else 0
+    for latent_step in range(max_steps):
+        active_indices = ((target_steps > latent_step) & (~halted)).nonzero(as_tuple=False).flatten()
+        if active_indices.numel() == 0:
+            break
+
+        prefix_lens = ctx_mask[active_indices].sum(dim=1).to(dtype=torch.long)
+        max_prefix_len = int(prefix_lens.max().item())
+        prefix_embeds = ctx[active_indices, :max_prefix_len, :].clone()
+        prefix_positions = torch.arange(max_prefix_len, device=device).unsqueeze(0)
+        prefix_mask = prefix_positions < prefix_lens.unsqueeze(1)
+        if max_prefix_len > 0:
+            prefix_embeds = torch.where(
+                prefix_mask.unsqueeze(-1),
+                prefix_embeds,
+                prefix_embeds.new_zeros((1, 1, prefix_embeds.size(-1))),
+            )
+
+        with _autocast_ctx(device, amp_dtype):
+            outputs = backbone(
+                inputs_embeds=prefix_embeds,
+                attention_mask=prefix_mask,
+                use_cache=False,
+            )
+        hidden = _extract_last_hidden_state(outputs, f"latent pass step={latent_step}")
+        last_positions = prefix_lens - 1
+        h_step = hidden[torch.arange(active_indices.numel(), device=device), last_positions, :]
+
+        append_mask = torch.ones(active_indices.numel(), dtype=torch.bool, device=device)
+        if halt_gate is not None:
+            has_prev = actual_k[active_indices] > 0
+            if bool(has_prev.any().item()):
+                halt_probs = halt_gate(
+                    h_step[has_prev].to(dtype=torch.float32),
+                    prev_hidden[active_indices[has_prev]].to(dtype=torch.float32),
+                )
+                halt_now = halt_probs > args.halt_threshold
+                if bool(halt_now.any().item()):
+                    blocked_local = has_prev.nonzero(as_tuple=False).flatten()[halt_now]
+                    append_mask[blocked_local] = False
+                    halted[active_indices[blocked_local]] = True
+
+        next_col = ctx.new_zeros((batch_size, 1, ctx.size(-1)))
+        next_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=device)
+        if bool(append_mask.any().item()):
+            append_indices = active_indices[append_mask]
+            append_hidden = h_step[append_mask].to(dtype=ctx.dtype)
+            next_col[append_indices, 0, :] = append_hidden
+            next_mask[append_indices, 0] = True
+            actual_k[append_indices] += 1
+            prev_hidden[append_indices] = append_hidden
+
+        ctx = torch.cat([ctx, next_col], dim=1)
+        ctx_mask = torch.cat([ctx_mask, next_mask], dim=1)
+
+    if ctx_mask.numel() > 0 and ctx_mask.size(1) > 0:
+        active_cols = ctx_mask.any(dim=0)
+        if bool(active_cols.any().item()):
+            last_active_col = int(active_cols.nonzero(as_tuple=False).max().item()) + 1
+            ctx = ctx[:, :last_active_col, :]
+            ctx_mask = ctx_mask[:, :last_active_col]
+        else:
+            ctx = ctx[:, :0, :]
+            ctx_mask = ctx_mask[:, :0]
+
+    return_k: Any = int(actual_k[0].item()) if scalar_input and batch_size == 1 else actual_k
+    return ctx, ctx_mask, return_k
+
+
+def _collect_latent_hidden_sequences(
+    latent_ctx: torch.Tensor,
+    max_q_len: int,
+    actual_n_latents: torch.Tensor,
+) -> List[List[torch.Tensor]]:
+    hidden_sequences: List[List[torch.Tensor]] = [[] for _ in range(int(latent_ctx.size(0)))]
+    max_steps = int(actual_n_latents.max().item()) if actual_n_latents.numel() > 0 else 0
+    for latent_step in range(max_steps):
+        active_indices = (actual_n_latents > latent_step).nonzero(as_tuple=False).flatten()
+        if active_indices.numel() == 0:
+            break
+        step_hidden = latent_ctx[active_indices, max_q_len + latent_step, :]
+        for local_idx, sample_idx in enumerate(active_indices.tolist()):
+            hidden_sequences[sample_idx].append(step_hidden[local_idx : local_idx + 1])
+    return hidden_sequences
 
 
 def _compute_batched_halt_metrics(
     hidden_sequences: List[List[torch.Tensor]],
-    n_latents: torch.Tensor,
+    actual_n_latents: torch.Tensor,
     halt_gate: HaltGate,
     device: torch.device,
     args: argparse.Namespace,
@@ -1579,7 +1742,7 @@ def _compute_batched_halt_metrics(
 
         halt_steps = torch.where(
             halt_steps == 0,
-            torch.full_like(halt_steps, float(int(n_latents[row].item()))),
+            torch.full_like(halt_steps, float(int(actual_n_latents[row].item()))),
             halt_steps,
         )
         ponder_terms.append(ponder.mean())
@@ -1618,49 +1781,35 @@ def _forward_batched_latent(
     with _autocast_ctx(device, amp_dtype):
         all_embeds = embed_fn(input_ids)
         pad_embed = embed_fn(pad_id.view(1)).squeeze(0)
-    patched = all_embeds.clone()
 
-    batch_size = int(input_ids.size(0))
-    hidden_sequences: Optional[List[List[torch.Tensor]]] = (
-        [[] for _ in range(batch_size)] if halt_gate is not None else None
+    q_ctx, q_ctx_mask = _build_question_context(all_embeds, q_lens, pad_embed)
+    latent_ctx, _, actual_k = _run_latent_passes(
+        model=model,
+        ctx=q_ctx,
+        ctx_mask=q_ctx_mask,
+        n_latent=n_latents,
+        halt_gate=None,
+        args=args,
+        device=device,
+        amp_dtype=amp_dtype,
     )
+    actual_n_latents = actual_k if isinstance(actual_k, torch.Tensor) else torch.full_like(n_latents, int(actual_k))
 
-    max_n_latent = int(n_latents.max().item())
+    patched = all_embeds.clone()
+    max_q_len = int(q_ctx.size(1))
+    max_n_latent = int(actual_n_latents.max().item()) if actual_n_latents.numel() > 0 else 0
     for latent_step in range(max_n_latent):
-        active_indices = (n_latents > latent_step).nonzero(as_tuple=False).flatten()
+        active_indices = (actual_n_latents > latent_step).nonzero(as_tuple=False).flatten()
         if active_indices.numel() == 0:
             break
-
-        prefix_lens = q_lens[active_indices] + latent_step
-        prefix_embeds, prefix_mask = _build_padded_prefix_batch(
-            patched=patched,
-            active_indices=active_indices,
-            prefix_lens=prefix_lens,
-            pad_embed=pad_embed,
-        )
-        with _autocast_ctx(device, amp_dtype):
-            outputs = backbone(
-                inputs_embeds=prefix_embeds,
-                attention_mask=prefix_mask,
-                use_cache=False,
-            )
-        hidden = _extract_last_hidden_state(outputs, f"coconut prefix pass latent_step={latent_step}")
-        last_positions = prefix_lens - 1
-        h_step = hidden[torch.arange(active_indices.numel(), device=device), last_positions, :]
-
         inject_pos = q_lens[active_indices] + latent_step
         valid_inject = inject_pos < patched.size(1)
         if not bool(torch.all(valid_inject).item()):
             active_indices = active_indices[valid_inject]
             inject_pos = inject_pos[valid_inject]
-            h_step = h_step[valid_inject]
             if active_indices.numel() == 0:
                 continue
-
-        if hidden_sequences is not None:
-            for local_idx, sample_idx in enumerate(active_indices.tolist()):
-                hidden_sequences[sample_idx].append(h_step[local_idx : local_idx + 1])
-
+        h_step = latent_ctx[active_indices, max_q_len + latent_step, :]
         patched_next = patched.clone()
         patched_next[active_indices, inject_pos, :] = h_step.to(dtype=patched_next.dtype)
         patched = patched_next
@@ -1682,12 +1831,13 @@ def _forward_batched_latent(
         "lambda1": 0.0,
     }
 
-    if halt_gate is None or hidden_sequences is None:
+    if halt_gate is None:
         return result
 
+    hidden_sequences = _collect_latent_hidden_sequences(latent_ctx, max_q_len, actual_n_latents)
     halt_metrics = _compute_batched_halt_metrics(
         hidden_sequences=hidden_sequences,
-        n_latents=n_latents,
+        actual_n_latents=actual_n_latents,
         halt_gate=halt_gate,
         device=device,
         args=args,
@@ -1717,31 +1867,20 @@ def coconut_forward(
     pad_id = batch["pad_id"].to(device)
     amp_dtype = _amp_dtype(device)
 
-    all_n_latents_zero = stage_k == 0 or bool(torch.all(n_latents == 0).item())
-    if all_n_latents_zero:
-        result = _forward_batched_stage0(
-            model=model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            device=device,
-            amp_dtype=amp_dtype,
-        )
-    else:
-        result = _forward_batched_latent(
-            model=model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            q_lens=q_lens,
-            n_latents=n_latents,
-            pad_id=pad_id,
-            device=device,
-            halt_gate=halt_gate,
-            args=args,
-            step_in_phase=step_in_phase,
-            amp_dtype=amp_dtype,
-        )
+    result = _forward_batched_latent(
+        model=model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        q_lens=q_lens,
+        n_latents=n_latents,
+        pad_id=pad_id,
+        device=device,
+        halt_gate=halt_gate,
+        args=args,
+        step_in_phase=step_in_phase,
+        amp_dtype=amp_dtype,
+    )
 
     if result["n_valid"] == 0:
         zero = torch.zeros((), device=device, requires_grad=True)
@@ -1763,8 +1902,6 @@ def coconut_forward(
         )
 
     return total_loss, metrics
-
-
 def normalize_pred(text: str) -> str:
     boxed = _re.search(r"\\boxed\{([^}]*)\}", text)
     if boxed:
@@ -1840,11 +1977,8 @@ def evaluate_stage(
         ce_numer += float(loss.item()) * valid_tokens
         ce_denom += valid_tokens
 
-    if _distributed_is_initialized():
-        ce_tensor = torch.tensor([ce_numer, float(ce_denom)], device=device, dtype=torch.float64)
-        torch.distributed.all_reduce(ce_tensor, op=torch.distributed.ReduceOp.SUM)
-        ce_numer = ce_tensor[0].item()
-        ce_denom = int(ce_tensor[1].item())
+    ce_numer, ce_denom = _ddp_sum([ce_numer, ce_denom], device)
+    ce_denom = int(round(ce_denom))
 
     acc_samples = val_samples[:50]
     local_acc_samples = acc_samples[rank::world_size]
@@ -1862,28 +1996,16 @@ def evaluate_stage(
         q_tensor = q_ids.unsqueeze(0).to(device)
         ctx = embed_fn(q_tensor)
         ctx_mask = torch.ones((1, ctx.size(1)), dtype=torch.bool, device=device)
-        h_prev = None
-
-        for _ in range(n_latent):
-            with _autocast_ctx(device, amp_dtype):
-                outputs = backbone(inputs_embeds=ctx, attention_mask=ctx_mask, use_cache=False)
-                hidden = _extract_last_hidden_state(outputs, "eval latent pass")
-                h_curr = hidden[:, -1:, :]
-            if halt_gate is not None and h_prev is not None:
-                hp = float(
-                    halt_gate(
-                        h_curr.squeeze(1).to(dtype=torch.float32),
-                        h_prev.squeeze(1).to(dtype=torch.float32),
-                    ).item()
-                )
-                if hp > args.halt_threshold:
-                    break
-            ctx = torch.cat([ctx, h_curr], dim=1)
-            ctx_mask = torch.cat(
-                [ctx_mask, torch.ones((1, 1), dtype=torch.bool, device=device)],
-                dim=1,
-            )
-            h_prev = h_curr
+        ctx, ctx_mask, _ = _run_latent_passes(
+            model=model,
+            ctx=ctx,
+            ctx_mask=ctx_mask,
+            n_latent=n_latent,
+            halt_gate=halt_gate,
+            args=args,
+            device=device,
+            amp_dtype=amp_dtype,
+        )
 
         generated: List[int] = []
         eos_id = tokenizer.eos_token_id
@@ -1894,8 +2016,8 @@ def evaluate_stage(
             with _autocast_ctx(device, amp_dtype):
                 outputs = backbone(inputs_embeds=ctx, attention_mask=ctx_mask, use_cache=False)
                 hidden = _extract_last_hidden_state(outputs, "eval decode")
-                logit = lm_head_fn(hidden)
-            next_id = int(logit[:, -1, :].argmax(-1).item())
+                logits = lm_head_fn(hidden)
+            next_id = int(logits[:, -1, :].argmax(-1).item())
             if eos_id is not None and next_id == eos_id:
                 break
             generated.append(next_id)
@@ -1912,37 +2034,17 @@ def evaluate_stage(
             n_correct += 1
         n_total += 1
 
-    if _distributed_is_initialized():
-        acc_tensor = torch.tensor([n_correct, n_total], device=device, dtype=torch.long)
-        torch.distributed.all_reduce(acc_tensor, op=torch.distributed.ReduceOp.SUM)
-        n_correct = int(acc_tensor[0].item())
-        n_total = int(acc_tensor[1].item())
+    n_correct, n_total = _ddp_sum([n_correct, n_total], device)
+    n_correct = int(round(n_correct))
+    n_total = int(round(n_total))
 
     model.train()
     if halt_gate is not None:
         halt_gate.train()
 
     return ce_numer / max(ce_denom, 1), n_correct / max(n_total, 1)
-
-
 def _resolve_hf_token(cli_value: Optional[str]) -> Optional[str]:
-    if cli_value:
-        return cli_value
-    try:
-        from kaggle_secrets import UserSecretsClient
-        tok = UserSecretsClient().get_secret("HF_TOKEN")
-        if tok:
-            return tok
-    except Exception:
-        pass
-    try:
-        from google.colab import userdata as _cu
-        tok = _cu.get("HF_TOKEN")
-        if tok:
-            return tok
-    except Exception:
-        pass
-    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    return _resolve_hf_token_common(cli_value)
 
 
 def _hub_upload_checkpoint(
@@ -2343,30 +2445,16 @@ def run_generation_callback(
         q_tensor = torch.tensor(q_ids, device=device).unsqueeze(0)
         ctx = embed_fn(q_tensor)
         ctx_mask = torch.ones((1, ctx.size(1)), dtype=torch.bool, device=device)
-        h_prev = None
-        actual_k = 0
-
-        for _ in range(stage_k):
-            with _autocast_ctx(device, amp_dtype):
-                outputs = backbone(inputs_embeds=ctx, attention_mask=ctx_mask, use_cache=False)
-                hidden = _extract_last_hidden_state(outputs, "generation latent pass")
-                h_curr = hidden[:, -1:, :]
-            if halt_gate is not None and h_prev is not None:
-                hp = float(
-                    halt_gate(
-                        h_curr.squeeze(1).to(dtype=torch.float32),
-                        h_prev.squeeze(1).to(dtype=torch.float32),
-                    ).item()
-                )
-                if hp > args.halt_threshold:
-                    break
-            ctx = torch.cat([ctx, h_curr], dim=1)
-            ctx_mask = torch.cat(
-                [ctx_mask, torch.ones((1, 1), dtype=torch.bool, device=device)],
-                dim=1,
-            )
-            h_prev = h_curr
-            actual_k += 1
+        ctx, ctx_mask, actual_k = _run_latent_passes(
+            model=model,
+            ctx=ctx,
+            ctx_mask=ctx_mask,
+            n_latent=stage_k,
+            halt_gate=halt_gate,
+            args=args,
+            device=device,
+            amp_dtype=amp_dtype,
+        )
 
         generated: List[int] = []
         eos_id = tokenizer.eos_token_id
@@ -2395,7 +2483,7 @@ def run_generation_callback(
         mean_uwr += uwr
         display = text[:200].replace("\n", " ")
         print(f"  Q: {prompt}")
-        print(f"  A: {display}  [k_actual={actual_k} uwr={uwr:.3f}]")
+        print(f"  A: {display}  [k_actual={int(actual_k)} uwr={uwr:.3f}]")
 
     mean_uwr /= max(len(GEN_PROMPTS), 1)
     print(f"  Mean UWR: {mean_uwr:.3f}\n")
@@ -2406,8 +2494,6 @@ def run_generation_callback(
     if halt_gate is not None:
         halt_gate.train()
     return mean_uwr
-
-
 def _best_state_for_stage(stage_dir: Path) -> Tuple[float, float, Optional[Path]]:
     best_dir = stage_dir / "best"
     if not (best_dir / "training_state.pt").exists():
@@ -2475,15 +2561,807 @@ def startup_hub_sync_and_prune(
     print(f"  [startup] Sync+prune complete. Pruned {pruned} checkpoint(s) locally.")
 
 
+def diloco_get_shard(
+    train_samples: List[Dict[str, Any]],
+    worker_id: str,
+    stage_k: int,
+    round_n: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    """
+    Deterministic shard assignment. Every worker with the same args gets the same shard.
+    Shard is 1/3 of the dataset, non-overlapping, covering the full dataset across 3 workers.
+    Round-robin across rounds so different samples are seen each round.
+    """
+    worker_idx = {"A": 0, "B": 1, "C": 2}[worker_id]
+    n = len(train_samples)
+    rng = random.Random(seed + stage_k * 100_003 + round_n * 7)
+    indices = list(range(n))
+    rng.shuffle(indices)
+    shard_size = n // 3
+    start = worker_idx * shard_size
+    end = start + shard_size if worker_idx < 2 else n
+    shard_indices = indices[start:end]
+    return [train_samples[i] for i in shard_indices]
+
+
+def diloco_read_round_state(hf_token: str, repo_id: str) -> Dict[str, Any]:
+    """
+    Download and parse diloco_state/round_state.json from Hub.
+    Returns default state if file doesn't exist (first run).
+    """
+    from huggingface_hub import hf_hub_download
+
+    try:
+        path = hf_hub_download(
+            repo_id=repo_id,
+            filename="diloco_state/round_state.json",
+            token=hf_token,
+        )
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+        return {
+            "stage_k": int(state.get("stage_k", 0)),
+            "round_n": int(state.get("round_n", 0)),
+            "anchor_path": state.get("anchor_path", "diloco_state/anchor"),
+            "total_samples_seen": {
+                str(k): int(v) for k, v in dict(state.get("total_samples_seen", {})).items()
+            },
+            "completed_stages": [int(x) for x in state.get("completed_stages", [])],
+            **{k: v for k, v in state.items() if k not in {"stage_k", "round_n", "anchor_path", "total_samples_seen", "completed_stages"}},
+        }
+    except Exception:
+        return {
+            "stage_k": 0,
+            "round_n": 0,
+            "anchor_path": "diloco_state/anchor",
+            "total_samples_seen": {},
+            "completed_stages": [],
+        }
+
+
+def diloco_upload_worker_state(
+    adapter_dir: Path,
+    worker_id: str,
+    stage_k: int,
+    round_n: int,
+    samples_seen: int,
+    hf_token: str,
+    repo_id: str,
+) -> None:
+    """
+    Upload worker adapter weights and status to Hub.
+    Paths:
+      diloco_state/workers/{worker_id}/round_{round_n:04d}_stage_{stage_k}/adapter_model.safetensors
+      diloco_state/workers/{worker_id}/status.json
+    """
+    import tempfile
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=hf_token)
+    remote_prefix = f"diloco_state/workers/{worker_id}/round_{round_n:04d}_stage_{stage_k}"
+
+    for fname in ["adapter_model.safetensors", "adapter_config.json"]:
+        fpath = adapter_dir / fname
+        if fpath.exists():
+            api.upload_file(
+                path_or_fileobj=str(fpath),
+                path_in_repo=f"{remote_prefix}/{fname}",
+                repo_id=repo_id,
+                token=hf_token,
+                commit_message=f"Worker {worker_id} round {round_n} stage {stage_k}",
+            )
+
+    status = {
+        "worker_id": worker_id,
+        "stage_k": int(stage_k),
+        "round_n": int(round_n),
+        "samples_seen": int(samples_seen),
+        "status": "done",
+        "timestamp": time.time(),
+        "weights_path": remote_prefix,
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tf:
+        json.dump(status, tf, indent=2)
+        tmp_path = tf.name
+    try:
+        api.upload_file(
+            path_or_fileobj=tmp_path,
+            path_in_repo=f"diloco_state/workers/{worker_id}/status.json",
+            repo_id=repo_id,
+            token=hf_token,
+            commit_message=f"Worker {worker_id} status update",
+        )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def diloco_download_anchor(
+    model,
+    hf_token: str,
+    repo_id: str,
+    anchor_path: str,
+    device: torch.device,
+) -> None:
+    """
+    Download anchor adapter weights from Hub and load them into the model in-place.
+    Falls back silently if no anchor exists (first round uses random init).
+    """
+    from huggingface_hub import hf_hub_download
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file
+
+    try:
+        dl_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=f"{anchor_path}/adapter_model.safetensors",
+            token=hf_token,
+        )
+        weights = load_file(dl_path, device=str(device))
+        set_peft_model_state_dict(model, weights)
+        if _is_main_process():
+            print(f"  [diloco] Loaded anchor weights from {anchor_path}")
+    except Exception as exc:
+        if _is_main_process():
+            print(f"  [diloco] No anchor found at {anchor_path} ({exc}); using current weights.")
+
+
+def diloco_push_signal(
+    worker_id: str,
+    stage_k: int,
+    round_n: int,
+    github_token: str,
+    github_repo: str,
+) -> None:
+    """
+    Push a signal file to GitHub to trigger the coordinator GitHub Action.
+    File: signals/worker_{id}_stage_{k}_round_{n}.json
+    Uses GitHub API directly (no git clone needed).
+    """
+    import base64
+    import requests
+
+    signal_path = f"signals/worker_{worker_id}_stage_{stage_k}_round_{round_n}.json"
+    content = json.dumps(
+        {
+            "worker_id": worker_id,
+            "stage_k": int(stage_k),
+            "round_n": int(round_n),
+            "timestamp": time.time(),
+        },
+        indent=2,
+    )
+    encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+
+    url = f"https://api.github.com/repos/{github_repo}/contents/{signal_path}"
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    resp = requests.get(url, headers=headers, timeout=30)
+    payload = {
+        "message": f"Worker {worker_id} done: stage {stage_k} round {round_n}",
+        "content": encoded,
+    }
+    if resp.status_code == 200:
+        payload["sha"] = resp.json().get("sha")
+
+    resp = requests.put(url, headers=headers, json=payload, timeout=30)
+    if resp.status_code in (200, 201):
+        if _is_main_process():
+            print(f"  [diloco] Signal pushed to GitHub: {signal_path}")
+    else:
+        if _is_main_process():
+            print(f"  [diloco] WARNING: GitHub signal push failed: {resp.status_code} {resp.text[:200]}")
+
+
+def _optimizer_step_sample_count(step_idx: int, batch_size: int, grad_accum: int, dataset_size: int) -> int:
+    step_start = step_idx * grad_accum * batch_size
+    step_end = min((step_idx + 1) * grad_accum * batch_size, dataset_size)
+    return max(step_end - step_start, 0)
+
+
+def run_training_stages(
+    *,
+    model,
+    tokenizer,
+    halt_gate: Optional[HaltGate],
+    train_samples: List[Dict[str, Any]],
+    val_samples: List[Dict[str, Any]],
+    lat_token_id: int,
+    pad_id: int,
+    args: argparse.Namespace,
+    device: torch.device,
+    output_dir: Path,
+    session_start: float,
+    wandb_run,
+    stages: List[int],
+    curriculum_max_stage: int,
+    resume_path: Optional[Path] = None,
+    resume_same_stage: bool = False,
+    resume_stage: int = 0,
+    resume_epoch: int = 0,
+    resume_step_in_epoch: int = -1,
+    global_step: int = 0,
+    step_in_phase: int = 0,
+    load_best_between_stages: bool = True,
+    run_generation_at_stage_end: bool = True,
+    run_epoch_end_val: bool = True,
+) -> Dict[str, Any]:
+    if not train_samples:
+        raise ValueError("No training samples available for this training plan.")
+
+    rank = _rank()
+    world_size = _world_size()
+    distributed = world_size > 1
+    is_main = rank == 0
+    local_bs = args.batch_size // world_size if distributed else args.batch_size
+    check_timeout = make_timeout_checker(args, rank)
+
+    timeout_triggered = False
+    val_budget_triggered = False
+    samples_seen_total = 0
+
+    for stage_k in stages:
+        if args.use_halt_gate:
+            step_in_phase = step_in_phase if resume_same_stage and stage_k == resume_stage else 0
+
+        n_epochs = (args.stage_0_epochs or args.epochs_per_stage) if stage_k == 0 else args.epochs_per_stage
+        steps_per_epoch = max(
+            1,
+            math.ceil(len(train_samples) / max(args.batch_size * args.grad_accum, 1)),
+        )
+        total_stage_steps = max(1, n_epochs * steps_per_epoch)
+        optimizer, scheduler = build_optimizer_and_scheduler(model, halt_gate, args, total_stage_steps)
+        trainable_params = get_trainable_parameters(model, halt_gate)
+
+        stage_start_epoch = 0
+        stage_start_step_in_epoch = -1
+        if resume_same_stage and stage_k == resume_stage and resume_path is not None:
+            state = load_checkpoint(
+                resume_path,
+                model,
+                halt_gate,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                device=device,
+                verbose=is_main,
+            )
+            global_step = int(state.get("step", global_step))
+            stage_start_epoch = int(state.get("epoch", resume_epoch))
+            stage_start_step_in_epoch = int(state.get("step_in_epoch", resume_step_in_epoch))
+            if args.use_halt_gate:
+                step_in_phase = int(state.get("step_in_phase", step_in_phase))
+        else:
+            resume_same_stage = False
+
+        stage_dir = output_dir / f"stage_{stage_k}"
+        best_val_acc, best_val_ce, best_ckpt = _best_state_for_stage(stage_dir)
+
+        if is_main:
+            print()
+            print("=" * 64)
+            label = "(CoT warmup)" if stage_k == 0 else f"{stage_k} latent pass(es)"
+            extra = "  + DGAC" if args.use_halt_gate else ""
+            print(f"  Stage {stage_k}/{curriculum_max_stage}  {label}{extra}")
+            print(f"  Epochs: {n_epochs}  Steps/epoch: {steps_per_epoch}  Total: {total_stage_steps}")
+            if stage_start_epoch > 0 or stage_start_step_in_epoch >= 0:
+                print(
+                    f"  Resuming stage from epoch={stage_start_epoch} "
+                    f"step_in_epoch={stage_start_step_in_epoch} global_step={global_step}"
+                )
+            print("=" * 64)
+
+        timeout_triggered = False
+        stage_val_budget_triggered = False
+        val_budget_exhausted = False
+        for epoch in range(stage_start_epoch, n_epochs):
+            rng = random.Random(args.seed + stage_k * 100_003 + epoch)
+            perm = list(range(len(train_samples)))
+            rng.shuffle(perm)
+
+            model.train()
+            if halt_gate is not None:
+                halt_gate.train()
+            optimizer.zero_grad(set_to_none=True)
+            val_budget_exhausted = False
+
+            start_step = stage_start_step_in_epoch + 1 if epoch == stage_start_epoch else 0
+            remaining_steps = max(steps_per_epoch - start_step, 0)
+            pbar = (
+                tqdm(total=remaining_steps, desc=f"S{stage_k}E{epoch}", dynamic_ncols=True)
+                if is_main else None
+            )
+
+            for step_idx in range(start_step, steps_per_epoch):
+                timeout_triggered = broadcast_bool(check_timeout() or timeout_triggered, device)
+                if timeout_triggered:
+                    if is_main:
+                        print(f"  [timeout] saving emergency checkpoint at step {global_step} ...")
+                        save_checkpoint(
+                            output_dir=output_dir,
+                            step=global_step,
+                            epoch=epoch,
+                            step_in_epoch=step_idx - 1,
+                            step_in_phase=step_in_phase,
+                            stage_k=stage_k,
+                            model=model,
+                            halt_gate=halt_gate,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            args=args,
+                            val_ce=None,
+                            val_acc=best_val_acc if best_val_acc >= 0 else None,
+                        )
+                    barrier()
+                    break
+
+                step_metrics_accum: Dict[str, float] = defaultdict(float)
+                micro_count = 0
+                did_backward = False
+                step_samples_seen = _optimizer_step_sample_count(
+                    step_idx,
+                    args.batch_size,
+                    args.grad_accum,
+                    len(train_samples),
+                )
+
+                for micro in range(args.grad_accum):
+                    global_micro_base = (step_idx * args.grad_accum + micro) * args.batch_size
+                    rank_base = global_micro_base + rank * local_bs
+                    batch_indices = [
+                        perm[(rank_base + offset) % len(train_samples)]
+                        for offset in range(local_bs)
+                    ]
+                    batch_raw = [train_samples[idx] for idx in batch_indices]
+                    built = [
+                        build_sample_at_stage(
+                            tokenizer, sample, stage_k, lat_token_id, args.max_seq_len,
+                        )
+                        for sample in batch_raw
+                    ]
+                    built = [s for s in built if s is not None]
+                    if not built:
+                        continue
+                    batch = collate_stage_k(built, pad_id)
+                    loss, metrics = coconut_forward(
+                        model=model,
+                        batch=batch,
+                        stage_k=stage_k,
+                        device=device,
+                        halt_gate=halt_gate if args.use_halt_gate else None,
+                        args=args,
+                        step_in_phase=step_in_phase,
+                    )
+                    (loss / args.grad_accum).backward()
+                    did_backward = True
+                    micro_count += 1
+                    for k, v in metrics.items():
+                        step_metrics_accum[k] += float(v)
+
+                samples_seen_total += step_samples_seen
+
+                if not did_backward:
+                    optimizer.zero_grad(set_to_none=True)
+                    if pbar is not None:
+                        pbar.update(1)
+                        pbar.set_postfix(skip="1")
+                    continue
+
+                if distributed:
+                    all_reduce_gradients(trainable_params, world_size)
+
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        trainable_params,
+                        _stage_grad_clip_norm(args, stage_k),
+                    )
+                )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                if args.use_halt_gate:
+                    step_in_phase += 1
+
+                mean_metrics = {k: v / max(micro_count, 1) for k, v in step_metrics_accum.items()}
+                mean_ce = mean_metrics.get("ce", 0.0)
+
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(ce=f"{mean_ce:.3f}", gn=f"{grad_norm:.3f}")
+
+                if is_main and global_step % args.log_every == 0:
+                    log_payload = {
+                        "train/ce": mean_ce,
+                        "train/grad_norm": grad_norm,
+                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/stage": stage_k,
+                        **{f"train/{k}": v for k, v in mean_metrics.items()},
+                    }
+                    tqdm.write(
+                        f"  step={global_step:6d} s={stage_k} ep={epoch} "
+                        f"ce={mean_ce:.4f} gn={grad_norm:.4f}"
+                    )
+                    if wandb_run is not None:
+                        import wandb
+                        wandb.log(log_payload, step=global_step)
+
+            if pbar is not None:
+                pbar.close()
+
+            stage_start_step_in_epoch = -1
+
+            if timeout_triggered:
+                break
+
+            should_budget_guard = run_epoch_end_val or run_generation_at_stage_end
+            if is_main and should_budget_guard:
+                elapsed = time.perf_counter() - session_start
+                remaining_min = (args.session_timeout_hours * 3600 - elapsed) / 60.0
+                val_budget_exhausted = check_timeout() or (remaining_min < args.val_skip_buffer_minutes)
+                if val_budget_exhausted:
+                    tqdm.write(
+                        f"  [timeout] Skipping val/gen at epoch {epoch} - "
+                        f"{remaining_min:.0f}min remaining "
+                        f"(< {args.val_skip_buffer_minutes:.0f}min val budget)."
+                    )
+                    save_checkpoint(
+                        output_dir=output_dir,
+                        step=global_step,
+                        epoch=epoch,
+                        step_in_epoch=steps_per_epoch - 1,
+                        step_in_phase=step_in_phase,
+                        stage_k=stage_k,
+                        model=model,
+                        halt_gate=halt_gate,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        args=args,
+                        val_ce=None,
+                        val_acc=None,
+                    )
+
+            val_budget_exhausted = broadcast_bool(val_budget_exhausted, device) if should_budget_guard else False
+            if val_budget_exhausted:
+                stage_val_budget_triggered = True
+                barrier()
+                break
+
+            if is_main:
+                save_checkpoint(
+                    output_dir=output_dir,
+                    step=global_step,
+                    epoch=epoch,
+                    step_in_epoch=steps_per_epoch - 1,
+                    step_in_phase=step_in_phase,
+                    stage_k=stage_k,
+                    model=model,
+                    halt_gate=halt_gate,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    args=args,
+                    val_ce=None,
+                    val_acc=None,
+                )
+                if not run_epoch_end_val:
+                    prune_epoch_checkpoints(stage_dir, args.keep_checkpoints_per_stage)
+
+            if not run_epoch_end_val:
+                barrier()
+                continue
+
+            val_ce, val_acc = evaluate_stage(
+                model=model,
+                val_samples=val_samples,
+                tokenizer=tokenizer,
+                lat_token_id=lat_token_id,
+                stage_k=stage_k,
+                device=device,
+                args=args,
+                halt_gate=halt_gate if args.use_halt_gate else None,
+            )
+
+            if is_main:
+                tqdm.write(
+                    f"  [val] s={stage_k} ep={epoch} "
+                    f"val_ce={val_ce:.4f} val_acc={val_acc:.4f}"
+                )
+                if wandb_run is not None:
+                    import wandb
+                    wandb.log(
+                        {"val/ce": val_ce, "val/acc": val_acc, "val/stage": stage_k},
+                        step=global_step,
+                    )
+
+                save_checkpoint(
+                    output_dir=output_dir,
+                    step=global_step,
+                    epoch=epoch,
+                    step_in_epoch=steps_per_epoch - 1,
+                    step_in_phase=step_in_phase,
+                    stage_k=stage_k,
+                    model=model,
+                    halt_gate=halt_gate,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    args=args,
+                    val_ce=val_ce,
+                    val_acc=val_acc,
+                )
+                prune_epoch_checkpoints(stage_dir, args.keep_checkpoints_per_stage)
+
+                is_better = (val_acc > best_val_acc) or (
+                    math.isclose(val_acc, best_val_acc) and val_ce < best_val_ce
+                )
+                if is_better:
+                    best_val_acc = val_acc
+                    best_val_ce = val_ce
+                    best_ckpt = save_checkpoint(
+                        output_dir=output_dir,
+                        step=global_step,
+                        epoch=epoch,
+                        step_in_epoch=steps_per_epoch - 1,
+                        step_in_phase=step_in_phase,
+                        stage_k=stage_k,
+                        model=model,
+                        halt_gate=halt_gate,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        args=args,
+                        val_ce=val_ce,
+                        val_acc=val_acc,
+                        tag="best",
+                    )
+                    tqdm.write(f"  [best] stage={stage_k} new best acc={best_val_acc:.4f}")
+
+            barrier()
+
+        if timeout_triggered or stage_val_budget_triggered:
+            val_budget_triggered = val_budget_triggered or stage_val_budget_triggered
+            break
+
+        if is_main and run_generation_at_stage_end:
+            if not (check_timeout() or val_budget_exhausted):
+                run_generation_callback(
+                    model=model,
+                    tokenizer=tokenizer,
+                    halt_gate=halt_gate if args.use_halt_gate else None,
+                    stage_k=stage_k,
+                    device=device,
+                    args=args,
+                    step=global_step,
+                    wandb_run=wandb_run,
+                )
+            else:
+                tqdm.write("  [timeout] Skipping gen callback - insufficient time.")
+
+        barrier()
+
+        if load_best_between_stages and best_ckpt is not None and not args.use_halt_gate:
+            if is_main:
+                print(
+                    f"  [stage] Stage {stage_k} done. Best acc={best_val_acc:.4f}. "
+                    "Loading best ckpt before advancing."
+                )
+            best_dir = output_dir / f"stage_{stage_k}" / "best"
+            load_checkpoint(
+                best_dir,
+                model=model,
+                halt_gate=halt_gate,
+                optimizer=None,
+                scheduler=None,
+                device=device,
+                verbose=is_main,
+            )
+
+        barrier()
+        resume_same_stage = False
+
+    return {
+        "global_step": global_step,
+        "step_in_phase": step_in_phase,
+        "timeout_triggered": timeout_triggered,
+        "val_budget_triggered": val_budget_triggered,
+        "samples_seen": int(samples_seen_total),
+        "stages": list(stages),
+    }
+
+
+def run_diloco_worker(
+    *,
+    model,
+    tokenizer,
+    halt_gate: Optional[HaltGate],
+    train_samples: List[Dict[str, Any]],
+    val_samples: List[Dict[str, Any]],
+    curriculum_max_stage: int,
+    lat_token_id: int,
+    pad_id: int,
+    args: argparse.Namespace,
+    device: torch.device,
+    output_dir: Path,
+    session_start: float,
+    wandb_run,
+    hf_token: str,
+) -> Dict[str, Any]:
+    if args.use_halt_gate:
+        raise ValueError(
+            "DiLoCo mode currently syncs LoRA adapter weights only. "
+            "DGAC halt-gate training should remain on the sequential path."
+        )
+    if args.diloco_worker_id is None:
+        raise ValueError("--diloco_worker_id required with --diloco_mode")
+    if not hf_token:
+        raise ValueError("HF token required for DiLoCo mode")
+    if args.resume_from and _is_main_process():
+        print("  [diloco] Ignoring --resume_from; the shared anchor defines worker startup state.")
+
+    round_state = diloco_read_round_state(hf_token, args.diloco_state_repo)
+    stage_k = int(round_state.get("stage_k", 0))
+    round_n = int(round_state.get("round_n", 0))
+    anchor_path = round_state.get("anchor_path", "diloco_state/anchor")
+
+    if stage_k > curriculum_max_stage:
+        if _is_main_process():
+            print(f"  [diloco] stage={stage_k} exceeds max configured stage={curriculum_max_stage}. Nothing to do.")
+        return {"stage_k": stage_k, "round_n": round_n, "samples_seen": 0}
+
+    if _is_main_process():
+        print(f"  [diloco] Worker {args.diloco_worker_id} | stage={stage_k} round={round_n}")
+        if args.push_to_hub:
+            print("  [diloco] Regular stage checkpoint Hub sync is disabled in DiLoCo mode; worker uploads go to diloco_state/ only.")
+        diloco_download_anchor(model, hf_token, args.diloco_state_repo, anchor_path, device)
+    barrier()
+    if _world_size() > 1:
+        broadcast_parameters(get_trainable_parameters(model, None), src=0)
+        barrier()
+
+    should_run_pre_val = bool(args.diloco_run_val or (round_n == 0 and args.diloco_worker_id == "A"))
+    if should_run_pre_val and val_samples:
+        val_ce, val_acc = evaluate_stage(
+            model=model,
+            val_samples=val_samples,
+            tokenizer=tokenizer,
+            lat_token_id=lat_token_id,
+            stage_k=stage_k,
+            device=device,
+            args=args,
+            halt_gate=None,
+        )
+        if _is_main_process():
+            print(f"  [diloco] Pre-training val: stage={stage_k} ce={val_ce:.4f} acc={val_acc:.4f}")
+            if wandb_run is not None:
+                import wandb
+                wandb.log(
+                    {
+                        "diloco/pre_val_ce": val_ce,
+                        "diloco/pre_val_acc": val_acc,
+                        "diloco/stage": stage_k,
+                        "diloco/round": round_n,
+                    },
+                    step=round_n,
+                )
+    barrier()
+
+    train_shard = diloco_get_shard(
+        train_samples,
+        args.diloco_worker_id,
+        stage_k,
+        round_n,
+        args.seed,
+    )
+    if not train_shard:
+        raise ValueError("Resolved an empty DiLoCo shard; cannot continue.")
+    if _is_main_process():
+        print(f"  [diloco] Shard size: {len(train_shard)} samples")
+
+    original_push_to_hub = args.push_to_hub
+    original_stage0_epochs = args.stage_0_epochs
+    original_epochs_per_stage = args.epochs_per_stage
+    original_gen_every_stage = args.gen_every_stage
+
+    args.push_to_hub = False
+    args.epochs_per_stage = 1
+    if stage_k == 0:
+        args.stage_0_epochs = 1
+    args.gen_every_stage = False
+
+    try:
+        result = run_training_stages(
+            model=model,
+            tokenizer=tokenizer,
+            halt_gate=None,
+            train_samples=train_shard,
+            val_samples=val_samples,
+            lat_token_id=lat_token_id,
+            pad_id=pad_id,
+            args=args,
+            device=device,
+            output_dir=output_dir,
+            session_start=session_start,
+            wandb_run=wandb_run,
+            stages=[stage_k],
+            curriculum_max_stage=curriculum_max_stage,
+            resume_path=None,
+            resume_same_stage=False,
+            resume_stage=stage_k,
+            resume_epoch=0,
+            resume_step_in_epoch=-1,
+            global_step=0,
+            step_in_phase=0,
+            load_best_between_stages=False,
+            run_generation_at_stage_end=False,
+            run_epoch_end_val=False,
+        )
+    finally:
+        args.push_to_hub = original_push_to_hub
+        args.stage_0_epochs = original_stage0_epochs
+        args.epochs_per_stage = original_epochs_per_stage
+        args.gen_every_stage = original_gen_every_stage
+
+    samples_seen_this_round = int(min(result["samples_seen"], len(train_shard)))
+
+    barrier()
+    if _is_main_process():
+        upload_dir = output_dir / "diloco_worker_upload" / f"worker_{args.diloco_worker_id}_stage_{stage_k}_round_{round_n}"
+        if upload_dir.exists():
+            shutil.rmtree(upload_dir, ignore_errors=True)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(str(upload_dir))
+
+        diloco_upload_worker_state(
+            adapter_dir=upload_dir,
+            worker_id=args.diloco_worker_id,
+            stage_k=stage_k,
+            round_n=round_n,
+            samples_seen=samples_seen_this_round,
+            hf_token=hf_token,
+            repo_id=args.diloco_state_repo,
+        )
+
+        github_token = os.environ.get("GITHUB_TOKEN")
+        if github_token and args.diloco_signal_repo:
+            diloco_push_signal(
+                args.diloco_worker_id,
+                stage_k,
+                round_n,
+                github_token,
+                args.diloco_signal_repo,
+            )
+        else:
+            print("  [diloco] No GITHUB_TOKEN - coordinator must be triggered manually.")
+
+        print(
+            f"  [diloco] Worker {args.diloco_worker_id} done. "
+            f"stage={stage_k} round={round_n} samples_seen={samples_seen_this_round}"
+        )
+    barrier()
+
+    return {
+        "stage_k": stage_k,
+        "round_n": round_n,
+        "samples_seen": samples_seen_this_round,
+        **result,
+    }
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
-    rank       = _rank()
+    rank = _rank()
     world_size = _world_size()
     local_rank = _local_rank()
     distributed = world_size > 1
-    is_main    = rank == 0
+    is_main = rank == 0
+
+    if args.diloco_mode and args.use_halt_gate:
+        raise ValueError(
+            "--diloco_mode and --use_halt_gate should not be combined. "
+            "DiLoCo syncs LoRA adapters only; DGAC should stay on the sequential path."
+        )
 
     if distributed:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
@@ -2527,469 +3405,162 @@ def main() -> None:
         except ImportError:
             print("[warn] wandb not installed")
 
-    train_samples, val_samples, stats = load_canonical_dataset(Path(args.data_dir), args.max_samples)
-    if not train_samples:
-        raise ValueError("No training samples were loaded. Check --data_dir / --max_samples.")
-    curriculum_max_stage = get_max_stage(args, stats)
-
-    resume_path: Optional[Path] = Path(args.resume_from) if args.resume_from else None
-    hub_resume_dir = output_dir / ".hub_resume"
-
-    if resume_path is None:
-        resume_path = find_latest_resume_checkpoint(
-            output_dir,
-            hf_token=hf_token,
-            hf_repo_id=getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros"),
-            hf_stage_subdir=getattr(args, "hf_stage_subdir", "runs/stage3"),
-        )
-        if resume_path is not None and is_main:
-            print(f"  [resume] discovered latest checkpoint: {resume_path}")
-
-    if resume_path is not None and not (resume_path / "training_state.pt").exists():
-        if is_main:
-            print(f"  [warn] resume checkpoint not found: {resume_path}")
-        resume_path = None
-
-    if hf_token and getattr(args, "push_to_hub", False) and is_main:
-        startup_hub_sync_and_prune(
-            output_dir=output_dir,
-            resume_path=resume_path,
-            hf_token=hf_token,
-            hf_repo_id=getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros"),
-            hf_stage_subdir=getattr(args, "hf_stage_subdir", "runs/stage3"),
-        )
-    barrier()
-
-    model, tokenizer, d_model, lat_token_id = load_model_and_tokenizer(args, device)
-    pad_id = tokenizer.pad_token_id or 0
-    if is_main:
-        tokenizer_dir = output_dir / "tokenizer"
-        tokenizer.save_pretrained(tokenizer_dir)
-
-    halt_gate: Optional[HaltGate] = None
-    if args.use_halt_gate:
-        halt_gate = HaltGate(d_model).to(device=device, dtype=torch.float32)
-        if is_main:
-            n_params = sum(p.numel() for p in halt_gate.parameters())
-            print(f"  DGAC HaltGate: d_model={d_model}  params={n_params}")
-
-    resume_state: Optional[Dict[str, Any]] = None
-    resume_same_stage = False
-    resume_stage = 0
-    resume_epoch = 0
-    resume_step_in_epoch = -1
-    global_step = 0
-    step_in_phase = 0
-
-    if resume_path is not None:
-        resume_state = load_checkpoint(
-            resume_path,
-            model,
-            halt_gate,
-            optimizer=None,
-            scheduler=None,
-            device=device,
-            verbose=is_main,
-        )
-
-        if hub_resume_dir.exists():
-            shutil.rmtree(hub_resume_dir, ignore_errors=True)
-
-        resume_stage = int(resume_state.get("stage_k", 0))
-        global_step  = int(resume_state.get("step", 0))
-        if args.use_halt_gate:
-            resume_same_stage = bool(resume_state.get("use_halt_gate", False) and resume_path.name != "best")
-            if resume_same_stage:
-                resume_epoch          = int(resume_state.get("epoch", 0))
-                resume_step_in_epoch  = int(resume_state.get("step_in_epoch", -1))
-                step_in_phase         = int(resume_state.get("step_in_phase", 0))
-        else:
-            resume_same_stage = resume_path.name != "best"
-            if resume_same_stage:
-                resume_epoch         = int(resume_state.get("epoch", 0))
-                resume_step_in_epoch = int(resume_state.get("step_in_epoch", -1))
-
-    if args.use_halt_gate:
-        gate_stage = resume_stage if resume_state is not None else curriculum_max_stage
-        stages = [gate_stage]
-        if resume_state is None and is_main:
-            print(
-                "  [warn] --use_halt_gate without --resume_from: "
-                "training DGAC from current weights at Stage K."
-            )
-    else:
-        if resume_state is not None and resume_path is not None and resume_path.name == "best":
-            start_stage = resume_stage + 1
-        else:
-            start_stage = resume_stage if resume_state is not None else 0
-        stages = list(range(start_stage, curriculum_max_stage + 1))
-
-    if distributed:
-        broadcast_parameters(get_trainable_parameters(model, halt_gate), src=0)
-
-    if is_main and not stages:
-        print("  No stages left to run. Nothing to do.")
-    if not stages:
-        if distributed:
-            torch.distributed.destroy_process_group()
-        if wandb_run is not None:
-            import wandb
-            wandb.finish()
-        return
-
-    local_bs = args.batch_size // world_size if distributed else args.batch_size
-    check_timeout = make_timeout_checker(args, rank)
-    timeout_triggered = False
-    val_budget_triggered = False
-
     try:
-        for stage_k in stages:
-            if args.use_halt_gate:
-                step_in_phase = step_in_phase if resume_same_stage and stage_k == resume_stage else 0
+        train_samples, val_samples, stats = load_canonical_dataset(Path(args.data_dir), args.max_samples)
+        if not train_samples:
+            raise ValueError("No training samples were loaded. Check --data_dir / --max_samples.")
+        curriculum_max_stage = get_max_stage(args, stats)
 
-            n_epochs = (args.stage_0_epochs or args.epochs_per_stage) if stage_k == 0 else args.epochs_per_stage
-            steps_per_epoch = max(
-                1,
-                math.ceil(len(train_samples) / max(args.batch_size * args.grad_accum, 1)),
-            )
-            total_stage_steps = max(1, n_epochs * steps_per_epoch)
-            optimizer, scheduler = build_optimizer_and_scheduler(model, halt_gate, args, total_stage_steps)
-            trainable_params = get_trainable_parameters(model, halt_gate)
+        model, tokenizer, d_model, lat_token_id = load_model_and_tokenizer(args, device)
+        pad_id = tokenizer.pad_token_id or 0
+        if is_main:
+            tokenizer_dir = output_dir / "tokenizer"
+            tokenizer.save_pretrained(tokenizer_dir)
 
-            stage_start_epoch          = 0
-            stage_start_step_in_epoch  = -1
-            if resume_same_stage and stage_k == resume_stage and resume_path is not None:
-                state = load_checkpoint(
-                    resume_path,
-                    model,
-                    halt_gate,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    device=device,
-                    verbose=is_main,
-                )
-                global_step               = int(state.get("step", global_step))
-                stage_start_epoch         = int(state.get("epoch", resume_epoch))
-                stage_start_step_in_epoch = int(state.get("step_in_epoch", resume_step_in_epoch))
-                if args.use_halt_gate:
-                    step_in_phase = int(state.get("step_in_phase", step_in_phase))
-            else:
-                resume_same_stage = False
-
-            stage_dir = output_dir / f"stage_{stage_k}"
-            best_val_acc, best_val_ce, best_ckpt = _best_state_for_stage(stage_dir)
-
+        halt_gate: Optional[HaltGate] = None
+        if args.use_halt_gate:
+            halt_gate = HaltGate(d_model).to(device=device, dtype=torch.float32)
             if is_main:
-                print()
-                print("=" * 64)
-                label = "(CoT warmup)" if stage_k == 0 else f"{stage_k} latent pass(es)"
-                extra = "  + DGAC" if args.use_halt_gate else ""
-                print(f"  Stage {stage_k}/{curriculum_max_stage}  {label}{extra}")
-                print(f"  Epochs: {n_epochs}  Steps/epoch: {steps_per_epoch}  Total: {total_stage_steps}")
-                if stage_start_epoch > 0 or stage_start_step_in_epoch >= 0:
-                    print(
-                        f"  Resuming stage from epoch={stage_start_epoch} "
-                        f"step_in_epoch={stage_start_step_in_epoch} global_step={global_step}"
-                    )
-                print("=" * 64)
+                n_params = sum(p.numel() for p in halt_gate.parameters())
+                print(f"  DGAC HaltGate: d_model={d_model}  params={n_params}")
 
-            timeout_triggered = False
-            stage_val_budget_triggered = False
-            val_budget_exhausted = False
-            for epoch in range(stage_start_epoch, n_epochs):
-                rng = random.Random(args.seed + stage_k * 100_003 + epoch)
-                perm = list(range(len(train_samples)))
-                rng.shuffle(perm)
+        if args.diloco_mode:
+            run_diloco_worker(
+                model=model,
+                tokenizer=tokenizer,
+                halt_gate=halt_gate,
+                train_samples=train_samples,
+                val_samples=val_samples,
+                curriculum_max_stage=curriculum_max_stage,
+                lat_token_id=lat_token_id,
+                pad_id=pad_id,
+                args=args,
+                device=device,
+                output_dir=output_dir,
+                session_start=session_start,
+                wandb_run=wandb_run,
+                hf_token=hf_token or "",
+            )
+            return
 
-                model.train()
-                if halt_gate is not None:
-                    halt_gate.train()
-                optimizer.zero_grad(set_to_none=True)
-                val_budget_exhausted = False
+        resume_path: Optional[Path] = Path(args.resume_from) if args.resume_from else None
+        hub_resume_dir = output_dir / ".hub_resume"
 
-                start_step      = stage_start_step_in_epoch + 1 if epoch == stage_start_epoch else 0
-                remaining_steps = max(steps_per_epoch - start_step, 0)
-                pbar = (
-                    tqdm(total=remaining_steps, desc=f"S{stage_k}E{epoch}", dynamic_ncols=True)
-                    if is_main else None
+        if resume_path is None:
+            resume_path = find_latest_resume_checkpoint(
+                output_dir,
+                hf_token=hf_token,
+                hf_repo_id=getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros"),
+                hf_stage_subdir=getattr(args, "hf_stage_subdir", "runs/stage3"),
+            )
+            if resume_path is not None and is_main:
+                print(f"  [resume] discovered latest checkpoint: {resume_path}")
+
+        if resume_path is not None and not (resume_path / "training_state.pt").exists():
+            if is_main:
+                print(f"  [warn] resume checkpoint not found: {resume_path}")
+            resume_path = None
+
+        if hf_token and getattr(args, "push_to_hub", False) and is_main:
+            startup_hub_sync_and_prune(
+                output_dir=output_dir,
+                resume_path=resume_path,
+                hf_token=hf_token,
+                hf_repo_id=getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros"),
+                hf_stage_subdir=getattr(args, "hf_stage_subdir", "runs/stage3"),
+            )
+        barrier()
+
+        resume_state: Optional[Dict[str, Any]] = None
+        resume_same_stage = False
+        resume_stage = 0
+        resume_epoch = 0
+        resume_step_in_epoch = -1
+        global_step = 0
+        step_in_phase = 0
+
+        if resume_path is not None:
+            resume_state = load_checkpoint(
+                resume_path,
+                model,
+                halt_gate,
+                optimizer=None,
+                scheduler=None,
+                device=device,
+                verbose=is_main,
+            )
+
+            if hub_resume_dir.exists():
+                shutil.rmtree(hub_resume_dir, ignore_errors=True)
+
+            resume_stage = int(resume_state.get("stage_k", 0))
+            global_step = int(resume_state.get("step", 0))
+            if args.use_halt_gate:
+                resume_same_stage = bool(resume_state.get("use_halt_gate", False) and resume_path.name != "best")
+                if resume_same_stage:
+                    resume_epoch = int(resume_state.get("epoch", 0))
+                    resume_step_in_epoch = int(resume_state.get("step_in_epoch", -1))
+                    step_in_phase = int(resume_state.get("step_in_phase", 0))
+            else:
+                resume_same_stage = resume_path.name != "best"
+                if resume_same_stage:
+                    resume_epoch = int(resume_state.get("epoch", 0))
+                    resume_step_in_epoch = int(resume_state.get("step_in_epoch", -1))
+
+        if args.use_halt_gate:
+            gate_stage = resume_stage if resume_state is not None else curriculum_max_stage
+            stages = [gate_stage]
+            if resume_state is None and is_main:
+                print(
+                    "  [warn] --use_halt_gate without --resume_from: "
+                    "training DGAC from current weights at Stage K."
                 )
+        else:
+            if resume_state is not None and resume_path is not None and resume_path.name == "best":
+                start_stage = resume_stage + 1
+            else:
+                start_stage = resume_stage if resume_state is not None else 0
+            stages = list(range(start_stage, curriculum_max_stage + 1))
 
-                for step_idx in range(start_step, steps_per_epoch):
-                    timeout_triggered = broadcast_bool(check_timeout() or timeout_triggered, device)
-                    if timeout_triggered:
-                        if is_main:
-                            print(f"  [timeout] saving emergency checkpoint at step {global_step} ...")
-                            save_checkpoint(
-                                output_dir=output_dir,
-                                step=global_step,
-                                epoch=epoch,
-                                step_in_epoch=step_idx - 1,
-                                step_in_phase=step_in_phase,
-                                stage_k=stage_k,
-                                model=model,
-                                halt_gate=halt_gate,
-                                optimizer=optimizer,
-                                scheduler=scheduler,
-                                args=args,
-                                val_ce=None,
-                                val_acc=best_val_acc if best_val_acc >= 0 else None,
-                            )
-                        barrier()
-                        break
+        if distributed:
+            broadcast_parameters(get_trainable_parameters(model, halt_gate), src=0)
 
-                    step_metrics_accum: Dict[str, float] = defaultdict(float)
-                    micro_count  = 0
-                    did_backward = False
+        if is_main and not stages:
+            print("  No stages left to run. Nothing to do.")
+        if not stages:
+            return
 
-                    for micro in range(args.grad_accum):
-                        global_micro_base = (step_idx * args.grad_accum + micro) * args.batch_size
-                        rank_base   = global_micro_base + rank * local_bs
-                        batch_indices = [
-                            perm[(rank_base + offset) % len(train_samples)]
-                            for offset in range(local_bs)
-                        ]
-                        batch_raw = [train_samples[idx] for idx in batch_indices]
-                        built = [
-                            build_sample_at_stage(
-                                tokenizer, sample, stage_k, lat_token_id, args.max_seq_len,
-                            )
-                            for sample in batch_raw
-                        ]
-                        built = [s for s in built if s is not None]
-                        if not built:
-                            continue
-                        batch = collate_stage_k(built, pad_id)
-                        loss, metrics = coconut_forward(
-                            model=model,
-                            batch=batch,
-                            stage_k=stage_k,
-                            device=device,
-                            halt_gate=halt_gate if args.use_halt_gate else None,
-                            args=args,
-                            step_in_phase=step_in_phase,
-                        )
-                        (loss / args.grad_accum).backward()
-                        did_backward  = True
-                        micro_count  += 1
-                        for k, v in metrics.items():
-                            step_metrics_accum[k] += float(v)
-
-                    if not did_backward:
-                        optimizer.zero_grad(set_to_none=True)
-                        if pbar is not None:
-                            pbar.update(1)
-                            pbar.set_postfix(skip="1")
-                        continue
-
-                    if distributed:
-                        all_reduce_gradients(trainable_params, world_size)
-
-                    grad_norm = float(
-                        torch.nn.utils.clip_grad_norm_(
-                            trainable_params,
-                            _stage_grad_clip_norm(args, stage_k),
-                        )
-                    )
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    global_step += 1
-                    if args.use_halt_gate:
-                        step_in_phase += 1
-
-                    mean_metrics = {
-                        k: v / max(micro_count, 1) for k, v in step_metrics_accum.items()
-                    }
-                    mean_ce = mean_metrics.get("ce", 0.0)
-
-                    if pbar is not None:
-                        pbar.update(1)
-                        pbar.set_postfix(ce=f"{mean_ce:.3f}", gn=f"{grad_norm:.3f}")
-
-                    if is_main and global_step % args.log_every == 0:
-                        log_payload = {
-                            "train/ce":        mean_ce,
-                            "train/grad_norm": grad_norm,
-                            "train/lr":        scheduler.get_last_lr()[0],
-                            "train/stage":     stage_k,
-                            **{f"train/{k}": v for k, v in mean_metrics.items()},
-                        }
-                        tqdm.write(
-                            f"  step={global_step:6d} s={stage_k} ep={epoch} "
-                            f"ce={mean_ce:.4f} gn={grad_norm:.4f}"
-                        )
-                        if wandb_run is not None:
-                            import wandb
-                            wandb.log(log_payload, step=global_step)
-
-                if pbar is not None:
-                    pbar.close()
-
-                stage_start_step_in_epoch = -1
-
-                if timeout_triggered:
-                    break
-
-                if is_main:
-                    _elapsed = time.perf_counter() - session_start
-                    _remaining_min = (args.session_timeout_hours * 3600 - _elapsed) / 60.0
-                    val_budget_exhausted = check_timeout() or (_remaining_min < args.val_skip_buffer_minutes)
-                    if val_budget_exhausted:
-                        tqdm.write(
-                            f"  [timeout] Skipping val/gen at epoch {epoch} — "
-                            f"{_remaining_min:.0f}min remaining "
-                            f"(< {args.val_skip_buffer_minutes:.0f}min val budget)."
-                        )
-                        save_checkpoint(
-                            output_dir=output_dir,
-                            step=global_step,
-                            epoch=epoch,
-                            step_in_epoch=steps_per_epoch - 1,
-                            step_in_phase=step_in_phase,
-                            stage_k=stage_k,
-                            model=model,
-                            halt_gate=halt_gate,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            args=args,
-                            val_ce=None,
-                            val_acc=None,
-                        )
-
-                val_budget_exhausted = broadcast_bool(val_budget_exhausted, device)
-                if val_budget_exhausted:
-                    stage_val_budget_triggered = True
-                    barrier()
-                    break
-
-                if is_main:
-                    save_checkpoint(
-                        output_dir=output_dir,
-                        step=global_step,
-                        epoch=epoch,
-                        step_in_epoch=steps_per_epoch - 1,
-                        step_in_phase=step_in_phase,
-                        stage_k=stage_k,
-                        model=model,
-                        halt_gate=halt_gate,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        args=args,
-                        val_ce=None,
-                        val_acc=None,
-                    )
-
-                val_ce, val_acc = evaluate_stage(
-                    model=model,
-                    val_samples=val_samples,
-                    tokenizer=tokenizer,
-                    lat_token_id=lat_token_id,
-                    stage_k=stage_k,
-                    device=device,
-                    args=args,
-                    halt_gate=halt_gate if args.use_halt_gate else None,
-                )
-
-                if is_main:
-                    tqdm.write(
-                        f"  [val] s={stage_k} ep={epoch} "
-                        f"val_ce={val_ce:.4f} val_acc={val_acc:.4f}"
-                    )
-                    if wandb_run is not None:
-                        import wandb
-                        wandb.log(
-                            {"val/ce": val_ce, "val/acc": val_acc, "val/stage": stage_k},
-                            step=global_step,
-                        )
-
-                    save_checkpoint(
-                        output_dir=output_dir,
-                        step=global_step,
-                        epoch=epoch,
-                        step_in_epoch=steps_per_epoch - 1,
-                        step_in_phase=step_in_phase,
-                        stage_k=stage_k,
-                        model=model,
-                        halt_gate=halt_gate,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        args=args,
-                        val_ce=val_ce,
-                        val_acc=val_acc,
-                    )
-                    prune_epoch_checkpoints(stage_dir, args.keep_checkpoints_per_stage)
-
-                    is_better = (val_acc > best_val_acc) or (
-                        math.isclose(val_acc, best_val_acc) and val_ce < best_val_ce
-                    )
-                    if is_better:
-                        best_val_acc = val_acc
-                        best_val_ce  = val_ce
-                        best_ckpt = save_checkpoint(
-                            output_dir=output_dir,
-                            step=global_step,
-                            epoch=epoch,
-                            step_in_epoch=steps_per_epoch - 1,
-                            step_in_phase=step_in_phase,
-                            stage_k=stage_k,
-                            model=model,
-                            halt_gate=halt_gate,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            args=args,
-                            val_ce=val_ce,
-                            val_acc=val_acc,
-                            tag="best",
-                        )
-                        tqdm.write(f"  [best] stage={stage_k} new best acc={best_val_acc:.4f}")
-
-                barrier()
-
-            if timeout_triggered or stage_val_budget_triggered:
-                val_budget_triggered = val_budget_triggered or stage_val_budget_triggered
-                break
-
-            if is_main and args.gen_every_stage:
-               if not (check_timeout() or val_budget_exhausted):
-                  run_generation_callback(
-                    model=model,
-                    tokenizer=tokenizer,
-                    halt_gate=halt_gate if args.use_halt_gate else None,
-                    stage_k=stage_k,
-                    device=device,
-                    args=args,
-                    step=global_step,
-                    wandb_run=wandb_run,
-                  )
-               else:
-                  tqdm.write(f"  [timeout] Skipping gen callback — insufficient time.")
-
-            barrier()
-
-            if best_ckpt is not None and not args.use_halt_gate:
-                if is_main:
-                    print(
-                        f"  [stage] Stage {stage_k} done. Best acc={best_val_acc:.4f}. "
-                        "Loading best ckpt before advancing."
-                    )
-                best_dir = output_dir / f"stage_{stage_k}" / "best"
-                load_checkpoint(
-                    best_dir,
-                    model=model,
-                    halt_gate=halt_gate,
-                    optimizer=None,
-                    scheduler=None,
-                    device=device,
-                    verbose=is_main,
-                )
-
-            barrier()
-            resume_same_stage = False
+        result = run_training_stages(
+            model=model,
+            tokenizer=tokenizer,
+            halt_gate=halt_gate,
+            train_samples=train_samples,
+            val_samples=val_samples,
+            lat_token_id=lat_token_id,
+            pad_id=pad_id,
+            args=args,
+            device=device,
+            output_dir=output_dir,
+            session_start=session_start,
+            wandb_run=wandb_run,
+            stages=stages,
+            curriculum_max_stage=curriculum_max_stage,
+            resume_path=resume_path,
+            resume_same_stage=resume_same_stage,
+            resume_stage=resume_stage,
+            resume_epoch=resume_epoch,
+            resume_step_in_epoch=resume_step_in_epoch,
+            global_step=global_step,
+            step_in_phase=step_in_phase,
+            load_best_between_stages=not args.use_halt_gate,
+            run_generation_at_stage_end=bool(args.gen_every_stage),
+            run_epoch_end_val=True,
+        )
 
         if is_main:
             print("\n" + "=" * 64)
-            if timeout_triggered or val_budget_triggered:
-                if val_budget_triggered and not timeout_triggered:
+            if result["timeout_triggered"] or result["val_budget_triggered"]:
+                if result["val_budget_triggered"] and not result["timeout_triggered"]:
                     print(
                         "  [timeout] Remaining session time fell below "
                         f"--val_skip_buffer_minutes ({args.val_skip_buffer_minutes:.0f} min) - checkpoint saved."
@@ -2998,7 +3569,7 @@ def main() -> None:
                     print("  [timeout] Session budget exhausted - checkpoint saved.")
                 print("  Re-run the same command with the same --output_dir to auto-resume.")
             else:
-                print(f"  Curriculum complete. Stages: {stages}  Global steps: {global_step}")
+                print(f"  Curriculum complete. Stages: {stages}  Global steps: {result['global_step']}")
                 if not args.use_halt_gate:
                     best_k_dir = output_dir / f"stage_{curriculum_max_stage}" / "best"
                     print(
