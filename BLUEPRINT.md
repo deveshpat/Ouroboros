@@ -1,151 +1,208 @@
 # Project Ouroboros — Master Blueprint
 
-> **Thread-resume header. Read Part 0 first in any new session.**
-> **DRY Guidelines:** Session details live in `terminal_log.md`. Blueprint holds decisions, architecture, status, and next actions only.
-> **Source of truth:** If docs and `.py`/`.ipynb` files ever disagree, the Python/notebook file takes precedence.
+> **Thread-resume header. Read Part 0 first in every new session.**
+> **Source of truth:** If this doc and `.py`/`.ipynb` files ever disagree, the Python/notebook file wins.
+> **DRY rule:** Session details and verbatim logs live in `terminal_log.md` only. This file holds decisions, status, and next actions.
 
 ---
 
 ## Part 0 — Quick-Resume Context
 
 ### What this project is
-Coconut-Ouroboros latent reasoning injection into a Transformer-Mamba hybrid (Jamba Reasoning 3B). Mamba SSM recurrent state acts as compressed scratch-memory across K latent thought passes, bypassing token generation during reasoning. Core mechanism from Meta's Coconut (arXiv:2412.06769), extended with DGAC (Diversity-Gated Adaptive Coconut) — our novel anti-collapse halt gate.
+Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transformer-Mamba hybrid). The Mamba SSM recurrent state acts as compressed scratch-pad across K latent thought passes, replacing token generation during reasoning. Based on Meta's Coconut (arXiv:2412.06769), extended with DGAC (Diversity-Gated Adaptive Coconut) — a novel anti-collapse halt gate.
 
-### Strategic Status (Updated 2026-04-19)
+### Current Status (2026-04-19)
 
-| Stage | Name | Status |
+| Curriculum Stage | Status | Best val |
 |---|---|---|
-| 0 | Architecture & Viability (nano) | ✅ COMPLETE |
-| 1 | Pre-training (nano) | ✅ Pipeline test only; retired |
-| 2 | SFT (nano) | 🔴 RETIRED |
-| 3 | Coconut-Ouroboros + DGAC on Jamba Reasoning 3B | 🟡 ACTIVE |
-
-**Stage 3 sub-stages:**
-
-| Sub-stage | Status | Best val |
-|---|---|---|
-| Stage 0 (CoT warmup) | ✅ COMPLETE | ce=0.4041, acc=0.0222 |
-| Stage 1 (1 latent pass) | ✅ COMPLETE | ce=0.4912, acc=0.0444 |
-| Stage 2 (2 latent passes) | 🟡 IN PROGRESS — 679/1154 steps (59%), checkpoint-0002987 on Hub | — |
+| Stage 0 — CoT warmup | ✅ COMPLETE | ce=0.4041, acc=0.0222 |
+| Stage 1 — 1 latent pass | ✅ COMPLETE | ce=0.4912, acc=0.0444 |
+| Stage 2 — 2 latent passes | 🟡 59% (679/1154 steps) — anchor on Hub | — |
 | Stages 3–10 | ⬜ NOT STARTED | — |
+| Phase 3.4 — DGAC | ⬜ after Stage 10 | — |
+| Phase 4 — GRPO | ⬜ after DGAC | — |
 
-| Stage | Name | Status |
-|---|---|---|
-| 4 | GRPO on Jamba Reasoning 3B | ⬜ NOT STARTED |
-| 5 | Quantization / Edge Deploy | ⬜ NOT STARTED |
-
-### TRC Status
-✅ Accepted (email 2026-04-07). **TRC grants Cloud TPU quota only — fundamentally incompatible with our CUDA/Mamba stack** (no XLA kernels for mamba_ssm/causal_conv1d; bitsandbytes is CUDA-only). TRC cannot be used for this workload as granted.
-
-**Action pending:** Email trc-support@google.com requesting conversion to A100 GPU-hours or GCP credits applicable to GPU VMs. Draft in `terminal_log.md`.
-
-### Compute Strategy — Three-Account Relay Training
-Three Kaggle accounts (A/B/C) do **sequential relay handoff** via Hub checkpoints. This is NOT parallel DDP — true multi-node DDP is impossible on Kaggle (no public IPs, no inter-container networking). The Hub is the sole communication mechanism.
-
-**Relay rule: never run two accounts simultaneously. Sequential only.**
-
-| Account | Quota Now | Projected Work |
-|---|---|---|
-| A (current) | 8.5h | Stage 2 finish (~6.8h remaining) |
-| B | 30h | Stage 3 (~21.9h) + partial Stage 4 |
-| C | 30h | Remainder of Stage 4 + Stage 5 |
-| Weekly refresh | 90h/week | ~3 weeks total for stages 3–10 |
-
-### Dataset
-- **Train:** 36,906 samples  **Val:** 1,940 samples
-- **median_steps=10  mean=10.42  max=16**
-- **`--max_stage=10` for all production runs**
-
-### GPU Arch / Hub Wheel Status
-| Arch | causal_conv1d | mamba_ssm |
-|---|---|---|
-| sm75 (T4) | ✅ on Hub | ✅ on Hub |
-| sm100 (B100) | ✅ on Hub | ❌ not yet built |
-| sm60 (P100) | ❌ not built | ❌ not built |
-
-**P100 is not viable:** no Tensor Cores (would regress to ~120-150s/step), single GPU (no DDP), sm60 wheels not on Hub. Stick to Dual T4.
+**Compute mode: switching from sequential relay → DiLoCo 3-way parallel (3× speedup)**
 
 ---
 
-### Part 0.1 — Immediate Next Actions (ordered)
+## Part 0.1 — Immediate Next Steps (strict order, no ambiguity)
 
-1–10. **[ALL DONE]** See previous sessions.
+### Step 1 — Feed agent: implement DiLoCo + DRY pass
+Give the coding agent **this blueprint + `jamba_coconut_finetune.py` + `AGENT_PROMPT_diloco.md`**.
+The agent implements DiLoCo additions AND the DRY refactors listed in Part 0.4.
+No other files need changing yet.
 
-11. **[ACTION — BEFORE NEXT RUN]** Apply relay path fix to `jamba_coconut_finetune.py`:
-    - See `AGENT_PROMPT_relay_path_fix.md`
-    - One-line change in `save_checkpoint()`: `remote_prefix=subdir` → `remote_prefix=f"{subdir.strip('/')}/stage_{stage_k}"`
-    - **This is relay-blocking.** Account B/C cannot find Hub checkpoints without this fix.
-    - Commit fix to GitHub repo so `kaggle-utils.ipynb` cell 3 (git sync) pulls it automatically.
-
-12. **[Account A — 8.5h remaining]** Finish Stage 2:
-    ```bash
-    torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
-      --data_dir data/coconut_v1 --use_4bit \
-      --stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 \
-      --batch_size 4 --grad_accum 8 \
-      --val_batch_size 2 \
-      --val_skip_buffer_minutes 60 \
-      --session_timeout_hours 8.5 --graceful_exit_buffer_minutes 20 \
-      --push_to_hub \
-      --output_dir runs/stage3_curriculum
-    ```
-    - `--session_timeout_hours 8.5` — match actual remaining quota
-    - Auto-resumes from `stage_2/checkpoint-0002987` on Hub
-    - Stage 2 remaining: ~475 steps × ~52s ≈ 6.8h — should complete within this session
-
-13. **[Account B — 30h]** Same command with `--session_timeout_hours 11.0`:
-    - No local data, no `--resume_from` needed — Hub scan is automatic
-    - Expected startup: `[resume] No local checkpoints found. Scanning Hub...`
-
-14. **[Account C — 30h]** Same as B after B exhausts quota.
-
-15. **[Weekly rotation]** When all accounts exhaust quota, wait for weekly reset, relay continues.
-
-16. **[Email TRC]** Send draft from `terminal_log.md` — 5 minutes, potentially unlocks A100.
-
----
-
-### Part 0.1.1 — Relay Handoff Checklist (per account)
-
-Before starting a new account's session:
-- [ ] Previous account's session fully ended and Hub upload confirmed complete
-- [ ] Path fix applied and committed to GitHub (`AGENT_PROMPT_relay_path_fix.md`)
-- [ ] Cell 3 of `kaggle-utils.ipynb` will git-pull the fix automatically
-- [ ] Command includes `--push_to_hub`
-- [ ] `--session_timeout_hours` set to actual remaining quota for that account
-
-Expected startup log on Account B/C (no local checkpoints):
+### Step 2 — Run `bootstrap_diloco.py` (once, any machine with HF access)
+Seeds `diloco_state/anchor/` on Hub from the existing `runs/stage3/checkpoint-0002987/`.
+Also writes the initial `diloco_state/round_state.json`:
+```json
+{
+  "stage_k": 2,
+  "round_n": 0,
+  "anchor_path": "diloco_state/anchor",
+  "total_samples_seen": {"2": 21728},
+  "completed_stages": [0, 1]
+}
 ```
-  [resume] No local checkpoints found. Scanning Hub...
-  [hub] downloading stage_2/checkpoint-XXXXXXX ...
-  [resume] using stage_2/checkpoint-XXXXXXX as resume checkpoint
+> `total_samples_seen["2"] = 679 steps × 32 effective batch = 21728` (approximate; safe to round down)
+
+### Step 3 — GitHub repo setup (one-time)
+- Add `.github/workflows/diloco_coordinator.yml` to the repo
+- Add secrets: `HF_TOKEN`, `KAGGLE_USERNAME`, `KAGGLE_KEY`
+- Create `signals/` directory with a placeholder `.gitkeep`
+
+### Step 4 — Create three worker Kaggle notebooks
+- `ouroboros-worker-a` (Account A), `ouroboros-worker-b` (Account B), `ouroboros-worker-c` (Account C)
+- Identical except `--diloco_worker_id {A,B,C}`
+- Enable "Run on API trigger" in each notebook's settings (allows GitHub Actions to trigger them via Kaggle API)
+
+### Step 5 — Start all three workers simultaneously (Stage 2 test)
+This IS the DiLoCo proof-of-concept. Each worker trains ~158 steps (~2.3h) on its shard of Stage 2's remaining data. If it works, continue. If it breaks, Account A can resume sequential from `checkpoint-0002987` — nothing is lost.
+
+```bash
+# Worker A (Account A) — all three run at the same time
+torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
+  --data_dir data/coconut_v1 --use_4bit \
+  --stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 \
+  --batch_size 4 --grad_accum 8 --val_batch_size 2 \
+  --val_skip_buffer_minutes 60 \
+  --session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 \
+  --diloco_mode --diloco_worker_id A \
+  --diloco_outer_lr 0.7 \
+  --diloco_state_repo WeirdRunner/Ouroboros \
+  --diloco_signal_repo deveshpat/Ouroboros \
+  --push_to_hub \
+  --output_dir runs/diloco
 ```
 
+### Step 6 — Watch coordinator
+GitHub Actions fires when workers push signals. Coordinator aggregates, uploads new anchor, triggers next sessions. Monitor at `github.com/deveshpat/Ouroboros/actions`.
+
+### Step 7 — Validate and continue
+After Stage 2 completes via DiLoCo, coordinator runs val (or first worker of Stage 3 does via `--diloco_run_val`). If `val_acc` is within 10% of sequential Stage 2 benchmark (acc=0.0444), DiLoCo is confirmed. All remaining stages proceed with the same setup.
+
 ---
 
-### Part 0.2 — Pre-flight Blockers
+## Part 0.2 — Hub State: What's There, What Matters
+
+### Current Hub layout (as of 2026-04-19)
+```
+WeirdRunner/Ouroboros/
+  runs/stage3/
+    best/                     ← misplaced (stage_1 artifact) — IGNORE
+    checkpoint-0002308/       ← misplaced (stage_1 artifact) — IGNORE
+    checkpoint-0002987/       ← Stage 2 anchor — USED BY bootstrap_diloco.py
+    stage_0/best/             ← correct ✓
+    stage_1/                  ← correct ✓
+```
+
+**No cleanup needed.** DiLoCo uses `diloco_state/` prefix entirely. The misplaced files are a legacy artifact from Session 15 (fix was applied to `save_checkpoint()` after that session ran). For sequential fallback: pass `--resume_from runs/stage3/checkpoint-0002987` explicitly.
+
+### DiLoCo Hub layout (written by workers + coordinator)
+```
+WeirdRunner/Ouroboros/
+  diloco_state/
+    round_state.json
+    anchor/
+      adapter_model.safetensors
+      adapter_config.json
+    workers/{A,B,C}/
+      status.json
+      round_{N:04d}_stage_{k}/
+        adapter_model.safetensors
+        adapter_config.json
+```
+
+---
+
+## Part 0.3 — Resolved Decisions
+
+| Decision | Value |
+|---|---|
+| Model | Jamba Reasoning 3B (`ai21labs/AI21-Jamba-Reasoning-3B`) |
+| Fine-tuning | QLoRA (4-bit NF4) + LoRA r=32 |
+| LoRA targets | q/k/v/o_proj, in_proj, x_proj, dt_proj, out_proj — conv1d excluded |
+| Curriculum K | 10 stages |
+| `--max_seq_len` | 1024 |
+| `--max_grad_norm` | 0.3 (k≥2 stages) |
+| `--session_timeout_hours` | **12.0** (headless wall-clock; not quota-limited) |
+| `--val_batch_size` | 2 |
+| val accuracy samples | 50 |
+| `--val_skip_buffer_minutes` | 60 |
+| NCCL timeout | `timedelta(hours=4)` |
+| `--epochs_per_stage` | 1 |
+| `--batch_size` | 4 (2 per GPU on Dual T4) |
+| amp_dtype T4 (sm75) | FP16 |
+| amp_dtype A100+ (sm80+) | BF16 |
+| Gradient checkpointing | Auto-disabled at VRAM≥40GB |
+| Multi-account strategy | **DiLoCo 3-way parallel** (see `AGENT_PROMPT_diloco.md`) |
+| Stage advancement (DiLoCo) | When `sum(all workers' samples_seen_this_stage) >= len(train_set)` |
+| Val in DiLoCo mode | Coordinator only, once per stage (when `round_n == 0`) |
+| DiLoCo outer LR | 0.7 (DiLoCo paper default) |
+| DiLoCo min_workers | 2 of 3 |
+| DiLoCo inner steps | Full shard per session (~384 steps at stage 3); capped at session limit for higher stages |
+| TRC quota | TPU only — incompatible. Email requesting GPU conversion pending. |
+
+---
+
+## Part 0.4 — DRY Refactors for Coding Agent
+
+The agent should apply these **alongside** the DiLoCo additions. No behavioral changes — pure deduplication.
+
+### R1 — Merge the two token resolution functions
+`_bootstrap_resolve_token()` and `_resolve_hf_token()` are identical in logic (Kaggle secret → Colab userdata → env var). Keep one pre-import-safe (stdlib only) implementation. Call it from both bootstrap and post-import contexts. Remove the duplicate.
+
+### R2 — Extract shared latent pass loop
+`evaluate_stage()`, `run_generation_callback()`, and `_forward_batched_latent()` all implement:
+```
+for step in range(n_latent):
+    run backbone on prefix → get h_step
+    optionally check halt gate → maybe break
+    append h_step to context
+```
+Extract to `_run_latent_passes(model, ctx, ctx_mask, n_latent, halt_gate, args, device, amp_dtype) -> (ctx, ctx_mask, actual_k)`. Replace all three call sites.
+
+### R3 — Cache backbone/embed/lm_head lookups
+`_get_backbone()`, `_get_embed_tokens()`, `_get_lm_head()` traverse the model graph on every call and are invoked in the hot training loop. Decorate with `@functools.lru_cache(maxsize=None)` or cache results on the model object after first lookup. This is a free perf win.
+
+### R4 — Collapse `_forward_batched_stage0` into `_forward_batched_latent`
+`_forward_batched_stage0` is `_forward_batched_latent` with `n_latent=0`. The latent loop already exits immediately when `max_n_latent=0`. Remove `_forward_batched_stage0` and remove the routing branch in `coconut_forward`. Single code path, same behavior.
+
+### R5 — `_ddp_sum()` helper
+The all-reduce pattern appears 3× in `evaluate_stage()`:
+```python
+t = torch.tensor([a, b], device=device, dtype=torch.float64)
+torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+```
+Extract to `_ddp_sum(values: list, device) -> list` that no-ops when not distributed.
+
+---
+
+## Part 0.5 — Pre-flight Blockers
+
+All resolved. See `terminal_log.md` for session details.
 
 | Blocker | Resolution |
 |---|---|
-| `attn_implementation` hardcoded crash | try/except fallback to `eager` ✅ |
-| `use_mamba_kernels` kwarg on old TF | `_safe_from_pretrained` retries without kwarg ✅ |
-| `last_hidden_state` silent None | assert in Stage 0 and Phase B ✅ |
-| No graceful timeout → lost Kaggle work | `make_timeout_checker()` integrated ✅ |
-| `conv1d` in LoRA targets | Explicitly excluded ✅ |
-| OOM at first val step | `empty_cache()` + `val_batch_size=2` ✅ |
-| `--max_seq_len 512` filtered stage 1+ | Default changed to 1024 ✅ |
-| Exploding gradients at k≥2 | `--max_grad_norm 0.3` ✅ |
-| mamba-ssm 2.x API | Pinned to 1.2.2 ✅ |
-| Val decode time (200 samples) | Cap at 50 samples ✅ |
-| NCCL watchdog (60min) kills DDP val | `timedelta(hours=4)` + `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC` ✅ |
-| Val skip threshold used wrong buffer | `--val_skip_buffer_minutes 60` separate arg ✅ |
-| BF16 on T4 uses FP32 compute paths | `_amp_dtype` checks `cc >= (8, 0)`; T4 uses FP16 ✅ |
-| GC wastes 20-40% on A100 | Auto-disabled at VRAM≥40GB ✅ |
-| `_amp_dtype` called in hot loop | `@functools.lru_cache(maxsize=None)` ✅ |
-| `--push_to_hub` never passed | ✅ FIXED — confirmed Session 15 |
-| `prune_epoch_checkpoints` per-stage only | ✅ FIXED — `startup_hub_sync_and_prune` Session 15 |
-| `save_checkpoint` hub upload missing stage subdir | 🔴 RELAY-BLOCKING — `AGENT_PROMPT_relay_path_fix.md` |
-| Prefix re-computation at Stage k | 🟡 FUTURE — before Stage 5 on A100 |
+| `attn_implementation` crash | try/except fallback ✅ |
+| `use_mamba_kernels` old TF | `_safe_from_pretrained` retry ✅ |
+| `last_hidden_state` None | assert in all forward paths ✅ |
+| Graceful session timeout | `make_timeout_checker()` ✅ |
+| `conv1d` in LoRA | Excluded ✅ |
+| OOM at val | `empty_cache()` + `val_batch_size=2` ✅ |
+| Stage 1+ samples filtered by short seq_len | `--max_seq_len 1024` ✅ |
+| Exploding gradients k≥2 | `--max_grad_norm 0.3` ✅ |
+| mamba-ssm 2.x API break | Pinned to 1.2.2 via git URL ✅ |
+| Val at 200 samples too slow | Capped at 50 ✅ |
+| NCCL watchdog kills DDP val | `timedelta(hours=4)` + env var ✅ |
+| BF16 emulation on T4 | `_amp_dtype` checks `cc >= (8,0)` ✅ |
+| GC wastes compute on A100 | Auto-disable at VRAM≥40GB ✅ |
+| `_amp_dtype` called in hot loop | `@lru_cache` ✅ |
+| Hub upload missing `stage_{k}/` subdir | Fixed in `save_checkpoint()` ✅ |
+| Prior-stage `best/` accumulating | `startup_hub_sync_and_prune` prunes them ✅ |
+| Sequential relay bottleneck | → DiLoCo 3-way parallel ✅ |
+| Session timeout = quota display | Headless = 12h wall-clock; `--session_timeout_hours 12.0` ✅ |
 
 ---
 
@@ -154,172 +211,93 @@ Expected startup log on Account B/C (no local checkpoints):
 ### Jamba Reasoning 3B
 ```
 HuggingFace : ai21labs/AI21-Jamba-Reasoning-3B   License: Apache 2.0
-Layers      : 28 total (26 Mamba, 2 Attention) → 13:1 Mamba:Attention ratio
+Layers      : 28 (26 Mamba + 2 Attention) — 13:1 ratio
 Attention   : MQA (20 Q heads, 1 KV head)
-Vocab       : 64K / Context: 256K tokens
+Vocab / Context : 64K / 256K tokens
 d_model     : 2560
+Trainable   : 26,851,328 params (0.88% — LoRA adapters only)
 ```
 
----
-
-## Part 2 — Resolved Decisions
-
-| Decision | Resolution |
-|---|---|
-| Primary research model | Jamba Reasoning 3B |
-| Fine-tuning approach | QLoRA (4-bit NF4) + LoRA |
-| LoRA target modules | q_proj, k_proj, v_proj, o_proj, in_proj, x_proj, dt_proj, out_proj; conv1d excluded |
-| Coconut curriculum | Progressive step replacement per Meta paper |
-| max_stage K | **10** |
-| DGAC halt gate | Phase 3.4 only; λ₁ annealed from 0 |
-| `--max_seq_len` | 1024 |
-| `--max_grad_norm` | 0.3 for k≥2 stages |
-| `--session_timeout_hours` | Set to actual remaining quota per account (not fixed at 11.0) |
-| val_batch_size | **2** |
-| val accuracy samples | **50** |
-| val skip threshold | **`--val_skip_buffer_minutes 60`** |
-| NCCL timeout | **`timedelta(hours=4)`** |
-| epochs_per_stage | **1** |
-| batch_size | **4** |
-| DDP val strategy | All ranks participate (interleaved shard) |
-| amp_dtype on T4 (sm75) | ✅ **FP16** — ~41s/step (k=1), ~52-57s/step (k=2) |
-| amp_dtype on A100+ (sm80+) | ✅ **BF16** |
-| Gradient checkpointing | Auto-disabled at VRAM≥40GB |
-| Multi-account strategy | **Sequential relay via Hub** — NOT parallel DDP (impossible on Kaggle) |
-| TRC quota | **TPU only — incompatible with stack** — email requesting GPU conversion |
-| P100 viability | **No** — no Tensor Cores, single GPU. Dual T4 strictly better. |
-
----
-
-## Part 3 — Open Questions
-
-| Question | Status |
-|---|---|
-| Stage 2 elevated gn (up to ~1.9 pre-clip): transient? | 🟡 MONITOR — CE not diverging |
-| DGAC Phase 3.4: halt_step distribution across K≥2? | 🔴 OPEN — primary research |
-| Prefix re-computation optimization | 🟡 OPEN — before Stage 5 on A100 |
-| TRC GPU conversion via email? | 🟡 PENDING — draft ready, not sent |
-
----
-
-## Part 4 — Performance Analysis
-
-### Step-time model (empirical)
-
+### Coconut Curriculum
 ```
-t_fp16(k) ≈ 34 + ~11.5k  seconds/step
-
-Stage 0: ~34s  Stage 1: ~41s ✓  Stage 2: ~52-57s ✓
-Stage 3: ~69s  Stage 5: ~92s   Stage 10: ~149s  (projected)
-```
-
-### Stage hours on Dual T4 + 3-account relay
-
-| Stage | Est. Hours | Account |
-|---|---|---|
-| 2 (remaining ~475 steps) | ~6.8h | A (8.5h quota) |
-| 3 | ~21.9h | B (30h quota) |
-| 4 | ~25.7h | B remainder + C |
-| 5 | ~29.3h | C remainder + reset |
-| 6–10 | ~201h | Weekly resets |
-| **Stages 3–10 total** | **~278h** | **~3.1 weeks at 90h/week** |
-
-A100 (if TRC converts): ~5× faster → ~55h → ~2 days.
-
----
-
-## Part 5 — File Registry
-
-| File | Status | Notes |
-|---|---|---|
-| `jamba_coconut_finetune.py` | 🔴 NEEDS PATH FIX | Relay-blocking bug in `save_checkpoint` |
-| `kaggle-utils.ipynb` | ✅ CURRENT | Cell 5 has `--push_to_hub`; git-pull in cell 3 gets fix |
-| `AGENT_PROMPT_relay_path_fix.md` | ✅ READY | One-line fix, apply before Account B |
-| `AGENT_PROMPT_hub_prune_fix.md` | ✅ APPLIED | Session 15 confirmed |
-| `AGENT_PROMPT_perf_fix.md` | ✅ APPLIED | FP16 + lru_cache + auto-GC |
-| `AGENT_PROMPT_nccl_val_fix.md` | ✅ APPLIED | Session 13 confirmed |
-| `prepare_coconut_dataset.py` | ✅ DONE | coconut-v1 on Hub |
-| `build_wheels_kaggle.py` | ✅ DONE | sm75 wheels on Hub |
-
----
-
-## Part 6 — Coconut Curriculum Design
-
-```
-Stage 0:  [Q][S1][S2]...[Sn][A]    ← standard CoT; labels on S1..Sn + A
-Stage k:  [Q][●*k][S_{k+1}..Sn][A] ← first k steps replaced; labels shift
-Stage K:  [Q][●*K][A]              ← all steps replaced; labels on A only
+Stage 0:  [Q][S1..Sn][A]              standard CoT; labels on all steps + A
+Stage k:  [Q][●*k][S_{k+1}..Sn][A]   first k steps → latent; labels shift right
+Stage K:  [Q][●*K][A]                 all steps replaced; labels on A only
 K = 10
 ```
 
----
-
-## Part 7 — DGAC
-
+### DGAC (Phase 3.4 only)
 ```
-L_total = L_ce  +  λ₁(t) · L_ponder  +  λ₂ · L_diversity
-
-L_diversity = mean_batch( Σ_k relu(cos_sim(h_k, h_{k-1}) − τ) ),  τ = 0.9
-λ₁ schedule: 0 for steps 0-200, ramp 0→0.01 over steps 200-500, flat after
-```
-
-**HaltGate:** Linear(2*d_model → 1), zero-initialized → outputs 0.5 at Phase 3.4 start.
-
----
-
-## Part 8 — Checkpoint Format
-
-```
-output_dir/
-  stage_0/best/             ← acc=0.0222 ce=0.4041
-  stage_1/best/             ← acc=0.0444 ce=0.4912
-  stage_2/
-    checkpoint-0002987/     ← in progress (679/1154 steps)
-    best/
-  stage_k/best/
-    adapter_model/
-    training_state.pt
-    halt_gate.pt            ← Phase 3.4 only
-
-Hub (after path fix applied):
-  WeirdRunner/Ouroboros/runs/stage3/stage_{k}/checkpoint-XXXXXXX/
-  WeirdRunner/Ouroboros/runs/stage3/stage_{k}/best/
+L_total = L_ce + λ₁(t)·L_ponder + λ₂·L_diversity
+L_diversity = mean( Σ_k relu(cos_sim(h_k, h_{k-1}) − τ) ),  τ=0.9
+λ₁: 0 for steps 0-200, ramp 0→0.01 over steps 200-500
+HaltGate: Linear(2·d_model → 1), zero-init → outputs 0.5 at start
 ```
 
 ---
 
-## Part 9 — Compute Plan
+## Part 2 — Performance Model
 
-| Phase | Platform | Estimate |
-|---|---|---|
-| Stage 2 finish | Account A (8.5h) | ~6.8h ✅ fits |
-| Stage 3 | Account B (30h) | ~21.9h ✅ fits |
-| Stages 4–5 | Account B+C | ~55h |
-| Stages 6–10 | Weekly relay resets | ~223h |
-| Phase 3.4 (DGAC) | After Stage 10 | ~6–8h |
-| Phase 4 (GRPO) | After DGAC | ~8–12h |
+```
+t_fp16(k) ≈ 34 + 11.5·k  seconds/step  (empirical, Dual T4)
+Stage 2: ~52-57s  Stage 3: ~69s  Stage 5: ~92s  Stage 10: ~149s
+```
+
+| Mode | Stages 3–10 |
+|---|---|
+| Sequential relay | ~278h (~3.1 weeks) |
+| DiLoCo 3-way parallel | ~93h (~1 week) |
+| DiLoCo + A100 (if TRC) | ~19h (~2 days) |
+
+**Per-worker shard:** ~12,302 samples → ~384 steps/worker/stage. Stages 1-9 fit in one 12h session. Stage 10 (~149s/step × 384 = ~15.9h) needs 2 rounds; coordinator handles transparently.
 
 ---
 
-## Part 10 — Hard Lessons
+## Part 3 — File Registry
 
-| Lesson | Codified As |
+| File | Status |
+|---|---|
+| `jamba_coconut_finetune.py` | 🟡 Needs agent pass: DiLoCo additions + DRY refactors |
+| `diloco_coordinator.py` | ⬜ New — spec in `AGENT_PROMPT_diloco.md` |
+| `bootstrap_diloco.py` | ⬜ New — spec in `AGENT_PROMPT_diloco.md` |
+| `.github/workflows/diloco_coordinator.yml` | ⬜ New — spec in `AGENT_PROMPT_diloco.md` |
+| `kaggle-utils.ipynb` | 🟡 Cell 5 needs worker variant per account |
+| `prepare_coconut_dataset.py` | ✅ Done |
+| `build_wheels_kaggle.py` | ✅ Done |
+
+---
+
+## Part 4 — Open Questions
+
+| Question | Status |
+|---|---|
+| Stage 2 gn spikes (~1.9 pre-clip): transient? | 🟡 Monitor — CE not diverging |
+| Kaggle API `/kernels/{slug}/run` — verify endpoint works | 🟡 Test before first DiLoCo run |
+| TRC GPU quota conversion | 🟡 Draft email ready in `terminal_log.md` |
+| DGAC halt_step distribution at K≥2 | 🔴 Open — primary research question |
+| Prefix re-computation optimization | 🟡 Pre-A100, before Stage 5 if TRC succeeds |
+
+---
+
+## Part 5 — Hard Lessons
+
+| Lesson | Fix |
 |---|---|
 | val_batch_size=16 → OOM | `--val_batch_size 2` |
-| NCCL watchdog kills DDP | `timedelta(hours=4)` + env var |
-| max_seq_len=512 filtered stage 1+ | `--max_seq_len 1024` |
+| NCCL watchdog at 60min | `timedelta(hours=4)` + env var |
+| `max_seq_len=512` filtered stage 1+ | `--max_seq_len 1024` |
 | gn=36.9 at k=2 | `--max_grad_norm 0.3` |
-| mamba-ssm 2.x broke fast path | Pinned to 1.2.2 |
-| mamba-ssm PyPI sdist is 35kB stub | `git+https://...@v1.2.2` |
-| Per-sample loop → 113s/step | Batched forward path |
-| Val at 200 samples → 5.5h | Cap at 50 |
-| `is_bf16_supported()` True on sm75 (emulation) | `_amp_dtype` checks `cc >= (8, 0)` |
+| mamba-ssm 2.x broke fast path | Pinned 1.2.2 via git URL |
+| mamba-ssm PyPI sdist is a stub | Must use `git+https://...@v1.2.2` |
+| Per-sample loop → 113s/step | Batched forward |
+| Val 200 samples → 5.5h | Cap at 50 |
+| `is_bf16_supported()` true on T4 (emulation) | `cc >= (8,0)` check |
 | GC wastes 20-40% on A100 | Auto-disable at VRAM≥40GB |
-| `--push_to_hub` never added → silent no-op | Add flag explicitly |
-| `prune_epoch_checkpoints` per-stage only | `startup_hub_sync_and_prune` at session start |
-| Step-time model `34 + 6k` too optimistic | Empirical k=2 → ~11.5s/latent pass |
-| `save_checkpoint` remote_prefix missing stage subdir | 🔴 RELAY-BLOCKING — fix before Account B |
-| "Parallel sessions" misread as multi-node DDP | Impossible on Kaggle — Hub relay only |
-| TRC assumed to give GPU access | TPU-only — incompatible with CUDA/Mamba stack |
-| P100 assumed better than T4 | No Tensor Cores, single GPU — strictly worse |
-| `--session_timeout_hours` fixed at 11.0 | Set to actual remaining quota per account |
+| `--push_to_hub` omitted → silent no-op | Always add explicitly |
+| Checkpoint pruning per-stage only | `startup_hub_sync_and_prune` at session start |
+| Step-time model `34 + 6k` too optimistic | Empirical: `34 + 11.5k` |
+| `save_checkpoint` missing `stage_{k}/` in remote path | Fixed |
+| "Parallel sessions impossible on Kaggle" | DiLoCo makes it viable |
+| TRC assumed GPU access | TPU only — incompatible |
+| P100 assumed better than T4 | No Tensor Cores, single GPU — worse |
+| Headless sessions capped by quota display | Wall-clock = 12h; `--session_timeout_hours 12.0` |
