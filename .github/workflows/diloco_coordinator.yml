@@ -1,0 +1,38 @@
+name: DiLoCo Coordinator
+
+on:
+  push:
+    paths:
+      - 'signals/worker_*.json'   # Triggered when any worker pushes a signal
+
+jobs:
+  coordinate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install huggingface_hub safetensors torch requests
+
+      - name: Run coordinator
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          !python diloco_coordinator.py \
+            --hf_token "$HF_TOKEN" \
+            --repo_id "WeirdRunner/Ouroboros" \
+            --min_workers 2 \
+            --outer_lr 0.7 \
+            --kaggle_username "$KAGGLE_USERNAME" \
+            --kaggle_key "$KAGGLE_KEY" \
+            --total_train_samples 36906
