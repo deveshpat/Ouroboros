@@ -1013,8 +1013,15 @@ def _ddp_sum(values: List[float], device: torch.device) -> List[float]:
 
 
 def barrier() -> None:
-    if _distributed_is_initialized() and _world_size() > 1:
-        torch.distributed.barrier()
+    if not (_distributed_is_initialized() and _world_size() > 1):
+        return
+    if torch.cuda.is_available():
+        try:
+            torch.distributed.barrier(device_ids=[_local_rank()])
+            return
+        except TypeError:
+            pass
+    torch.distributed.barrier()
 
 
 def set_seed(seed: int) -> None:
@@ -2599,6 +2606,76 @@ def startup_hub_sync_and_prune(
     print(f"  [startup] Sync+prune complete. Pruned {pruned} checkpoint(s) locally.")
 
 
+def _distributed_resume_marker(output_dir: Path) -> Path:
+    return output_dir / ".resolved_resume_path.txt"
+
+
+def _resolve_resume_checkpoint_for_all_ranks(
+    *,
+    output_dir: Path,
+    requested_resume: Optional[Path],
+    hf_token: Optional[str],
+    hf_repo_id: str,
+    hf_stage_subdir: str,
+    distributed: bool,
+    is_main: bool,
+) -> Optional[Path]:
+    marker_path = _distributed_resume_marker(output_dir)
+    if is_main and marker_path.exists():
+        marker_path.unlink(missing_ok=True)
+
+    resolved: Optional[Path] = requested_resume
+    if distributed:
+        if is_main and resolved is None:
+            resolved = find_latest_resume_checkpoint(
+                output_dir,
+                hf_token=hf_token,
+                hf_repo_id=hf_repo_id,
+                hf_stage_subdir=hf_stage_subdir,
+            )
+            if resolved is not None:
+                print(f"  [resume] discovered latest checkpoint: {resolved}")
+        if is_main:
+            marker_path.write_text(
+                str(resolved.resolve()) if resolved is not None else "",
+                encoding="utf-8",
+            )
+        barrier()
+        if not is_main:
+            raw = marker_path.read_text(encoding="utf-8").strip() if marker_path.exists() else ""
+            resolved = Path(raw) if raw else None
+        barrier()
+        return resolved
+
+    if resolved is None:
+        resolved = find_latest_resume_checkpoint(
+            output_dir,
+            hf_token=hf_token,
+            hf_repo_id=hf_repo_id,
+            hf_stage_subdir=hf_stage_subdir,
+        )
+        if resolved is not None and is_main:
+            print(f"  [resume] discovered latest checkpoint: {resolved}")
+    return resolved
+
+
+def _cleanup_distributed_resume_artifacts(
+    output_dir: Path,
+    hub_resume_dir: Path,
+    distributed: bool,
+    is_main: bool,
+) -> None:
+    if distributed:
+        barrier()
+    if is_main:
+        marker_path = _distributed_resume_marker(output_dir)
+        marker_path.unlink(missing_ok=True)
+        if hub_resume_dir.exists():
+            shutil.rmtree(hub_resume_dir, ignore_errors=True)
+    if distributed:
+        barrier()
+
+
 def _partition_contiguous_range(n_items: int, n_parts: int, part_idx: int) -> Tuple[int, int]:
     if n_items <= 0:
         return 0, 0
@@ -3506,11 +3583,21 @@ def main() -> None:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
-        torch.distributed.init_process_group(
+        init_kwargs = dict(
             backend=backend,
             init_method="env://",
             timeout=timedelta(hours=4),
         )
+        if torch.cuda.is_available():
+            try:
+                torch.distributed.init_process_group(
+                    **init_kwargs,
+                    device_id=torch.device("cuda", local_rank),
+                )
+            except TypeError:
+                torch.distributed.init_process_group(**init_kwargs)
+        else:
+            torch.distributed.init_process_group(**init_kwargs)
 
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
 
@@ -3584,23 +3671,30 @@ def main() -> None:
             )
             return
 
-        resume_path: Optional[Path] = Path(args.resume_from) if args.resume_from else None
+        requested_resume_path: Optional[Path] = Path(args.resume_from) if args.resume_from else None
         hub_resume_dir = output_dir / ".hub_resume"
-
-        if resume_path is None:
-            resume_path = find_latest_resume_checkpoint(
-                output_dir,
-                hf_token=hf_token,
-                hf_repo_id=getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros"),
-                hf_stage_subdir=getattr(args, "hf_stage_subdir", "runs/stage3"),
-            )
-            if resume_path is not None and is_main:
-                print(f"  [resume] discovered latest checkpoint: {resume_path}")
+        resume_path = _resolve_resume_checkpoint_for_all_ranks(
+            output_dir=output_dir,
+            requested_resume=requested_resume_path,
+            hf_token=hf_token,
+            hf_repo_id=getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros"),
+            hf_stage_subdir=getattr(args, "hf_stage_subdir", "runs/stage3"),
+            distributed=distributed,
+            is_main=is_main,
+        )
 
         if resume_path is not None and not (resume_path / "training_state.pt").exists():
             if is_main:
                 print(f"  [warn] resume checkpoint not found: {resume_path}")
             resume_path = None
+            if distributed and is_main:
+                _distributed_resume_marker(output_dir).write_text("", encoding="utf-8")
+        if distributed:
+            barrier()
+            if not is_main and resume_path is None:
+                raw = _distributed_resume_marker(output_dir).read_text(encoding="utf-8").strip() if _distributed_resume_marker(output_dir).exists() else ""
+                resume_path = Path(raw) if raw else None
+            barrier()
 
         if hf_token and getattr(args, "push_to_hub", False) and is_main:
             startup_hub_sync_and_prune(
@@ -3630,9 +3724,6 @@ def main() -> None:
                 device=device,
                 verbose=is_main,
             )
-
-            if hub_resume_dir.exists():
-                shutil.rmtree(hub_resume_dir, ignore_errors=True)
 
             resume_stage = int(resume_state.get("stage_k", 0))
             global_step = int(resume_state.get("step", 0))
@@ -3669,6 +3760,7 @@ def main() -> None:
         if is_main and not stages:
             print("  No stages left to run. Nothing to do.")
         if not stages:
+            _cleanup_distributed_resume_artifacts(output_dir, hub_resume_dir, distributed, is_main)
             return
 
         result = run_training_stages(
@@ -3697,6 +3789,8 @@ def main() -> None:
             run_generation_at_stage_end=bool(args.gen_every_stage),
             run_epoch_end_val=True,
         )
+
+        _cleanup_distributed_resume_artifacts(output_dir, hub_resume_dir, distributed, is_main)
 
         if is_main:
             print("\n" + "=" * 64)
