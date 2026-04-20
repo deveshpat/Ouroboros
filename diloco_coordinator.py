@@ -11,7 +11,6 @@ Usage:
         --outer_lr 0.7 \
         --wandb_key "$WANDB_KEY" \
         --wandb_project "ouroboros-stage3-jamba" \
-        --wandb_entity "devesh-patel0922-weirdrunner" \
         --kaggle_username_a "$KAGGLE_USERNAME_A" \
         --kaggle_key_a "$KAGGLE_KEY_A" \
         --kaggle_username_b "$KAGGLE_USERNAME_B" \
@@ -68,7 +67,7 @@ def parse_args() -> argparse.Namespace:
         help="W&B API key. If omitted, coordinator skips W&B logging.",
     )
     parser.add_argument("--wandb_project", default="ouroboros-stage3-jamba")
-    parser.add_argument("--wandb_entity", default="devesh-patel0922-weirdrunner")
+    parser.add_argument("--wandb_entity", default=None)
     parser.add_argument("--total_train_samples", type=int, default=36906)
     return parser.parse_args()
 
