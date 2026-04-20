@@ -11,90 +11,50 @@
 ### What this project is
 Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transformer-Mamba hybrid). The Mamba SSM recurrent state acts as compressed scratch-pad across K latent thought passes, replacing token generation during reasoning. Based on Meta's Coconut (arXiv:2412.06769), extended with DGAC (Diversity-Gated Adaptive Coconut) — a novel anti-collapse halt gate.
 
-### Current Status (2026-04-19)
+### Current Status (2026-04-20)
 
 | Curriculum Stage | Status | Best val |
 |---|---|---|
 | Stage 0 — CoT warmup | ✅ COMPLETE | ce=0.4041, acc=0.0222 |
 | Stage 1 — 1 latent pass | ✅ COMPLETE | ce=0.4912, acc=0.0444 |
-| Stage 2 — 2 latent passes | 🟡 59% (679/1154 steps) — anchor on Hub at checkpoint-0002987 | — |
+| Stage 2 — 2 latent passes | 🟡 DiLoCo Round 0 active — Workers A+B running (159 steps each) | — |
 | Stages 3–10 | ⬜ NOT STARTED | — |
 | Phase 3.4 — DGAC | ⬜ after Stage 10 | — |
 | Phase 4 — GRPO | ⬜ after DGAC | — |
 
-**Compute mode: DiLoCo 3-way parallel (3× speedup over sequential relay)**
+**Compute mode: DiLoCo 3-way parallel (Worker C quota exhausted; A+B sufficient at min_workers=2)**
 
 ---
 
-## Part 0.1 — Immediate Next Steps (strict order, no ambiguity)
+## Part 0.1 — Immediate Next Steps (strict order)
 
-### Step 1 — Verify Cell 5 in `kaggle-utils.ipynb` on Kaggle ⚠️ CONFIRM FIRST
+### Step 1 — Monitor Stage 2 Round 0 completion ⏳
 
-The notebook file in this repo still shows the old Session 15 sequential Cell 5. The new Cell 5 (subprocess auto-detect via `DILOCO_WORKER_ID` secret) is a **manual Kaggle edit** — the coding agent cannot apply it. Confirm on each account's `kaggle-utils` notebook that Cell 5 reads:
+Workers A and B are running ~159 steps each. When both finish:
+1. Each pushes `signals/worker_{id}_stage_2_round_0.json` to GitHub
+2. GitHub Actions fires `diloco_coordinator.yml`
+3. Coordinator finds 2/2 ready workers, aggregates, uploads new anchor, re-triggers A+B for Stage 3
 
-```python
-import os, subprocess
-from kaggle_secrets import UserSecretsClient
-_secrets = UserSecretsClient()
-WORKER_ID = _secrets.get_secret("DILOCO_WORKER_ID").strip().upper()
-assert WORKER_ID in ("A", "B", "C"), ...
-cmd = ("torchrun ... --diloco_mode "
-       f"--diloco_worker_id {WORKER_ID} ...")
-subprocess.run(cmd, shell=True, check=True)
-```
+Monitor at `github.com/deveshpat/Ouroboros/actions`.
 
-If not yet updated: open each account's `kaggle-utils` → Edit → replace Cell 5 → Save version.
+### Step 2 — Update W&B entity in coordinator ⚠️ REQUIRED
 
-### Step 2 — Run `bootstrap_diloco.py` (once, any machine with HF access)
+The `--wandb_entity "devesh-patel0922-weirdrunner"` arg in `.github/workflows/diloco_coordinator.yml` may be stale after the W&B account change. Confirm the new entity slug and update:
+- `.github/workflows/diloco_coordinator.yml` line: `--wandb_entity`
+- Any hardcoded entity in `diloco_coordinator.py`
 
-Seeds `diloco_state/anchor/` from `runs/stage3/checkpoint-0002987` and writes initial `round_state.json`:
+W&B logging failure is silent (doesn't break training), but fix before Stage 3 begins.
 
-```bash
-python bootstrap_diloco.py \
-  --hf_token "$HF_TOKEN" \
-  --repo_id "WeirdRunner/Ouroboros" \
-  --source_checkpoint "runs/stage3/checkpoint-0002987" \
-  --stage_k 2 \
-  --round_n 0 \
-  --samples_seen 21728 \
-  --completed_stages 0 1
-```
+### Step 3 — Validate Stage 2 DiLoCo result
 
-Expected Hub output:
-```
-diloco_state/anchor/adapter_model.safetensors
-diloco_state/anchor/adapter_config.json
-diloco_state/round_state.json  ← {"stage_k": 2, "round_n": 0, ...}
-```
+After coordinator completes Round 0, Worker A of Stage 3 runs pre-val automatically (`round_n == 0`, new stage). Target: `val_acc` within 10% of sequential Stage 2 baseline (acc=0.0444 from Stage 1 best). If confirmed, DiLoCo is validated and all remaining stages proceed identically.
 
-### Step 3 — Start all three workers simultaneously
+### Step 4 — Stages 3–10 run unattended
 
-Trigger `kaggle-utils` manually on all three accounts at the same time. Each reads `DILOCO_WORKER_ID` and launches with `--diloco_worker_id {A,B,C}`. This is the Stage 2 DiLoCo proof-of-concept.
-
-```bash
-# Worker A (weirdrunner) — Account A
-torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
-  --data_dir data/coconut_v1 --use_4bit \
-  --stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 \
-  --batch_size 4 --grad_accum 8 --val_batch_size 2 \
-  --val_skip_buffer_minutes 60 \
-  --session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 \
-  --diloco_mode --diloco_worker_id A \
-  --diloco_outer_lr 0.7 \
-  --diloco_state_repo WeirdRunner/Ouroboros \
-  --diloco_signal_repo deveshpat/Ouroboros \
-  --push_to_hub \
-  --output_dir runs/diloco
-```
-(Workers B and C identical except `--diloco_worker_id B/C`)
-
-### Step 4 — Watch coordinator
-
-GitHub Actions fires when workers push `signals/worker_*.json`. Monitor at `github.com/deveshpat/Ouroboros/actions`. After each round: coordinator aggregates, uploads new anchor, triggers next sessions automatically.
-
-### Step 5 — Validate and continue
-
-After Stage 2 completes via DiLoCo, Worker A of Stage 3 runs pre-val (`--diloco_run_val`). If `val_acc` is within 10% of sequential Stage 2 baseline (acc=0.0444), DiLoCo is confirmed. All remaining stages proceed with the same setup.
+Coordinator auto-triggers workers after each round. Human intervention only needed if:
+- A GitHub Action fails (check Actions tab)
+- Worker quota depleted on A or B (C already exhausted)
+- Val accuracy collapse at a stage boundary
 
 ---
 
@@ -102,19 +62,19 @@ After Stage 2 completes via DiLoCo, Worker A of Stage 3 runs pre-val (`--diloco_
 
 ```
 WeirdRunner/Ouroboros/
-  runs/stage3/
-    best/                     ← misplaced (stage_1 artifact) — IGNORE
-    checkpoint-0002308/       ← misplaced (stage_1 artifact) — IGNORE
-    checkpoint-0002987/       ← Stage 2 anchor — SOURCE for bootstrap_diloco.py
+  runs/stage3_curriculum/
     stage_0/best/             ← correct ✓
     stage_1/                  ← correct ✓
-  diloco_state/               ← created by bootstrap_diloco.py (Step 2 above)
-    anchor/
-    round_state.json
+    stage_2/checkpoint-0002987/  ← Stage 2 sequential anchor (source for bootstrap_diloco.py)
+  diloco_state/               ← created by bootstrap_diloco.py ✓
+    anchor/                   ← seeded from checkpoint-0002987
+    round_state.json          ← {"stage_k": 2, "round_n": 0, ...}
     workers/{A,B,C}/          ← written by workers during training
+  runs/stage3/
+    best/                     ← misplaced stage_1 artifact — IGNORE
+    checkpoint-0002308/       ← misplaced stage_1 artifact — IGNORE
+    checkpoint-0002987/       ← misplaced (legacy path bug, now fixed) — IGNORE
 ```
-
-The misplaced files are a legacy artifact from Session 15 (path bug fixed in `save_checkpoint()`). No cleanup needed — DiLoCo uses `diloco_state/` prefix entirely.
 
 ---
 
@@ -139,48 +99,47 @@ The misplaced files are a legacy artifact from Session 15 (path bug fixed in `sa
 | amp_dtype A100+ (sm80+) | BF16 |
 | Gradient checkpointing | Auto-disabled at VRAM≥40GB |
 | Multi-account strategy | DiLoCo 3-way parallel |
-| Notebook strategy | One `kaggle-utils` per account (no separate `ouroboros-worker-*` notebooks) |
+| Notebook launch cells | `!torchrun` magic commands only — never `subprocess.run`. Magic commands stream output to notebook in real time; subprocess suppresses it, hides crashes, and prevented session-kill on fatal errors. |
 | Worker auto-detection | `DILOCO_WORKER_ID` Kaggle secret per account (`A`/`B`/`C`) |
 | Kaggle trigger auth | Per-worker credentials; Kaggle API is owner-authenticated (403 on cross-account) |
 | W&B worker run ID | `diloco-{worker_lower}-s{stage_k}` — persists and resumes across rounds within a stage |
 | W&B coordinator run ID | `diloco-coordinator-s{stage_k}` |
+| W&B account | New account created (old account's free trial expired). Entity slug TBD — update `--wandb_entity` in coordinator workflow before Stage 3. |
 | W&B step axis | `round_n × shard_step_estimate + local_step` (monotonic across rounds) |
 | `shard_step_estimate` | `ceil(36906 / 3 / (batch_size × grad_accum))` = 385 at defaults |
 | DiLoCo wandb init timing | Deferred to `run_diloco_worker()` where stage_k/round_n are known |
 | Stage advancement (DiLoCo) | When `sum(all workers' samples_seen_this_stage) >= len(train_set)` |
-| Val in DiLoCo mode | Worker A only, once per stage (round_n == 0) |
+| Val in DiLoCo mode | Worker A only, once per stage (round_n == 0, is_new_stage == True) |
 | DiLoCo outer LR | 0.7 (DiLoCo paper default) |
 | DiLoCo min_workers | 2 of 3 |
-| TRC quota | TPU only — incompatible. Email requesting GPU conversion pending. |
+| Timeout clock anchor | `_SCRIPT_START = time.perf_counter()` at **module import**, before `_bootstrap()`. `make_timeout_checker()` uses this value — never resets the clock. |
+| DiLoCo shard computation | Subtracts `total_samples_seen[stage_k]` from full dataset before partitioning A/B/C. Ensures partial-stage resumes only process the true remainder. |
+| Hub auto-resume (DDP) | Rank 0 resolves and downloads resume checkpoint; path broadcast to all ranks via marker file. `.hub_resume/` cleanup deferred until all code paths are done. |
+| Pre-val guard | Auto pre-val runs only when `is_new_stage == True` (i.e. `stage_samples_seen == 0`). Resumed partial stages skip it. |
+| TRC quota | TPU only — incompatible. Email requesting GPU conversion sent. |
 
 ---
 
-## Part 0.4 — DRY Refactors (pending — lower priority than DiLoCo first run)
+## Part 0.4 — DRY Refactors (all complete)
 
-Apply after DiLoCo Stage 2 is confirmed working. Feed as a separate agent prompt.
-
-| Refactor | Description |
+| Refactor | Status |
 |---|---|
-| R1 — Merge token resolution | `_bootstrap_resolve_token()` and `_resolve_hf_token_common()` are identical. Keep one. |
-| R2 — Extract latent pass loop | `evaluate_stage()`, `run_generation_callback()`, `_forward_batched_latent()` share the same latent loop. Extract to `_run_latent_passes()`. ✅ Already done in current code. |
-| R3 — Cache backbone/embed/lm_head | `_get_backbone()` etc. already use `_cache_model_lookup()`. ✅ Done. |
-| R4 — Collapse `_forward_batched_stage0` | Already unified into `_forward_batched_latent`. ✅ Done. |
-| R5 — `_ddp_sum()` helper | ✅ Already implemented in current code. |
-
-R2–R5 already done. R1 is the only remaining refactor.
+| R1 — Merge token resolution (`_bootstrap_resolve_token` / `_resolve_hf_token_common`) | ✅ One function — `_resolve_hf_token_common` |
+| R2 — Extract latent pass loop | ✅ `_run_latent_passes()` |
+| R3 — Cache backbone/embed/lm_head | ✅ `_cache_model_lookup()` |
+| R4 — Collapse `_forward_batched_stage0` | ✅ Unified into `_forward_batched_latent` |
+| R5 — `_ddp_sum()` helper | ✅ Implemented |
 
 ---
 
-## Part 0.5 — Pre-flight Blockers
-
-All resolved.
+## Part 0.5 — Pre-flight Blockers (all resolved)
 
 | Blocker | Resolution |
 |---|---|
 | `attn_implementation` crash | try/except fallback ✅ |
 | `use_mamba_kernels` old TF | `_safe_from_pretrained` retry ✅ |
 | `last_hidden_state` None | assert in all forward paths ✅ |
-| Graceful session timeout | `make_timeout_checker()` ✅ |
+| Graceful session timeout | `make_timeout_checker()` using `_SCRIPT_START` ✅ |
 | `conv1d` in LoRA | Excluded ✅ |
 | OOM at val | `empty_cache()` + `val_batch_size=2` ✅ |
 | Stage 1+ samples filtered by short seq_len | `--max_seq_len 1024` ✅ |
@@ -200,6 +159,11 @@ All resolved.
 | Pre-val `step=round_n` (tiny int) breaks W&B timeline | `step=global_step_offset` ✅ |
 | Pre-val `wandb_run` always None in DiLoCo mode | Uses `diloco_wandb_run` ✅ |
 | Two conflicting agent prompts (multiworker + wandb) | Merged into `AGENT_PROMPT_diloco_v2.md` ✅ |
+| **Timeout clock starts too late** | `_SCRIPT_START` captured at module import before `_bootstrap()` ✅ |
+| **DiLoCo sharding ignores stage remainder** | Subtracts `total_samples_seen[stage_k]` before A/B/C split ✅ |
+| **Pre-val fires on resumed partial stage** | Guarded by `is_new_stage = (stage_samples_seen == 0)` ✅ |
+| **Hub auto-resume not DDP-safe** | Rank 0 resolves/downloads once; path broadcast; cleanup deferred ✅ |
+| **subprocess in notebook Cell 5 suppressed output** | Replaced with `!torchrun` magic command; subprocess hid crashes and blocked session kill ✅ |
 
 ---
 
@@ -237,16 +201,19 @@ HaltGate: Linear(2·d_model → 1), zero-init → outputs 0.5 at start
 
 ```
 t_fp16(k) ≈ 34 + 11.5·k  seconds/step  (empirical, Dual T4)
-Stage 2: ~52-57s  Stage 3: ~69s  Stage 5: ~92s  Stage 10: ~149s
+Stage 2: ~50-56s  Stage 3: ~69s  Stage 5: ~92s  Stage 10: ~149s
 ```
+*Session 16 Worker A observed ~49.9s/step at k=2, consistent with model.*
 
 | Mode | Stages 3–10 |
 |---|---|
 | Sequential relay | ~278h (~3.1 weeks) |
 | DiLoCo 3-way parallel | ~93h (~1 week) |
+| DiLoCo 2-way (A+B only) | ~139h (~1.5 weeks) — current fallback if C stays exhausted |
 | DiLoCo + A100 (if TRC) | ~19h (~2 days) |
 
-**Per-worker shard:** ~12,302 samples → ~385 steps/worker/stage. Stages 1-9 fit in one 12h session. Stage 10 (~149s/step × 385 = ~16h) needs 2 rounds; coordinator handles transparently.
+**Per-worker shard (full stage):** ~12,302 samples → ~385 steps/worker/stage.
+**Stage 2 remainder shard (this round):** ~5,060 samples → ~159 steps/worker. ✅ Confirmed.
 
 ---
 
@@ -254,16 +221,13 @@ Stage 2: ~52-57s  Stage 3: ~69s  Stage 5: ~92s  Stage 10: ~149s
 
 | File | Status |
 |---|---|
-| `jamba_coconut_finetune.py` | ✅ Complete — all DiLoCo + W&B changes verified |
-| `diloco_coordinator.py` | ✅ Complete — per-worker creds, W&B coordinator run, all changes verified |
-| `bootstrap_diloco.py` | ✅ Code complete — not yet run (Step 2 above) |
-| `.github/workflows/diloco_coordinator.yml` | ✅ Complete — WANDB_KEY + 6 Kaggle secrets verified |
-| `kaggle-utils.ipynb` Cell 5 | ⚠️ Manual Kaggle edit — cannot verify from repo context; confirm on each account |
+| `jamba_coconut_finetune.py` | ✅ Complete — all DiLoCo + W&B + timeout + sharding fixes verified |
+| `diloco_coordinator.py` | ✅ Complete — per-worker creds, W&B coordinator run verified; ⚠️ `wandb_entity` may need update |
+| `bootstrap_diloco.py` | ✅ Run and confirmed (seeded `diloco_state/anchor/`) |
+| `.github/workflows/diloco_coordinator.yml` | ✅ Complete — ⚠️ `--wandb_entity` may need update |
+| `kaggle-utils.ipynb` Cell 5 | ✅ Uses `!torchrun` magic command + `DILOCO_WORKER_ID` secret |
 | `prepare_coconut_dataset.py` | ✅ Done |
 | `build_wheels_kaggle.py` | ✅ Done |
-| `AGENT_PROMPT_diloco_v2.md` | ✅ Delivered — supersedes both predecessor prompts |
-| `AGENT_PROMPT_multiworker.md` | ⛔ Superseded — do not use |
-| `AGENT_PROMPT_wandb_and_notebook.md` | ⛔ Superseded — do not use |
 
 ---
 
@@ -271,12 +235,13 @@ Stage 2: ~52-57s  Stage 3: ~69s  Stage 5: ~92s  Stage 10: ~149s
 
 | Question | Status |
 |---|---|
-| Stage 2 gn spikes (~1.9 pre-clip): transient? | 🟡 Monitor — CE not diverging at step 2987 |
-| Kaggle API `/kernels/{slug}/run` — verify endpoint works | 🟡 Test before first DiLoCo run (Step 3) |
-| TRC GPU quota conversion | 🟡 Draft email ready in `terminal_log.md` |
+| Stage 2 DiLoCo Round 0: do A+B complete within quota? | 🟡 In progress |
+| Stage 2 gn spikes (~1.9 pre-clip in Session 15): resolved by DiLoCo reset? | 🟡 Monitor Round 0 gn values |
+| W&B entity slug for new account | 🔴 Confirm and update `--wandb_entity` in coordinator workflow |
+| TRC GPU quota conversion | 🟡 Email sent — awaiting response |
 | DGAC halt_step distribution at K≥2 | 🔴 Open — primary research question |
 | Prefix re-computation optimization | 🟡 Pre-A100, before Stage 5 if TRC succeeds |
-| Cell 5 replaced on all 3 accounts? | 🟡 Verify manually — cannot confirm from repo context |
+| Worker C quota: replenishment timeline? | 🟡 Nice-to-have; A+B sufficient for now |
 
 ---
 
@@ -308,3 +273,8 @@ Stage 2: ~52-57s  Stage 3: ~69s  Stage 5: ~92s  Stage 10: ~149s
 | Pre-val `step=round_n` (tiny int) breaks W&B timeline | `step=global_step_offset` |
 | Pre-val logging used `wandb_run` (always None in DiLoCo) | Uses `diloco_wandb_run` |
 | Two conflicting agent prompts defining same constants differently | Merge into one canonical prompt before handing to agent |
+| **Timeout clock reset inside `main()`** | `_SCRIPT_START` at module import; `make_timeout_checker()` takes it as param — never restarts |
+| **DiLoCo sharding used full dataset, not stage remainder** | Subtract `total_samples_seen[stage_k]` from indices before A/B/C partition |
+| **Pre-val fired on every round_n==0, even mid-stage resumes** | `is_new_stage = (stage_samples_seen == 0)` guard added |
+| **Hub resume path lost between DDP ranks** | Rank 0 writes resolved path to marker file; all ranks read it; cleanup deferred past all uses |
+| **`subprocess.run` in notebook Cell 5 hid all output** | `!torchrun` magic command used instead; subprocess suppressed stdout/stderr, masked crash messages, and held the session open after fatal errors |

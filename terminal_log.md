@@ -3,6 +3,45 @@
 
 ---
 
+## Session 16 — DiLoCo Stage 2 Round 0 Active, Workers A+B Confirmed (2026-04-20) 🟡 IN PROGRESS
+
+**Context:** First live DiLoCo run. Worker C quota exhausted; A+B sufficient (min_workers=2).
+Bugs fixed in single pass by ChatGPT o3 extended thinking (brief pasted into project chat):
+- `_SCRIPT_START` moved to module import (true wall-clock timeout)
+- DiLoCo sharding subtracts `total_samples_seen[stage_k]` before A/B/C split
+- Pre-val guard: only runs for truly new stages (`is_new_stage` check)
+- DDP-safe Hub auto-resume: rank 0 resolves, broadcasts path to all ranks; `.hub_resume/` cleanup deferred
+
+**Worker B (weirdrunner007) — verbatim:**
+```
+2026-04-20 19:15:48
+================================================================
+  Stage 2/10  2 latent pass(es)
+  Epochs: 1  Steps/epoch: 159  Total: 159
+================================================================
+S2E0:   0%|                                             | 0/159 [00:00<?, ?it/s]
+S2E0:  18%|██▍           | 28/159 [24:11<2:02:00, 55.88s/it, ce=0.567, gn=0.928]
+  step=    20 s=2 ep=0 ce=0.5731 gn=1.1896
+```
+
+**Worker A (weirdrunner) — verbatim:**
+```
+2026-04-20 19:28:22
+================================================================
+  Stage 2/10  2 latent pass(es)
+  Epochs: 1  Steps/epoch: 159  Total: 159
+================================================================
+S2E0:   0%|                                             | 0/159 [00:00<?, ?it/s]
+S2E0:   9%|█▎            | 15/159 [12:08<1:59:39, 49.86s/it, ce=0.492, gn=1.049]
+```
+
+**Key observations:**
+- Steps/epoch = 159 confirms remainder-sharding is working correctly (blueprint target: ~158 steps/worker)
+- CE values (0.49–0.57) are within Stage 2 historical range (0.36–0.64 in Session 15)
+- gn values healthy and pre-clip; clipping at 0.3 correctly active
+
+---
+
 ## Session 15 — Hub+Prune Confirmed, Stage 1 Complete, Stage 2 59% (2026-04-18 → 2026-04-19) ✅ COMPLETE (timed out)
 
 **Command:**
@@ -67,52 +106,14 @@ S2E0:  59%|█████▉    | 679/1154 [9:43:06<6:55:29, 52.48s/it, ce=0.63
   step=  2740 s=2 ep=0 ce=0.6196 gn=1.9030
   step=  2860 s=2 ep=0 ce=0.5273 gn=1.1574
 ```
-*gn values are pre-clip; max_grad_norm=0.3 clipping correctly. CE not diverging.*
+*gn values are pre-clip; max_grad_norm=0.3 clipping correctly active. CE not diverging.*
 
-**Bug identified (relay-blocking):**
-`save_checkpoint` uploads to `runs/stage3/checkpoint-XXXXXXX` missing `stage_{k}/` subdir.
-`find_latest_resume_checkpoint` on Account B/C (no local files) won't find these.
-Fix: `AGENT_PROMPT_relay_path_fix.md` — one line in `save_checkpoint`.
-
----
-
-## TRC Email Draft (send to trc-support@google.com)
-
-**Subject:** TRC Quota Request — CUDA-Dependent Workload Requires GPU (Not TPU)
-
-```
-Hi TRC Support,
-
-Thank you for the TRC invitation (received April 7, 2026). I'm writing to ask
-whether my quota can be converted to A100 GPU-hours, or whether GCP credits
-can be applied to GPU VM instances.
-
-The reason: my research workload (Coconut latent reasoning injection into Jamba
-Reasoning 3B, a Transformer-Mamba hybrid) has a hard dependency on CUDA-compiled
-kernels — specifically mamba_ssm and causal_conv1d, which are custom CUDA
-extensions with no XLA/TPU implementation. These kernels are fundamental to the
-architecture being studied, not optional dependencies. The workload cannot run
-on TPU.
-
-Project details:
-- Research: Coconut progressive latent reasoning curriculum (Meta arXiv:2412.06769)
-  applied to Jamba 3B
-- Stack: PyTorch, QLoRA (bitsandbytes 4-bit, CUDA-only), mamba_ssm==1.2.2
-  custom CUDA kernels
-- Hardware needed: A100 80GB GPU (confirmed compatible; currently running on
-  Kaggle Dual T4 as a stopgap)
-- Estimated compute: ~150 GPU-hours on A100 to complete the 10-stage curriculum
-
-If the TPU quota cannot be converted, I'd also appreciate guidance on whether
-TRC participants have any pathway to GPU credits or A100 access for
-CUDA-dependent research.
-
-Thank you for your time.
-
-Best regards,
-Devesh Patel
-devesh.patel0922@gmail.com
-```
+**Bugs identified post-session (fixed before Session 16):**
+1. `save_checkpoint` uploads to `runs/stage3/checkpoint-XXXXXXX` missing `stage_{k}/` subdir → fixed.
+2. Timeout clock started too late (inside `main()` after model load) → `_SCRIPT_START` moved to module import.
+3. DiLoCo sharding ignored `total_samples_seen` remainder → fixed with pre-subtraction.
+4. Hub auto-resume not DDP-coordinated → rank 0 resolves, broadcasts, deferred cleanup.
+5. Auto pre-val on resumed partial stages → guarded by `is_new_stage`.
 
 ---
 
