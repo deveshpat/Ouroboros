@@ -85,6 +85,10 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", str(4 * 3600))  # match init_process_group
 os.environ.setdefault("NCCL_TIMEOUT", str(4 * 3600))
 
+# Wall-clock start for Kaggle timeout accounting. This must be captured
+# before _bootstrap() so dependency install and model load time are included
+# in the graceful-exit budget.
+_SCRIPT_START = time.perf_counter()
 
 # ── Hub wheel config ──────────────────────────────────────────────────────────
 _HUB_WHEEL_BASES = [
@@ -2355,8 +2359,13 @@ def build_optimizer_and_scheduler(
     return optimizer, LambdaLR(optimizer, lr_lambda)
 
 
-def make_timeout_checker(args: argparse.Namespace, rank: int):
-    session_start = time.perf_counter()
+def make_timeout_checker(
+    args: argparse.Namespace,
+    rank: int,
+    session_start: Optional[float] = None,
+):
+    if session_start is None:
+        session_start = _SCRIPT_START
     timeout_limit_s  = args.session_timeout_hours * 3600.0
     timeout_buffer_s = args.graceful_exit_buffer_minutes * 60.0
     triggered = [False]
@@ -2590,27 +2599,48 @@ def startup_hub_sync_and_prune(
     print(f"  [startup] Sync+prune complete. Pruned {pruned} checkpoint(s) locally.")
 
 
+def _partition_contiguous_range(n_items: int, n_parts: int, part_idx: int) -> Tuple[int, int]:
+    if n_items <= 0:
+        return 0, 0
+    base = n_items // n_parts
+    remainder = n_items % n_parts
+    start = part_idx * base + min(part_idx, remainder)
+    width = base + (1 if part_idx < remainder else 0)
+    return start, start + width
+
+
 def diloco_get_shard(
     train_samples: List[Dict[str, Any]],
     worker_id: str,
     stage_k: int,
     round_n: int,
     seed: int,
+    samples_already_seen: int = 0,
 ) -> List[Dict[str, Any]]:
     """
-    Deterministic shard assignment. Every worker with the same args gets the same shard.
-    Shard is 1/3 of the dataset, non-overlapping, covering the full dataset across 3 workers.
-    Round-robin across rounds so different samples are seen each round.
+    Deterministic shard assignment for the current DiLoCo round.
+
+    The permutation is still stage/round dependent, but we trim the prefix that
+    has already been counted in round_state.total_samples_seen for this stage.
+    This keeps partially-complete stages from re-running a full 1/3 shard when
+    only the stage remainder should be trained.
     """
     worker_idx = {"A": 0, "B": 1, "C": 2}[worker_id]
     n = len(train_samples)
+    if n <= 0:
+        return []
+
     rng = random.Random(seed + stage_k * 100_003 + round_n * 7)
     indices = list(range(n))
     rng.shuffle(indices)
-    shard_size = n // 3
-    start = worker_idx * shard_size
-    end = start + shard_size if worker_idx < 2 else n
-    shard_indices = indices[start:end]
+
+    seen = max(0, min(int(samples_already_seen), n))
+    remaining_indices = indices[seen:]
+    if not remaining_indices:
+        return []
+
+    start, end = _partition_contiguous_range(len(remaining_indices), 3, worker_idx)
+    shard_indices = remaining_indices[start:end]
     return [train_samples[i] for i in shard_indices]
 
 
@@ -2826,7 +2856,7 @@ def run_training_stages(
     distributed = world_size > 1
     is_main = rank == 0
     local_bs = args.batch_size // world_size if distributed else args.batch_size
-    check_timeout = make_timeout_checker(args, rank)
+    check_timeout = make_timeout_checker(args, rank, session_start=session_start)
 
     timeout_triggered = False
     val_budget_triggered = False
@@ -3244,7 +3274,48 @@ def run_diloco_worker(
         diloco_download_anchor(model, hf_token, args.diloco_state_repo, anchor_path, device)
     barrier()
 
+    if _world_size() > 1:
+        broadcast_parameters(get_trainable_parameters(model, None), src=0)
+        barrier()
+
+    stage_samples_seen = int(round_state.get("total_samples_seen", {}).get(str(stage_k), 0))
+    stage_samples_seen = max(0, min(stage_samples_seen, len(train_samples)))
+    remaining_stage_samples = max(len(train_samples) - stage_samples_seen, 0)
+    is_new_stage = stage_samples_seen == 0
+
+    train_shard = diloco_get_shard(
+        train_samples,
+        args.diloco_worker_id,
+        stage_k,
+        round_n,
+        args.seed,
+        samples_already_seen=stage_samples_seen,
+    )
+    if _is_main_process():
+        print(
+            f"  [diloco] Stage progress before round: "
+            f"{stage_samples_seen}/{len(train_samples)} samples"
+        )
+        print(f"  [diloco] Remaining global samples: {remaining_stage_samples}")
+        print(f"  [diloco] Shard size: {len(train_shard)} samples")
+
+    if not train_shard:
+        if _is_main_process():
+            print("  [diloco] No remaining samples for this stage. Exiting without upload.")
+        return {
+            "stage_k": stage_k,
+            "round_n": round_n,
+            "samples_seen": 0,
+            "global_step": 0,
+            "timeout_triggered": False,
+            "val_budget_triggered": False,
+            "stages": [stage_k],
+        }
+
     # ── Step-offset (always computed, regardless of W&B mode) ─────────────────
+    # Keep the step budget based on a full nominal 1/3 worker shard so W&B step
+    # offsets remain monotonic across rounds even when the final round is a
+    # trimmed remainder.
     shard_step_estimate = math.ceil(
         len(train_samples) / 3 / max(args.batch_size * args.grad_accum, 1)
     )
@@ -3272,6 +3343,8 @@ def run_diloco_worker(
                     "worker_id": args.diloco_worker_id,
                     "mode": "diloco",
                     "shard_step_estimate": shard_step_estimate,
+                    "remaining_stage_samples": remaining_stage_samples,
+                    "planned_shard_samples": len(train_shard),
                 },
                 mode=args.wandb_mode,
             )
@@ -3282,11 +3355,10 @@ def run_diloco_worker(
         except Exception as _we:
             print(f"  [diloco] W&B init failed: {_we}")
 
-    if _world_size() > 1:
-        broadcast_parameters(get_trainable_parameters(model, None), src=0)
-        barrier()
-
-    should_run_pre_val = bool(args.diloco_run_val or (round_n == 0 and args.diloco_worker_id == "A"))
+    should_run_pre_val = bool(
+        args.diloco_run_val
+        or (round_n == 0 and is_new_stage and args.diloco_worker_id == "A")
+    )
     if should_run_pre_val and val_samples:
         val_ce, val_acc = evaluate_stage(
             model=model,
@@ -3312,18 +3384,6 @@ def run_diloco_worker(
                     step=global_step_offset,
                 )
     barrier()
-
-    train_shard = diloco_get_shard(
-        train_samples,
-        args.diloco_worker_id,
-        stage_k,
-        round_n,
-        args.seed,
-    )
-    if not train_shard:
-        raise ValueError("Resolved an empty DiLoCo shard; cannot continue.")
-    if _is_main_process():
-        print(f"  [diloco] Shard size: {len(train_shard)} samples")
 
     original_push_to_hub = args.push_to_hub
     original_stage0_epochs = args.stage_0_epochs
@@ -3461,7 +3521,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    session_start = time.perf_counter()
+    session_start = _SCRIPT_START
 
     hf_token = _resolve_hf_token(getattr(args, "hf_token", None))
     args._resolved_hf_token = hf_token
