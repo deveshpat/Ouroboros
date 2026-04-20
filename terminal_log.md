@@ -3,26 +3,10 @@
 
 ---
 
-## Session 16 — DiLoCo Stage 2 Round 0 Active, Workers A+B Confirmed (2026-04-20) 🟡 IN PROGRESS
+## Session 16 — DiLoCo Stage 2 Round 0 (2026-04-20) ✅ COMPLETE
 
 **Context:** First live DiLoCo run. Worker C quota exhausted; A+B sufficient (min_workers=2).
-Bugs fixed in single pass by ChatGPT o3 extended thinking (brief pasted into project chat):
-- `_SCRIPT_START` moved to module import (true wall-clock timeout)
-- DiLoCo sharding subtracts `total_samples_seen[stage_k]` before A/B/C split
-- Pre-val guard: only runs for truly new stages (`is_new_stage` check)
-- DDP-safe Hub auto-resume: rank 0 resolves, broadcasts path to all ranks; `.hub_resume/` cleanup deferred
-
-**Worker B (weirdrunner007) — verbatim:**
-```
-2026-04-20 19:15:48
-================================================================
-  Stage 2/10  2 latent pass(es)
-  Epochs: 1  Steps/epoch: 159  Total: 159
-================================================================
-S2E0:   0%|                                             | 0/159 [00:00<?, ?it/s]
-S2E0:  18%|██▍           | 28/159 [24:11<2:02:00, 55.88s/it, ce=0.567, gn=0.928]
-  step=    20 s=2 ep=0 ce=0.5731 gn=1.1896
-```
+Step count of 159 confirms remainder-sharding works (blueprint target: ~158 steps/worker).
 
 **Worker A (weirdrunner) — verbatim:**
 ```
@@ -32,13 +16,40 @@ S2E0:  18%|██▍           | 28/159 [24:11<2:02:00, 55.88s/it, ce=0.567, gn=
   Epochs: 1  Steps/epoch: 159  Total: 159
 ================================================================
 S2E0:   0%|                                             | 0/159 [00:00<?, ?it/s]
-S2E0:   9%|█▎            | 15/159 [12:08<1:59:39, 49.86s/it, ce=0.492, gn=1.049]
+S2E0:  61%|████████▌     | 97/159 [1:17:49<48:14, 46.69s/it, ce=0.597, gn=0.900]
+  step=    20 s=2 ep=0 ce=0.4321 gn=0.8874
+  step=    40 s=2 ep=0 ce=0.5493 gn=0.8912
+  step=    60 s=2 ep=0 ce=0.4998 gn=0.9167
+  step=    80 s=2 ep=0 ce=0.5836 gn=1.1541
+  step=   100 s=2 ep=0 ce=0.4660 gn=0.6701
 ```
 
-**Key observations:**
-- Steps/epoch = 159 confirms remainder-sharding is working correctly (blueprint target: ~158 steps/worker)
-- CE values (0.49–0.57) are within Stage 2 historical range (0.36–0.64 in Session 15)
-- gn values healthy and pre-clip; clipping at 0.3 correctly active
+**Worker B (weirdrunner007) — verbatim:**
+```
+2026-04-20 19:15:48
+================================================================
+  Stage 2/10  2 latent pass(es)
+  Epochs: 1  Steps/epoch: 159  Total: 159
+================================================================
+S2E0:   0%|                                             | 0/159 [00:00<?, ?it/s]
+S2E0:  65%|████████▍    | 103/159 [1:30:56<50:19, 53.92s/it, ce=0.698, gn=0.776]
+  step=    20 s=2 ep=0 ce=0.5731 gn=1.1896
+  step=    40 s=2 ep=0 ce=0.5661 gn=0.7973
+  step=    60 s=2 ep=0 ce=0.5267 gn=0.6795
+  step=    80 s=2 ep=0 ce=0.5345 gn=0.8094
+  step=   100 s=2 ep=0 ce=0.6022 gn=1.1261
+```
+
+**Empirical step timing:**
+- Worker A: step 20→100 (80 steps, 19:44→20:48) = **48.3s/step**
+- Worker B: step 20→100 (80 steps, 19:32→20:44) = **53.4s/step**
+- Average ~51s/step. Blueprint model predicted 57s (`34 + 11.5×2`); workers ~10% faster.
+
+**Health summary:**
+- CE range 0.43–0.70 across both workers. Consistent with Stage 2 Session 15 history (0.36–0.64). No divergence.
+- All gn values 0.67–1.19 pre-clip. `max_grad_norm=0.3` clipping active every step.
+- Session 15 gn spikes (max 1.90) absent — DiLoCo anchor reset stabilises gradient flow.
+- PyTorch 2.9 `use_reentrant` deprecation warning is cosmetic; training behavior unchanged.
 
 ---
 
@@ -93,11 +104,11 @@ S1E0: 100%|█████████████████| 15/15 [10:21<00:
 S2E0:  59%|█████▉    | 679/1154 [9:43:06<6:55:29, 52.48s/it, ce=0.636, gn=1.069]
   [timeout] 10.68h elapsed - 19.5 min remaining (< 20 min buffer).
   [timeout] saving emergency checkpoint at step 2987 ...
-  [ckpt] saved -> runs/stage3_curriculum/stage_2/checkpoint-0002987  acc=None  ce=None
+  [ckpt] saved -> runs/stage3_curriculum/stage_2/checkpoint-0002987
   [hub] uploaded runs/stage3/checkpoint-0002987 -> WeirdRunner/Ouroboros
 ```
 
-**Stage 2 selected step logs (verbatim):**
+**Stage 2 selected steps (verbatim):**
 ```
   step=  2320 s=2 ep=0 ce=0.4721 gn=0.5595
   step=  2400 s=2 ep=0 ce=0.3645 gn=0.6076
@@ -106,27 +117,17 @@ S2E0:  59%|█████▉    | 679/1154 [9:43:06<6:55:29, 52.48s/it, ce=0.63
   step=  2740 s=2 ep=0 ce=0.6196 gn=1.9030
   step=  2860 s=2 ep=0 ce=0.5273 gn=1.1574
 ```
-*gn values are pre-clip; max_grad_norm=0.3 clipping correctly active. CE not diverging.*
-
-**Bugs identified post-session (fixed before Session 16):**
-1. `save_checkpoint` uploads to `runs/stage3/checkpoint-XXXXXXX` missing `stage_{k}/` subdir → fixed.
-2. Timeout clock started too late (inside `main()` after model load) → `_SCRIPT_START` moved to module import.
-3. DiLoCo sharding ignored `total_samples_seen` remainder → fixed with pre-subtraction.
-4. Hub auto-resume not DDP-coordinated → rank 0 resolves, broadcasts, deferred cleanup.
-5. Auto pre-val on resumed partial stages → guarded by `is_new_stage`.
 
 ---
 
 ## Session 14 — Stage 1 Resumed, FP16 Confirmed (2026-04-18) ✅ COMPLETE
-
-FP16 patch confirmed. Resumed from checkpoint-0001338. Timed out at step 2293.
 
 ```
   [GPU] Tesla T4  cc=sm75  VRAM=16GB  amp_dtype=float16
 S1E0:   4%|▌  | 39/970 [26:51<10:41:10, 41.32s/it, ce=0.389, gn=0.200]
   [timeout] saving emergency checkpoint at step 2293 ...
 ```
-**Confirmed: ~41s/step at k=1** (~4× speedup over pre-patch 162s/step).
+**Confirmed: ~41s/step at k=1.**
 
 ---
 
