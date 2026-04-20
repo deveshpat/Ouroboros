@@ -191,15 +191,58 @@ def save_and_upload_anchor(
 
 
 
+def _trigger_single_worker(worker_id: str, username: str, key: str, slug: str) -> bool:
+    """
+    Trigger a Kaggle kernel run via pull → re-push using the official SDK.
+
+    Kaggle has NO standalone 'run' endpoint. The only programmatic way to
+    trigger a new run of an existing notebook is to push a new version.
+    kaggle.api.kernels_pull() downloads the current code + kernel-metadata.json;
+    kaggle.api.kernels_push() re-uploads it unchanged, which creates a new
+    version and starts it immediately.
+
+    Per-worker credentials are injected via KAGGLE_USERNAME / KAGGLE_KEY env vars
+    (takes precedence over ~/.kaggle/kaggle.json per official SDK behaviour).
+    A fresh KaggleApi instance is created per worker so credentials don't bleed.
+    """
+    import os
+    import tempfile
+
+    prev = {k: os.environ.get(k) for k in ("KAGGLE_USERNAME", "KAGGLE_KEY")}
+    os.environ["KAGGLE_USERNAME"] = username
+    os.environ["KAGGLE_KEY"] = key
+
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Downloads notebook source + kernel-metadata.json (preserves GPU/internet flags)
+            api.kernels_pull(slug, path=tmpdir, metadata=True, quiet=True)
+            # Re-push identical content → new version → run starts automatically
+            api.kernels_push(tmpdir)
+
+        print(f"[coordinator] Triggered Worker {worker_id}: {slug}")
+        return True
+    except Exception as exc:
+        print(f"[coordinator] WARNING: Failed to trigger {slug}: {exc}")
+        return False
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def trigger_kaggle_workers(
     kaggle_creds: Dict[str, Tuple[Optional[str], Optional[str]]],
 ) -> None:
     """
     Trigger each worker's Kaggle notebook using that worker's own credentials.
-
-    Kaggle's /run API authenticates as the notebook owner; cross-account triggers
-    return 403. Each worker therefore has its own credential pair stored as
-    separate GitHub secrets.
+    Kaggle's /run API does not exist; cross-account triggers also return 403.
+    Each worker therefore has its own credential pair stored as GitHub secrets.
     """
     for worker_id in WORKER_IDS:
         username, key = kaggle_creds.get(worker_id, (None, None))
@@ -212,21 +255,7 @@ def trigger_kaggle_workers(
             )
             continue
 
-        url = f"https://www.kaggle.com/api/v1/kernels/{slug}/run"
-        try:
-            resp = requests.post(url, auth=(username, key), json={}, timeout=60)
-        except requests.RequestException as exc:
-            print(f"[coordinator] WARNING: Failed to trigger {slug}: {exc}")
-            continue
-
-        if resp.status_code == 200:
-            print(f"[coordinator] Triggered Worker {worker_id}: {slug}")
-        else:
-            print(
-                f"[coordinator] WARNING: Failed to trigger {slug}: "
-                f"{resp.status_code} {resp.text[:200]}"
-            )
-
+        _trigger_single_worker(worker_id, username, key, slug)
 
 
 def collect_ready_workers(repo_id: str, token: str, stage_k: int, round_n: int) -> List[Dict]:
