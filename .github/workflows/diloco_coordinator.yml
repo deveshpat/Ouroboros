@@ -46,7 +46,6 @@ jobs:
             --outer_lr          0.7 \
             --wandb_key         "$WANDB_KEY" \
             --wandb_project     "ouroboros-stage3-jamba" \
-            --wandb_entity      "devesh-patel0922-weirdrunner" \
             --kaggle_username_a "$KAGGLE_USERNAME_A" \
             --kaggle_key_a      "$KAGGLE_KEY_A" \
             --kaggle_username_b "$KAGGLE_USERNAME_B" \
