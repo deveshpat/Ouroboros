@@ -65,6 +65,7 @@ jobs:
             --hf_token          "$HF_TOKEN" \
             --repo_id           "WeirdRunner/Ouroboros" \
             --outer_lr          0.7 \
+            --worker_timeout_hours 13.0 \
             --wandb_key         "$WANDB_KEY" \
             --wandb_project     "ouroboros-stage3-jamba" \
             --kaggle_username_a "$KAGGLE_USERNAME_A" \
