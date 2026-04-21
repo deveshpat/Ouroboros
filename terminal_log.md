@@ -3,6 +3,48 @@
 
 ---
 
+## Session 17 — Coordinator Run #3 SUCCESS + kaggle 2.x trigger failure diagnosed (2026-04-20) ✅ AGGREGATED / ⚠️ TRIGGER STILL BROKEN
+
+**Context:** numpy fix from Session 16 deployed. Coordinator ran and completed all core work. New failure: Kaggle worker auto-trigger failed with 403 due to `kaggle==2.0.1` gRPC API change. Fix identified: pin `kaggle<2.0.0`.
+
+### Coordinator Run #3 — verbatim key lines
+
+```
+[coordinator] stage=2 round=0
+[coordinator] Worker A: 5060 samples ready
+[coordinator] Worker B: 5059 samples ready
+[coordinator] Worker C: not ready (status=None)
+[coordinator] Loading anchor weights...
+[coordinator] Loading worker weights...
+[coordinator] Aggregating on CPU...
+[coordinator] New anchor uploaded: DiLoCo anchor: stage 2 round 0 (2 workers, 10119 samples)
+[coordinator] Stage 2 progress: 31847/36906 samples seen
+[coordinator] round_state.json updated: stage=2 round=1
+[coordinator] WARNING: Failed to trigger ***/kaggle-utils: 403 Client Error: Forbidden for url: https://api.kaggle.com/v1/kernels.KernelsApiService/GetKernel
+[coordinator] WARNING: Failed to trigger ***/kaggle-utils: 403 Client Error: Forbidden for url: https://api.kaggle.com/v1/kernels.KernelsApiService/GetKernel
+[coordinator] WARNING: Failed to trigger ***/kaggle-utils: 403 Client Error: Forbidden for url: https://api.kaggle.com/v1/kernels.KernelsApiService/GetKernel
+[coordinator] Done.
+```
+
+W&B coordinator summary:
+```
+coordinator/pct_stage_done:        86.3
+coordinator/samples_this_round:    10119
+coordinator/total_samples_stage:   31847
+coordinator/workers_aggregated:    2
+coordinator/stage_complete:        0
+```
+
+**Root cause of 403:** `kaggle==2.0.1` (installed) uses gRPC endpoint `api.kaggle.com/v1/kernels.KernelsApiService/GetKernel`. Confirmed via `kaggle/configuration.py` in the installed package:
+- `kaggle<2.0.0`: `self.host = "https://www.kaggle.com/api/v1"` (old REST, works)
+- `kaggle==2.0.x`: gRPC, 403 on all accounts
+
+**Fix:** `pip install "kaggle<2.0.0"` in `diloco_coordinator.yml`.
+
+**State after run:** `round_state.json = {stage_k: 2, round_n: 1}`. Remaining: 5059/36906 samples. Workers need one more manual round (~1686 samples each).
+
+---
+
 ## Session 16 — DiLoCo Stage 2 Round 0 (2026-04-20) ✅ TRAINING COMPLETE / ⚠️ COORDINATOR CRASHED
 
 **Context:** First live DiLoCo run. Workers A+B completed 159/159 steps each, weights on HF Hub.
