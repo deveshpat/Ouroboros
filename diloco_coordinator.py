@@ -166,11 +166,6 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_KAGGLE_NOTEBOOK_PATH),
         help="Absolute or repo-relative path to the Kaggle notebook that should be pushed to auto-trigger workers.",
     )
-    parser.add_argument(
-        "--kaggle_accelerator",
-        default=DEFAULT_KAGGLE_ACCELERATOR,
-        help="Optional Kaggle accelerator name to request when pushing the worker notebook. Omit to rely on kernel metadata.",
-    )
     # W&B
     parser.add_argument(
         "--wandb_key",
@@ -311,9 +306,10 @@ def _build_kaggle_kernel_metadata(*, slug: str, notebook_filename: str) -> Dict[
         "kernel_type": "notebook",
         "is_private": True,
         "enable_gpu": True,
+        "accelerator": "nvidiaTeslaT4",          # ← ADD: pins T4, not just any GPU
         "enable_tpu": False,
         "enable_internet": True,
-        "dataset_sources": [],
+        "dataset_sources": ["weirdrunner007/ouroboros-cache"],  # ← ADD: attaches cache
         "competition_sources": [],
         "kernel_sources": [],
         "model_sources": [],
@@ -396,8 +392,6 @@ def _trigger_single_worker(
             _stage_local_kaggle_kernel(notebook_path, slug, tmp_path)
 
             push_args = ["kernels", "push", "-p", str(tmp_path)]
-            if accelerator:
-                push_args.extend(["--accelerator", accelerator])
             push = _run_kaggle(push_args)
             if push.returncode != 0:
                 err = (push.stderr or push.stdout or "").strip()
