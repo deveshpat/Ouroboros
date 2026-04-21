@@ -190,50 +190,78 @@ def save_and_upload_anchor(
     print(f"[coordinator] New anchor uploaded: {message}")
 
 
-
 def _trigger_single_worker(worker_id: str, username: str, key: str, slug: str) -> bool:
     """
-    Trigger a Kaggle kernel run via pull → re-push using the official SDK.
+    Trigger a Kaggle kernel run via pull → re-push using the kaggle CLI subprocess.
 
-    Kaggle has NO standalone 'run' endpoint. The only programmatic way to
-    trigger a new run of an existing notebook is to push a new version.
-    kaggle.api.kernels_pull() downloads the current code + kernel-metadata.json;
-    kaggle.api.kernels_push() re-uploads it unchanged, which creates a new
-    version and starts it immediately.
+    Why subprocess over the Python API:
+      - kaggle>=1.7.3 removed Swagger REST; >=1.8.3/2.0 migrated to gRPC (kagglesdk).
+        The new KernelsApiService/GetKernel endpoint returns 403 for private notebooks.
+      - Pinning kaggle==1.6.17 (last REST-based version) and calling the CLI via
+        subprocess is stable, version-agnostic, and avoids import-path churn.
 
-    Per-worker credentials are injected via KAGGLE_USERNAME / KAGGLE_KEY env vars
-    (takes precedence over ~/.kaggle/kaggle.json per official SDK behaviour).
-    A fresh KaggleApi instance is created per worker so credentials don't bleed.
+    Flow:
+      1. Set per-worker KAGGLE_USERNAME/KAGGLE_KEY env vars.
+      2. `kaggle kernels pull {slug} -p {tmpdir} -m`  → downloads source + metadata.
+      3. `kaggle kernels push -p {tmpdir}`            → re-uploads unchanged, starts run.
+
+    Requirements:
+      - `kaggle==1.6.17` must be installed (pinned in diloco_coordinator.yml).
+      - KAGGLE_USERNAME_{A/B/C} and KAGGLE_KEY_{A/B/C} must be set as GitHub secrets
+        on deveshpat/Ouroboros → Settings → Secrets and variables → Actions.
     """
     import os
+    import subprocess
     import tempfile
 
-    prev = {k: os.environ.get(k) for k in ("KAGGLE_USERNAME", "KAGGLE_KEY")}
-    os.environ["KAGGLE_USERNAME"] = username
-    os.environ["KAGGLE_KEY"] = key
+    if not username or not key:
+        print(f"[coordinator] No credentials for Worker {worker_id} — skipping trigger.")
+        return False
+
+    env = os.environ.copy()
+    env["KAGGLE_USERNAME"] = username
+    env["KAGGLE_KEY"] = key
+    # Prevent CLI from reading a stale ~/.kaggle/kaggle.json that could override creds
+    env.pop("KAGGLE_CONFIG_DIR", None)
+
+    def _run_kaggle(args: List[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["kaggle"] + args,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
 
     try:
-        from kaggle.api.kaggle_api_extended import KaggleApi
-        api = KaggleApi()
-        api.authenticate()
-
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Downloads notebook source + kernel-metadata.json (preserves GPU/internet flags)
-            api.kernels_pull(slug, path=tmpdir, metadata=True, quiet=True)
-            # Re-push identical content → new version → run starts automatically
-            api.kernels_push(tmpdir)
+            # Step 1: pull current notebook source + kernel-metadata.json
+            pull = _run_kaggle(["kernels", "pull", slug, "-p", tmpdir, "-m"])
+            if pull.returncode != 0:
+                err = (pull.stderr or pull.stdout or "").strip()
+                print(f"[coordinator] WARNING: kernels pull failed for Worker {worker_id} ({slug}): {err}")
+                return False
 
-        print(f"[coordinator] Triggered Worker {worker_id}: {slug}")
+            # Step 2: re-push unchanged → new version → execution starts automatically
+            push = _run_kaggle(["kernels", "push", "-p", tmpdir])
+            if push.returncode != 0:
+                err = (push.stderr or push.stdout or "").strip()
+                print(f"[coordinator] WARNING: kernels push failed for Worker {worker_id} ({slug}): {err}")
+                return False
+
+        out = (push.stdout or "").strip()
+        print(f"[coordinator] Triggered Worker {worker_id}: {slug}  ({out})")
         return True
+
+    except subprocess.TimeoutExpired:
+        print(f"[coordinator] WARNING: kaggle CLI timed out for Worker {worker_id} ({slug})")
+        return False
+    except FileNotFoundError:
+        print("[coordinator] WARNING: `kaggle` CLI not found — is kaggle==1.6.17 installed?")
+        return False
     except Exception as exc:
         print(f"[coordinator] WARNING: Failed to trigger {slug}: {exc}")
         return False
-    finally:
-        for k, v in prev.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
 
 
 def trigger_kaggle_workers(

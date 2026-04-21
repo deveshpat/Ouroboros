@@ -17,7 +17,7 @@ Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transform
 |---|---|---|
 | Stage 0 — CoT warmup | ✅ COMPLETE | ce=0.4041, acc=0.0222 |
 | Stage 1 — 1 latent pass | ✅ COMPLETE | ce=0.4912, acc=0.0444 |
-| Stage 2 — 2 latent passes | ⚠️ Workers done; coordinator crashed (numpy missing) — fix deployed | — |
+| Stage 2 — 2 latent passes | ⚠️ Round 0 aggregated (31847/36906 samples, 86.3%); Round 1 pending — trigger workers manually | — |
 | Stages 3–10 | ⬜ NOT STARTED | — |
 | Phase 3.4 — DGAC | ⬜ after Stage 10 | — |
 | Phase 4 — GRPO | ⬜ after DGAC | — |
@@ -28,40 +28,22 @@ Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transform
 
 ## Part 0.1 — Immediate Next Steps (strict order)
 
-### Step 1 — Deploy the workflow fix ⚡ BLOCKING
-Push `.github/workflows/diloco_coordinator.yml` to `deveshpat/Ouroboros` with these changes:
-- `pip install numpy` added (crash root cause — `safetensors.torch.save_file` calls numpy internally)
-- `torch` switched to CPU-only wheel (`--index-url https://download.pytorch.org/whl/cpu`)
-- `timeout-minutes: 30` (up from 15 — anchor upload is ~1.5 GB)
-- `workflow_dispatch:` trigger added (allows manual re-run from Actions UI without a signal commit)
+### Step 1 — Trigger workers for Stage 2 Round 1 ⚡ BLOCKING
+Open kaggle-utils on Worker A and Worker B accounts and run Cell 5 manually.
+`round_state.json` is now `{stage_k: 2, round_n: 1}`. Each worker trains on ~1686 samples (remaining ~5059/3) to complete stage 2, then the coordinator runs for the final aggregation.
 
-### Step 2 — Re-trigger the coordinator
-After pushing the fix, either:
-- **Option A (simplest):** Actions tab → DiLoCo Coordinator → "Run workflow" (now available via `workflow_dispatch`)
-- **Option B:** Edit either signal file (e.g. bump the timestamp) and commit
+### Step 2 — Deploy the kaggle version pin ⚡ IMPORTANT
+Push the updated `.github/workflows/diloco_coordinator.yml` to `deveshpat/Ouroboros`.
+**The one-line change:** `kaggle` → `"kaggle<2.0.0"` in the pip install step.
 
-`round_state.json` is still clean at `{stage_k: 2, round_n: 0}`. Worker weights are on HF Hub. The coordinator will pick up exactly where it left off.
+Root cause: `kaggle==2.0.1` moved `kernels_pull` to a gRPC endpoint
+(`api.kaggle.com/v1/kernels.KernelsApiService/GetKernel`) that returns `403 Forbidden`.
+`kaggle==1.6.17` uses the stable REST API (`www.kaggle.com/api/v1`) that is owner-authenticated and works correctly.
 
-### Step 3 — Verify coordinator completes
-Expected log:
-```
-[coordinator] Worker A: 5060 samples ready
-[coordinator] Worker B: 5059 samples ready
-[coordinator] Aggregating on CPU...
-[coordinator] New anchor uploaded: DiLoCo anchor: stage 2 round 0 ...
-[coordinator] round_state.json updated: stage=3 round=0
-[coordinator] Triggered Worker A: weirdrunner/kaggle-utils
-[coordinator] Triggered Worker B: weirdrunner007/kaggle-utils
-[coordinator] Done.
-```
-
-### Step 4 — Fix GITHUB_TOKEN on both Kaggle accounts (for future rounds)
+### Step 3 — Fix GITHUB_TOKEN on both Kaggle accounts (for future rounds)
 Generate a classic PAT from the **`deveshpat` GitHub account** with `repo` scope.
 Update `GITHUB_TOKEN` Kaggle secret on **weirdrunner** and **weirdrunner007** accounts.
-Worker B's current token is expired (401) — urgent for future auto-signalling.
-
-### Step 5 — If Kaggle auto-trigger fails, start workers manually
-Aggregation is independent of the trigger. If `Triggered Worker` lines show errors, open kaggle-utils on Account A and B and run manually. `round_state.json` will already have `stage=3 round=0`.
+Worker B's current token is expired (401). Worker A's has wrong scope (403).
 
 ---
 
@@ -74,10 +56,10 @@ WeirdRunner/Ouroboros/
     stage_1/                  ← correct ✓
     stage_2/checkpoint-0002987/  ← Stage 2 sequential anchor (source for bootstrap_diloco.py)
   diloco_state/
-    anchor/                   ← seeded from checkpoint-0002987 ✓
-    round_state.json          ← {"stage_k": 2, "round_n": 0}  ← STALE — coordinator crashed before update
-    workers/A/                ← Stage 2 Round 0 weights uploaded ✓ (5060 samples)
-    workers/B/                ← Stage 2 Round 0 weights uploaded ✓ (5059 samples)
+    anchor/                   ← Updated after Round 0 aggregation ✓
+    round_state.json          ← {"stage_k": 2, "round_n": 1}  ← current ✓
+    workers/A/                ← Stage 2 Round 0 weights ✓ (5060 samples)
+    workers/B/                ← Stage 2 Round 0 weights ✓ (5059 samples)
   runs/stage3/
     best/ checkpoint-0002308/ checkpoint-0002987/  ← legacy path artifacts — IGNORE
 ```
@@ -109,6 +91,7 @@ WeirdRunner/Ouroboros/
 | Worker auto-detection | `DILOCO_WORKER_ID` Kaggle secret per account (`A`/`B`/`C`) |
 | Kaggle trigger auth | Per-worker credentials; Kaggle API is owner-authenticated (403 on cross-account) |
 | Kaggle trigger mechanism | SDK pull → re-push (`kernels_pull` + `kernels_push`). No standalone `/run` endpoint exists. |
+| **Kaggle SDK version** | Must pin `kaggle<2.0.0`. Version 2.0.x switched to gRPC (`api.kaggle.com`) that returns 403 on `kernels_pull`. Version 1.6.17 uses REST (`www.kaggle.com/api/v1`) and works correctly. |
 | W&B worker run ID | `diloco-{worker_lower}-s{stage_k}` — persists and resumes across rounds within a stage |
 | W&B coordinator run ID | `diloco-coordinator-s{stage_k}` |
 | W&B entity | `default=None` — auto-resolved from API key |
@@ -174,6 +157,7 @@ WeirdRunner/Ouroboros/
 | **Coordinator CUDA torch bloat** | Switched to CPU-only wheel ✅ |
 | **Coordinator timeout too short** | Bumped to 30 min ✅ |
 | **No manual re-trigger path** | `workflow_dispatch:` added to yml ✅ |
+| **`kaggle==2.0.x` gRPC endpoint → 403 on `kernels_pull`** | Pinned `kaggle<2.0.0` in coordinator workflow ✅ |
 | **GITHUB_TOKEN read-only → 403/401 on signal push** | Use `deveshpat` classic PAT with `repo` scope on all worker Kaggle accounts ⚠️ PENDING |
 
 ---
@@ -224,7 +208,7 @@ Stage 1: ~41s  Stage 2: ~48–53s  Stage 3: ~69s  Stage 5: ~92s  Stage 10: ~149s
 | DiLoCo + A100 (if TRC) | ~19h (~2 days) |
 
 **Per-worker shard (full stage):** ~12,302 samples → ~385 steps/worker/stage.
-**Stage 2 remainder shard:** ~5,060 samples → ~159 steps/worker. ✅ Confirmed empirically.
+**Stage 2 Round 1 shard:** ~1686 samples/worker (~5059/3). Final stage-2 round.
 
 ---
 
@@ -235,7 +219,7 @@ Stage 1: ~41s  Stage 2: ~48–53s  Stage 3: ~69s  Stage 5: ~92s  Stage 10: ~149s
 | `jamba_coconut_finetune.py` | ✅ Complete |
 | `diloco_coordinator.py` | ✅ Complete |
 | `bootstrap_diloco.py` | ✅ Run and confirmed |
-| `.github/workflows/diloco_coordinator.yml` | ✅ Fixed — numpy, CPU torch, 30min timeout, workflow_dispatch |
+| `.github/workflows/diloco_coordinator.yml` | ✅ Fixed — numpy, CPU torch, 30min timeout, workflow_dispatch, **kaggle<2.0.0** |
 | `kaggle-utils.ipynb` Cell 5 | ✅ `!torchrun` magic + `DILOCO_WORKER_ID` secret |
 | `prepare_coconut_dataset.py` | ✅ Done |
 | `build_wheels_kaggle.py` | ✅ Done |
@@ -246,7 +230,7 @@ Stage 1: ~41s  Stage 2: ~48–53s  Stage 3: ~69s  Stage 5: ~92s  Stage 10: ~149s
 
 | Question | Status |
 |---|---|
-| Coordinator re-run with numpy fix: succeeds? | 🟡 Pending — deploy fix and re-trigger |
+| Stage 2 Round 1: workers complete, coordinator auto-triggers? | 🟡 Pending — deploy kaggle<2.0.0 fix first |
 | Stage 2 DiLoCo: does aggregated model match sequential baseline? | 🟡 Pre-val by Worker A at Stage 3 start |
 | TRC GPU quota conversion | 🟡 Email sent — awaiting response |
 | DGAC halt_step distribution at K≥2 | 🔴 Open — primary research question |
@@ -285,3 +269,4 @@ Stage 1: ~41s  Stage 2: ~48–53s  Stage 3: ~69s  Stage 5: ~92s  Stage 10: ~149s
 | **`safetensors.torch.save_file` needs numpy** | `safetensors` has Rust backend but PyTorch tensor-to-bytes path calls `import numpy`. Add numpy to coordinator pip install. |
 | **Coordinator job timeout too short** | Anchor is ~1.5 GB; 15 min not enough. Use 30 min. |
 | **No manual coordinator re-trigger** | Add `workflow_dispatch:` to yml — Actions UI gets "Run workflow" button. |
+| **`kaggle==2.0.x` breaks `kernels_pull` with 403** | `kaggle 2.0.x` moved to gRPC (`api.kaggle.com/v1/kernels.KernelsApiService/GetKernel`) which returns 403. Pin `kaggle<2.0.0` to use REST API (`www.kaggle.com/api/v1`). Confirmed in `kaggle/configuration.py`: `self.host = "https://www.kaggle.com/api/v1"` in 1.6.17 vs gRPC in 2.x. `kagglehub` is a data-download library and has no kernel-trigger capability. |
