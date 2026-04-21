@@ -1,20 +1,36 @@
-name: DiLoCo Coordinator
+name: coordinate
 
 on:
   push:
+    branches:
+      - main
     paths:
-      - 'signals/worker_*.json'
-  workflow_dispatch:  # allow manual trigger from GitHub Actions UI
+      - 'signals/*.json'
+  workflow_dispatch:
+    inputs:
+      force_worker_ids:
+        description: 'Force-trigger specific workers, e.g. "A,B". Empty = auto-detect from shard sizes.'
+        required: false
+        default: ''
+      skip_trigger:
+        description: 'Aggregate previous round only. Do not trigger next workers.'
+        required: false
+        default: 'false'
+      dry_run:
+        description: 'Print round plan without aggregating or triggering.'
+        required: false
+        default: 'false'
 
 concurrency:
-  group: diloco-coordinator
+  group: diloco-coordinate
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   coordinate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # bumped from 15: anchor upload is ~1.5GB, needs headroom
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,19 +52,18 @@ jobs:
 
       - name: Run coordinator
         env:
-          HF_TOKEN:          ${{ secrets.HF_TOKEN }}
-          WANDB_KEY:         ${{ secrets.WANDB_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          WANDB_KEY: ${{ secrets.WANDB_KEY }}
           KAGGLE_USERNAME_A: ${{ secrets.KAGGLE_USERNAME_A }}
-          KAGGLE_KEY_A:      ${{ secrets.KAGGLE_KEY_A }}
+          KAGGLE_KEY_A: ${{ secrets.KAGGLE_KEY_A }}
           KAGGLE_USERNAME_B: ${{ secrets.KAGGLE_USERNAME_B }}
-          KAGGLE_KEY_B:      ${{ secrets.KAGGLE_KEY_B }}
+          KAGGLE_KEY_B: ${{ secrets.KAGGLE_KEY_B }}
           KAGGLE_USERNAME_C: ${{ secrets.KAGGLE_USERNAME_C }}
-          KAGGLE_KEY_C:      ${{ secrets.KAGGLE_KEY_C }}
+          KAGGLE_KEY_C: ${{ secrets.KAGGLE_KEY_C }}
         run: |
           python diloco_coordinator.py \
             --hf_token          "$HF_TOKEN" \
             --repo_id           "WeirdRunner/Ouroboros" \
-            --min_workers       2 \
             --outer_lr          0.7 \
             --wandb_key         "$WANDB_KEY" \
             --wandb_project     "ouroboros-stage3-jamba" \
@@ -58,4 +73,8 @@ jobs:
             --kaggle_key_b      "$KAGGLE_KEY_B" \
             --kaggle_username_c "$KAGGLE_USERNAME_C" \
             --kaggle_key_c      "$KAGGLE_KEY_C" \
-            --total_train_samples 36906
+            --total_train_samples 36906 \
+            --min_shard_samples  32 \
+            ${{ github.event.inputs.force_worker_ids && format('--force_worker_ids "{0}"', github.event.inputs.force_worker_ids) || '' }} \
+            ${{ github.event.inputs.skip_trigger == 'true' && '--skip_trigger' || '' }} \
+            ${{ github.event.inputs.dry_run == 'true' && '--dry_run' || '' }}
