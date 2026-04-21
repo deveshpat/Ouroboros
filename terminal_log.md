@@ -39,7 +39,7 @@ coordinator/stage_complete:        0
 - `kaggle<2.0.0`: `self.host = "https://www.kaggle.com/api/v1"` (old REST, works)
 - `kaggle==2.0.x`: gRPC, 403 on all accounts
 
-**Fix:** `pip install "kaggle<2.0.0"` in `diloco_coordinator.yml`.
+**Fix:** `pip install "kaggle==1.6.17"` in `diloco_coordinator.yml`.
 
 **State after run:** `round_state.json = {stage_k: 2, round_n: 1}`. Remaining: 5059/36906 samples. Workers need one more manual round (~1686 samples each).
 
