@@ -149,6 +149,15 @@ def parse_args() -> argparse.Namespace:
              "Useful for quota-exhausted scenarios.",
     )
     parser.add_argument("--outer_lr", type=float, default=0.7)
+    parser.add_argument(
+        "--worker_timeout_hours",
+        type=float,
+        default=13.0,
+        help=(
+            "Hours after triggered_at before a non-responsive worker is demoted to "
+            "attendance_workers. 13h = Kaggle 12h hard wall + 1h grace. Default 13.0."
+        ),
+    )
     # Per-worker Kaggle credentials (each account can only trigger its own notebook)
     parser.add_argument(
         "--kaggle_username_a",
@@ -491,10 +500,25 @@ def main() -> None:
     # Workers that were triggered last round — only check these for ready status
     expected_workers = state.get("triggered_workers", None)
     seed = int(state.get("seed", 42))
+    current_mode = state.get("mode", "diloco")
+    triggered_at = float(state.get("triggered_at", 0.0))
+    attendance_workers_prev = list(state.get("attendance_workers", []))
+    worker_timeout_s = args.worker_timeout_hours * 3600.0
+    is_round_timed_out = triggered_at > 0 and (time.time() - triggered_at) > worker_timeout_s
 
-    print(f"[coordinator] stage={stage_k} round={round_n}")
+    kaggle_creds: Dict[str, Tuple[Optional[str], Optional[str]]] = {
+        "A": (args.kaggle_username_a, args.kaggle_key_a),
+        "B": (args.kaggle_username_b, args.kaggle_key_b),
+        "C": (args.kaggle_username_c, args.kaggle_key_c),
+    }
+    credentialed = [w for w in WORKER_IDS if kaggle_creds[w][0] and kaggle_creds[w][1]]
 
-    # ── Projected shard planning ─────────────────────────────────────────────
+    force_ids: Optional[List[str]] = None
+    if args.force_worker_ids:
+        force_ids = [w.strip().upper() for w in args.force_worker_ids.split(",") if w.strip()]
+
+    print(f"[coordinator] stage={stage_k} round={round_n} mode={current_mode}")
+
     stage_samples_seen = int(total_samples_seen.get(str(stage_k), 0))
     projected_shards = _compute_projected_shards(
         total_samples=args.total_train_samples,
@@ -507,35 +531,113 @@ def main() -> None:
     print(f"[coordinator] Remaining samples for stage {stage_k}: {remaining}")
     print(f"[coordinator] Projected shards: {projected_shards}")
 
-    # ── Determine credentialed workers ───────────────────────────────────────
-    kaggle_creds: Dict[str, Tuple[Optional[str], Optional[str]]] = {
-        "A": (args.kaggle_username_a, args.kaggle_key_a),
-        "B": (args.kaggle_username_b, args.kaggle_key_b),
-        "C": (args.kaggle_username_c, args.kaggle_key_c),
-    }
-    credentialed = [w for w in WORKER_IDS if kaggle_creds[w][0] and kaggle_creds[w][1]]
-
-    # ── Parse force_worker_ids override ─────────────────────────────────────
-    force_ids: Optional[List[str]] = None
-    if args.force_worker_ids:
-        force_ids = [w.strip().upper() for w in args.force_worker_ids.split(",") if w.strip()]
-
-    # ── Determine mode for the NEXT round ───────────────────────────────────
+    eligible_for_training_now = [w for w in credentialed if w not in attendance_workers_prev]
     next_mode, next_active_workers = _determine_round_mode(
         projected_shards=projected_shards,
-        credentialed_workers=credentialed,
+        credentialed_workers=eligible_for_training_now,
         min_shard_samples=args.min_shard_samples,
         force_worker_ids=force_ids,
     )
+    next_attendance_workers = list(attendance_workers_prev)
     print(f"[coordinator] Next round mode: {next_mode}  active workers: {next_active_workers}")
 
-    # ── Dry run: print plan and exit ─────────────────────────────────────────
     if args.dry_run:
         print("[coordinator] DRY RUN — no aggregation or triggering.")
         print(f"  stage_k={stage_k} round_n={round_n}")
         print(f"  remaining={remaining} min_shard_samples={args.min_shard_samples}")
         print(f"  projected_shards={projected_shards}")
         print(f"  next_mode={next_mode} next_active_workers={next_active_workers}")
+        print(f"  next_attendance_workers={next_attendance_workers}")
+        print(f"  worker_timeout_hours={args.worker_timeout_hours}")
+        return
+
+    if current_mode == "waiting":
+        responded_in_waiting = collect_ready_workers(
+            args.repo_id,
+            args.hf_token,
+            stage_k,
+            round_n,
+            expected_workers=attendance_workers_prev,
+        )
+        responded_ids = {str(w.get("worker_id", "")) for w in responded_in_waiting}
+        still_absent = [w for w in attendance_workers_prev if w not in responded_ids]
+
+        if not responded_ids:
+            if not is_round_timed_out:
+                print("[coordinator] Waiting mode: no responses yet, standing by.")
+                return
+            print(f"[coordinator] Waiting mode: re-dispatching attendance to {attendance_workers_prev}")
+            new_state = {**state, "triggered_at": time.time()}
+            hub_upload_json(
+                args.repo_id,
+                ROUND_STATE_PATH,
+                new_state,
+                args.hf_token,
+                message=f"Waiting mode: re-dispatch attendance round={round_n}",
+            )
+            if not args.skip_trigger and not args.dry_run:
+                trigger_kaggle_workers(
+                    kaggle_creds,
+                    active_workers=attendance_workers_prev,
+                    notebook_path=Path(args.kaggle_notebook_path),
+                )
+            print("[coordinator] Done (waiting mode re-dispatch).")
+            return
+
+        responded_list = sorted(responded_ids)
+        print(f"[coordinator] Waiting mode exit: promoting {responded_list}")
+        total_samples_seen[str(stage_k)] = stage_samples_seen
+        next_round_n = round_n + 1
+        next_stage_k = stage_k
+        projected_shards_next = _compute_projected_shards(
+            total_samples=args.total_train_samples,
+            stage_k=next_stage_k,
+            round_n=next_round_n,
+            seed=seed,
+            total_samples_seen=stage_samples_seen,
+        )
+        eligible_for_training = [w for w in credentialed if w in responded_ids]
+        next_mode, next_active_workers = _determine_round_mode(
+            projected_shards=projected_shards_next,
+            credentialed_workers=eligible_for_training,
+            min_shard_samples=args.min_shard_samples,
+            force_worker_ids=force_ids,
+        )
+        next_attendance_workers = still_absent
+        if not next_active_workers:
+            next_mode = "waiting"
+            next_attendance_workers = attendance_workers_prev
+
+        new_state = {
+            **state,
+            "stage_k": next_stage_k,
+            "round_n": next_round_n,
+            "mode": next_mode,
+            "triggered_workers": next_active_workers,
+            "attendance_workers": next_attendance_workers,
+            "projected_shards": projected_shards_next,
+            "total_samples_seen": total_samples_seen,
+            "last_updated": time.time(),
+            "triggered_at": time.time(),
+            "last_round_workers": responded_list,
+            "last_round_samples": 0,
+            "seed": seed,
+        }
+        hub_upload_json(
+            args.repo_id,
+            ROUND_STATE_PATH,
+            new_state,
+            args.hf_token,
+            message=f"Waiting mode resolved: stage={next_stage_k} round={next_round_n} mode={next_mode}",
+        )
+        print(f"[coordinator] round_state updated: stage={next_stage_k} round={next_round_n} mode={next_mode}")
+        if not args.skip_trigger and next_active_workers:
+            trigger_kaggle_workers(
+                kaggle_creds,
+                active_workers=next_active_workers + next_attendance_workers,
+                notebook_path=Path(args.kaggle_notebook_path),
+            )
+        print("[coordinator] Done (waiting mode resolved).")
         return
 
     # ── W&B init ─────────────────────────────────────────────────────────────
@@ -572,8 +674,17 @@ def main() -> None:
             ready_ids = {str(w.get("worker_id", "")) for w in ready_workers}
             missing_workers = [w for w in expected_workers if w not in ready_ids]
             if missing_workers:
-                print(f"[coordinator] Waiting for workers to finish this round: {missing_workers}")
-                return
+                if not is_round_timed_out:
+                    print(f"[coordinator] Waiting for workers to finish this round: {missing_workers}")
+                    return
+                newly_demoted = [w for w in missing_workers if w not in attendance_workers_prev]
+                still_absent = [w for w in missing_workers if w in attendance_workers_prev]
+                if newly_demoted:
+                    print(
+                        f"[coordinator] Timed out (>{args.worker_timeout_hours}h): {newly_demoted} — demoting to attendance"
+                    )
+                if still_absent:
+                    print(f"[coordinator] Still absent after attendance: {still_absent} — retrying")
 
         # Filter to workers that actually did work (samples_seen > 0) for aggregation
         contributing_workers = [w for w in ready_workers if int(w.get("samples_seen", 0)) > 0]
@@ -647,6 +758,22 @@ def main() -> None:
                     step=round_n,
                 )
 
+        ready_ids = {str(w.get("worker_id", "")) for w in ready_workers}
+
+        attendance_promoted = [w for w in attendance_workers_prev if w in ready_ids]
+        if attendance_promoted:
+            print(f"[coordinator] Attendance workers responded, promoting next round: {attendance_promoted}")
+
+        newly_demoted = [
+            w for w in (expected_workers or [])
+            if w not in ready_ids and w not in attendance_workers_prev
+        ] if is_round_timed_out else []
+
+        still_attending = [w for w in attendance_workers_prev if w not in ready_ids]
+        next_attendance_workers = [
+            w for w in WORKER_IDS if w in set(newly_demoted + still_attending)
+        ]
+
         # ── Re-check remaining after aggregation ─────────────────────────────
         final_stage_samples = int(total_samples_seen.get(str(stage_k), stage_samples_seen))
         remaining_after = max(args.total_train_samples - final_stage_samples, 0)
@@ -659,9 +786,16 @@ def main() -> None:
             seed=seed,
             total_samples_seen=final_stage_samples,
         )
-        next_mode, next_active_workers = _determine_round_mode(
+        completion_mode, _ = _determine_round_mode(
             projected_shards=projected_shards_next,
             credentialed_workers=credentialed,
+            min_shard_samples=args.min_shard_samples,
+            force_worker_ids=force_ids,
+        )
+        eligible_for_training = [w for w in credentialed if w not in next_attendance_workers]
+        next_mode, next_active_workers = _determine_round_mode(
+            projected_shards=projected_shards_next,
+            credentialed_workers=eligible_for_training,
             min_shard_samples=args.min_shard_samples,
             force_worker_ids=force_ids,
         )
@@ -669,18 +803,19 @@ def main() -> None:
         # ── Stage advance check ───────────────────────────────────────────────
         stage_complete = (
             final_stage_samples >= args.total_train_samples
-            or next_mode == "complete"
+            or completion_mode == "complete"
         )
         next_stage_k = stage_k
         next_round_n = round_n + 1
         if stage_complete:
-            print(f"[coordinator] Stage {stage_k} COMPLETE ({final_stage_samples}/{args.total_train_samples} samples). Advancing to stage {stage_k + 1}.")
+            print(
+                f"[coordinator] Stage {stage_k} COMPLETE ({final_stage_samples}/{args.total_train_samples} samples). Advancing to stage {stage_k + 1}."
+            )
             if stage_k not in completed_stages:
                 completed_stages.append(stage_k)
             completed_stages = sorted(set(completed_stages))
             next_stage_k = stage_k + 1
             next_round_n = 0
-            # Recompute shards and mode for stage+1, round 0
             projected_shards_next = _compute_projected_shards(
                 total_samples=args.total_train_samples,
                 stage_k=next_stage_k,
@@ -688,9 +823,10 @@ def main() -> None:
                 seed=seed,
                 total_samples_seen=0,
             )
+            eligible_for_training = [w for w in credentialed if w not in next_attendance_workers]
             next_mode, next_active_workers = _determine_round_mode(
                 projected_shards=projected_shards_next,
-                credentialed_workers=credentialed,
+                credentialed_workers=eligible_for_training,
                 min_shard_samples=args.min_shard_samples,
                 force_worker_ids=force_ids,
             )
@@ -699,17 +835,25 @@ def main() -> None:
                 import wandb
                 wandb.log({"coordinator/stage_complete": 1}, step=round_n)
 
+        if not stage_complete and not next_active_workers and next_attendance_workers:
+            print("[coordinator] All workers absent — entering waiting mode. Coordinator idles until workers signal presence.")
+            next_mode = "waiting"
+            next_round_n = round_n
+            next_stage_k = stage_k
+
         # ── Write round_state.json ────────────────────────────────────────────
         new_state = {
             "stage_k": next_stage_k,
             "round_n": next_round_n,
             "mode": next_mode,
             "triggered_workers": next_active_workers,
+            "attendance_workers": next_attendance_workers,
             "projected_shards": projected_shards_next,
             "anchor_path": ANCHOR_PREFIX,
             "total_samples_seen": total_samples_seen,
             "completed_stages": completed_stages,
             "last_updated": time.time(),
+            "triggered_at": time.time() if (next_active_workers or next_attendance_workers) else 0.0,
             "last_round_workers": [w["worker_id"] for w in contributing_workers] if contributing_workers else [],
             "last_round_samples": sum(w.get("samples_seen", 0) for w in contributing_workers) if contributing_workers else 0,
             "seed": seed,
@@ -724,15 +868,18 @@ def main() -> None:
         print(f"[coordinator] round_state.json updated: stage={next_stage_k} round={next_round_n} mode={next_mode}")
 
         # ── Trigger next workers ──────────────────────────────────────────────
+        all_workers_to_trigger = next_active_workers + [
+            w for w in next_attendance_workers if w not in next_active_workers
+        ]
         if args.skip_trigger:
             print("[coordinator] --skip_trigger set. Skipping worker trigger.")
-        elif not next_active_workers:
-            print("[coordinator] No active workers for next round (stage complete or all below threshold).")
+        elif not all_workers_to_trigger:
+            print("[coordinator] No workers to trigger (stage complete or waiting with no dispatch needed).")
         else:
-            print(f"[coordinator] Triggering workers: {next_active_workers}")
+            print(f"[coordinator] Triggering training: {next_active_workers}  attendance: {next_attendance_workers}")
             trigger_kaggle_workers(
                 kaggle_creds,
-                active_workers=next_active_workers,
+                active_workers=all_workers_to_trigger,
                 notebook_path=Path(args.kaggle_notebook_path),
             )
 

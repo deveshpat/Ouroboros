@@ -3344,6 +3344,58 @@ def run_diloco_worker(
             print(f"  [diloco] stage={stage_k} exceeds max configured stage={curriculum_max_stage}. Nothing to do.")
         return {"stage_k": stage_k, "round_n": round_n, "samples_seen": 0}
 
+    attendance_workers = round_state.get("attendance_workers", [])
+    is_attendance_only = args.diloco_worker_id in attendance_workers
+
+    if is_attendance_only:
+        if _is_main_process():
+            print(
+                f"  [diloco] Worker {args.diloco_worker_id} in attendance mode — "
+                f"signaling presence (no training this round)."
+            )
+            diloco_download_anchor(model, hf_token, args.diloco_state_repo, anchor_path, device)
+
+            _attend_dir = (
+                output_dir / "diloco_worker_upload"
+                / f"worker_{args.diloco_worker_id}_attend_{stage_k}_{round_n}"
+            )
+            _attend_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(str(_attend_dir))
+            diloco_upload_worker_state(
+                adapter_dir=_attend_dir,
+                worker_id=args.diloco_worker_id,
+                stage_k=stage_k,
+                round_n=round_n,
+                samples_seen=0,
+                hf_token=hf_token,
+                repo_id=args.diloco_state_repo,
+            )
+            github_token = os.environ.get("GITHUB_TOKEN")
+            if github_token and args.diloco_signal_repo:
+                diloco_push_signal(
+                    args.diloco_worker_id,
+                    stage_k,
+                    round_n,
+                    github_token,
+                    args.diloco_signal_repo,
+                )
+            else:
+                print("  [diloco] No GITHUB_TOKEN — coordinator must be triggered manually.")
+            print(
+                f"  [diloco] Worker {args.diloco_worker_id} attendance done. "
+                f"stage={stage_k} round={round_n}"
+            )
+        barrier()
+        return {
+            "stage_k": stage_k,
+            "round_n": round_n,
+            "samples_seen": 0,
+            "global_step": 0,
+            "timeout_triggered": False,
+            "val_budget_triggered": False,
+            "stages": [stage_k],
+        }
+
     if _is_main_process():
         print(f"  [diloco] Worker {args.diloco_worker_id} | stage={stage_k} round={round_n}")
         if args.push_to_hub:
