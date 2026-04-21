@@ -114,6 +114,49 @@ def _determine_round_mode(
     return "diloco", active
 
 
+def _ordered_unique_worker_ids(*groups: Optional[List[str]]) -> List[str]:
+    """Return worker IDs in first-seen order, filtered to known workers."""
+    ordered: List[str] = []
+    seen = set()
+    for group in groups:
+        for worker_id in group or []:
+            wid = str(worker_id).upper()
+            if wid not in WORKER_IDS or wid in seen:
+                continue
+            ordered.append(wid)
+            seen.add(wid)
+    return ordered
+
+
+
+def _partition_ready_workers(
+    ready_workers: List[Dict],
+    *,
+    expected_workers: Optional[List[str]],
+    attendance_workers: Optional[List[str]],
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Split ready workers into active-round completions and attendance check-ins.
+
+    Attendance workers are opportunistic: they should be observed and promoted
+    when they check in, but they must not block aggregation for the active round.
+    If a worker is somehow present in both groups, treat it as active so the
+    round still enforces its completion semantics.
+    """
+    expected_set = set(_ordered_unique_worker_ids(expected_workers))
+    attendance_set = set(_ordered_unique_worker_ids(attendance_workers))
+
+    active_ready: List[Dict] = []
+    attendance_ready: List[Dict] = []
+    for status in ready_workers:
+        worker_id = str(status.get("worker_id", "")).upper()
+        if worker_id in attendance_set and worker_id not in expected_set:
+            attendance_ready.append(status)
+        else:
+            active_ready.append(status)
+    return active_ready, attendance_ready
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CPU-only DiLoCo coordinator")
     parser.add_argument("--hf_token", required=True)
@@ -518,6 +561,8 @@ def main() -> None:
         force_ids = [w.strip().upper() for w in args.force_worker_ids.split(",") if w.strip()]
 
     print(f"[coordinator] stage={stage_k} round={round_n} mode={current_mode}")
+    if attendance_workers_prev:
+        print(f"[coordinator] Attendance workers: {attendance_workers_prev}")
 
     stage_samples_seen = int(total_samples_seen.get(str(stage_k), 0))
     projected_shards = _compute_projected_shards(
@@ -665,13 +710,27 @@ def main() -> None:
                 print(f"[coordinator] W&B init failed: {_we}")
 
         # ── Collect ready workers from previous round ────────────────────────
-        ready_workers = collect_ready_workers(
-            args.repo_id, args.hf_token, stage_k, round_n,
-            expected_workers=expected_workers,
+        workers_to_check = _ordered_unique_worker_ids(expected_workers, attendance_workers_prev)
+        ready_statuses = collect_ready_workers(
+            args.repo_id,
+            args.hf_token,
+            stage_k,
+            round_n,
+            expected_workers=workers_to_check if workers_to_check else None,
         )
+        ready_workers, attendance_ready_workers = _partition_ready_workers(
+            ready_statuses,
+            expected_workers=expected_workers,
+            attendance_workers=attendance_workers_prev,
+        )
+        ready_ids = {str(w.get("worker_id", "")) for w in ready_workers}
+        attendance_ready_ids = {str(w.get("worker_id", "")) for w in attendance_ready_workers}
+        if attendance_ready_ids:
+            print(
+                f"[coordinator] Attendance responses received: {sorted(attendance_ready_ids)}"
+            )
 
         if expected_workers:
-            ready_ids = {str(w.get("worker_id", "")) for w in ready_workers}
             missing_workers = [w for w in expected_workers if w not in ready_ids]
             if missing_workers:
                 if not is_round_timed_out:
@@ -758,9 +817,7 @@ def main() -> None:
                     step=round_n,
                 )
 
-        ready_ids = {str(w.get("worker_id", "")) for w in ready_workers}
-
-        attendance_promoted = [w for w in attendance_workers_prev if w in ready_ids]
+        attendance_promoted = [w for w in attendance_workers_prev if w in attendance_ready_ids]
         if attendance_promoted:
             print(f"[coordinator] Attendance workers responded, promoting next round: {attendance_promoted}")
 
@@ -769,7 +826,7 @@ def main() -> None:
             if w not in ready_ids and w not in attendance_workers_prev
         ] if is_round_timed_out else []
 
-        still_attending = [w for w in attendance_workers_prev if w not in ready_ids]
+        still_attending = [w for w in attendance_workers_prev if w not in attendance_ready_ids]
         next_attendance_workers = [
             w for w in WORKER_IDS if w in set(newly_demoted + still_attending)
         ]
