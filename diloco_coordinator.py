@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import json
+import shutil
 import sys
 import tempfile
 import time
@@ -43,6 +44,10 @@ WORKER_KAGGLE_SLUGS: Dict[str, Tuple[str, str]] = {
 }
 
 
+DEFAULT_KAGGLE_NOTEBOOK_PATH = Path(__file__).resolve().with_name("kaggle-utils.ipynb")
+DEFAULT_KAGGLE_ACCELERATOR = "NvidiaTeslaT4"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CPU-only DiLoCo coordinator")
     parser.add_argument("--hf_token", required=True)
@@ -60,6 +65,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kaggle_key_b", default=None, help="Kaggle API key for Worker B.")
     parser.add_argument("--kaggle_username_c", default=None, help="Kaggle username for Worker C.")
     parser.add_argument("--kaggle_key_c", default=None, help="Kaggle API key for Worker C.")
+    parser.add_argument(
+        "--kaggle_notebook_path",
+        default=str(DEFAULT_KAGGLE_NOTEBOOK_PATH),
+        help="Absolute or repo-relative path to the Kaggle notebook that should be pushed to auto-trigger workers.",
+    )
+    parser.add_argument(
+        "--kaggle_accelerator",
+        default=DEFAULT_KAGGLE_ACCELERATOR,
+        help="Kaggle accelerator name to request when pushing the worker notebook.",
+    )
     # W&B
     parser.add_argument(
         "--wandb_key",
@@ -190,25 +205,65 @@ def save_and_upload_anchor(
     print(f"[coordinator] New anchor uploaded: {message}")
 
 
-def _trigger_single_worker(worker_id: str, username: str, key: str, slug: str) -> bool:
+def _build_kaggle_kernel_metadata(*, slug: str, notebook_filename: str) -> Dict[str, object]:
+    title = slug.split("/", 1)[-1]
+    return {
+        "id": slug,
+        "title": title,
+        "code_file": notebook_filename,
+        "language": "python",
+        "kernel_type": "notebook",
+        "is_private": True,
+        "enable_gpu": True,
+        "enable_tpu": False,
+        "enable_internet": True,
+        "dataset_sources": [],
+        "competition_sources": [],
+        "kernel_sources": [],
+        "model_sources": [],
+        "keywords": [],
+    }
+
+
+def _stage_local_kaggle_kernel(notebook_path: Path, slug: str, staging_dir: Path) -> Path:
+    if not notebook_path.exists():
+        raise FileNotFoundError(
+            f"Notebook source not found at {notebook_path}. "
+            "Auto-trigger requires a local kaggle-utils.ipynb checkout."
+        )
+
+    staged_notebook = staging_dir / notebook_path.name
+    shutil.copy2(notebook_path, staged_notebook)
+    metadata_path = staging_dir / "kernel-metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            _build_kaggle_kernel_metadata(slug=slug, notebook_filename=staged_notebook.name),
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return staged_notebook
+
+
+def _trigger_single_worker(
+    worker_id: str,
+    username: str,
+    key: str,
+    slug: str,
+    notebook_path: Path,
+    accelerator: Optional[str],
+) -> bool:
     """
-    Trigger a Kaggle kernel run via pull → re-push using the kaggle CLI subprocess.
+    Trigger a Kaggle kernel by pushing the repo-tracked notebook with generated
+    metadata, instead of pulling the live kernel back from Kaggle first.
 
-    Why subprocess over the Python API:
-      - kaggle>=1.7.3 removed Swagger REST; >=1.8.3/2.0 migrated to gRPC (kagglesdk).
-        The new KernelsApiService/GetKernel endpoint returns 403 for private notebooks.
-      - Pinning kaggle==1.6.17 (last REST-based version) and calling the CLI via
-        subprocess is stable, version-agnostic, and avoids import-path churn.
-
-    Flow:
-      1. Set per-worker KAGGLE_USERNAME/KAGGLE_KEY env vars.
-      2. `kaggle kernels pull {slug} -p {tmpdir} -m`  → downloads source + metadata.
-      3. `kaggle kernels push -p {tmpdir}`            → re-uploads unchanged, starts run.
-
-    Requirements:
-      - `kaggle==1.6.17` must be installed (pinned in diloco_coordinator.yml).
-      - KAGGLE_USERNAME_{A/B/C} and KAGGLE_KEY_{A/B/C} must be set as GitHub secrets
-        on deveshpat/Ouroboros → Settings → Secrets and variables → Actions.
+    Why this path is safer:
+      - the coordinator logs show `kaggle kernels pull` failing with
+        `Permission 'kernels.get' was denied`, which blocks the old pull→push flow
+        even when the worker has already completed successfully.
+      - `kaggle kernels push` is the supported CLI path for updating and running a
+        kernel; staging the checked-in notebook locally avoids the fragile readback
+        permission entirely.
     """
     import os
     import subprocess
@@ -218,10 +273,16 @@ def _trigger_single_worker(worker_id: str, username: str, key: str, slug: str) -
         print(f"[coordinator] No credentials for Worker {worker_id} — skipping trigger.")
         return False
 
+    expected_owner, _ = WORKER_KAGGLE_SLUGS[worker_id]
+    if username.strip().lower() != expected_owner.lower():
+        print(
+            f"[coordinator] WARNING: Worker {worker_id} expects Kaggle owner "
+            f"{expected_owner}, but received username {username!r}. Trigger may fail."
+        )
+
     env = os.environ.copy()
     env["KAGGLE_USERNAME"] = username
     env["KAGGLE_KEY"] = key
-    # Prevent CLI from reading a stale ~/.kaggle/kaggle.json that could override creds
     env.pop("KAGGLE_CONFIG_DIR", None)
 
     def _run_kaggle(args: List[str]) -> subprocess.CompletedProcess:
@@ -230,34 +291,32 @@ def _trigger_single_worker(worker_id: str, username: str, key: str, slug: str) -
             env=env,
             capture_output=True,
             text=True,
-            timeout=90,
+            timeout=120,
         )
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Step 1: pull current notebook source + kernel-metadata.json
-            pull = _run_kaggle(["kernels", "pull", slug, "-p", tmpdir, "-m"])
-            if pull.returncode != 0:
-                err = (pull.stderr or pull.stdout or "").strip()
-                print(f"[coordinator] WARNING: kernels pull failed for Worker {worker_id} ({slug}): {err}")
-                return False
+            tmp_path = Path(tmpdir)
+            _stage_local_kaggle_kernel(notebook_path, slug, tmp_path)
 
-            # Step 2: re-push unchanged → new version → execution starts automatically
-            push = _run_kaggle(["kernels", "push", "-p", tmpdir])
+            push_args = ["kernels", "push", "-p", str(tmp_path)]
+            if accelerator:
+                push_args.extend(["--accelerator", accelerator])
+            push = _run_kaggle(push_args)
             if push.returncode != 0:
                 err = (push.stderr or push.stdout or "").strip()
                 print(f"[coordinator] WARNING: kernels push failed for Worker {worker_id} ({slug}): {err}")
                 return False
 
-        out = (push.stdout or "").strip()
+        out = (push.stdout or push.stderr or "").strip()
         print(f"[coordinator] Triggered Worker {worker_id}: {slug}  ({out})")
         return True
 
     except subprocess.TimeoutExpired:
         print(f"[coordinator] WARNING: kaggle CLI timed out for Worker {worker_id} ({slug})")
         return False
-    except FileNotFoundError:
-        print("[coordinator] WARNING: `kaggle` CLI not found — is kaggle==1.6.17 installed?")
+    except FileNotFoundError as exc:
+        print(f"[coordinator] WARNING: Auto-trigger prerequisites missing for {slug}: {exc}")
         return False
     except Exception as exc:
         print(f"[coordinator] WARNING: Failed to trigger {slug}: {exc}")
@@ -266,11 +325,14 @@ def _trigger_single_worker(worker_id: str, username: str, key: str, slug: str) -
 
 def trigger_kaggle_workers(
     kaggle_creds: Dict[str, Tuple[Optional[str], Optional[str]]],
+    *,
+    notebook_path: Path,
+    accelerator: Optional[str],
 ) -> None:
     """
     Trigger each worker's Kaggle notebook using that worker's own credentials.
-    Kaggle's /run API does not exist; cross-account triggers also return 403.
-    Each worker therefore has its own credential pair stored as GitHub secrets.
+    The coordinator pushes the repo-tracked notebook source directly so it does
+    not depend on `kernels pull`, which is currently returning 403 in CI.
     """
     for worker_id in WORKER_IDS:
         username, key = kaggle_creds.get(worker_id, (None, None))
@@ -283,7 +345,14 @@ def trigger_kaggle_workers(
             )
             continue
 
-        _trigger_single_worker(worker_id, username, key, slug)
+        _trigger_single_worker(
+            worker_id,
+            username,
+            key,
+            slug,
+            notebook_path=notebook_path,
+            accelerator=accelerator,
+        )
 
 
 def collect_ready_workers(repo_id: str, token: str, stage_k: int, round_n: int) -> List[Dict]:
@@ -507,7 +576,11 @@ def main() -> None:
             "B": (args.kaggle_username_b, args.kaggle_key_b),
             "C": (args.kaggle_username_c, args.kaggle_key_c),
         }
-        trigger_kaggle_workers(kaggle_creds)
+        trigger_kaggle_workers(
+        kaggle_creds,
+        notebook_path=Path(args.kaggle_notebook_path),
+        accelerator=args.kaggle_accelerator,
+    )
 
         if coordinator_wandb_run is not None:
             import wandb

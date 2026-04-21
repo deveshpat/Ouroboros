@@ -3392,13 +3392,16 @@ def run_diloco_worker(
     # ── Step-offset (always computed, regardless of W&B mode) ─────────────────
     # Keep the step budget based on a full nominal 1/3 worker shard so W&B step
     # offsets remain monotonic across rounds even when the final round is a
-    # trimmed remainder.
+    # trimmed remainder. Reserve one extra marker step between rounds so the
+    # round-start log for round N is strictly greater than the round-complete
+    # log from round N-1.
     shard_step_estimate = math.ceil(
         len(train_samples) / 3 / max(args.batch_size * args.grad_accum, 1)
     )
     if shard_step_estimate <= 0:
         shard_step_estimate = _DILOCO_SHARD_STEP_FALLBACK
-    global_step_offset = round_n * shard_step_estimate
+    round_step_span = shard_step_estimate + 1
+    global_step_offset = round_n * round_step_span
 
     # ── W&B init (DiLoCo path only) ──────────────────────────────────────────
     # Each worker gets one persistent run per stage, resumed across rounds.
@@ -3420,6 +3423,7 @@ def run_diloco_worker(
                     "worker_id": args.diloco_worker_id,
                     "mode": "diloco",
                     "shard_step_estimate": shard_step_estimate,
+                    "wandb_round_step_span": round_step_span,
                     "remaining_stage_samples": remaining_stage_samples,
                     "planned_shard_samples": len(train_shard),
                 },
@@ -3548,6 +3552,8 @@ def run_diloco_worker(
         import wandb
         wandb.log(
             {
+                "diloco/round": round_n,
+                "diloco/stage": stage_k,
                 "diloco/samples_seen_this_round": samples_seen_this_round,
                 "diloco/round_complete": 1,
             },
