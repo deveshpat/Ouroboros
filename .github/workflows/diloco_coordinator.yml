@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - 'signals/*.json'
+  schedule:
+    # Watchdog for missed GitHub signals and worker-timeout demotion.
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       force_worker_ids:
