@@ -7,7 +7,7 @@ Usage:
     python diloco_coordinator.py \
         --hf_token "$HF_TOKEN" \
         --repo_id WeirdRunner/Ouroboros \
-        --min_workers 2 \
+        --min_shard_samples 32 \
         --outer_lr 0.7 \
         --wandb_key "$WANDB_KEY" \
         --wandb_project "ouroboros-stage3-jamba" \
@@ -45,14 +45,110 @@ WORKER_KAGGLE_SLUGS: Dict[str, Tuple[str, str]] = {
 
 
 DEFAULT_KAGGLE_NOTEBOOK_PATH = Path(__file__).resolve().with_name("kaggle-utils.ipynb")
-DEFAULT_KAGGLE_ACCELERATOR = "NvidiaTeslaT4"
+DEFAULT_KAGGLE_ACCELERATOR = None
+
+
+def _compute_projected_shards(
+    total_samples: int,
+    stage_k: int,
+    round_n: int,
+    seed: int,
+    total_samples_seen: int,
+    worker_ids: List[str] = None,
+) -> Dict[str, int]:
+    """
+    Deterministically compute each worker's projected shard size for the
+    upcoming round. Uses identical partition logic to diloco_get_shard()
+    in jamba_coconut_finetune.py.
+
+    Returns dict: {worker_id: projected_shard_size}
+    """
+    if worker_ids is None:
+        worker_ids = WORKER_IDS
+
+    worker_index = {"A": 0, "B": 1, "C": 2}
+    remaining = max(total_samples - int(total_samples_seen), 0)
+
+    result: Dict[str, int] = {}
+    for wid in worker_ids:
+        idx = worker_index.get(wid, 0)
+        n_parts = 3  # always 3-way partition for determinism, even if C is inactive
+        base = remaining // n_parts
+        remainder = remaining % n_parts
+        width = base + (1 if idx < remainder else 0)
+        result[wid] = max(int(width), 0)
+
+    return result
+
+
+
+def _determine_round_mode(
+    projected_shards: Dict[str, int],
+    credentialed_workers: List[str],
+    min_shard_samples: int,
+    force_worker_ids: Optional[List[str]] = None,
+) -> Tuple[str, List[str]]:
+    """
+    Determine the coordination mode and which workers to trigger.
+
+    Returns:
+        mode: "complete" | "solo" | "diloco"
+        active_workers: list of worker IDs to trigger
+    """
+    if force_worker_ids:
+        # Manual override: trigger exactly the specified workers, no threshold check
+        active = [w for w in force_worker_ids if w in credentialed_workers]
+        if not active:
+            return "complete", []
+        mode = "solo" if len(active) == 1 else "diloco"
+        return mode, active
+
+    active = [
+        w for w in credentialed_workers
+        if projected_shards.get(w, 0) >= min_shard_samples
+    ]
+
+    if not active:
+        return "complete", []
+    if len(active) == 1:
+        return "solo", active
+    return "diloco", active
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CPU-only DiLoCo coordinator")
     parser.add_argument("--hf_token", required=True)
     parser.add_argument("--repo_id", default="WeirdRunner/Ouroboros")
-    parser.add_argument("--min_workers", type=int, default=2)
+    parser.add_argument(
+        "--min_shard_samples",
+        type=int,
+        default=32,
+        help=(
+            "Minimum projected samples a worker must have to be triggered. "
+            "Default 32 = one optimizer step (batch_size=4 × grad_accum=8). "
+            "Workers below this threshold are skipped. "
+            "If total remaining < min_shard_samples, stage is declared complete."
+        ),
+    )
+    parser.add_argument(
+        "--skip_trigger",
+        action="store_true",
+        help="Aggregate previous round only. Do not trigger next workers. "
+             "For use when workers were started manually.",
+    )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Print the round plan (projected shards, mode, active workers) "
+             "without aggregating or triggering anything.",
+    )
+    parser.add_argument(
+        "--force_worker_ids",
+        default=None,
+        help="Comma-separated worker IDs to force-trigger regardless of shard size, "
+             "e.g. 'A,B'. Bypasses min_shard_samples check. "
+             "Useful for quota-exhausted scenarios.",
+    )
     parser.add_argument("--outer_lr", type=float, default=0.7)
     # Per-worker Kaggle credentials (each account can only trigger its own notebook)
     parser.add_argument(
@@ -73,7 +169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kaggle_accelerator",
         default=DEFAULT_KAGGLE_ACCELERATOR,
-        help="Kaggle accelerator name to request when pushing the worker notebook.",
+        help="Optional Kaggle accelerator name to request when pushing the worker notebook. Omit to rely on kernel metadata.",
     )
     # W&B
     parser.add_argument(
@@ -326,15 +422,14 @@ def _trigger_single_worker(
 def trigger_kaggle_workers(
     kaggle_creds: Dict[str, Tuple[Optional[str], Optional[str]]],
     *,
+    active_workers: List[str],
     notebook_path: Path,
     accelerator: Optional[str],
 ) -> None:
     """
-    Trigger each worker's Kaggle notebook using that worker's own credentials.
-    The coordinator pushes the repo-tracked notebook source directly so it does
-    not depend on `kernels pull`, which is currently returning 403 in CI.
+    Trigger only the specified active_workers using their Kaggle credentials.
     """
-    for worker_id in WORKER_IDS:
+    for worker_id in active_workers:
         username, key = kaggle_creds.get(worker_id, (None, None))
         _, slug = WORKER_KAGGLE_SLUGS[worker_id]
 
@@ -355,9 +450,22 @@ def trigger_kaggle_workers(
         )
 
 
-def collect_ready_workers(repo_id: str, token: str, stage_k: int, round_n: int) -> List[Dict]:
+def collect_ready_workers(
+    repo_id: str,
+    token: str,
+    stage_k: int,
+    round_n: int,
+    expected_workers: Optional[List[str]] = None,
+) -> List[Dict]:
+    """
+    Collect workers whose status.json marks them done for this stage/round.
+    Only checks expected_workers if provided (from round_state.triggered_workers).
+    Falls back to checking all WORKER_IDS for backward compatibility.
+    Workers with samples_seen=0 are included (empty-shard passthrough).
+    """
+    check_ids = expected_workers if expected_workers else WORKER_IDS
     ready: List[Dict] = []
-    for worker_id in WORKER_IDS:
+    for worker_id in check_ids:
         status = hub_download_json(
             repo_id,
             f"diloco_state/workers/{worker_id}/status.json",
@@ -370,65 +478,12 @@ def collect_ready_workers(repo_id: str, token: str, stage_k: int, round_n: int) 
             and status.get("status") == "done"
         ):
             ready.append(status)
-            print(f"[coordinator] Worker {worker_id}: {int(status['samples_seen'])} samples ready")
+            samples = int(status.get("samples_seen", 0))
+            print(f"[coordinator] Worker {worker_id}: {samples} samples ready")
         else:
             print(f"[coordinator] Worker {worker_id}: not ready (status={status})")
     ready.sort(key=lambda item: item.get("worker_id", ""))
     return ready
-
-
-
-def maybe_update_insufficient_worker_streak(
-    *,
-    state: Dict,
-    repo_id: str,
-    token: str,
-    ready_workers: List[Dict],
-    min_workers: int,
-) -> Optional[List[Dict]]:
-    """
-    Validation rule from the prompt:
-      - prefer min_workers workers
-      - after 3 consecutive single-worker rounds, warn and continue with 1 worker
-    """
-    streak = int(state.get("insufficient_worker_rounds", 0))
-    if len(ready_workers) >= min_workers:
-        state["insufficient_worker_rounds"] = 0
-        return ready_workers
-
-    if len(ready_workers) != 1:
-        print(
-            f"[coordinator] Only {len(ready_workers)}/{min_workers} workers ready. "
-            "Waiting for more workers."
-        )
-        return None
-
-    streak += 1
-    state["insufficient_worker_rounds"] = streak
-    if streak < 3:
-        print(
-            f"[coordinator] Only 1/{min_workers} workers ready. "
-            f"Deferring aggregation (streak={streak}/3)."
-        )
-        hub_upload_json(
-            repo_id,
-            ROUND_STATE_PATH,
-            {**state, "last_updated": time.time()},
-            token,
-            message=(
-                f"Track insufficient workers: stage {int(state['stage_k'])} "
-                f"round {int(state['round_n'])} streak {streak}"
-            ),
-        )
-        return None
-
-    print(
-        "[coordinator] WARNING: only one worker has been available for 3 consecutive rounds. "
-        "Proceeding with single-worker aggregation."
-    )
-    state["insufficient_worker_rounds"] = 0
-    return ready_workers
-
 
 
 def main() -> None:
@@ -444,10 +499,57 @@ def main() -> None:
     round_n = int(state.get("round_n", 0))
     total_samples_seen = {str(k): int(v) for k, v in dict(state.get("total_samples_seen", {})).items()}
     completed_stages = [int(x) for x in state.get("completed_stages", [])]
+    # Workers that were triggered last round — only check these for ready status
+    expected_workers = state.get("triggered_workers", None)
+    seed = int(state.get("seed", 42))
 
     print(f"[coordinator] stage={stage_k} round={round_n}")
 
-    # - W&B coordinator run --------------------------------------------------
+    # ── Projected shard planning ─────────────────────────────────────────────
+    stage_samples_seen = int(total_samples_seen.get(str(stage_k), 0))
+    projected_shards = _compute_projected_shards(
+        total_samples=args.total_train_samples,
+        stage_k=stage_k,
+        round_n=round_n,
+        seed=seed,
+        total_samples_seen=stage_samples_seen,
+    )
+    remaining = max(args.total_train_samples - stage_samples_seen, 0)
+    print(f"[coordinator] Remaining samples for stage {stage_k}: {remaining}")
+    print(f"[coordinator] Projected shards: {projected_shards}")
+
+    # ── Determine credentialed workers ───────────────────────────────────────
+    kaggle_creds: Dict[str, Tuple[Optional[str], Optional[str]]] = {
+        "A": (args.kaggle_username_a, args.kaggle_key_a),
+        "B": (args.kaggle_username_b, args.kaggle_key_b),
+        "C": (args.kaggle_username_c, args.kaggle_key_c),
+    }
+    credentialed = [w for w in WORKER_IDS if kaggle_creds[w][0] and kaggle_creds[w][1]]
+
+    # ── Parse force_worker_ids override ─────────────────────────────────────
+    force_ids: Optional[List[str]] = None
+    if args.force_worker_ids:
+        force_ids = [w.strip().upper() for w in args.force_worker_ids.split(",") if w.strip()]
+
+    # ── Determine mode for the NEXT round ───────────────────────────────────
+    next_mode, next_active_workers = _determine_round_mode(
+        projected_shards=projected_shards,
+        credentialed_workers=credentialed,
+        min_shard_samples=args.min_shard_samples,
+        force_worker_ids=force_ids,
+    )
+    print(f"[coordinator] Next round mode: {next_mode}  active workers: {next_active_workers}")
+
+    # ── Dry run: print plan and exit ─────────────────────────────────────────
+    if args.dry_run:
+        print("[coordinator] DRY RUN — no aggregation or triggering.")
+        print(f"  stage_k={stage_k} round_n={round_n}")
+        print(f"  remaining={remaining} min_shard_samples={args.min_shard_samples}")
+        print(f"  projected_shards={projected_shards}")
+        print(f"  next_mode={next_mode} next_active_workers={next_active_workers}")
+        return
+
+    # ── W&B init ─────────────────────────────────────────────────────────────
     coordinator_wandb_run = None
     try:
         if args.wandb_key:
@@ -463,7 +565,7 @@ def main() -> None:
                     config={
                         "stage_k": stage_k,
                         "outer_lr": args.outer_lr,
-                        "min_workers": args.min_workers,
+                        "min_shard_samples": args.min_shard_samples,
                         "total_train": args.total_train_samples,
                     },
                     mode="online",
@@ -471,122 +573,187 @@ def main() -> None:
             except Exception as _we:
                 print(f"[coordinator] W&B init failed: {_we}")
 
-        ready_workers = collect_ready_workers(args.repo_id, args.hf_token, stage_k, round_n)
-        allowed_workers = maybe_update_insufficient_worker_streak(
-            state=state,
-            repo_id=args.repo_id,
-            token=args.hf_token,
-            ready_workers=ready_workers,
-            min_workers=args.min_workers,
-        )
-        if allowed_workers is None:
-            return
-
-        print("[coordinator] Loading anchor weights...")
-        anchor_weights = load_adapter_weights_cpu(args.repo_id, ANCHOR_PREFIX, args.hf_token)
-        anchor_adapter_config = json.loads(
-            hub_download_text(args.repo_id, f"{ANCHOR_PREFIX}/adapter_config.json", args.hf_token)
+        # ── Collect ready workers from previous round ────────────────────────
+        ready_workers = collect_ready_workers(
+            args.repo_id, args.hf_token, stage_k, round_n,
+            expected_workers=expected_workers,
         )
 
-        print("[coordinator] Loading worker weights...")
-        worker_weights_list = []
-        worker_samples_list = []
-        for status in allowed_workers:
-            worker_weights_list.append(
-                load_adapter_weights_cpu(args.repo_id, status["weights_path"], args.hf_token)
+        if expected_workers:
+            ready_ids = {str(w.get("worker_id", "")) for w in ready_workers}
+            missing_workers = [w for w in expected_workers if w not in ready_ids]
+            if missing_workers:
+                print(f"[coordinator] Waiting for workers to finish this round: {missing_workers}")
+                return
+
+        # Filter to workers that actually did work (samples_seen > 0) for aggregation
+        contributing_workers = [w for w in ready_workers if int(w.get("samples_seen", 0)) > 0]
+
+        if not contributing_workers:
+            # No work was done this round (can happen on very first coordinator run
+            # before any workers have trained, or on a stage advance)
+            print("[coordinator] No contributing workers found. Proceeding to trigger planning.")
+        else:
+            # ── Aggregate ───────────────────────────────────────────────────
+            mode_this_round = state.get("mode", "diloco")
+            print("[coordinator] Loading anchor weights...")
+            anchor_weights = load_adapter_weights_cpu(args.repo_id, ANCHOR_PREFIX, args.hf_token)
+            anchor_adapter_config = json.loads(
+                hub_download_text(args.repo_id, f"{ANCHOR_PREFIX}/adapter_config.json", args.hf_token)
             )
-            worker_samples_list.append(int(status["samples_seen"]))
+            print("[coordinator] Loading worker weights...")
+            worker_weights_list = []
+            worker_samples_list = []
+            for status in contributing_workers:
+                worker_weights_list.append(
+                    load_adapter_weights_cpu(args.repo_id, status["weights_path"], args.hf_token)
+                )
+                worker_samples_list.append(int(status["samples_seen"]))
 
-        print("[coordinator] Aggregating on CPU...")
-        new_anchor = weighted_average_deltas(
-            anchor_weights,
-            worker_weights_list,
-            worker_samples_list,
-            args.outer_lr,
+            print("[coordinator] Aggregating on CPU...")
+            if len(contributing_workers) == 1 or mode_this_round == "solo":
+                print(f"[coordinator] Solo mode: promoting Worker {contributing_workers[0]['worker_id']} weights directly.")
+                new_anchor = worker_weights_list[0]
+            else:
+                new_anchor = weighted_average_deltas(
+                    anchor_weights,
+                    worker_weights_list,
+                    worker_samples_list,
+                    args.outer_lr,
+                )
+
+            save_and_upload_anchor(
+                new_anchor,
+                anchor_adapter_config,
+                args.repo_id,
+                args.hf_token,
+                message=(
+                    f"DiLoCo anchor: stage {stage_k} round {round_n} "
+                    f"({len(contributing_workers)} workers, {sum(worker_samples_list)} samples, mode={mode_this_round})"
+                ),
+            )
+
+            # ── Update stage sample counts ───────────────────────────────────
+            stage_key = str(stage_k)
+            current_stage_samples = stage_samples_seen + sum(worker_samples_list)
+            total_samples_seen[stage_key] = current_stage_samples
+            print(
+                f"[coordinator] Stage {stage_k} progress: "
+                f"{current_stage_samples}/{args.total_train_samples} samples seen"
+            )
+
+            if coordinator_wandb_run is not None:
+                import wandb
+                wandb.log(
+                    {
+                        "coordinator/round": round_n,
+                        "coordinator/workers_aggregated": len(contributing_workers),
+                        "coordinator/samples_this_round": sum(worker_samples_list),
+                        "coordinator/total_samples_stage": current_stage_samples,
+                        "coordinator/mode": mode_this_round,
+                        "coordinator/pct_stage_done": round(
+                            current_stage_samples / max(args.total_train_samples, 1) * 100, 1
+                        ),
+                    },
+                    step=round_n,
+                )
+
+        # ── Re-check remaining after aggregation ─────────────────────────────
+        final_stage_samples = int(total_samples_seen.get(str(stage_k), stage_samples_seen))
+        remaining_after = max(args.total_train_samples - final_stage_samples, 0)
+
+        # Recompute mode for next round based on updated sample counts
+        projected_shards_next = _compute_projected_shards(
+            total_samples=args.total_train_samples,
+            stage_k=stage_k,
+            round_n=round_n + 1,
+            seed=seed,
+            total_samples_seen=final_stage_samples,
+        )
+        next_mode, next_active_workers = _determine_round_mode(
+            projected_shards=projected_shards_next,
+            credentialed_workers=credentialed,
+            min_shard_samples=args.min_shard_samples,
+            force_worker_ids=force_ids,
         )
 
-        save_and_upload_anchor(
-            new_anchor,
-            anchor_adapter_config,
-            args.repo_id,
-            args.hf_token,
-            message=(
-                f"DiLoCo anchor: stage {stage_k} round {round_n} "
-                f"({len(allowed_workers)} workers, {sum(worker_samples_list)} samples)"
-            ),
+        # ── Stage advance check ───────────────────────────────────────────────
+        stage_complete = (
+            final_stage_samples >= args.total_train_samples
+            or next_mode == "complete"
         )
-
-        stage_key = str(stage_k)
-        current_stage_samples = int(total_samples_seen.get(stage_key, 0)) + sum(worker_samples_list)
-        total_samples_seen[stage_key] = current_stage_samples
-        print(
-            f"[coordinator] Stage {stage_k} progress: "
-            f"{current_stage_samples}/{args.total_train_samples} samples seen"
-        )
-
-        stage_complete = current_stage_samples >= args.total_train_samples
         next_stage_k = stage_k
         next_round_n = round_n + 1
         if stage_complete:
-            print(f"[coordinator] Stage {stage_k} COMPLETE. Advancing to stage {stage_k + 1}.")
+            print(f"[coordinator] Stage {stage_k} COMPLETE ({final_stage_samples}/{args.total_train_samples} samples). Advancing to stage {stage_k + 1}.")
             if stage_k not in completed_stages:
                 completed_stages.append(stage_k)
             completed_stages = sorted(set(completed_stages))
             next_stage_k = stage_k + 1
             next_round_n = 0
-
-        if coordinator_wandb_run is not None:
-            import wandb
-            wandb.log(
-                {
-                    "coordinator/round": round_n,
-                    "coordinator/workers_aggregated": len(allowed_workers),
-                    "coordinator/samples_this_round": sum(worker_samples_list),
-                    "coordinator/total_samples_stage": current_stage_samples,
-                    "coordinator/stage_complete": int(stage_complete),
-                    "coordinator/pct_stage_done": round(
-                        current_stage_samples / max(args.total_train_samples, 1) * 100, 1
-                    ),
-                },
-                step=round_n,
+            # Recompute shards and mode for stage+1, round 0
+            projected_shards_next = _compute_projected_shards(
+                total_samples=args.total_train_samples,
+                stage_k=next_stage_k,
+                round_n=0,
+                seed=seed,
+                total_samples_seen=0,
+            )
+            next_mode, next_active_workers = _determine_round_mode(
+                projected_shards=projected_shards_next,
+                credentialed_workers=credentialed,
+                min_shard_samples=args.min_shard_samples,
+                force_worker_ids=force_ids,
             )
 
+            if coordinator_wandb_run is not None:
+                import wandb
+                wandb.log({"coordinator/stage_complete": 1}, step=round_n)
+
+        # ── Write round_state.json ────────────────────────────────────────────
         new_state = {
             "stage_k": next_stage_k,
             "round_n": next_round_n,
+            "mode": next_mode,
+            "triggered_workers": next_active_workers,
+            "projected_shards": projected_shards_next,
             "anchor_path": ANCHOR_PREFIX,
             "total_samples_seen": total_samples_seen,
             "completed_stages": completed_stages,
-            "insufficient_worker_rounds": 0,
             "last_updated": time.time(),
-            "last_round_workers": [status["worker_id"] for status in allowed_workers],
-            "last_round_samples": sum(worker_samples_list),
+            "last_round_workers": [w["worker_id"] for w in contributing_workers] if contributing_workers else [],
+            "last_round_samples": sum(w.get("samples_seen", 0) for w in contributing_workers) if contributing_workers else 0,
+            "seed": seed,
         }
         hub_upload_json(
             args.repo_id,
             ROUND_STATE_PATH,
             new_state,
             args.hf_token,
-            message=f"Round state update: stage {next_stage_k} round {next_round_n}",
+            message=f"Round state: stage={next_stage_k} round={next_round_n} mode={next_mode}",
         )
-        print(f"[coordinator] round_state.json updated: stage={next_stage_k} round={next_round_n}")
+        print(f"[coordinator] round_state.json updated: stage={next_stage_k} round={next_round_n} mode={next_mode}")
 
-        kaggle_creds: Dict[str, Tuple[Optional[str], Optional[str]]] = {
-            "A": (args.kaggle_username_a, args.kaggle_key_a),
-            "B": (args.kaggle_username_b, args.kaggle_key_b),
-            "C": (args.kaggle_username_c, args.kaggle_key_c),
-        }
-        trigger_kaggle_workers(
-        kaggle_creds,
-        notebook_path=Path(args.kaggle_notebook_path),
-        accelerator=args.kaggle_accelerator,
-    )
+        # ── Trigger next workers ──────────────────────────────────────────────
+        if args.skip_trigger:
+            print("[coordinator] --skip_trigger set. Skipping worker trigger.")
+        elif not next_active_workers:
+            print("[coordinator] No active workers for next round (stage complete or all below threshold).")
+        else:
+            print(f"[coordinator] Triggering workers: {next_active_workers}")
+            trigger_kaggle_workers(
+                kaggle_creds,
+                active_workers=next_active_workers,
+                notebook_path=Path(args.kaggle_notebook_path),
+                accelerator=args.kaggle_accelerator,
+            )
 
         if coordinator_wandb_run is not None:
             import wandb
             wandb.finish()
             coordinator_wandb_run = None
         print("[coordinator] Done.")
+
     finally:
         if coordinator_wandb_run is not None:
             import wandb

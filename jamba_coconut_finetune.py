@@ -3378,7 +3378,30 @@ def run_diloco_worker(
 
     if not train_shard:
         if _is_main_process():
-            print("  [diloco] No remaining samples for this stage. Exiting without upload.")
+            print("  [diloco] Empty shard — uploading passthrough status and signal.")
+            # Save current adapter (anchor weights, unchanged) for status upload
+            _passthrough_dir = output_dir / "diloco_worker_upload" / f"worker_{args.diloco_worker_id}_stage_{stage_k}_round_{round_n}_passthrough"
+            _passthrough_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(str(_passthrough_dir))
+            diloco_upload_worker_state(
+                adapter_dir=_passthrough_dir,
+                worker_id=args.diloco_worker_id,
+                stage_k=stage_k,
+                round_n=round_n,
+                samples_seen=0,
+                hf_token=hf_token,
+                repo_id=args.diloco_state_repo,
+            )
+            github_token = os.environ.get("GITHUB_TOKEN")
+            if github_token and args.diloco_signal_repo:
+                diloco_push_signal(
+                    args.diloco_worker_id, stage_k, round_n,
+                    github_token, args.diloco_signal_repo,
+                )
+            else:
+                print("  [diloco] No GITHUB_TOKEN — coordinator must be triggered manually.")
+            print(f"  [diloco] Worker {args.diloco_worker_id} passthrough done. stage={stage_k} round={round_n}")
+        barrier()
         return {
             "stage_k": stage_k,
             "round_n": round_n,
