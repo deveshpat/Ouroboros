@@ -45,7 +45,6 @@ WORKER_KAGGLE_SLUGS: Dict[str, Tuple[str, str]] = {
 
 
 DEFAULT_KAGGLE_NOTEBOOK_PATH = Path(__file__).resolve().with_name("kaggle-utils.ipynb")
-DEFAULT_KAGGLE_ACCELERATOR = None
 
 
 def _compute_projected_shards(
@@ -305,8 +304,7 @@ def _build_kaggle_kernel_metadata(*, slug: str, notebook_filename: str) -> Dict[
         "language": "python",
         "kernel_type": "notebook",
         "is_private": True,
-        "enable_gpu": True,
-        "accelerator": "nvidiaTeslaT4",          # ← ADD: pins T4, not just any GPU
+        "enable_gpu": True,          # ← ADD: pins T4, not just any GPU
         "enable_tpu": False,
         "enable_internet": True,
         "dataset_sources": ["weirdrunner007/ouroboros-cache"],  # ← ADD: attaches cache
@@ -343,7 +341,6 @@ def _trigger_single_worker(
     key: str,
     slug: str,
     notebook_path: Path,
-    accelerator: Optional[str],
 ) -> bool:
     """
     Trigger a Kaggle kernel by pushing the repo-tracked notebook with generated
@@ -418,7 +415,6 @@ def trigger_kaggle_workers(
     *,
     active_workers: List[str],
     notebook_path: Path,
-    accelerator: Optional[str],
 ) -> None:
     """
     Trigger only the specified active_workers using their Kaggle credentials.
@@ -440,7 +436,6 @@ def trigger_kaggle_workers(
             key,
             slug,
             notebook_path=notebook_path,
-            accelerator=accelerator,
         )
 
 
@@ -739,7 +734,6 @@ def main() -> None:
                 kaggle_creds,
                 active_workers=next_active_workers,
                 notebook_path=Path(args.kaggle_notebook_path),
-                accelerator=args.kaggle_accelerator,
             )
 
         if coordinator_wandb_run is not None:
