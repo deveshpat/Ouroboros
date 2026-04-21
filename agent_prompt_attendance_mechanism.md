@@ -71,6 +71,8 @@ worker_timeout_s = args.worker_timeout_hours * 3600.0
 is_round_timed_out = triggered_at > 0 and (time.time() - triggered_at) > worker_timeout_s
 ```
 
+Also move the `kaggle_creds`, `credentialed`, and `force_ids` computation to this same location (immediately after state fields are read), since the waiting-mode early path in 1.3 requires these variables to already be in scope.
+
 ### 1.3 Waiting-mode early path
 
 Insert this block BEFORE the W&B init and BEFORE `collect_ready_workers`. If `current_mode == "waiting"`, the coordinator takes a separate, simpler path:
@@ -403,3 +405,5 @@ After deploying:
 4. **Waiting mode exit**: trigger `workflow_dispatch` (or let an attendance signal fire). Coordinator should print `Waiting mode exit: promoting [...]` and write a new `round_state.json` with `mode: diloco` and advanced `round_n`.
 
 5. **round_n freeze**: while `mode: "waiting"`, confirm `round_n` does not increment across multiple coordinator runs.
+
+6. No-trigger gap awareness: When workers exhaust quota mid-round without pushing signals, the coordinator receives no automatic trigger. One manual `workflow_dispatch` after ≥13h is required to initiate the timeout path. After that single dispatch, the system is fully self-healing. No `round_state.json` edits are needed.
