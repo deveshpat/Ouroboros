@@ -12,65 +12,61 @@
 Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transformer-Mamba hybrid). The Mamba SSM recurrent state acts as compressed scratch-pad across K latent thought passes, replacing token generation during reasoning. Based on Meta's Coconut (arXiv:2412.06769), extended with DGAC (Diversity-Gated Adaptive Coconut) — a novel anti-collapse halt gate.
 
 ### Current Status (2026-04-22)
- 
+
 | Curriculum Stage | Status | Best val |
 |---|---|---|
 | Stage 0 — CoT warmup | ✅ COMPLETE | ce=0.4041, acc=0.0222 |
 | Stage 1 — 1 latent pass | ✅ COMPLETE | ce=0.4912, acc=0.0444 |
 | Stage 2 — 2 latent passes | ✅ COMPLETE (6 rounds, ~36,865 samples) | — |
-| Stage 3 — 3 latent passes | ⚠️ Round 0 complete (24,604/36,906 samples, 66.7%); Round 1 deadlocked — apply two-step fix below | ce=0.6087 (pre-val), acc=0.0000 |
+| Stage 3 — 3 latent passes | ⚠️ Round 0 ✅ (24,604 samples, 66.7%); Round 1 in progress — B cancelled (P100 GPU, needs fix below); A status unknown | ce=0.6087 (pre-val), acc=0.0000 |
 | Stages 4–10 | ⬜ NOT STARTED | — |
- 
+
 **Compute mode: DiLoCo dynamic (Worker C quota exhausted; A+B active. C in attendance.)**
- 
+
 ---
 
 ## Part 0.1 — Immediate Next Steps (strict order)
- 
-### Step 1 — Push fixed `diloco_coordinator.py` ⚡ BLOCKING
-The file is in outputs. Push it to `deveshpat/Ouroboros` main branch.
- 
-Only one function block changed: the `if missing_workers:` guard in the normal-mode wait path now has a `triggered_at <= 0` → immediate re-dispatch branch before the `elif not is_round_timed_out` branch.
- 
-### Step 2 — One-time `round_state.json` fix on HF Hub ⚡ BLOCKING
-Manually edit `diloco_state/round_state.json` on `WeirdRunner/Ouroboros`:
-- Set `triggered_at: 0`
-- All other fields unchanged (`stage_k=3, round_n=1, mode=diloco, triggered_workers=["A","B"], attendance_workers=["C"]`)
 
-```json
-{
-  "stage_k": 3,
-  "round_n": 1,
-  "mode": "diloco",
-  "triggered_workers": ["A", "B"],
-  "attendance_workers": ["C"],
-  "triggered_at": 0
-}
+### Step 1 — Push GPU + W&B fixes ⚡ BLOCKING
+Two surgical patches — use `agent_prompt_gpu_wandb_fixes.md`.
+
+**Fix A — P100 → T4 (`diloco_coordinator.py`):**
+In `_build_kaggle_kernel_metadata()`, add one line:
+```python
+"accelerator": "nvidiaTeslaT4",   # pins T4 explicitly in kernel-metadata.json
 ```
- 
-### Step 3 — Wait for next cron coordinator run (≤30 min)
-The patched coordinator will detect `triggered_at=0` + missing workers and immediately re-dispatch A and B for round 1. Watch Actions for:
-```
-[coordinator] Round 1: ['A', 'B'] marked triggered but triggered_at=0 (unconfirmed dispatch). Re-dispatching now.
+This is a `kernel-metadata.json` field — not the old `--accelerator` CLI flag.
+
+**Fix B — W&B per-round grouping (`jamba_coconut_finetune.py`):**
+In `run_diloco_worker()`, change the W&B init:
+```python
+# id:   diloco-a-s3-r1  (was: diloco-a-s3)
+# group: diloco-a-s3    (new field)
+# name: Worker A | Stage 3 | Round 1  (was: Worker A | Stage 3)
+# remove: resume="allow"
 ```
 
-### Step 4 — Stage 3 self-completes
-A and B train round 1 (~4101 samples each), push signals, coordinator aggregates and triggers rounds 2+. Stage closes after round 2 or 3 (remaining <64 samples per active worker).
- 
+### Step 2 — Wait for next coordinator run (≤30 min)
+The coordinator will detect Worker B as not ready for round 1 and re-dispatch.
+With the P100 fix deployed, B should now get T4.
+
+### Step 3 — Stage 3 self-completes
+Round 1: A+B train ~4101 samples each. Round 2: ~0 or trivial close-out.
+
 ---
- 
-## Part 0.2 — Hub State Update
- 
+
+## Part 0.2 — Hub State
+
 ```
 WeirdRunner/Ouroboros/
   diloco_state/
-    anchor/                   ← Stage 3 Round 0 aggregate ✓ (66.7% complete)
-    round_state.json          ← BROKEN: triggered_at=<April 21 22:30>, round_n=1
-                                 FIX: set triggered_at=0
+    anchor/                   ← Stage 3 Round 0 aggregate ✓
+    round_state.json          ← stage_k=3, round_n=1, triggered_workers=["A","B"], triggered_at=<live>
     workers/A/round_0000_stage_3/  ✓
     workers/B/round_0000_stage_3/  ✓
+    workers/A/round_0001_stage_3/  ⚠️ status unknown (may have completed on T4)
 ```
- 
+
 ---
 
 ## Part 0.3 — Resolved Decisions
@@ -99,30 +95,22 @@ WeirdRunner/Ouroboros/
 | Kaggle trigger auth | Per-worker credentials; owner-authenticated |
 | **Kaggle trigger mechanism** | Local `kernels push`: stage checked-in `kaggle-utils.ipynb` + generated `kernel-metadata.json` → `kaggle kernels push -p <tmpdir>`. No pull needed. ✅ |
 | **Kaggle SDK version** | Pinned `kaggle==1.6.17`. ✅ |
-| W&B worker run ID | `diloco-{worker_lower}-s{stage_k}` — persists across rounds within a stage |
+| **`accelerator` in kernel-metadata.json** | **`"nvidiaTeslaT4"` — JSON field, pins T4. Distinct from the old `--accelerator` CLI flag. ✅** |
+| W&B worker run ID | `diloco-{worker_lower}-s{stage_k}-r{round_n}` — unique per round |
+| W&B worker group | `diloco-{worker_lower}-s{stage_k}` — groups all rounds for a stage |
 | W&B coordinator run ID | `diloco-coordinator-s{stage_k}` |
 | W&B step axis | Monotonic: `round_n × (shard_step_estimate + 1) + local_step` ✅ |
 | `shard_step_estimate` | `ceil(36906 / 3 / (batch_size × grad_accum))` = 385 at defaults |
 | DiLoCo outer LR | 0.7 (diloco mode) / 1.0 effective (solo mode = direct promotion) |
-| **`min_workers`** | **REMOVED** — superseded by `min_shard_samples` dynamic logic |
-| **`min_shard_samples`** | **32** (1 optimizer step = batch_size × grad_accum). Workers projected below this are not triggered. |
+| **`min_shard_samples`** | **32** (1 optimizer step = batch_size × grad_accum) |
 | **Solo mode** | 1 active worker → direct weight promotion (skip outer update). |
 | **Stage close** | remaining < `min_shard_samples` per active worker → declare stage complete, advance. |
-| **Coordinator planning** | Coordinator computes projected shards before triggering. Only active workers (shard ≥ min_shard_samples) get triggered. `round_state.json` stores `triggered_workers` + `mode`. |
 | **`workflow_dispatch` inputs** | `force_worker_ids`, `skip_trigger`, `dry_run`. Full control from Actions UI. |
-| DiLoCo wandb init timing | Deferred to `run_diloco_worker()` where stage_k/round_n are known |
-| Stage advancement (DiLoCo) | When `sum(all workers' samples_seen_this_stage) >= len(train_set)` OR `remaining < min_shard_samples` |
-| Val in DiLoCo mode | Worker A only, once per stage (round_n == 0, is_new_stage == True) |
 | **Worker timeout threshold** | **13h** (Kaggle 12h hard wall + 1h grace). Set via `--worker_timeout_hours`. |
-| **`triggered_at` field** | Written to `round_state.json` on every worker dispatch. Used to compute timeout deadline. Reset on re-dispatch in waiting mode. |
-| **Attendance round** | Worker in `attendance_workers` → skips training, downloads anchor, uploads `status.json` with `samples_seen=0`, pushes signal. Proves quota active. |
-| **Attendance promotion** | Worker responds to attendance → added to `eligible_for_training` on NEXT round. `round_n` advances normally. |
-| **Waiting mode** | All credentialed workers in `attendance_workers`, none training. `round_n` frozen. Exited by any worker signal push OR manual `workflow_dispatch`. |
-| **Worker C permanent exclusion** | NOT needed. Attendance mechanism handles it: C stays in `attendance_workers` until quota renews, then auto-promotes. No config changes required. |
-| **`numpy` in coordinator** | Installed. ✅ |
-| **Coordinator torch** | CPU-only wheel. ✅ |
-| **Coordinator timeout** | 30 minutes. ✅ | **`triggered_at=0` semantics** | **Canonical signal for "dispatch unconfirmed" in `round_state.json`. Coordinator immediately re-dispatches when it sees `triggered_at <= 0` with missing workers (normal mode) or no responses (waiting mode). Use this as the manual reset mechanism.** |
-| **Normal-mode unconfirmed dispatch recovery** | **`triggered_at <= 0` → re-dispatch `expected_workers` + `attendance_workers` immediately, run `_reconcile_post_dispatch_state`, update `triggered_at`. Added to coordinator in Session 19.** |
+| **`triggered_at` field** | Written to `round_state.json` on every worker dispatch. Reset to 0 as manual "unconfirmed dispatch" signal. |
+| **`triggered_at=0` semantics** | Canonical signal for "dispatch unconfirmed". Coordinator immediately re-dispatches on next run. ✅ VERIFIED |
+| **Attendance round** | Worker in `attendance_workers` → skips training, uploads status(samples=0), pushes signal. |
+| **Waiting mode** | All credentialed workers in `attendance_workers`. `round_n` frozen. |
 
 ---
 
@@ -156,9 +144,11 @@ WeirdRunner/Ouroboros/
 | W&B step collision between rounds | `round_step_span = shard_step_estimate + 1` ✅ |
 | `kaggle kernels pull` → 403 | Replaced with local `kernels push` ✅ |
 | `kaggle==2.0.x` gRPC → 403 | Pinned `kaggle==1.6.17` ✅ |
-| `kaggle kernels push --accelerator` → unrecognized arg | Removed flag; GPU requested via `enable_gpu: true` in metadata JSON ✅ |
-| Coordinator stalls on quota-dead worker | `triggered_at` + 13h timeout → attendance mechanism ✅ (patch in progress) |
-| Worker C deadlock (round 4) | One-time `round_state.json` fix (Step 2) + attendance patch ✅ (in progress) |
+| `kaggle kernels push --accelerator` → unrecognized arg | Removed CLI flag; GPU requested via JSON metadata ✅ |
+| Coordinator stalls on quota-dead worker | `triggered_at` + 13h timeout → attendance mechanism ✅ |
+| Round 1 deadlock (triggered_at≠0, workers never ran) | `triggered_at=0` manual reset → immediate re-dispatch ✅ VERIFIED (Session 19) |
+| **Kaggle assigns P100 instead of T4** | **`"accelerator": "nvidiaTeslaT4"` in `_build_kaggle_kernel_metadata()` ⚠️ PENDING** |
+| **W&B subsequent rounds not logged (wandb 0.25.0 resume bug)** | **Per-round run IDs + `group=` parameter ⚠️ PENDING** |
 
 ---
 
@@ -200,7 +190,6 @@ Each round:
   Timeout (coordinator, next run after 13h)
     - Non-responsive triggered workers → demote to attendance_workers
     - All in attendance → mode = "waiting", round_n frozen
-    - Any attendance worker signals → promote to training next round
 ```
 
 ### DGAC (Phase 3.4 only)
@@ -218,29 +207,19 @@ Stage 1: ~41s/step  Stage 2: ~48–53s/step  Stage 3: ~69s/step
 Stage 5: ~92s/step  Stage 10: ~149s/step
 ```
 
-**Stage 2 remaining rounds (from round 4, A+B only, C in attendance):**
-
-| Round | Remaining | A shard | B shard | New total seen | Done? |
-|---|---|---|---|---|---|
-| 4 (current) | 375 | 125 | 125 | 36,781 | No |
-| 5 | 125 | 42 | 42 | 36,865 | No |
-| 6 | 41 | all < 32 | — | — | **Close-out** ✅ |
-
-Round 6: remaining (41) → projected per worker ~14 < min_shard_samples (32) → coordinator declares stage complete, advances to Stage 3. Max samples missed: 41/36906 ≈ 0.11%.
-
 ---
 
 ## Part 3 — File Registry
 
 | File | Status |
 |---|---|
-| `jamba_coconut_finetune.py` | ⚠️ Attendance check patch pending (Part 7) |
-| `diloco_coordinator.py` | ⚠️ Attendance + timeout patch pending (Part 7) |
-| `bootstrap_diloco.py` | ✅ Run and confirmed |
-| `.github/workflows/diloco_coordinator.yml` | ⚠️ `--worker_timeout_hours` arg pending (Part 7) |
+| `jamba_coconut_finetune.py` | ⚠️ W&B grouping patch pending |
+| `diloco_coordinator.py` | ⚠️ T4 accelerator patch pending |
+| `bootstrap_diloco.py` | ✅ |
+| `.github/workflows/diloco_coordinator.yml` | ✅ |
 | `kaggle-utils.ipynb` Cell 5 | ✅ `!torchrun` magic + `DILOCO_WORKER_ID` secret |
-| `prepare_coconut_dataset.py` | ✅ Done |
-| `build_wheels_kaggle.py` | ✅ Done |
+| `prepare_coconut_dataset.py` | ✅ |
+| `build_wheels_kaggle.py` | ✅ |
 
 ---
 
@@ -248,11 +227,11 @@ Round 6: remaining (41) → projected per worker ~14 < min_shard_samples (32) �
 
 | Question | Status |
 |---|---|
-| Stage 2 DiLoCo: does aggregated model match sequential baseline? | 🟡 Pre-val by Worker A at Stage 3 start |
+| Stage 2 DiLoCo: does aggregated model match sequential baseline? | 🟡 Pre-val by Worker A at Stage 3 start (ce=0.6087, acc=0.0000 — expected at stage entry) |
 | TRC GPU quota conversion | 🟡 Email sent — awaiting response |
 | DGAC halt_step distribution at K≥2 | 🔴 Open — primary research question |
 | Worker C quota: replenishment timeline? | 🟡 Attendance mechanism handles automatically when renewed |
-| PyTorch 2.9 `use_reentrant` warning | 🟡 Minor — add `gradient_checkpointing_kwargs={"use_reentrant": True}` |
+| Worker A Stage 3 Round 1: succeeded on T4 or also P100? | 🟡 Needs confirmation from next coordinator run |
 
 ---
 
@@ -266,28 +245,8 @@ Round 6: remaining (41) → projected per worker ~14 < min_shard_samples (32) �
 | Stage never closes with geometric remainder | `remaining < min_shard_samples` → declare stage complete |
 | Coordinator triggers all workers even when some have nothing to do | Pre-compute projected shards, trigger only active workers |
 | Solo mode with outer_lr=0.7 blends stale anchor into new weights | Direct weight promotion in solo mode |
-| `kaggle kernels push --accelerator NvidiaTeslaT4` → unrecognized argument | Remove `--accelerator` flag; GPU is already set via `enable_gpu: true` in kernel metadata JSON |
-| Worker C in `triggered_workers` with exhausted quota → coordinator stalls forever | `triggered_at` + 13h timeout + attendance mechanism |
-| Removing dead worker's credentials is a temporary fix only | Attendance mechanism: permanent, self-healing, zero config on quota renewal | Pre-patch coordinator writes `triggered_workers` but Kaggle push fails silently; post-patch coordinator has no recovery path for this pre-existing corrupted state | `triggered_at <= 0` branch in normal-mode wait path forces immediate re-dispatch. Manual state fix: set `triggered_at=0` in round_state.json to trigger recovery on next cron run. |
-
----
-
-## Part 6 — Agent Prompt: Dynamic DiLoCo
-
-See separate file: `agent_prompt_dynamic_diloco.md`
-
----
-
-## Part 7 — Agent Prompt: Worker Attendance & Timeout Mechanism
-
-See separate file: `agent_prompt_attendance_mechanism.md`
-
-Changes: `diloco_coordinator.py`, `jamba_coconut_finetune.py`, `.github/workflows/diloco_coordinator.yml`
-
-Key additions:
-- `triggered_at` timestamp written on every worker dispatch
-- `attendance_workers` list in `round_state.json`
-- 13h timeout → demote non-responsive triggered workers to attendance
-- Attendance round: worker proves quota active with 0-sample ping, no training
-- Waiting mode: `round_n` frozen, coordinator re-pings on manual dispatch or incoming signal
-- Fully self-healing: Worker C auto-promotes when quota renews, no config changes needed
+| `kaggle kernels push --accelerator` → unrecognized argument | Remove `--accelerator` CLI flag; GPU requested via `enable_gpu: true` in kernel metadata JSON |
+| Worker C quota exhausted → coordinator stalls forever | `triggered_at` + 13h timeout + attendance mechanism |
+| Coordinator writes `triggered_workers` but push fails silently | `triggered_at=0` manual reset → immediate re-dispatch on next run |
+| `enable_gpu: true` in kernel-metadata.json → Kaggle assigns P100 | Add `"accelerator": "nvidiaTeslaT4"` JSON field explicitly |
+| `wandb==0.25.0` `resume="allow"` on finished run creates ephemeral run | Per-round run IDs + `group=` for stage-level grouping |
