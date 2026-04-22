@@ -3,6 +3,141 @@
 
 ---
 
+## Session 19 — Stage 3 Round 1 Deadlock: Root Cause & Fix (2026-04-22) ⚠️ PATCH REQUIRED
+
+**Context:** Stage 3 Round 0 completed successfully (A: 12302 samples, B: 12302 samples = 24604 total, 66.7% of stage). The coordinator aggregated round 0 correctly. However, round 1 is now deadlocked — workers A and B are marked as triggered but never actually started.
+
+---
+
+### Failing Coordinator Run — verbatim (Stage 3, Round 1 check)
+
+```
+[coordinator] Reading round state...
+[coordinator] stage=3 round=1 mode=diloco
+[coordinator] Attendance workers: ['C']
+[coordinator] Remaining samples for stage 3: 12302
+[coordinator] Projected shards: {'A': 4101, 'B': 4101, 'C': 4100}
+[coordinator] Next round mode: diloco  active workers: ['A', 'B']
+[coordinator] Worker A: not ready (status={'worker_id': 'A', 'stage_k': 3, 'round_n': 0, 'samples_seen': 12302, 'status': 'done', ...})
+[coordinator] Worker B: not ready (status={'worker_id': 'B', 'stage_k': 3, 'round_n': 0, 'samples_seen': 12302, 'status': 'done', ...})
+[coordinator] Download JSON diloco_state/workers/C/status.json failed (attempt 1/3): RemoteEntryNotFoundError: 404 ...
+[coordinator] Worker C: not ready (status=None)
+[coordinator] Waiting for workers to finish this round: ['A', 'B']
+```
+
+W&B coordinator summary (from resumed run, reflecting round 0 aggregate):
+```
+coordinator/round:                0
+coordinator/samples_this_round:   24604
+coordinator/total_samples_stage:  24604
+coordinator/workers_aggregated:   2
+coordinator/pct_stage_done:       66.7
+```
+
+---
+
+### Root Cause: Two-Stage Failure Chain
+
+**Stage 1 — Pre-patch coordinator (April 21 ~22:30 UTC):**
+- Both workers pushed round 0 signals; coordinator aggregated successfully.
+- The **OLD** coordinator (without `_reconcile_post_dispatch_state`) attempted `kaggle kernels push` for A and B (round 1).
+- The push likely returned CLI exit code 0 but the Kaggle backend never queued the kernel run (silent failure — a known Kaggle intermittent behaviour).
+- Old code wrote `triggered_workers=["A","B"], triggered_at=<April 21 22:30>, mode=diloco` with no failure detection.
+
+**Stage 2 — Agent-patched coordinator (all subsequent runs including April 22 07:16):**
+- Reads state: `round_n=1, triggered_workers=["A","B"], triggered_at=1776811800`
+- Checks A/B statuses: both still at `round_n=0` (they were never triggered).
+- Evaluates: `is_round_timed_out = triggered_at > 0 and (now - triggered_at) > 13h` → **False** (only ~8h elapsed).
+- Falls into: `if not is_round_timed_out: print("Waiting..."); return`
+- **Exits without dispatching.** System is stuck in this loop every 30 min.
+
+**The 13h timeout would fire ~April 22 11:30 UTC, but would DEMOTE A and B to attendance (skipping round 1 training) — wrong behaviour.**
+
+---
+
+### Gap in the Agent's Patch
+
+The agent correctly added `_reconcile_post_dispatch_state` (guards FUTURE dispatch failures) and added `triggered_at <= 0` handling inside the **waiting-mode** path. However, it **did not add the equivalent `triggered_at <= 0` check inside the normal diloco-mode wait path**:
+
+```python
+# PATCHED BUNDLE — normal-mode wait path (lines 944–948):
+if missing_workers:
+    if not is_round_timed_out:          # ← no triggered_at <= 0 branch here
+        print(f"Waiting for workers...") # ← so we're stuck here
+        return
+```
+
+When `triggered_at=0`, `triggered_at > 0` is False → `is_round_timed_out=False` → coordinator returns "Waiting" indefinitely. The `triggered_at=0` recovery path exists only in waiting-mode, not in normal-mode.
+
+---
+
+### Fix: Two Steps
+
+**Step 1 — Code fix (already applied, push `diloco_coordinator.py`):**
+
+Add `triggered_at <= 0` branch before the `elif not is_round_timed_out` branch in the normal-mode missing-worker check:
+
+```python
+if missing_workers:
+    if triggered_at <= 0:
+        # Dispatch was never confirmed (silent Kaggle failure or manual reset).
+        # Re-dispatch immediately without waiting 13h.
+        print(f"[coordinator] Round {round_n}: {missing_workers} marked triggered but "
+              f"triggered_at=0 (unconfirmed dispatch). Re-dispatching now.")
+        new_state = {**state, "triggered_at": time.time(), "last_updated": time.time()}
+        hub_upload_json(...)
+        if not args.skip_trigger:
+            dispatch_results = trigger_kaggle_workers(
+                kaggle_creds, active_workers=expected_workers + attendance_workers_prev, ...)
+            post_corrected = _reconcile_post_dispatch_state(...)
+            if post_corrected is not None:
+                hub_upload_json(...)
+        print(f"[coordinator] Done (re-dispatch unconfirmed round {round_n}).")
+        return
+    elif not is_round_timed_out:
+        print(f"[coordinator] Waiting for workers to finish this round: {missing_workers}")
+        return
+    # ... existing timeout/demotion logic unchanged
+```
+
+**Step 2 — One-time `round_state.json` manual fix on HF Hub (`WeirdRunner/Ouroboros`):**
+
+Edit `diloco_state/round_state.json` — set `triggered_at` to `0` (keep everything else, especially `round_n=1`):
+
+```json
+{
+  "stage_k": 3,
+  "round_n": 1,
+  "mode": "diloco",
+  "triggered_workers": ["A", "B"],
+  "attendance_workers": ["C"],
+  "triggered_at": 0,
+  ...all other fields preserved...
+}
+```
+
+With `triggered_at=0`, the next coordinator cron run detects the unconfirmed dispatch and re-triggers A and B for round 1 (preserving all training data).
+
+---
+
+### Why NOT Just Wait for the 13h Timeout?
+
+The timeout fires ~April 22 11:30 UTC. But on timeout:
+- A and B get **demoted to attendance** (not re-dispatched for training)
+- `round_n` advances to 2 with **zero contributing workers** (no data aggregated)
+- System enters waiting mode; A and B do attendance pings; advance to round 3 for training
+- Round 1 data (12302 samples, 33% of stage 3) is **permanently skipped**
+- Stage 3 covers only ~90% of planned data, spread over more rounds
+
+The two-step fix above recovers round 1 training correctly with zero data loss.
+
+---
+
+### Hardening: `triggered_at <= 0` as a Manual Reset Signal
+
+Going forward: **setting `triggered_at: 0` in `round_state.json` is the canonical way to signal an unconfirmed dispatch** to the coordinator. The new code will detect this and immediately re-dispatch — no need to wait hours for the timeout or manually pick through coordinator logic. This is the pattern used in the waiting-mode path and now unified across all modes.
+
+--- 
 ## Session 18 — Round 4 Worker C Deadlock Diagnosed; Attendance Mechanism Designed (2026-04-21) ⚠️ PATCH PENDING
 
 **Context:** Round 3 completed successfully (A: 188 samples, B: 187 samples = 375 total). The patched `kernels push` auto-trigger fired correctly for Round 4. However, Round 4 stalled because the coordinator included Worker C in `triggered_workers` despite C having exhausted quota. C will never respond, so the coordinator exits early on every run.
