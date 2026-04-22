@@ -11,71 +11,66 @@
 ### What this project is
 Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transformer-Mamba hybrid). The Mamba SSM recurrent state acts as compressed scratch-pad across K latent thought passes, replacing token generation during reasoning. Based on Meta's Coconut (arXiv:2412.06769), extended with DGAC (Diversity-Gated Adaptive Coconut) — a novel anti-collapse halt gate.
 
-### Current Status (2026-04-21)
-
+### Current Status (2026-04-22)
+ 
 | Curriculum Stage | Status | Best val |
 |---|---|---|
 | Stage 0 — CoT warmup | ✅ COMPLETE | ce=0.4041, acc=0.0222 |
 | Stage 1 — 1 latent pass | ✅ COMPLETE | ce=0.4912, acc=0.0444 |
-| Stage 2 — 2 latent passes | ⚠️ Round 3 complete (~36,531/36,906 samples); Round 4 stalled (Worker C deadlock — apply attendance patch first) | — |
-| Stages 3–10 | ⬜ NOT STARTED | — |
-| Phase 3.4 — DGAC | ⬜ after Stage 10 | — |
-| Phase 4 — GRPO | ⬜ after DGAC | — |
-
-**Compute mode: DiLoCo dynamic (Worker C quota exhausted; A+B active. C managed via attendance mechanism.)**
-
+| Stage 2 — 2 latent passes | ✅ COMPLETE (6 rounds, ~36,865 samples) | — |
+| Stage 3 — 3 latent passes | ⚠️ Round 0 complete (24,604/36,906 samples, 66.7%); Round 1 deadlocked — apply two-step fix below | ce=0.6087 (pre-val), acc=0.0000 |
+| Stages 4–10 | ⬜ NOT STARTED | — |
+ 
+**Compute mode: DiLoCo dynamic (Worker C quota exhausted; A+B active. C in attendance.)**
+ 
 ---
 
 ## Part 0.1 — Immediate Next Steps (strict order)
-
-### Step 1 — Apply Worker Attendance & Timeout patch ⚡ BLOCKING
-Feed `agent_prompt_attendance_mechanism.md` (Part 7) to the coding agent.
-Modifies: `diloco_coordinator.py`, `jamba_coconut_finetune.py`, `.github/workflows/diloco_coordinator.yml`.
-Push to `deveshpat/Ouroboros`.
-
-### Step 2 — One-time `round_state.json` fix ⚡ BLOCKING
-Manually update `diloco_state/round_state.json` on `WeirdRunner/Ouroboros`:
-- Move `"C"` from `triggered_workers` → `attendance_workers`
-- Set `triggered_at: 0` (so coordinator doesn't immediately timeout on first run)
+ 
+### Step 1 — Push fixed `diloco_coordinator.py` ⚡ BLOCKING
+The file is in outputs. Push it to `deveshpat/Ouroboros` main branch.
+ 
+Only one function block changed: the `if missing_workers:` guard in the normal-mode wait path now has a `triggered_at <= 0` → immediate re-dispatch branch before the `elif not is_round_timed_out` branch.
+ 
+### Step 2 — One-time `round_state.json` fix on HF Hub ⚡ BLOCKING
+Manually edit `diloco_state/round_state.json` on `WeirdRunner/Ouroboros`:
+- Set `triggered_at: 0`
+- All other fields unchanged (`stage_k=3, round_n=1, mode=diloco, triggered_workers=["A","B"], attendance_workers=["C"]`)
 
 ```json
 {
-  "stage_k": 2, "round_n": 4,
+  "stage_k": 3,
+  "round_n": 1,
+  "mode": "diloco",
   "triggered_workers": ["A", "B"],
   "attendance_workers": ["C"],
   "triggered_at": 0
 }
 ```
-
-### Step 3 — Trigger `workflow_dispatch` with `skip_trigger=false`
-Let the patched coordinator aggregate round 3 weights and kick off round 4 automatically.
-A+B train normally; C is pinged. Watch Actions for:
+ 
+### Step 3 — Wait for next cron coordinator run (≤30 min)
+The patched coordinator will detect `triggered_at=0` + missing workers and immediately re-dispatch A and B for round 1. Watch Actions for:
 ```
-[coordinator] Triggering training: ['A', 'B']  attendance: ['C']
+[coordinator] Round 1: ['A', 'B'] marked triggered but triggered_at=0 (unconfirmed dispatch). Re-dispatching now.
 ```
 
-### Step 4 — Stage 2 self-completes (~2 more rounds after round 4)
-Rounds 4–6 run fully automatically. Coordinator closes Stage 2 when remaining < min_shard_samples per worker.
-
+### Step 4 — Stage 3 self-completes
+A and B train round 1 (~4101 samples each), push signals, coordinator aggregates and triggers rounds 2+. Stage closes after round 2 or 3 (remaining <64 samples per active worker).
+ 
 ---
-
-## Part 0.2 — Hub State: What's There, What Matters
-
+ 
+## Part 0.2 — Hub State Update
+ 
 ```
 WeirdRunner/Ouroboros/
-  runs/stage3_curriculum/
-    stage_0/best/             ← correct ✓
-    stage_1/                  ← correct ✓
-    stage_2/checkpoint-0002987/  ← Stage 2 sequential anchor (pre-DiLoCo)
   diloco_state/
-    anchor/                   ← Updated after Round 3 aggregation ✓
-    round_state.json          ← {"stage_k": 2, "round_n": 4, triggered_workers: ["A","B","C"]} ← BROKEN, fix per Step 2
-    workers/A/                ← Stage 2 Round 3 weights ✓
-    workers/B/                ← Stage 2 Round 3 weights ✓
-  runs/stage3/
-    best/ checkpoint-0002308/ checkpoint-0002987/  ← legacy path — IGNORE
+    anchor/                   ← Stage 3 Round 0 aggregate ✓ (66.7% complete)
+    round_state.json          ← BROKEN: triggered_at=<April 21 22:30>, round_n=1
+                                 FIX: set triggered_at=0
+    workers/A/round_0000_stage_3/  ✓
+    workers/B/round_0000_stage_3/  ✓
 ```
-
+ 
 ---
 
 ## Part 0.3 — Resolved Decisions
@@ -126,7 +121,8 @@ WeirdRunner/Ouroboros/
 | **Worker C permanent exclusion** | NOT needed. Attendance mechanism handles it: C stays in `attendance_workers` until quota renews, then auto-promotes. No config changes required. |
 | **`numpy` in coordinator** | Installed. ✅ |
 | **Coordinator torch** | CPU-only wheel. ✅ |
-| **Coordinator timeout** | 30 minutes. ✅ |
+| **Coordinator timeout** | 30 minutes. ✅ | **`triggered_at=0` semantics** | **Canonical signal for "dispatch unconfirmed" in `round_state.json`. Coordinator immediately re-dispatches when it sees `triggered_at <= 0` with missing workers (normal mode) or no responses (waiting mode). Use this as the manual reset mechanism.** |
+| **Normal-mode unconfirmed dispatch recovery** | **`triggered_at <= 0` → re-dispatch `expected_workers` + `attendance_workers` immediately, run `_reconcile_post_dispatch_state`, update `triggered_at`. Added to coordinator in Session 19.** |
 
 ---
 
@@ -272,7 +268,7 @@ Round 6: remaining (41) → projected per worker ~14 < min_shard_samples (32) �
 | Solo mode with outer_lr=0.7 blends stale anchor into new weights | Direct weight promotion in solo mode |
 | `kaggle kernels push --accelerator NvidiaTeslaT4` → unrecognized argument | Remove `--accelerator` flag; GPU is already set via `enable_gpu: true` in kernel metadata JSON |
 | Worker C in `triggered_workers` with exhausted quota → coordinator stalls forever | `triggered_at` + 13h timeout + attendance mechanism |
-| Removing dead worker's credentials is a temporary fix only | Attendance mechanism: permanent, self-healing, zero config on quota renewal |
+| Removing dead worker's credentials is a temporary fix only | Attendance mechanism: permanent, self-healing, zero config on quota renewal | Pre-patch coordinator writes `triggered_workers` but Kaggle push fails silently; post-patch coordinator has no recovery path for this pre-existing corrupted state | `triggered_at <= 0` branch in normal-mode wait path forces immediate re-dispatch. Manual state fix: set `triggered_at=0` in round_state.json to trigger recovery on next cron run. |
 
 ---
 
