@@ -222,11 +222,42 @@ def _resolve_hf_token_common(cli_value: Optional[str] = None) -> Optional[str]:
         if token:
             return token
 
-    for token in (
-        _maybe_get_kaggle_secret("HF_TOKEN"),
-        _maybe_get_colab_secret("HF_TOKEN"),
+    for secret_name, resolver in (
+        ("HF_TOKEN", _maybe_get_kaggle_secret),
+        ("HF_TOKEN", _maybe_get_colab_secret),
     ):
-        token = _normalize_optional_text(token)
+        token = _normalize_optional_text(resolver(secret_name))
+        if token:
+            return token
+    return None
+
+
+def _resolve_github_token_common(cli_value: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the GitHub token used for worker->coordinator signaling.
+
+    Resolution order:
+      1. Explicit CLI override
+      2. GITHUB_TOKEN / GH_TOKEN env vars
+      3. Kaggle secret GITHUB_TOKEN / GH_TOKEN
+      4. Colab userdata GITHUB_TOKEN / GH_TOKEN
+    """
+    token = _normalize_optional_text(cli_value)
+    if token:
+        return token
+
+    for env_name in ("GITHUB_TOKEN", "GH_TOKEN"):
+        token = _normalize_optional_text(os.environ.get(env_name))
+        if token:
+            return token
+
+    for secret_name, resolver in (
+        ("GITHUB_TOKEN", _maybe_get_kaggle_secret),
+        ("GH_TOKEN", _maybe_get_kaggle_secret),
+        ("GITHUB_TOKEN", _maybe_get_colab_secret),
+        ("GH_TOKEN", _maybe_get_colab_secret),
+    ):
+        token = _normalize_optional_text(resolver(secret_name))
         if token:
             return token
     return None
@@ -247,10 +278,16 @@ def _resolve_diloco_worker_id_common(cli_value: Optional[str] = None) -> Optiona
         os.environ.get("DILOCO_WORKER_ID"),
         os.environ.get("OUROBOROS_DILOCO_WORKER_ID"),
         os.environ.get("WORKER_ID"),
-        _maybe_get_kaggle_secret("DILOCO_WORKER_ID"),
-        _maybe_get_colab_secret("DILOCO_WORKER_ID"),
     ):
         worker_id = _normalize_optional_text(candidate, uppercase=True)
+        if worker_id:
+            return worker_id
+
+    for secret_name, resolver in (
+        ("DILOCO_WORKER_ID", _maybe_get_kaggle_secret),
+        ("DILOCO_WORKER_ID", _maybe_get_colab_secret),
+    ):
+        worker_id = _normalize_optional_text(resolver(secret_name), uppercase=True)
         if worker_id:
             return worker_id
     return None
@@ -1314,6 +1351,7 @@ def parse_args() -> argparse.Namespace:
 
     # wandb
     parser.add_argument("--wandb_project", default="ouroboros-stage3-jamba")
+    parser.add_argument("--wandb_entity", default=None)
     parser.add_argument("--wandb_run_name", default=None)
     parser.add_argument(
         "--wandb_mode",
@@ -1326,7 +1364,7 @@ def parse_args() -> argparse.Namespace:
 
 def _wandb_config(args: argparse.Namespace) -> Dict[str, Any]:
     config = dict(vars(args))
-    for key in ["hf_token", "_resolved_hf_token"]:
+    for key in ["hf_token", "_resolved_hf_token", "_resolved_github_token"]:
         if key in config and config[key] is not None:
             config[key] = "***"
     return config
@@ -3655,7 +3693,7 @@ def run_diloco_worker(
                 hf_token=hf_token,
                 repo_id=args.diloco_state_repo,
             )
-            github_token = os.environ.get("GITHUB_TOKEN")
+            github_token = _resolve_github_token_common()
             if github_token and args.diloco_signal_repo:
                 diloco_push_signal(
                     args.diloco_worker_id,
@@ -3729,7 +3767,7 @@ def run_diloco_worker(
                 hf_token=hf_token,
                 repo_id=args.diloco_state_repo,
             )
-            github_token = os.environ.get("GITHUB_TOKEN")
+            github_token = _resolve_github_token_common()
             if github_token and args.diloco_signal_repo:
                 diloco_push_signal(
                     args.diloco_worker_id, stage_k, round_n,
@@ -3774,6 +3812,7 @@ def run_diloco_worker(
             group_id  = f"diloco-{args.diloco_worker_id.lower()}-s{stage_k}"
             diloco_wandb_run = _wandb.init(
                 project=args.wandb_project,
+                entity=args.wandb_entity,
                 id=run_id,
                 group=group_id,
                 name=f"Worker {args.diloco_worker_id} | Stage {stage_k} | Round {round_n}",
@@ -3892,7 +3931,7 @@ def run_diloco_worker(
             repo_id=args.diloco_state_repo,
         )
 
-        github_token = os.environ.get("GITHUB_TOKEN")
+        github_token = _resolve_github_token_common()
         if github_token and args.diloco_signal_repo:
             diloco_push_signal(
                 args.diloco_worker_id,
@@ -3935,14 +3974,26 @@ def main() -> None:
     args = parse_args()
     if args.diloco_mode:
         args.diloco_worker_id = _require_valid_diloco_worker_id(args.diloco_worker_id)
+        os.environ["DILOCO_WORKER_ID"] = args.diloco_worker_id
+        os.environ.setdefault("OUROBOROS_DILOCO_WORKER_ID", args.diloco_worker_id)
+        os.environ.setdefault("WORKER_ID", args.diloco_worker_id)
 
     hf_token = _resolve_hf_token(getattr(args, "hf_token", None))
     args._resolved_hf_token = hf_token
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+        os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", hf_token)
     if args.diloco_mode and not hf_token:
         raise ValueError(
             "HF token required for DiLoCo mode. Provide --hf_token, set HF_TOKEN / "
             "HUGGINGFACE_HUB_TOKEN, or define a Kaggle/Colab secret named HF_TOKEN."
         )
+
+    github_token = _resolve_github_token_common()
+    args._resolved_github_token = github_token
+    if github_token:
+        os.environ["GITHUB_TOKEN"] = github_token
+        os.environ.setdefault("GH_TOKEN", github_token)
 
     set_seed(args.seed)
 
@@ -4021,7 +4072,7 @@ def main() -> None:
                     hf_token or "",
                     getattr(args, "diloco_state_repo", "WeirdRunner/Ouroboros"),
                 )
-                _github_token = os.environ.get("GITHUB_TOKEN")
+                _github_token = _resolve_github_token_common()
                 if _github_token and getattr(args, "diloco_signal_repo", ""):
                     diloco_push_signal(
                         args.diloco_worker_id,
@@ -4050,6 +4101,7 @@ def main() -> None:
             import wandb
             wandb_run = wandb.init(
                 project=args.wandb_project,
+                entity=args.wandb_entity,
                 name=args.wandb_run_name,
                 mode=args.wandb_mode,
                 config=_wandb_config(args),

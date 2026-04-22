@@ -20,11 +20,14 @@ Usage:
 """
 
 import argparse
+import base64
 import json
+import os
 import shutil
 import sys
 import tempfile
 import time
+import zlib
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
@@ -86,6 +89,153 @@ def _retry_io(
         return default
     assert last_exc is not None
     raise last_exc
+
+
+def _normalize_optional_text(value: Optional[Any], *, uppercase: bool = False) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text.upper() if uppercase else text
+
+
+def _first_nonempty_text(*values: Optional[Any], uppercase: bool = False) -> Optional[str]:
+    for value in values:
+        text = _normalize_optional_text(value, uppercase=uppercase)
+        if text is not None:
+            return text
+    return None
+
+
+def _set_env_if_present(
+    target: Dict[str, str],
+    key: str,
+    value: Optional[Any],
+    *,
+    uppercase: bool = False,
+) -> None:
+    text = _normalize_optional_text(value, uppercase=uppercase)
+    if text is not None:
+        target[key] = text
+
+
+def _infer_runtime_repo_url(default: str = "https://github.com/deveshpat/Ouroboros.git") -> str:
+    explicit = _first_nonempty_text(os.environ.get("OUROBOROS_REPO_URL"))
+    if explicit:
+        return explicit
+    repo = _first_nonempty_text(os.environ.get("GITHUB_REPOSITORY"))
+    server = _first_nonempty_text(os.environ.get("GITHUB_SERVER_URL"), "https://github.com")
+    if repo:
+        return f"{server.rstrip('/')}/{repo}.git"
+    return default
+
+
+def _infer_runtime_repo_ref(default: str = "main") -> str:
+    return (
+        _first_nonempty_text(
+            os.environ.get("OUROBOROS_REPO_REF"),
+            os.environ.get("GITHUB_REF_NAME"),
+            default,
+        )
+        or default
+    )
+
+
+def _infer_runtime_repo_commit() -> Optional[str]:
+    return _first_nonempty_text(
+        os.environ.get("OUROBOROS_REPO_COMMIT"),
+        os.environ.get("GITHUB_SHA"),
+    )
+
+
+def _build_worker_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[str, str]:
+    worker = _normalize_optional_text(worker_id, uppercase=True)
+    if worker not in WORKER_IDS:
+        raise ValueError(f"Invalid worker id for runtime env injection: {worker_id!r}")
+
+    runtime_env: Dict[str, str] = {}
+
+    for name, value in os.environ.items():
+        if name.startswith("OUROBOROS_"):
+            _set_env_if_present(runtime_env, name, value)
+
+    _set_env_if_present(runtime_env, "DILOCO_WORKER_ID", worker, uppercase=True)
+    _set_env_if_present(runtime_env, "OUROBOROS_DILOCO_WORKER_ID", worker, uppercase=True)
+    _set_env_if_present(runtime_env, "WORKER_ID", worker, uppercase=True)
+    runtime_env["OUROBOROS_AUTO_TRIGGERED"] = "1"
+
+    hf_token = _first_nonempty_text(
+        getattr(args, "hf_token", None),
+        os.environ.get("HF_TOKEN"),
+        os.environ.get("HUGGINGFACE_HUB_TOKEN"),
+    )
+    if hf_token:
+        runtime_env["HF_TOKEN"] = hf_token
+        runtime_env["HUGGINGFACE_HUB_TOKEN"] = hf_token
+
+    wandb_key = _first_nonempty_text(
+        getattr(args, "wandb_key", None),
+        os.environ.get("WANDB_API_KEY"),
+        os.environ.get("WANDB_KEY"),
+    )
+    if wandb_key:
+        runtime_env["WANDB_API_KEY"] = wandb_key
+        runtime_env["WANDB_KEY"] = wandb_key
+
+    github_token = _first_nonempty_text(
+        os.environ.get("GITHUB_TOKEN"),
+        os.environ.get("GH_TOKEN"),
+    )
+    if github_token:
+        runtime_env["GITHUB_TOKEN"] = github_token
+        runtime_env["GH_TOKEN"] = github_token
+
+    _set_env_if_present(runtime_env, "OUROBOROS_REPO_URL", _infer_runtime_repo_url())
+    _set_env_if_present(runtime_env, "OUROBOROS_REPO_REF", _infer_runtime_repo_ref())
+    _set_env_if_present(runtime_env, "OUROBOROS_REPO_COMMIT", _infer_runtime_repo_commit())
+    _set_env_if_present(
+        runtime_env,
+        "OUROBOROS_DILOCO_STATE_REPO",
+        _first_nonempty_text(os.environ.get("OUROBOROS_DILOCO_STATE_REPO"), getattr(args, "repo_id", None)),
+    )
+    _set_env_if_present(
+        runtime_env,
+        "OUROBOROS_DILOCO_SIGNAL_REPO",
+        _first_nonempty_text(
+            os.environ.get("OUROBOROS_DILOCO_SIGNAL_REPO"),
+            os.environ.get("GITHUB_REPOSITORY"),
+        ),
+    )
+    _set_env_if_present(
+        runtime_env,
+        "OUROBOROS_DILOCO_OUTER_LR",
+        _first_nonempty_text(
+            os.environ.get("OUROBOROS_DILOCO_OUTER_LR"),
+            f"{float(getattr(args, 'outer_lr', 0.7)):g}",
+        ),
+    )
+    _set_env_if_present(
+        runtime_env,
+        "OUROBOROS_WANDB_PROJECT",
+        _first_nonempty_text(os.environ.get("OUROBOROS_WANDB_PROJECT"), getattr(args, "wandb_project", None)),
+    )
+    _set_env_if_present(
+        runtime_env,
+        "OUROBOROS_WANDB_ENTITY",
+        _first_nonempty_text(os.environ.get("OUROBOROS_WANDB_ENTITY"), getattr(args, "wandb_entity", None)),
+    )
+    _set_env_if_present(
+        runtime_env,
+        "OUROBOROS_DILOCO_OUTPUT_DIR",
+        _first_nonempty_text(os.environ.get("OUROBOROS_DILOCO_OUTPUT_DIR"), "runs/diloco"),
+    )
+    return runtime_env
+
+
+def _encode_runtime_env_payload(runtime_env: Dict[str, str]) -> str:
+    payload = json.dumps(runtime_env, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(zlib.compress(payload, level=9)).decode("ascii")
 
 
 def _compute_projected_shards(
@@ -430,10 +580,20 @@ def _build_kaggle_kernel_metadata(*, slug: str, notebook_filename: str) -> Dict[
     }
 
 
-def _build_worker_dispatch_cell(worker_id: str) -> Dict[str, object]:
+def _build_worker_dispatch_cell(
+    worker_id: str,
+    runtime_env: Optional[Dict[str, str]] = None,
+) -> Dict[str, object]:
     worker_id = worker_id.strip().upper()
     if worker_id not in WORKER_IDS:
         raise ValueError(f"Invalid worker id for notebook dispatch: {worker_id!r}")
+
+    payload = _encode_runtime_env_payload(runtime_env or {
+        "DILOCO_WORKER_ID": worker_id,
+        "OUROBOROS_DILOCO_WORKER_ID": worker_id,
+        "WORKER_ID": worker_id,
+        "OUROBOROS_AUTO_TRIGGERED": "1",
+    })
 
     return {
         "cell_type": "code",
@@ -443,14 +603,20 @@ def _build_worker_dispatch_cell(worker_id: str) -> Dict[str, object]:
         "outputs": [],
         "source": [
             "# AUTO-GENERATED BY DILOCO COORDINATOR. DO NOT EDIT IN REPO.\n",
+            "import base64\n",
+            "import json\n",
             "import os\n",
-            f"os.environ['DILOCO_WORKER_ID'] = '{worker_id}'\n",
-            f"os.environ['OUROBOROS_DILOCO_WORKER_ID'] = '{worker_id}'\n",
-            "os.environ['OUROBOROS_AUTO_TRIGGERED'] = '1'\n",
+            "import zlib\n",
+            f"_DISPATCH_PAYLOAD = {json.dumps(payload)}\n",
+            "_DISPATCH_ENV = json.loads(zlib.decompress(base64.b64decode(_DISPATCH_PAYLOAD)).decode('utf-8'))\n",
+            "for _dispatch_key, _dispatch_value in _DISPATCH_ENV.items():\n",
+            "    if _dispatch_value is None:\n",
+            "        continue\n",
+            "    os.environ[str(_dispatch_key)] = str(_dispatch_value)\n",
+            "del _DISPATCH_ENV, _DISPATCH_PAYLOAD\n",
             f"print('[dispatch] Bound notebook to DiLoCo worker {worker_id}')\n",
         ],
     }
-
 
 def _stage_local_kaggle_kernel(
     notebook_path: Path,
@@ -458,6 +624,7 @@ def _stage_local_kaggle_kernel(
     staging_dir: Path,
     *,
     worker_id: Optional[str] = None,
+    runtime_env: Optional[Dict[str, str]] = None,
 ) -> Path:
     if not notebook_path.exists():
         raise FileNotFoundError(
@@ -474,7 +641,7 @@ def _stage_local_kaggle_kernel(
         if not isinstance(cells, list):
             raise ValueError("Kaggle notebook JSON is missing a valid 'cells' list")
 
-        dispatch_cell = _build_worker_dispatch_cell(worker_id)
+        dispatch_cell = _build_worker_dispatch_cell(worker_id, runtime_env=runtime_env)
         replaced = False
         for idx, cell in enumerate(cells):
             if not isinstance(cell, dict):
@@ -514,6 +681,8 @@ def _trigger_single_worker(
     key: str,
     slug: str,
     notebook_path: Path,
+    *,
+    injected_env: Optional[Dict[str, str]] = None,
 ) -> bool:
     """
     Trigger a Kaggle kernel by pushing the repo-tracked notebook with generated
@@ -559,7 +728,7 @@ def _trigger_single_worker(
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
-            _stage_local_kaggle_kernel(notebook_path, slug, tmp_path, worker_id=worker_id)
+            _stage_local_kaggle_kernel(notebook_path, slug, tmp_path, worker_id=worker_id, runtime_env=injected_env)
 
             # --accelerator requires kaggle>=1.8.4 (added in PR #907).
             # "NvidiaTeslaT4" is the official accelerator ID per kaggle-cli docs.
@@ -591,6 +760,7 @@ def trigger_kaggle_workers(
     *,
     active_workers: List[str],
     notebook_path: Path,
+    coordinator_args: Optional[argparse.Namespace] = None,
 ) -> Dict[str, str]:
     """
     Trigger only the specified active_workers using their Kaggle credentials.
@@ -613,6 +783,11 @@ def trigger_kaggle_workers(
             results[worker_id] = "manual"
             continue
 
+        injected_env = (
+            _build_worker_runtime_env(coordinator_args, worker_id)
+            if coordinator_args is not None
+            else None
+        )
         results[worker_id] = (
             "success"
             if _trigger_single_worker(
@@ -621,6 +796,7 @@ def trigger_kaggle_workers(
                 key,
                 slug,
                 notebook_path=notebook_path,
+                injected_env=injected_env,
             )
             else "failed"
         )
@@ -842,6 +1018,7 @@ def main() -> None:
                         kaggle_creds,
                         active_workers=attendance_workers_prev,
                         notebook_path=Path(args.kaggle_notebook_path),
+                        coordinator_args=args,
                     )
                     corrected_state = _reconcile_post_dispatch_state(
                         state=new_state,
@@ -879,7 +1056,8 @@ def main() -> None:
                     kaggle_creds,
                     active_workers=attendance_workers_prev,
                     notebook_path=Path(args.kaggle_notebook_path),
-                )
+                coordinator_args=args,
+            )
                 corrected_state = _reconcile_post_dispatch_state(
                     state=new_state,
                     planned_active_workers=[],
@@ -952,6 +1130,7 @@ def main() -> None:
                 kaggle_creds,
                 active_workers=next_active_workers + next_attendance_workers,
                 notebook_path=Path(args.kaggle_notebook_path),
+                coordinator_args=args,
             )
         print("[coordinator] Done (waiting mode resolved).")
         return
@@ -1028,6 +1207,7 @@ def main() -> None:
                             kaggle_creds,
                             active_workers=all_to_trigger,
                             notebook_path=Path(args.kaggle_notebook_path),
+                            coordinator_args=args,
                         )
                         post_corrected = _reconcile_post_dispatch_state(
                             state=new_state,
@@ -1250,6 +1430,7 @@ def main() -> None:
                 kaggle_creds,
                 active_workers=all_workers_to_trigger,
                 notebook_path=Path(args.kaggle_notebook_path),
+                coordinator_args=args,
             )
             corrected_state = _reconcile_post_dispatch_state(
                 state=new_state,
