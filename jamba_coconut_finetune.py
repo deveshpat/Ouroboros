@@ -3623,12 +3623,14 @@ def run_diloco_worker(
     if _is_main_process() and args.wandb_mode != "disabled":
         try:
             import wandb as _wandb
-            run_id = f"diloco-{args.diloco_worker_id.lower()}-s{stage_k}"
+            run_id    = f"diloco-{args.diloco_worker_id.lower()}-s{stage_k}-r{round_n}"
+            group_id  = f"diloco-{args.diloco_worker_id.lower()}-s{stage_k}"
             diloco_wandb_run = _wandb.init(
                 project=args.wandb_project,
                 id=run_id,
-                resume="allow",
-                name=f"Worker {args.diloco_worker_id} | Stage {stage_k}",
+                group=group_id,
+                name=f"Worker {args.diloco_worker_id} | Stage {stage_k} | Round {round_n}",
+                # No resume= needed: each round is a guaranteed-fresh run
                 config={
                     **_wandb_config(args),
                     "stage_k": stage_k,
