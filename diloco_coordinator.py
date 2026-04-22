@@ -942,7 +942,48 @@ def main() -> None:
         if expected_workers:
             missing_workers = [w for w in expected_workers if w not in ready_ids]
             if missing_workers:
-                if not is_round_timed_out:
+                if triggered_at <= 0:
+                    # triggered_at=0 means this round's dispatch was never confirmed —
+                    # the Kaggle push may have failed silently, or the state was manually reset.
+                    # Re-dispatch immediately instead of waiting up to 13h for the timeout.
+                    print(
+                        f"[coordinator] Round {round_n}: {missing_workers} marked triggered but "
+                        f"triggered_at=0 (unconfirmed dispatch). Re-dispatching now."
+                    )
+                    new_state = {**state, "triggered_at": time.time(), "last_updated": time.time()}
+                    hub_upload_json(
+                        args.repo_id,
+                        ROUND_STATE_PATH,
+                        new_state,
+                        args.hf_token,
+                        message=f"Re-dispatch unconfirmed: stage={stage_k} round={round_n}",
+                    )
+                    if not args.skip_trigger:
+                        all_to_trigger = expected_workers + [
+                            w for w in attendance_workers_prev if w not in expected_workers
+                        ]
+                        dispatch_results = trigger_kaggle_workers(
+                            kaggle_creds,
+                            active_workers=all_to_trigger,
+                            notebook_path=Path(args.kaggle_notebook_path),
+                        )
+                        post_corrected = _reconcile_post_dispatch_state(
+                            state=new_state,
+                            planned_active_workers=expected_workers,
+                            planned_attendance_workers=attendance_workers_prev,
+                            dispatch_results=dispatch_results,
+                        )
+                        if post_corrected is not None:
+                            hub_upload_json(
+                                args.repo_id,
+                                ROUND_STATE_PATH,
+                                post_corrected,
+                                args.hf_token,
+                                message=f"Re-dispatch reconcile: stage={stage_k} round={round_n}",
+                            )
+                    print(f"[coordinator] Done (re-dispatch unconfirmed round {round_n}).")
+                    return
+                elif not is_round_timed_out:
                     print(f"[coordinator] Waiting for workers to finish this round: {missing_workers}")
                     return
                 newly_demoted = [w for w in missing_workers if w not in attendance_workers_prev]
