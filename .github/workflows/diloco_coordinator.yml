@@ -57,6 +57,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           WANDB_KEY: ${{ secrets.WANDB_KEY }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
           KAGGLE_USERNAME_A: ${{ secrets.KAGGLE_USERNAME_A }}
           KAGGLE_KEY_A: ${{ secrets.KAGGLE_KEY_A }}
           KAGGLE_USERNAME_B: ${{ secrets.KAGGLE_USERNAME_B }}
