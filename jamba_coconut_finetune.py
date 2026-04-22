@@ -76,7 +76,7 @@ import time
 from collections import defaultdict
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 # Set critical env vars BEFORE any torch/nccl import
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -102,6 +102,61 @@ _KNOWN_ARCH_SUFFIXES = [
     "sm90", "sm100", "sm120", "smunknown",
 ]
 
+T = TypeVar("T")
+_DILOCO_IO_RETRIES = 3
+_DILOCO_IO_RETRY_BASE_DELAY_S = 1.5
+
+
+def _retry_diloco_io(
+    label: str,
+    fn: Callable[[], T],
+    *,
+    attempts: int = _DILOCO_IO_RETRIES,
+    base_delay_s: float = _DILOCO_IO_RETRY_BASE_DELAY_S,
+    swallow: bool = False,
+    default: Optional[T] = None,
+) -> Optional[T]:
+    """Retry transient DiLoCo network/HF operations with exponential backoff."""
+    last_exc: Optional[Exception] = None
+    attempts = max(int(attempts), 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - Kaggle/HF/GitHub I/O should be retried
+            last_exc = exc
+            if attempt >= attempts:
+                if swallow:
+                    if _is_main_process():
+                        print(
+                            f"  [diloco] {label} failed after {attempts} attempts: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    return default
+                raise
+            delay = base_delay_s * (2 ** (attempt - 1))
+            if _is_main_process():
+                print(
+                    f"  [diloco] {label} failed (attempt {attempt}/{attempts}): "
+                    f"{type(exc).__name__}: {exc}. Retrying in {delay:.1f}s..."
+                )
+            time.sleep(delay)
+    if swallow:
+        return default
+    assert last_exc is not None
+    raise last_exc
+
+
+def _ordered_unique_diloco_workers(*groups: Optional[List[str]]) -> List[str]:
+    ordered: List[str] = []
+    seen = set()
+    for group in groups:
+        for worker_id in group or []:
+            wid = str(worker_id).upper()
+            if wid not in {"A", "B", "C"} or wid in seen:
+                continue
+            ordered.append(wid)
+            seen.add(wid)
+    return ordered
 
 
 
@@ -2728,7 +2783,7 @@ def diloco_read_round_state(hf_token: str, repo_id: str) -> Dict[str, Any]:
     """
     from huggingface_hub import hf_hub_download
 
-    try:
+    def _download() -> Dict[str, Any]:
         path = hf_hub_download(
             repo_id=repo_id,
             filename="diloco_state/round_state.json",
@@ -2736,6 +2791,11 @@ def diloco_read_round_state(hf_token: str, repo_id: str) -> Dict[str, Any]:
         )
         with open(path, encoding="utf-8") as f:
             state = json.load(f)
+        triggered_workers = _ordered_unique_diloco_workers(state.get("triggered_workers"))
+        attendance_workers = [
+            w for w in _ordered_unique_diloco_workers(state.get("attendance_workers"))
+            if w not in set(triggered_workers)
+        ]
         return {
             "stage_k": int(state.get("stage_k", 0)),
             "round_n": int(state.get("round_n", 0)),
@@ -2744,16 +2804,40 @@ def diloco_read_round_state(hf_token: str, repo_id: str) -> Dict[str, Any]:
                 str(k): int(v) for k, v in dict(state.get("total_samples_seen", {})).items()
             },
             "completed_stages": [int(x) for x in state.get("completed_stages", [])],
-            **{k: v for k, v in state.items() if k not in {"stage_k", "round_n", "anchor_path", "total_samples_seen", "completed_stages"}},
+            "triggered_workers": triggered_workers,
+            "attendance_workers": attendance_workers,
+            **{
+                k: v
+                for k, v in state.items()
+                if k not in {
+                    "stage_k",
+                    "round_n",
+                    "anchor_path",
+                    "total_samples_seen",
+                    "completed_stages",
+                    "triggered_workers",
+                    "attendance_workers",
+                }
+            },
         }
-    except Exception:
-        return {
-            "stage_k": 0,
-            "round_n": 0,
-            "anchor_path": "diloco_state/anchor",
-            "total_samples_seen": {},
-            "completed_stages": [],
-        }
+
+    state = _retry_diloco_io(
+        "Download round_state.json",
+        _download,
+        swallow=True,
+        default=None,
+    )
+    if state is not None:
+        return state
+    return {
+        "stage_k": 0,
+        "round_n": 0,
+        "anchor_path": "diloco_state/anchor",
+        "total_samples_seen": {},
+        "completed_stages": [],
+        "triggered_workers": [],
+        "attendance_workers": [],
+    }
 
 
 def diloco_upload_worker_state(
@@ -2780,12 +2864,15 @@ def diloco_upload_worker_state(
     for fname in ["adapter_model.safetensors", "adapter_config.json"]:
         fpath = adapter_dir / fname
         if fpath.exists():
-            api.upload_file(
-                path_or_fileobj=str(fpath),
-                path_in_repo=f"{remote_prefix}/{fname}",
-                repo_id=repo_id,
-                token=hf_token,
-                commit_message=f"Worker {worker_id} round {round_n} stage {stage_k}",
+            _retry_diloco_io(
+                f"Upload worker artifact {worker_id}/{fname}",
+                lambda fpath=fpath, fname=fname: api.upload_file(
+                    path_or_fileobj=str(fpath),
+                    path_in_repo=f"{remote_prefix}/{fname}",
+                    repo_id=repo_id,
+                    token=hf_token,
+                    commit_message=f"Worker {worker_id} round {round_n} stage {stage_k}",
+                ),
             )
 
     status = {
@@ -2801,12 +2888,15 @@ def diloco_upload_worker_state(
         json.dump(status, tf, indent=2)
         tmp_path = tf.name
     try:
-        api.upload_file(
-            path_or_fileobj=tmp_path,
-            path_in_repo=f"diloco_state/workers/{worker_id}/status.json",
-            repo_id=repo_id,
-            token=hf_token,
-            commit_message=f"Worker {worker_id} status update",
+        _retry_diloco_io(
+            f"Upload worker status {worker_id}",
+            lambda: api.upload_file(
+                path_or_fileobj=tmp_path,
+                path_in_repo=f"diloco_state/workers/{worker_id}/status.json",
+                repo_id=repo_id,
+                token=hf_token,
+                commit_message=f"Worker {worker_id} status update",
+            ),
         )
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -2828,13 +2918,16 @@ def diloco_download_anchor(
     from safetensors.torch import load_file
 
     try:
-        dl_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=f"{anchor_path}/adapter_model.safetensors",
-            token=hf_token,
-        )
-        weights = load_file(dl_path, device=str(device))
-        set_peft_model_state_dict(model, weights)
+        def _download() -> None:
+            dl_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=f"{anchor_path}/adapter_model.safetensors",
+                token=hf_token,
+            )
+            weights = load_file(dl_path, device=str(device))
+            set_peft_model_state_dict(model, weights)
+
+        _retry_diloco_io(f"Download anchor {anchor_path}", _download)
         if _is_main_process():
             print(f"  [diloco] Loaded anchor weights from {anchor_path}")
     except Exception as exc:
@@ -2875,21 +2968,34 @@ def diloco_push_signal(
         "Accept": "application/vnd.github+json",
     }
 
-    resp = requests.get(url, headers=headers, timeout=30)
+    existing = _retry_diloco_io(
+        f"Lookup existing signal {signal_path}",
+        lambda: requests.get(url, headers=headers, timeout=30),
+        swallow=True,
+        default=None,
+    )
     payload = {
         "message": f"Worker {worker_id} done: stage {stage_k} round {round_n}",
         "content": encoded,
     }
-    if resp.status_code == 200:
-        payload["sha"] = resp.json().get("sha")
+    if existing is not None and existing.status_code == 200:
+        payload["sha"] = existing.json().get("sha")
 
-    resp = requests.put(url, headers=headers, json=payload, timeout=30)
-    if resp.status_code in (200, 201):
+    resp = _retry_diloco_io(
+        f"Push signal {signal_path}",
+        lambda: requests.put(url, headers=headers, json=payload, timeout=30),
+        swallow=True,
+        default=None,
+    )
+    if resp is not None and resp.status_code in (200, 201):
         if _is_main_process():
             print(f"  [diloco] Signal pushed to GitHub: {signal_path}")
     else:
         if _is_main_process():
-            print(f"  [diloco] WARNING: GitHub signal push failed: {resp.status_code} {resp.text[:200]}")
+            if resp is None:
+                print(f"  [diloco] WARNING: GitHub signal push failed: no response for {signal_path}")
+            else:
+                print(f"  [diloco] WARNING: GitHub signal push failed: {resp.status_code} {resp.text[:200]}")
 
 
 def _optimizer_step_sample_count(step_idx: int, batch_size: int, grad_accum: int, dataset_size: int) -> int:
@@ -3344,8 +3450,40 @@ def run_diloco_worker(
             print(f"  [diloco] stage={stage_k} exceeds max configured stage={curriculum_max_stage}. Nothing to do.")
         return {"stage_k": stage_k, "round_n": round_n, "samples_seen": 0}
 
-    attendance_workers = round_state.get("attendance_workers", [])
-    is_attendance_only = args.diloco_worker_id in attendance_workers
+    triggered_workers_raw = round_state.get("triggered_workers")
+    triggered_workers = (
+        _ordered_unique_diloco_workers(triggered_workers_raw)
+        if triggered_workers_raw is not None
+        else None
+    )
+    attendance_workers = _ordered_unique_diloco_workers(round_state.get("attendance_workers"))
+    if triggered_workers:
+        attendance_workers = [w for w in attendance_workers if w not in set(triggered_workers)]
+
+    is_selected_for_training = (
+        triggered_workers is None or args.diloco_worker_id in triggered_workers
+    )
+    is_attendance_only = (
+        args.diloco_worker_id in attendance_workers and not is_selected_for_training
+    )
+
+    if triggered_workers is not None and not is_selected_for_training and not is_attendance_only:
+        if _is_main_process():
+            print(
+                f"  [diloco] Worker {args.diloco_worker_id} not scheduled for "
+                f"stage={stage_k} round={round_n}; exiting without training."
+            )
+        barrier()
+        return {
+            "stage_k": stage_k,
+            "round_n": round_n,
+            "samples_seen": 0,
+            "global_step": 0,
+            "timeout_triggered": False,
+            "val_budget_triggered": False,
+            "stages": [stage_k],
+            "skipped_not_scheduled": True,
+        }
 
     if is_attendance_only:
         if _is_main_process():

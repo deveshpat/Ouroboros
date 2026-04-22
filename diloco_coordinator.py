@@ -26,10 +26,12 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import requests
 
+
+T = TypeVar("T")
 
 ROUND_STATE_PATH = "diloco_state/round_state.json"
 ANCHOR_PREFIX = "diloco_state/anchor"
@@ -45,6 +47,45 @@ WORKER_KAGGLE_SLUGS: Dict[str, Tuple[str, str]] = {
 
 
 DEFAULT_KAGGLE_NOTEBOOK_PATH = Path(__file__).resolve().with_name("kaggle-utils.ipynb")
+DEFAULT_IO_RETRIES = 3
+DEFAULT_IO_RETRY_BASE_DELAY_S = 1.5
+
+
+def _retry_io(
+    label: str,
+    fn: Callable[[], T],
+    *,
+    attempts: int = DEFAULT_IO_RETRIES,
+    base_delay_s: float = DEFAULT_IO_RETRY_BASE_DELAY_S,
+    swallow: bool = False,
+    default: Optional[T] = None,
+) -> Optional[T]:
+    """Retry transient coordinator I/O with exponential backoff."""
+    last_exc: Optional[Exception] = None
+    attempts = max(int(attempts), 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - coordinator must keep going on transient I/O errors
+            last_exc = exc
+            if attempt >= attempts:
+                if swallow:
+                    print(
+                        f"[coordinator] {label} failed after {attempts} attempts: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    return default
+                raise
+            delay = base_delay_s * (2 ** (attempt - 1))
+            print(
+                f"[coordinator] {label} failed (attempt {attempt}/{attempts}): "
+                f"{type(exc).__name__}: {exc}. Retrying in {delay:.1f}s..."
+            )
+            time.sleep(delay)
+    if swallow:
+        return default
+    assert last_exc is not None
+    raise last_exc
 
 
 def _compute_projected_shards(
@@ -233,12 +274,17 @@ def parse_args() -> argparse.Namespace:
 def hub_download_json(repo_id: str, path: str, token: str) -> Optional[Dict]:
     from huggingface_hub import hf_hub_download
 
-    try:
+    def _download() -> Dict:
         local = hf_hub_download(repo_id=repo_id, filename=path, token=token)
         with open(local, encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
-        return None
+
+    return _retry_io(
+        f"Download JSON {path}",
+        _download,
+        swallow=True,
+        default=None,
+    )
 
 
 
@@ -250,12 +296,15 @@ def hub_upload_json(repo_id: str, path: str, data: Dict, token: str, message: st
         json.dump(data, tf, indent=2)
         tmp = tf.name
     try:
-        api.upload_file(
-            path_or_fileobj=tmp,
-            path_in_repo=path,
-            repo_id=repo_id,
-            token=token,
-            commit_message=message,
+        _retry_io(
+            f"Upload JSON {path}",
+            lambda: api.upload_file(
+                path_or_fileobj=tmp,
+                path_in_repo=path,
+                repo_id=repo_id,
+                token=token,
+                commit_message=message,
+            ),
         )
     finally:
         Path(tmp).unlink(missing_ok=True)
@@ -265,8 +314,13 @@ def hub_upload_json(repo_id: str, path: str, data: Dict, token: str, message: st
 def hub_download_text(repo_id: str, path: str, token: str) -> str:
     from huggingface_hub import hf_hub_download
 
-    local = hf_hub_download(repo_id=repo_id, filename=path, token=token)
-    return Path(local).read_text(encoding="utf-8")
+    def _download() -> str:
+        local = hf_hub_download(repo_id=repo_id, filename=path, token=token)
+        return Path(local).read_text(encoding="utf-8")
+
+    result = _retry_io(f"Download text {path}", _download)
+    assert result is not None
+    return result
 
 
 
@@ -275,12 +329,17 @@ def load_adapter_weights_cpu(repo_id: str, weights_path: str, token: str) -> Dic
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
 
-    local = hf_hub_download(
-        repo_id=repo_id,
-        filename=f"{weights_path}/adapter_model.safetensors",
-        token=token,
-    )
-    return load_file(local, device="cpu")
+    def _download() -> Dict:
+        local = hf_hub_download(
+            repo_id=repo_id,
+            filename=f"{weights_path}/adapter_model.safetensors",
+            token=token,
+        )
+        return load_file(local, device="cpu")
+
+    result = _retry_io(f"Download adapter weights {weights_path}", _download)
+    assert result is not None
+    return result
 
 
 
@@ -337,12 +396,15 @@ def save_and_upload_anchor(
         config_path.write_text(json.dumps(anchor_adapter_config, indent=2), encoding="utf-8")
 
         for fname in ["adapter_model.safetensors", "adapter_config.json"]:
-            api.upload_file(
-                path_or_fileobj=str(tmp_path / fname),
-                path_in_repo=f"{ANCHOR_PREFIX}/{fname}",
-                repo_id=repo_id,
-                token=token,
-                commit_message=message,
+            _retry_io(
+                f"Upload anchor artifact {fname}",
+                lambda fname=fname: api.upload_file(
+                    path_or_fileobj=str(tmp_path / fname),
+                    path_in_repo=f"{ANCHOR_PREFIX}/{fname}",
+                    repo_id=repo_id,
+                    token=token,
+                    commit_message=message,
+                ),
             )
     print(f"[coordinator] New anchor uploaded: {message}")
 
@@ -467,10 +529,16 @@ def trigger_kaggle_workers(
     *,
     active_workers: List[str],
     notebook_path: Path,
-) -> None:
+) -> Dict[str, str]:
     """
     Trigger only the specified active_workers using their Kaggle credentials.
+
+    Returns:
+        Mapping of worker_id -> "success" | "failed" | "manual".
+        "manual" means no credentials were present, so the worker remains an
+        outstanding manual dispatch rather than a confirmed auto-trigger.
     """
+    results: Dict[str, str] = {}
     for worker_id in active_workers:
         username, key = kaggle_creds.get(worker_id, (None, None))
         _, slug = WORKER_KAGGLE_SLUGS[worker_id]
@@ -480,15 +548,95 @@ def trigger_kaggle_workers(
                 f"[coordinator] No credentials for Worker {worker_id} ({slug}) - "
                 "skipping automatic trigger. Start this worker manually."
             )
+            results[worker_id] = "manual"
             continue
 
-        _trigger_single_worker(
-            worker_id,
-            username,
-            key,
-            slug,
-            notebook_path=notebook_path,
+        results[worker_id] = (
+            "success"
+            if _trigger_single_worker(
+                worker_id,
+                username,
+                key,
+                slug,
+                notebook_path=notebook_path,
+            )
+            else "failed"
         )
+    return results
+
+
+
+def _mode_from_active_workers(active_workers: List[str], fallback: str = "complete") -> str:
+    if not active_workers:
+        return fallback
+    return "solo" if len(active_workers) == 1 else "diloco"
+
+
+
+def _reconcile_post_dispatch_state(
+    *,
+    state: Dict[str, Any],
+    planned_active_workers: List[str],
+    planned_attendance_workers: List[str],
+    dispatch_results: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Correct round_state after trigger failures.
+
+    The coordinator must write round_state before dispatch so workers see the new
+    round/stage. If one or more Kaggle pushes fail, the just-written state can
+    incorrectly wait on workers that were never actually launched. This helper
+    demotes failed active workers to attendance, preserves successfully/manual
+    dispatched workers, and clears triggered_at when nothing was really sent.
+    """
+    failed_workers = [w for w, status in dispatch_results.items() if status == "failed"]
+    if not failed_workers:
+        return None
+
+    dispatched_active = [
+        w for w in planned_active_workers if dispatch_results.get(w) in {"success", "manual"}
+    ]
+    dispatched_attendance = [
+        w for w in planned_attendance_workers if dispatch_results.get(w) in {"success", "manual"}
+    ]
+    failed_active = [w for w in planned_active_workers if dispatch_results.get(w) == "failed"]
+    failed_attendance = [w for w in planned_attendance_workers if dispatch_results.get(w) == "failed"]
+
+    corrected_triggered_workers = _ordered_unique_worker_ids(dispatched_active)
+    corrected_attendance_workers = _ordered_unique_worker_ids(
+        dispatched_attendance,
+        failed_active,
+        failed_attendance,
+    )
+
+    corrected_mode = state.get("mode", "complete")
+    if corrected_triggered_workers:
+        corrected_mode = _mode_from_active_workers(corrected_triggered_workers, fallback=corrected_mode)
+    elif corrected_attendance_workers:
+        corrected_mode = "waiting"
+
+    outstanding_dispatches = _ordered_unique_worker_ids(
+        corrected_triggered_workers,
+        corrected_attendance_workers,
+    )
+    successful_or_manual = [
+        w for w in outstanding_dispatches if dispatch_results.get(w) in {"success", "manual"}
+    ]
+
+    corrected_state = {
+        **state,
+        "mode": corrected_mode,
+        "triggered_workers": corrected_triggered_workers,
+        "attendance_workers": corrected_attendance_workers,
+        "triggered_at": time.time() if successful_or_manual else 0.0,
+        "last_updated": time.time(),
+        "dispatch_failures": failed_workers,
+    }
+    print(
+        "[coordinator] Reconciled failed dispatches. "
+        f"triggered={corrected_triggered_workers} attendance={corrected_attendance_workers}"
+    )
+    return corrected_state
 
 
 def collect_ready_workers(
@@ -540,12 +688,16 @@ def main() -> None:
     round_n = int(state.get("round_n", 0))
     total_samples_seen = {str(k): int(v) for k, v in dict(state.get("total_samples_seen", {})).items()}
     completed_stages = [int(x) for x in state.get("completed_stages", [])]
-    # Workers that were triggered last round — only check these for ready status
-    expected_workers = state.get("triggered_workers", None)
+    # Workers that were triggered last round — only check these for ready status.
+    # Sanitize/normalize to defend against duplicated, lowercase, or overlapping IDs.
+    expected_workers = _ordered_unique_worker_ids(state.get("triggered_workers"))
     seed = int(state.get("seed", 42))
     current_mode = state.get("mode", "diloco")
     triggered_at = float(state.get("triggered_at", 0.0))
-    attendance_workers_prev = list(state.get("attendance_workers", []))
+    attendance_workers_prev = [
+        w for w in _ordered_unique_worker_ids(state.get("attendance_workers"))
+        if w not in set(expected_workers)
+    ]
     worker_timeout_s = args.worker_timeout_hours * 3600.0
     is_round_timed_out = triggered_at > 0 and (time.time() - triggered_at) > worker_timeout_s
 
@@ -558,7 +710,9 @@ def main() -> None:
 
     force_ids: Optional[List[str]] = None
     if args.force_worker_ids:
-        force_ids = [w.strip().upper() for w in args.force_worker_ids.split(",") if w.strip()]
+        force_ids = _ordered_unique_worker_ids(
+            [w.strip().upper() for w in args.force_worker_ids.split(",") if w.strip()]
+        ) or None
 
     print(f"[coordinator] stage={stage_k} round={round_n} mode={current_mode}")
     if attendance_workers_prev:
@@ -608,11 +762,49 @@ def main() -> None:
         still_absent = [w for w in attendance_workers_prev if w not in responded_ids]
 
         if not responded_ids:
+            if triggered_at <= 0:
+                print(
+                    "[coordinator] Waiting mode: no confirmed dispatch timestamp yet; "
+                    "attempting attendance dispatch now."
+                )
+                new_state = {**state, "triggered_at": time.time(), "last_updated": time.time()}
+                hub_upload_json(
+                    args.repo_id,
+                    ROUND_STATE_PATH,
+                    new_state,
+                    args.hf_token,
+                    message=f"Waiting mode: initial attendance dispatch round={round_n}",
+                )
+                if not args.skip_trigger and not args.dry_run:
+                    dispatch_results = trigger_kaggle_workers(
+                        kaggle_creds,
+                        active_workers=attendance_workers_prev,
+                        notebook_path=Path(args.kaggle_notebook_path),
+                    )
+                    corrected_state = _reconcile_post_dispatch_state(
+                        state=new_state,
+                        planned_active_workers=[],
+                        planned_attendance_workers=attendance_workers_prev,
+                        dispatch_results=dispatch_results,
+                    )
+                    if corrected_state is not None:
+                        hub_upload_json(
+                            args.repo_id,
+                            ROUND_STATE_PATH,
+                            corrected_state,
+                            args.hf_token,
+                            message=(
+                                f"Waiting mode dispatch reconcile: stage={stage_k} round={round_n} "
+                                f"attendance={corrected_state['attendance_workers']}"
+                            ),
+                        )
+                print("[coordinator] Done (waiting mode initial dispatch).")
+                return
             if not is_round_timed_out:
                 print("[coordinator] Waiting mode: no responses yet, standing by.")
                 return
             print(f"[coordinator] Waiting mode: re-dispatching attendance to {attendance_workers_prev}")
-            new_state = {**state, "triggered_at": time.time()}
+            new_state = {**state, "triggered_at": time.time(), "last_updated": time.time()}
             hub_upload_json(
                 args.repo_id,
                 ROUND_STATE_PATH,
@@ -621,11 +813,28 @@ def main() -> None:
                 message=f"Waiting mode: re-dispatch attendance round={round_n}",
             )
             if not args.skip_trigger and not args.dry_run:
-                trigger_kaggle_workers(
+                dispatch_results = trigger_kaggle_workers(
                     kaggle_creds,
                     active_workers=attendance_workers_prev,
                     notebook_path=Path(args.kaggle_notebook_path),
                 )
+                corrected_state = _reconcile_post_dispatch_state(
+                    state=new_state,
+                    planned_active_workers=[],
+                    planned_attendance_workers=attendance_workers_prev,
+                    dispatch_results=dispatch_results,
+                )
+                if corrected_state is not None:
+                    hub_upload_json(
+                        args.repo_id,
+                        ROUND_STATE_PATH,
+                        corrected_state,
+                        args.hf_token,
+                        message=(
+                            f"Waiting mode re-dispatch reconcile: round={round_n} "
+                            f"attendance={corrected_state['attendance_workers']}"
+                        ),
+                    )
             print("[coordinator] Done (waiting mode re-dispatch).")
             return
 
@@ -934,11 +1143,28 @@ def main() -> None:
             print("[coordinator] No workers to trigger (stage complete or waiting with no dispatch needed).")
         else:
             print(f"[coordinator] Triggering training: {next_active_workers}  attendance: {next_attendance_workers}")
-            trigger_kaggle_workers(
+            dispatch_results = trigger_kaggle_workers(
                 kaggle_creds,
                 active_workers=all_workers_to_trigger,
                 notebook_path=Path(args.kaggle_notebook_path),
             )
+            corrected_state = _reconcile_post_dispatch_state(
+                state=new_state,
+                planned_active_workers=next_active_workers,
+                planned_attendance_workers=next_attendance_workers,
+                dispatch_results=dispatch_results,
+            )
+            if corrected_state is not None:
+                hub_upload_json(
+                    args.repo_id,
+                    ROUND_STATE_PATH,
+                    corrected_state,
+                    args.hf_token,
+                    message=(
+                        f"Dispatch reconcile: stage={next_stage_k} round={next_round_n} "
+                        f"mode={corrected_state['mode']}"
+                    ),
+                )
 
         if coordinator_wandb_run is not None:
             import wandb
