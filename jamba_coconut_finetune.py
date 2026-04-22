@@ -160,46 +160,132 @@ def _ordered_unique_diloco_workers(*groups: Optional[List[str]]) -> List[str]:
 
 
 
+_VALID_DILOCO_WORKER_IDS: Tuple[str, ...] = ("A", "B", "C")
+
+
+def _normalize_optional_text(value: Optional[Any], *, uppercase: bool = False) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text.upper() if uppercase else text
+
+
+def _maybe_get_kaggle_secret(label: str) -> Optional[str]:
+    try:
+        mod = importlib.import_module("kaggle_secrets")
+        client_cls = getattr(mod, "UserSecretsClient", None)
+        if client_cls is None:
+            return None
+        value = client_cls().get_secret(label)
+    except Exception:
+        return None
+    return _normalize_optional_text(value)
+
+
+def _maybe_get_colab_secret(label: str) -> Optional[str]:
+    try:
+        colab_mod = importlib.import_module("google.colab")
+        userdata = getattr(colab_mod, "userdata", None)
+        if userdata is None:
+            return None
+        value = userdata.get(label)
+    except Exception:
+        return None
+    return _normalize_optional_text(value)
+
+
+def _parse_diloco_worker_id_cli(value: str) -> str:
+    worker_id = _normalize_optional_text(value, uppercase=True)
+    if worker_id is None:
+        raise argparse.ArgumentTypeError("DiLoCo worker id cannot be empty")
+    return worker_id
+
+
 def _resolve_hf_token_common(cli_value: Optional[str] = None) -> Optional[str]:
     """
     Resolve HF token without importing heavy third-party ML libraries.
 
     Resolution order:
       1. Explicit CLI override
-      2. Kaggle secret HF_TOKEN
-      3. Colab userdata HF_TOKEN
-      4. HF_TOKEN / HUGGINGFACE_HUB_TOKEN env vars
+      2. HF_TOKEN / HUGGINGFACE_HUB_TOKEN env vars
+      3. Kaggle secret HF_TOKEN
+      4. Colab userdata HF_TOKEN
     """
-    if cli_value:
-        return cli_value
+    token = _normalize_optional_text(cli_value)
+    if token:
+        return token
 
-    def _maybe_get_kaggle_secret() -> Optional[str]:
-        try:
-            mod = importlib.import_module("kaggle_secrets")
-            client_cls = getattr(mod, "UserSecretsClient", None)
-            if client_cls is None:
-                return None
-            tok = client_cls().get_secret("HF_TOKEN")
-            return tok or None
-        except Exception:
-            return None
+    for env_name in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+        token = _normalize_optional_text(os.environ.get(env_name))
+        if token:
+            return token
 
-    def _maybe_get_colab_secret() -> Optional[str]:
-        try:
-            colab_mod = importlib.import_module("google.colab")
-            userdata = getattr(colab_mod, "userdata", None)
-            if userdata is None:
-                return None
-            tok = userdata.get("HF_TOKEN")
-            return tok or None
-        except Exception:
-            return None
+    for token in (
+        _maybe_get_kaggle_secret("HF_TOKEN"),
+        _maybe_get_colab_secret("HF_TOKEN"),
+    ):
+        token = _normalize_optional_text(token)
+        if token:
+            return token
+    return None
 
-    for resolver in (_maybe_get_kaggle_secret, _maybe_get_colab_secret):
-        tok = resolver()
-        if tok:
-            return tok
-    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+def _resolve_diloco_worker_id_common(cli_value: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the DiLoCo worker id from CLI, environment, or notebook secrets.
+
+    Resolution order:
+      1. Explicit CLI override
+      2. DILOCO_WORKER_ID / OUROBOROS_DILOCO_WORKER_ID / WORKER_ID env vars
+      3. Kaggle secret DILOCO_WORKER_ID
+      4. Colab userdata DILOCO_WORKER_ID
+    """
+    for candidate in (
+        cli_value,
+        os.environ.get("DILOCO_WORKER_ID"),
+        os.environ.get("OUROBOROS_DILOCO_WORKER_ID"),
+        os.environ.get("WORKER_ID"),
+        _maybe_get_kaggle_secret("DILOCO_WORKER_ID"),
+        _maybe_get_colab_secret("DILOCO_WORKER_ID"),
+    ):
+        worker_id = _normalize_optional_text(candidate, uppercase=True)
+        if worker_id:
+            return worker_id
+    return None
+
+
+def _require_valid_diloco_worker_id(value: Optional[str]) -> str:
+    worker_id = _resolve_diloco_worker_id_common(value)
+    if worker_id is None:
+        raise ValueError(
+            "DiLoCo mode requires a worker id. Provide --diloco_worker_id, set "
+            "DILOCO_WORKER_ID / OUROBOROS_DILOCO_WORKER_ID, or define a "
+            "Kaggle/Colab secret named DILOCO_WORKER_ID."
+        )
+    if worker_id not in _VALID_DILOCO_WORKER_IDS:
+        raise ValueError(
+            f"Invalid DiLoCo worker id {worker_id!r}. "
+            f"Expected one of {_VALID_DILOCO_WORKER_IDS}."
+        )
+    return worker_id
+
+
+def _wandb_credentials_available() -> bool:
+    for env_name in ("WANDB_API_KEY", "WANDB_KEY"):
+        if _normalize_optional_text(os.environ.get(env_name)):
+            return True
+
+    try:
+        import netrc as _netrc
+
+        auth = _netrc.netrc().authenticators("api.wandb.ai")
+        if auth is not None and any(auth):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _bootstrap_resolve_token() -> Optional[str]:
@@ -1189,8 +1275,16 @@ def parse_args() -> argparse.Namespace:
     # DiLoCo
     parser.add_argument("--diloco_mode", action="store_true",
         help="Enable DiLoCo parallel training mode.")
-    parser.add_argument("--diloco_worker_id", default=None, choices=["A", "B", "C"],
-        help="This worker's identity. Required when --diloco_mode is set.")
+    parser.add_argument(
+        "--diloco_worker_id",
+        type=_parse_diloco_worker_id_cli,
+        default=None,
+        choices=list(_VALID_DILOCO_WORKER_IDS),
+        help=(
+            "This worker's identity. If omitted in --diloco_mode, falls back to "
+            "DILOCO_WORKER_ID env / notebook secret."
+        ),
+    )
     parser.add_argument("--diloco_outer_lr", type=float, default=0.7,
         help="Outer SGD learning rate for DiLoCo aggregation. Default: 0.7 (DiLoCo paper).")
     parser.add_argument("--diloco_min_workers", type=int, default=2,
@@ -3839,6 +3933,17 @@ def run_diloco_worker(
 
 def main() -> None:
     args = parse_args()
+    if args.diloco_mode:
+        args.diloco_worker_id = _require_valid_diloco_worker_id(args.diloco_worker_id)
+
+    hf_token = _resolve_hf_token(getattr(args, "hf_token", None))
+    args._resolved_hf_token = hf_token
+    if args.diloco_mode and not hf_token:
+        raise ValueError(
+            "HF token required for DiLoCo mode. Provide --hf_token, set HF_TOKEN / "
+            "HUGGINGFACE_HUB_TOKEN, or define a Kaggle/Colab secret named HF_TOKEN."
+        )
+
     set_seed(args.seed)
 
     rank = _rank()
@@ -3884,8 +3989,13 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     session_start = _SCRIPT_START
 
-    hf_token = _resolve_hf_token(getattr(args, "hf_token", None))
-    args._resolved_hf_token = hf_token
+    if args.wandb_mode == "online" and not _wandb_credentials_available():
+        if is_main:
+            print(
+                "[warn] --wandb_mode=online requested but no W&B credentials were "
+                "found; falling back to disabled."
+            )
+        args.wandb_mode = "disabled"
 
     # ── DiLoCo GPU architecture guard ────────────────────────────────────────
     # Safety net: even with --accelerator NvidiaTeslaT4 in the push command,
