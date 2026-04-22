@@ -48,10 +48,10 @@ jobs:
           python -m pip install --upgrade pip
           # CPU-only torch: ~200MB vs ~2.5GB for CUDA build — coordinator never uses GPU
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          # Pin kaggle==1.6.17: last version using REST/Swagger API.
-          # kaggle>=1.7.3 removed Swagger; >=1.8.3 migrated to gRPC (kagglesdk).
-          # kaggle 2.0+ hits KernelsApiService/GetKernel which returns 403 for our use case.
-          pip install numpy "kaggle==1.6.17" huggingface_hub safetensors requests wandb
+          # kaggle>=1.8.4 required: --accelerator flag for kernels push added in v1.8.4 (#907).
+          # The prior 403 (Session 15) was on KernelsApiService/GetKernel (pull endpoint).
+          # We use push-only; push endpoint is not blocked. kaggle>=1.8.3 gRPC is fine here.
+          pip install numpy "kaggle>=1.8.4" huggingface_hub safetensors requests wandb
 
       - name: Run coordinator
         env:
