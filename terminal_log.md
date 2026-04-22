@@ -3,9 +3,55 @@
 
 ---
 
+## Session 21 — Full Root Cause: kaggle==1.6.17 Predates `--accelerator` Feature (2026-04-22) ⚠️ PATCH PENDING
+
+**Context:** Session 20's `"accelerator": "nvidiaTeslaT4"` patch confirmed non-functional.
+Version #70 (Worker B) still assigned P100. Full investigation conducted; correct fix designed.
+
+**Evidence:** `github.com/Kaggle/kaggle-cli/blob/main/CHANGELOG.md` confirms:
+> v1.8.4: "Add `--acc` to set accelerator for: `kaggle kernels push` ... (#907)"
+
+**Evidence:** `github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md` confirms:
+> `--accelerator <ACCELERATOR_ID>`: "NvidiaTeslaP100" (aka default GPU), "NvidiaTeslaT4", "TpuV6E8"
+
+### Root Cause (complete)
+
+**Root cause 1 — Feature didn't exist in our pinned version:**
+`kaggle==1.6.17` predates `--accelerator` by at least two major versions. The `KernelPushRequest`
+object in v1.6.17's REST/Swagger API has no GPU-type field. `"accelerator": "nvidiaTeslaT4"` in
+`kernel-metadata.json` is silently discarded. Kaggle assigns "NvidiaTeslaP100" (documented default).
+
+**Root cause 2 — Wrong capitalisation (secondary):**
+Even if the JSON field were read, `"nvidiaTeslaT4"` (lowercase n) does not match the official
+valid value `"NvidiaTeslaT4"` (capital N) as documented.
+
+**Why upgrading is now safe:**
+The Session 15 403 error was on `KernelsApiService/GetKernel` — the **pull** endpoint. The old
+flow tried to GET another account's kernel. We already fixed this by switching to push-only.
+`kernels push` uses a different gRPC method in `kaggle>=1.8.3` that is not blocked.
+
+### Complete Fix (three files)
+
+**`.github/workflows/diloco_coordinator.yml`:**
+- `"kaggle==1.6.17"` → `"kaggle>=1.8.4"`
+- Update comment (no longer pinning to 1.6.17 for REST API reasons)
+
+**`diloco_coordinator.py`:**
+- `_build_kaggle_kernel_metadata()`: `"nvidiaTeslaT4"` → `"NvidiaTeslaT4"` (correct capitalisation)
+- `_trigger_single_worker()`: `push_args` → add `"--accelerator", "NvidiaTeslaT4"`
+
+**`jamba_coconut_finetune.py`** (safety net for P100 silent fallback):
+- Add `"sm60"` to `_KNOWN_ARCH_SUFFIXES`
+- Add `_diloco_reset_triggered_at()` helper
+- Add GPU guard in `main()`: if `diloco_mode` and `cc < (7,5)` → reset `triggered_at=0` + push signal + exit
+
+---
+
 ## Session 20 — P100 GPU Assignment & W&B Round Tracking (2026-04-22) ⚠️ PATCH PENDING
 
-**Context:** Session 19's `triggered_at=0` fix is confirmed working (see coordinator log below). Stage 3 round 1 was re-dispatched. However, Worker B's kernel ran on **GPU P100** (not T4) and was manually cancelled after 28 minutes. Worker A's status unknown. Two new issues diagnosed and fixed.
+**Context:** Session 19's `triggered_at=0` fix confirmed working. Stage 3 round 1
+re-dispatched. Worker B's kernel ran on **GPU P100** (Version #70) and was manually
+cancelled after 28 minutes. Worker A status unknown.
 
 ---
 
@@ -36,23 +82,21 @@ Kernel push error: Maximum weekly GPU quota of 30.00 hours reached.)
 
 ### Issue 1 — P100 GPU: Root Cause
 
-`_build_kaggle_kernel_metadata()` generates only `"enable_gpu": true` with no GPU type. Kaggle assigned P100 to Worker B (version 69), which was cancelled after 28 minutes. Worker A (version 14) GPU type unknown.
+`_build_kaggle_kernel_metadata()` generates only `"enable_gpu": true` with `"accelerator": "nvidiaTeslaT4"`.
+Kaggle assigned P100 to Worker B (version 69, then 70). **Root cause: `kaggle==1.6.17` REST API
+`KernelPushRequest` has no GPU-type field. `"accelerator"` key silently dropped.**
 
-**Root cause:** `kernel-metadata.json` is authoritative over the notebook's own `metadata.kaggle.accelerator: "nvidiaTeslaT4"`. Our generated JSON has no accelerator type → Kaggle picks freely.
-
-**Fix:** Add `"accelerator": "nvidiaTeslaT4"` to `_build_kaggle_kernel_metadata()`. This is a metadata JSON field; distinct from the old `--accelerator` CLI flag.
-
-W&B coordinator run version: 0.26.0 (GitHub Actions).
+**Fix:** Runtime fast-fail in `main()` (see Session 21 above).
 
 ---
 
 ### Issue 2 — W&B Missing Rounds: Root Cause
 
-Workers use `wandb==0.25.0` (Kaggle pre-installed). In this version, `resume="allow"` on a **cleanly finished** run does not reopen the existing run; it creates a new run with an auto-generated ID (discarding the specified `id=`). So rounds 1..N of each stage logged to invisible ephemeral runs.
+Workers use `wandb==0.25.0`. `resume="allow"` on a cleanly finished run does not reopen
+it — creates a new run with auto-generated ID (discarding specified `id=`). Rounds 1..N
+logged to invisible ephemeral runs.
 
-Evidence: Stage 2 (6 rounds) shows exactly 1 "Worker A | Stage 2" and 1 "Worker B | Stage 2" entry in W&B. Only round 0 data is visible.
-
-Contrast: coordinator uses wandb 0.26.0 where `resume="allow"` on finished runs works correctly (`wandb: Resuming run Coordinator | Stage 3` confirmed in log).
+Evidence: Stage 2 (6 rounds) shows exactly 1 "Worker A | Stage 2" entry in W&B.
 
 **Fix:** Per-round unique run IDs + `group=` parameter:
 - `id = diloco-{worker}-s{stage}-r{round}` (unique per round, no resume needed)
@@ -63,10 +107,6 @@ Contrast: coordinator uses wandb 0.26.0 where `resume="allow"` on finished runs 
 ---
 
 ## Session 19 — Stage 3 Round 1 Deadlock: Root Cause & Fix (2026-04-22) ✅ VERIFIED
-
-**Context:** Stage 3 Round 0 completed successfully (A: 12302 samples, B: 12302 samples = 24604 total, 66.7% of stage). Round 1 deadlocked — workers A and B marked triggered but never started.
-
-### Failing Coordinator Run — verbatim (Stage 3, Round 1 check)
 
 ```
 [coordinator] stage=3 round=1 mode=diloco
@@ -89,11 +129,8 @@ coordinator/workers_aggregated:   2
 coordinator/pct_stage_done:       66.7
 ```
 
-**Root cause:** Pre-patch coordinator wrote `triggered_at=<April 21 22:30>` but Kaggle push for round 1 silently failed. Post-patch coordinator saw `is_round_timed_out=False` (only ~8h elapsed) and returned "Waiting" on every run. The `triggered_at <= 0` recovery branch existed only in waiting-mode path, not in normal-mode path.
-
-**Fix applied:** Added `triggered_at <= 0` branch to normal-mode missing-worker check → immediate re-dispatch. Manual state fix: set `triggered_at=0` in `round_state.json`.
-
-**Verification (Session 20):** ✅ Coordinator log confirms `Round 1: ['A', 'B'] marked triggered but triggered_at=0 (unconfirmed dispatch). Re-dispatching now.`
+**Fix applied:** Added `triggered_at <= 0` branch to normal-mode missing-worker check.
+Manual state fix: set `triggered_at=0` in `round_state.json`. **Verification (Session 20): ✅**
 
 ---
 
@@ -134,7 +171,7 @@ Root cause: C in `triggered_workers` with exhausted quota; no deadline logic. Fi
 kaggle: error: unrecognized arguments: --accelerator NvidiaTeslaT4
 ```
 
-Root cause: coordinator was generating metadata that passed `--accelerator` as a CLI flag. Fixed by removing the CLI flag (GPU still enabled via `enable_gpu: true` in JSON).
+Root cause: coordinator was generating metadata that passed `--accelerator` as a CLI flag. Fixed by removing CLI flag.
 
 ---
 

@@ -18,7 +18,7 @@ Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transform
 | Stage 0 — CoT warmup | ✅ COMPLETE | ce=0.4041, acc=0.0222 |
 | Stage 1 — 1 latent pass | ✅ COMPLETE | ce=0.4912, acc=0.0444 |
 | Stage 2 — 2 latent passes | ✅ COMPLETE (6 rounds, ~36,865 samples) | — |
-| Stage 3 — 3 latent passes | ⚠️ Round 0 ✅ (24,604 samples, 66.7%); Round 1 in progress — B cancelled (P100 GPU, needs fix below); A status unknown | ce=0.6087 (pre-val), acc=0.0000 |
+| Stage 3 — 3 latent passes | ⚠️ Round 0 ✅ (24,604 samples, 66.7%); Round 1 blocked — B got P100 (Version #70), fast-fail fix pending | ce=0.6087 (pre-val), acc=0.0000 |
 | Stages 4–10 | ⬜ NOT STARTED | — |
 
 **Compute mode: DiLoCo dynamic (Worker C quota exhausted; A+B active. C in attendance.)**
@@ -27,31 +27,44 @@ Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transform
 
 ## Part 0.1 — Immediate Next Steps (strict order)
 
-### Step 1 — Push GPU + W&B fixes ⚡ BLOCKING
-Two surgical patches — use `agent_prompt_gpu_wandb_fixes.md`.
+### Step 1 — Push complete T4 pinning fix ⚡ BLOCKING
+Use `agent_prompt_t4_pin_complete.md`.
 
-**Fix A — P100 → T4 (`diloco_coordinator.py`):**
-In `_build_kaggle_kernel_metadata()`, add one line:
-```python
-"accelerator": "nvidiaTeslaT4",   # pins T4 explicitly in kernel-metadata.json
-```
-This is a `kernel-metadata.json` field — not the old `--accelerator` CLI flag.
+**Root cause confirmed (full chain):**
+- `--accelerator` CLI flag added in `kaggle-cli v1.8.4` (PR #907). We pinned `1.6.17` — feature didn't exist.
+- Prior 403 (Session 15) was on `KernelsApiService/GetKernel` (**pull** endpoint, now unused). Push endpoint is not blocked.
+- `"accelerator": "nvidiaTeslaT4"` JSON — additionally had wrong capitalisation. Correct: `"NvidiaTeslaT4"`.
 
-**Fix B — W&B per-round grouping (`jamba_coconut_finetune.py`):**
-In `run_diloco_worker()`, change the W&B init:
+**Three-file fix:**
+
+**`diloco_coordinator.yml`:** `"kaggle==1.6.17"` → `"kaggle>=1.8.4"`. Update pin comment.
+
+**`diloco_coordinator.py`:**
+- `_build_kaggle_kernel_metadata()`: fix capitalisation → `"NvidiaTeslaT4"`
+- `_trigger_single_worker()`: add `"--accelerator", "NvidiaTeslaT4"` to `push_args`
+
+**`jamba_coconut_finetune.py`** (safety net — in case Kaggle silently ignores flag):
+- Add `"sm60"` to `_KNOWN_ARCH_SUFFIXES`
+- Add `_diloco_reset_triggered_at()` helper
+- Add GPU guard in `main()`: if `cc < (7,5)` → reset `triggered_at=0` + push signal + exit
+
+### Step 2 — Push W&B per-round grouping fix (unblocked, can be done in parallel)
+Use `agent_prompt_gpu_wandb_fixes.md` (the W&B section only — the GPU section is superseded).
+
+In `run_diloco_worker()`:
 ```python
-# id:   diloco-a-s3-r1  (was: diloco-a-s3)
-# group: diloco-a-s3    (new field)
-# name: Worker A | Stage 3 | Round 1  (was: Worker A | Stage 3)
+# id:   diloco-a-s3-r1  (unique per round)
+# group: diloco-a-s3    (groups all rounds in W&B dashboard)
+# name: Worker A | Stage 3 | Round 1
 # remove: resume="allow"
 ```
 
-### Step 2 — Wait for next coordinator run (≤30 min)
-The coordinator will detect Worker B as not ready for round 1 and re-dispatch.
-With the P100 fix deployed, B should now get T4.
+### Step 3 — Wait for next coordinator run (≤30 min)
+With fast-fail deployed: B gets P100 → exits in <60s → resets triggered_at=0 → coordinator
+re-dispatches. Repeats until T4 assigned.
 
-### Step 3 — Stage 3 self-completes
-Round 1: A+B train ~4101 samples each. Round 2: ~0 or trivial close-out.
+### Step 4 — Stage 3 self-completes
+Round 1: A+B train ~4101 samples each. Round 2: trivial close-out.
 
 ---
 
@@ -60,11 +73,12 @@ Round 1: A+B train ~4101 samples each. Round 2: ~0 or trivial close-out.
 ```
 WeirdRunner/Ouroboros/
   diloco_state/
-    anchor/                   ← Stage 3 Round 0 aggregate ✓
-    round_state.json          ← stage_k=3, round_n=1, triggered_workers=["A","B"], triggered_at=<live>
+    anchor/                        ← Stage 3 Round 0 aggregate ✓
+    round_state.json               ← stage_k=3, round_n=1, triggered_workers=["A","B"], triggered_at=<live>
     workers/A/round_0000_stage_3/  ✓
     workers/B/round_0000_stage_3/  ✓
     workers/A/round_0001_stage_3/  ⚠️ status unknown (may have completed on T4)
+    workers/B/round_0001_stage_3/  ✗ not done (P100 cancellation)
 ```
 
 ---
@@ -94,8 +108,9 @@ WeirdRunner/Ouroboros/
 | Worker auto-detection | `DILOCO_WORKER_ID` Kaggle secret per account (`A`/`B`/`C`) |
 | Kaggle trigger auth | Per-worker credentials; owner-authenticated |
 | **Kaggle trigger mechanism** | Local `kernels push`: stage checked-in `kaggle-utils.ipynb` + generated `kernel-metadata.json` → `kaggle kernels push -p <tmpdir>`. No pull needed. ✅ |
-| **Kaggle SDK version** | Pinned `kaggle==1.6.17`. ✅ |
-| **`accelerator` in kernel-metadata.json** | **`"nvidiaTeslaT4"` — JSON field, pins T4. Distinct from the old `--accelerator` CLI flag. ✅** |
+| **Kaggle SDK version** | **`kaggle>=1.8.4`** — first version with `--accelerator` for `kernels push` (PR #907). Prior 403 was on `GetKernel` (pull endpoint, unused). Push endpoint not blocked. ✅ |
+| **`"accelerator"` field in kernel-metadata.json** | **`"NvidiaTeslaT4"` (capital N).** Belt-and-suspenders alongside `--accelerator` CLI flag. |
+| **`"accelerator"` CLI flag in push command** | **`--accelerator NvidiaTeslaT4`** added to `push_args` in `_trigger_single_worker()`. Primary GPU pin mechanism. ✅ |
 | W&B worker run ID | `diloco-{worker_lower}-s{stage_k}-r{round_n}` — unique per round |
 | W&B worker group | `diloco-{worker_lower}-s{stage_k}` — groups all rounds for a stage |
 | W&B coordinator run ID | `diloco-coordinator-s{stage_k}` |
@@ -107,7 +122,7 @@ WeirdRunner/Ouroboros/
 | **Stage close** | remaining < `min_shard_samples` per active worker → declare stage complete, advance. |
 | **`workflow_dispatch` inputs** | `force_worker_ids`, `skip_trigger`, `dry_run`. Full control from Actions UI. |
 | **Worker timeout threshold** | **13h** (Kaggle 12h hard wall + 1h grace). Set via `--worker_timeout_hours`. |
-| **`triggered_at` field** | Written to `round_state.json` on every worker dispatch. Reset to 0 as manual "unconfirmed dispatch" signal. |
+| **`triggered_at` field** | Written to `round_state.json` on every worker dispatch. Reset to 0 as "unconfirmed dispatch" signal. |
 | **`triggered_at=0` semantics** | Canonical signal for "dispatch unconfirmed". Coordinator immediately re-dispatches on next run. ✅ VERIFIED |
 | **Attendance round** | Worker in `attendance_workers` → skips training, uploads status(samples=0), pushes signal. |
 | **Waiting mode** | All credentialed workers in `attendance_workers`. `round_n` frozen. |
@@ -147,7 +162,7 @@ WeirdRunner/Ouroboros/
 | `kaggle kernels push --accelerator` → unrecognized arg | Removed CLI flag; GPU requested via JSON metadata ✅ |
 | Coordinator stalls on quota-dead worker | `triggered_at` + 13h timeout → attendance mechanism ✅ |
 | Round 1 deadlock (triggered_at≠0, workers never ran) | `triggered_at=0` manual reset → immediate re-dispatch ✅ VERIFIED (Session 19) |
-| **Kaggle assigns P100 instead of T4** | **`"accelerator": "nvidiaTeslaT4"` in `_build_kaggle_kernel_metadata()` ⚠️ PENDING** |
+| **`"accelerator": "nvidiaTeslaT4"` in kernel-metadata.json → P100 still assigned** | **Root cause 1: `--accelerator` flag added in `kaggle-cli v1.8.4`; we pinned `1.6.17` (predates feature). Root cause 2: wrong capitalisation (`nvidiaTeslaT4` vs `NvidiaTeslaT4`). Fix: upgrade to `kaggle>=1.8.4`, add `--accelerator NvidiaTeslaT4` to `push_args`, fix JSON capitalisation. Safety net: runtime fast-fail in `main()` for the rare case Kaggle ignores the flag. ⚠️ PENDING** |
 | **W&B subsequent rounds not logged (wandb 0.25.0 resume bug)** | **Per-round run IDs + `group=` parameter ⚠️ PENDING** |
 
 ---
@@ -184,6 +199,7 @@ Each round:
     8. Write round_state.json with triggered_workers, attendance_workers, mode, triggered_at
 
   Workers (triggered subset)
+    - GPU guard: if sm60 (P100) → reset triggered_at=0 + push signal + exit
     - If in attendance_workers → download anchor, upload status(samples=0), push signal, return
     - Else → train on shard, upload weights + status, push signal
 
@@ -213,11 +229,10 @@ Stage 5: ~92s/step  Stage 10: ~149s/step
 
 | File | Status |
 |---|---|
-| `jamba_coconut_finetune.py` | ⚠️ W&B grouping patch pending |
-| `diloco_coordinator.py` | ⚠️ T4 accelerator patch pending |
-| `bootstrap_diloco.py` | ✅ |
-| `.github/workflows/diloco_coordinator.yml` | ✅ |
-| `kaggle-utils.ipynb` Cell 5 | ✅ `!torchrun` magic + `DILOCO_WORKER_ID` secret |
+| `jamba_coconut_finetune.py` | ⚠️ GPU fast-fail safety net + W&B grouping patches pending |
+| `diloco_coordinator.py` | ⚠️ kaggle upgrade + `--accelerator` flag + JSON capitalisation fix pending |
+| `.github/workflows/diloco_coordinator.yml` | ⚠️ `kaggle>=1.8.4` version pin update pending |
+| `kaggle-utils.ipynb` Cell 5 | ✅ No changes needed |
 | `prepare_coconut_dataset.py` | ✅ |
 | `build_wheels_kaggle.py` | ✅ |
 
@@ -248,5 +263,5 @@ Stage 5: ~92s/step  Stage 10: ~149s/step
 | `kaggle kernels push --accelerator` → unrecognized argument | Remove `--accelerator` CLI flag; GPU requested via `enable_gpu: true` in kernel metadata JSON |
 | Worker C quota exhausted → coordinator stalls forever | `triggered_at` + 13h timeout + attendance mechanism |
 | Coordinator writes `triggered_workers` but push fails silently | `triggered_at=0` manual reset → immediate re-dispatch on next run |
-| `enable_gpu: true` in kernel-metadata.json → Kaggle assigns P100 | Add `"accelerator": "nvidiaTeslaT4"` JSON field explicitly |
+| `enable_gpu: true` + `"accelerator": "nvidiaTeslaT4"` in kernel-metadata.json → still P100 | **Root cause 1: `--accelerator` CLI flag didn't exist in `kaggle==1.6.17` (added in v1.8.4). Root cause 2: wrong capitalisation (`nvidiaTeslaT4` vs `NvidiaTeslaT4`). Fix: upgrade `kaggle>=1.8.4` + add `--accelerator NvidiaTeslaT4` to push_args + fix JSON capitalisation + runtime fast-fail safety net.** |
 | `wandb==0.25.0` `resume="allow"` on finished run creates ephemeral run | Per-round run IDs + `group=` for stage-level grouping |
