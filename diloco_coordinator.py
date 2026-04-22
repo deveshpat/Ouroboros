@@ -418,7 +418,8 @@ def _build_kaggle_kernel_metadata(*, slug: str, notebook_filename: str) -> Dict[
         "language": "python",
         "kernel_type": "notebook",
         "is_private": True,
-        "enable_gpu": True,          # ← ADD: pins T4, not just any GPU
+        "enable_gpu": True,          
+        "accelerator": "nvidiaTeslaT4", # ← ADD: pins T4, not just any GPU
         "enable_tpu": False,
         "enable_internet": True,
         "dataset_sources": ["weirdrunner007/ouroboros-cache"],  # ← ADD: attaches cache
