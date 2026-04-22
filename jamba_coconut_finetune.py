@@ -98,7 +98,7 @@ _HUB_WHEEL_BASES = [
 _HUB_REPO_ID = "WeirdRunner/Ouroboros"
 
 _KNOWN_ARCH_SUFFIXES = [
-    "sm70", "sm72", "sm75", "sm80", "sm86", "sm87", "sm89",
+    "sm60", "sm70", "sm72", "sm75", "sm80", "sm86", "sm87", "sm89",
     "sm90", "sm100", "sm120", "smunknown",
 ]
 
@@ -1997,6 +1997,7 @@ def coconut_forward(
         )
 
     return total_loss, metrics
+  
 def normalize_pred(text: str) -> str:
     boxed = _re.search(r"\\boxed\{([^}]*)\}", text)
     if boxed:
@@ -2138,6 +2139,7 @@ def evaluate_stage(
         halt_gate.train()
 
     return ce_numer / max(ce_denom, 1), n_correct / max(n_total, 1)
+  
 def _resolve_hf_token(cli_value: Optional[str]) -> Optional[str]:
     return _resolve_hf_token_common(cli_value)
 
@@ -3003,7 +3005,58 @@ def _optimizer_step_sample_count(step_idx: int, batch_size: int, grad_accum: int
     step_end = min((step_idx + 1) * grad_accum * batch_size, dataset_size)
     return max(step_end - step_start, 0)
 
+def _diloco_reset_triggered_at(hf_token: str, repo_id: str) -> None:
+    """
+    Download diloco_state/round_state.json from Hub, set triggered_at=0,
+    and re-upload. triggered_at=0 is the canonical signal for an unconfirmed
+    dispatch; the coordinator immediately re-dispatches on its next run
+    (verified working in Session 19/20).
+    """
+    _ROUND_STATE_REMOTE = "diloco_state/round_state.json"
+    if not hf_token:
+        print("  [diloco] WARNING: no HF token — cannot reset triggered_at.")
+        return
 
+    def _reset() -> None:
+        from huggingface_hub import HfApi, hf_hub_download
+
+        local = hf_hub_download(
+            repo_id=repo_id,
+            filename=_ROUND_STATE_REMOTE,
+            token=hf_token,
+        )
+        with open(local, encoding="utf-8") as f:
+            state = json.load(f)
+        state["triggered_at"] = 0.0
+        state["last_updated"] = time.time()
+        api = HfApi(token=hf_token)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        ) as tf:
+            json.dump(state, tf, indent=2)
+            tmp_path = tf.name
+        try:
+            api.upload_file(
+                path_or_fileobj=tmp_path,
+                path_in_repo=_ROUND_STATE_REMOTE,
+                repo_id=repo_id,
+                token=hf_token,
+                commit_message="GPU mismatch fast-fail: reset triggered_at=0",
+            )
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+    _retry_diloco_io(
+        "Reset triggered_at in round_state.json",
+        _reset,
+        swallow=True,
+    )
+    if _is_main_process():
+        print(
+            "  [diloco] triggered_at reset to 0 in round_state.json ✓ "
+            "— coordinator will re-dispatch on next run (≤30 min)."
+        )
+      
 def run_training_stages(
     *,
     model,
@@ -3833,6 +3886,46 @@ def main() -> None:
 
     hf_token = _resolve_hf_token(getattr(args, "hf_token", None))
     args._resolved_hf_token = hf_token
+
+    # ── DiLoCo GPU architecture guard ────────────────────────────────────────
+    # Safety net: even with --accelerator NvidiaTeslaT4 in the push command,
+    # Kaggle may silently fall back to P100 (sm60) if T4 quota is exhausted.
+    # P100 → bootstrap attempts 30+ min source compile → kernel cancellation.
+    # Fast-fail: detect wrong GPU, reset triggered_at=0 (coordinator
+    # immediately re-dispatches via existing triggered_at=0 branch), exit.
+    if args.diloco_mode and device.type == "cuda" and args.diloco_worker_id:
+        _cc = torch.cuda.get_device_capability(device)
+        if _cc < (7, 5):  # sm75 = T4 (minimum for cached Mamba wheels on Hub)
+            _gpu_name = torch.cuda.get_device_name(device)
+            if is_main:
+                print(
+                    f"\n  [diloco] GPU MISMATCH: {_gpu_name} sm{_cc[0]}{_cc[1]} detected "
+                    f"(requires sm75+/T4 for cached Mamba wheels).\n"
+                    f"  [diloco] Resetting triggered_at=0 for immediate coordinator re-dispatch."
+                )
+                _diloco_reset_triggered_at(
+                    hf_token or "",
+                    getattr(args, "diloco_state_repo", "WeirdRunner/Ouroboros"),
+                )
+                _round_state_quick = diloco_read_round_state(
+                    hf_token or "",
+                    getattr(args, "diloco_state_repo", "WeirdRunner/Ouroboros"),
+                )
+                _github_token = os.environ.get("GITHUB_TOKEN")
+                if _github_token and getattr(args, "diloco_signal_repo", ""):
+                    diloco_push_signal(
+                        args.diloco_worker_id,
+                        int(_round_state_quick.get("stage_k", 0)),
+                        int(_round_state_quick.get("round_n", 0)),
+                        _github_token,
+                        args.diloco_signal_repo,
+                    )
+            if distributed:
+                barrier()
+            if distributed and _distributed_is_initialized():
+                torch.distributed.destroy_process_group()
+            sys.exit(0)
+    # ─────────────────────────────────────────────────────────────────────────
 
     if getattr(args, "push_to_hub", False) and not hf_token:
         if _is_main_process():
