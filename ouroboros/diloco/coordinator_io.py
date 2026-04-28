@@ -41,6 +41,18 @@ def hub_download_json(repo_id: str, path: str, *, token: str | None = None, defa
         raise
 
 
+def hub_download_file(repo_id: str, path: str, *, token: str | None = None) -> str:
+    """Download any Hub file and return its local path.
+
+    Use this for binary artifacts such as safetensors. JSON state should use
+    :func:`hub_download_json` so callers receive decoded dictionaries.
+    """
+
+    from huggingface_hub import hf_hub_download  # type: ignore
+
+    return str(retry_io(lambda: hf_hub_download(repo_id=repo_id, filename=path, repo_type="model", token=token)))
+
+
 def hub_upload_json(repo_id: str, path: str, payload: Mapping[str, Any], *, token: str | None = None) -> None:
     from huggingface_hub import upload_file  # type: ignore
 
@@ -82,6 +94,7 @@ def save_and_upload_anchor(repo_id: str, path_in_repo: str, weights: Mapping[str
 
 
 _retry_io = retry_io
+_hub_download_file = hub_download_file
 _hub_download_json = hub_download_json
 _hub_upload_json = hub_upload_json
 _load_adapter_weights_cpu = load_adapter_weights_cpu
@@ -91,6 +104,7 @@ _save_and_upload_anchor = save_and_upload_anchor
 
 __all__ = [
     "ANCHOR_PREFIX",
+    "hub_download_file",
     "hub_download_json",
     "hub_upload_json",
     "load_adapter_weights_cpu",
