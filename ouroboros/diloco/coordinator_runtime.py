@@ -31,9 +31,6 @@ import zlib
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
-import requests
-
-
 T = TypeVar("T")
 
 ROUND_STATE_PATH = "diloco_state/round_state.json"
@@ -91,146 +88,10 @@ def _retry_io(
     raise last_exc
 
 
-def _normalize_optional_text(value: Optional[Any], *, uppercase: bool = False) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    return text.upper() if uppercase else text
-
-
-def _first_nonempty_text(*values: Optional[Any], uppercase: bool = False) -> Optional[str]:
-    for value in values:
-        text = _normalize_optional_text(value, uppercase=uppercase)
-        if text is not None:
-            return text
-    return None
-
-
-def _set_env_if_present(
-    target: Dict[str, str],
-    key: str,
-    value: Optional[Any],
-    *,
-    uppercase: bool = False,
-) -> None:
-    text = _normalize_optional_text(value, uppercase=uppercase)
-    if text is not None:
-        target[key] = text
-
-
-def _infer_runtime_repo_url(default: str = "https://github.com/deveshpat/Ouroboros.git") -> str:
-    explicit = _first_nonempty_text(os.environ.get("OUROBOROS_REPO_URL"))
-    if explicit:
-        return explicit
-    repo = _first_nonempty_text(os.environ.get("GITHUB_REPOSITORY"))
-    server = _first_nonempty_text(os.environ.get("GITHUB_SERVER_URL"), "https://github.com")
-    if repo:
-        return f"{server.rstrip('/')}/{repo}.git"
-    return default
-
-
-def _infer_runtime_repo_ref(default: str = "main") -> str:
-    return (
-        _first_nonempty_text(
-            os.environ.get("OUROBOROS_REPO_REF"),
-            os.environ.get("GITHUB_REF_NAME"),
-            default,
-        )
-        or default
-    )
-
-
-def _infer_runtime_repo_commit() -> Optional[str]:
-    return _first_nonempty_text(
-        os.environ.get("OUROBOROS_REPO_COMMIT"),
-        os.environ.get("GITHUB_SHA"),
-    )
-
-
 def _build_worker_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[str, str]:
-    worker = _normalize_optional_text(worker_id, uppercase=True)
-    if worker not in WORKER_IDS:
-        raise ValueError(f"Invalid worker id for runtime env injection: {worker_id!r}")
+    from ouroboros.diloco.runtime_env import build_worker_runtime_env
 
-    runtime_env: Dict[str, str] = {}
-
-    for name, value in os.environ.items():
-        if name.startswith("OUROBOROS_"):
-            _set_env_if_present(runtime_env, name, value)
-
-    _set_env_if_present(runtime_env, "DILOCO_WORKER_ID", worker, uppercase=True)
-    _set_env_if_present(runtime_env, "OUROBOROS_DILOCO_WORKER_ID", worker, uppercase=True)
-    _set_env_if_present(runtime_env, "WORKER_ID", worker, uppercase=True)
-    runtime_env["OUROBOROS_AUTO_TRIGGERED"] = "1"
-
-    hf_token = _first_nonempty_text(
-        getattr(args, "hf_token", None),
-        os.environ.get("HF_TOKEN"),
-        os.environ.get("HUGGINGFACE_HUB_TOKEN"),
-    )
-    if hf_token:
-        runtime_env["HF_TOKEN"] = hf_token
-        runtime_env["HUGGINGFACE_HUB_TOKEN"] = hf_token
-
-    wandb_key = _first_nonempty_text(
-        getattr(args, "wandb_key", None),
-        os.environ.get("WANDB_API_KEY"),
-        os.environ.get("WANDB_KEY"),
-    )
-    if wandb_key:
-        runtime_env["WANDB_API_KEY"] = wandb_key
-        runtime_env["WANDB_KEY"] = wandb_key
-
-    github_token = _first_nonempty_text(
-        os.environ.get("GITHUB_TOKEN"),
-        os.environ.get("GH_TOKEN"),
-    )
-    if github_token:
-        runtime_env["GITHUB_TOKEN"] = github_token
-        runtime_env["GH_TOKEN"] = github_token
-
-    _set_env_if_present(runtime_env, "OUROBOROS_REPO_URL", _infer_runtime_repo_url())
-    _set_env_if_present(runtime_env, "OUROBOROS_REPO_REF", _infer_runtime_repo_ref())
-    _set_env_if_present(runtime_env, "OUROBOROS_REPO_COMMIT", _infer_runtime_repo_commit())
-    _set_env_if_present(
-        runtime_env,
-        "OUROBOROS_DILOCO_STATE_REPO",
-        _first_nonempty_text(os.environ.get("OUROBOROS_DILOCO_STATE_REPO"), getattr(args, "repo_id", None)),
-    )
-    _set_env_if_present(
-        runtime_env,
-        "OUROBOROS_DILOCO_SIGNAL_REPO",
-        _first_nonempty_text(
-            os.environ.get("OUROBOROS_DILOCO_SIGNAL_REPO"),
-            os.environ.get("GITHUB_REPOSITORY"),
-        ),
-    )
-    _set_env_if_present(
-        runtime_env,
-        "OUROBOROS_DILOCO_OUTER_LR",
-        _first_nonempty_text(
-            os.environ.get("OUROBOROS_DILOCO_OUTER_LR"),
-            f"{float(getattr(args, 'outer_lr', 0.7)):g}",
-        ),
-    )
-    _set_env_if_present(
-        runtime_env,
-        "OUROBOROS_WANDB_PROJECT",
-        _first_nonempty_text(os.environ.get("OUROBOROS_WANDB_PROJECT"), getattr(args, "wandb_project", None)),
-    )
-    _set_env_if_present(
-        runtime_env,
-        "OUROBOROS_WANDB_ENTITY",
-        _first_nonempty_text(os.environ.get("OUROBOROS_WANDB_ENTITY"), getattr(args, "wandb_entity", None)),
-    )
-    _set_env_if_present(
-        runtime_env,
-        "OUROBOROS_DILOCO_OUTPUT_DIR",
-        _first_nonempty_text(os.environ.get("OUROBOROS_DILOCO_OUTPUT_DIR"), "runs/diloco"),
-    )
-    return runtime_env
+    return build_worker_runtime_env(args, worker_id)
 
 
 def _encode_runtime_env_payload(runtime_env: Dict[str, str]) -> str:
@@ -641,11 +502,13 @@ def collect_ready_workers(
     Workers with samples_seen=0 are included (empty-shard passthrough).
     """
     check_ids = expected_workers if expected_workers else WORKER_IDS
+    from ouroboros.diloco.hub_state import worker_status_path
+
     ready: List[Dict] = []
     for worker_id in check_ids:
         status = hub_download_json(
             repo_id,
-            f"diloco_state/workers/{worker_id}/status.json",
+            worker_status_path(worker_id),
             token,
         )
         if (
