@@ -64,3 +64,14 @@ python -m py_compile diloco_coordinator.py jamba_coconut_finetune.py
 git status
 git diff --stat
 ```
+
+## Entrypoint thinning pass
+
+The repository-root executable scripts are now thin adapters:
+
+- `diloco_coordinator.py` delegates to `ouroboros.diloco.coordinator_runtime`.
+- `jamba_coconut_finetune.py` delegates to `ouroboros.coconut.finetune_runtime`.
+
+This preserves stable CLI paths for GitHub Actions, Kaggle notebooks, and manual
+runs, while moving the implementations into package modules where future seams
+can be deepened incrementally and tested through the package interface.
