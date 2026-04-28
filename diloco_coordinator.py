@@ -246,29 +246,14 @@ def _compute_projected_shards(
     total_samples_seen: int,
     worker_ids: List[str] = None,
 ) -> Dict[str, int]:
-    """
-    Deterministically compute each worker's projected shard size for the
-    upcoming round. Uses identical partition logic to diloco_get_shard()
-    in jamba_coconut_finetune.py.
+    """Delegate DiLoCo shard projection to the protocol module."""
+    from ouroboros.diloco.protocol import compute_projected_shards
 
-    Returns dict: {worker_id: projected_shard_size}
-    """
-    if worker_ids is None:
-        worker_ids = WORKER_IDS
-
-    worker_index = {"A": 0, "B": 1, "C": 2}
-    remaining = max(total_samples - int(total_samples_seen), 0)
-
-    result: Dict[str, int] = {}
-    for wid in worker_ids:
-        idx = worker_index.get(wid, 0)
-        n_parts = 3  # always 3-way partition for determinism, even if C is inactive
-        base = remaining // n_parts
-        remainder = remaining % n_parts
-        width = base + (1 if idx < remainder else 0)
-        result[wid] = max(int(width), 0)
-
-    return result
+    return compute_projected_shards(
+        total_samples=total_samples,
+        total_samples_seen=total_samples_seen,
+        worker_ids=worker_ids or WORKER_IDS,
+    )
 
 
 
@@ -278,45 +263,22 @@ def _determine_round_mode(
     min_shard_samples: int,
     force_worker_ids: Optional[List[str]] = None,
 ) -> Tuple[str, List[str]]:
-    """
-    Determine the coordination mode and which workers to trigger.
+    """Delegate round-mode choice to the protocol module."""
+    from ouroboros.diloco.protocol import determine_round_mode
 
-    Returns:
-        mode: "complete" | "solo" | "diloco"
-        active_workers: list of worker IDs to trigger
-    """
-    if force_worker_ids:
-        # Manual override: trigger exactly the specified workers, no threshold check
-        active = [w for w in force_worker_ids if w in credentialed_workers]
-        if not active:
-            return "complete", []
-        mode = "solo" if len(active) == 1 else "diloco"
-        return mode, active
-
-    active = [
-        w for w in credentialed_workers
-        if projected_shards.get(w, 0) >= min_shard_samples
-    ]
-
-    if not active:
-        return "complete", []
-    if len(active) == 1:
-        return "solo", active
-    return "diloco", active
+    return determine_round_mode(
+        projected_shards=projected_shards,
+        credentialed_workers=credentialed_workers,
+        min_shard_samples=min_shard_samples,
+        force_worker_ids=force_worker_ids,
+    )
 
 
 def _ordered_unique_worker_ids(*groups: Optional[List[str]]) -> List[str]:
-    """Return worker IDs in first-seen order, filtered to known workers."""
-    ordered: List[str] = []
-    seen = set()
-    for group in groups:
-        for worker_id in group or []:
-            wid = str(worker_id).upper()
-            if wid not in WORKER_IDS or wid in seen:
-                continue
-            ordered.append(wid)
-            seen.add(wid)
-    return ordered
+    """Delegate worker-id normalization to the protocol module."""
+    from ouroboros.diloco.protocol import ordered_unique_worker_ids
+
+    return ordered_unique_worker_ids(*groups)
 
 
 
@@ -326,26 +288,14 @@ def _partition_ready_workers(
     expected_workers: Optional[List[str]],
     attendance_workers: Optional[List[str]],
 ) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Split ready workers into active-round completions and attendance check-ins.
+    """Delegate attendance splitting to the protocol module."""
+    from ouroboros.diloco.protocol import partition_ready_workers
 
-    Attendance workers are opportunistic: they should be observed and promoted
-    when they check in, but they must not block aggregation for the active round.
-    If a worker is somehow present in both groups, treat it as active so the
-    round still enforces its completion semantics.
-    """
-    expected_set = set(_ordered_unique_worker_ids(expected_workers))
-    attendance_set = set(_ordered_unique_worker_ids(attendance_workers))
-
-    active_ready: List[Dict] = []
-    attendance_ready: List[Dict] = []
-    for status in ready_workers:
-        worker_id = str(status.get("worker_id", "")).upper()
-        if worker_id in attendance_set and worker_id not in expected_set:
-            attendance_ready.append(status)
-        else:
-            active_ready.append(status)
-    return active_ready, attendance_ready
+    return partition_ready_workers(
+        ready_workers,
+        expected_workers=expected_workers,
+        attendance_workers=attendance_workers,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -499,31 +449,10 @@ def weighted_average_deltas(
     worker_samples: List[int],
     outer_lr: float,
 ) -> Dict:
-    """
-    DiLoCo outer update:
-      pseudo_grad_i = anchor - worker_i
-      outer_grad = weighted_mean(pseudo_grad_i, weights=samples_i)
-      new_anchor = anchor - outer_lr * outer_grad
+    """Delegate DiLoCo CPU aggregation to the aggregation module."""
+    from ouroboros.diloco.aggregation import weighted_average_deltas as _weighted_average_deltas
 
-    All operations run on CPU tensors.
-    """
-    import torch
-
-    total_samples = sum(worker_samples)
-    if total_samples <= 0:
-        raise ValueError("total_samples must be > 0 for aggregation")
-
-    new_weights = {}
-    for key in anchor_weights:
-        anchor_tensor = anchor_weights[key].float()
-        outer_grad = torch.zeros_like(anchor_tensor)
-        for weights, n_samples in zip(worker_weights, worker_samples):
-            if key not in weights:
-                continue
-            delta = anchor_tensor - weights[key].float()
-            outer_grad += delta * (float(n_samples) / float(total_samples))
-        new_weights[key] = (anchor_tensor - outer_lr * outer_grad).to(anchor_weights[key].dtype)
-    return new_weights
+    return _weighted_average_deltas(anchor_weights, worker_weights, worker_samples, outer_lr)
 
 
 
@@ -560,63 +489,20 @@ def save_and_upload_anchor(
 
 
 def _build_kaggle_kernel_metadata(*, slug: str, notebook_filename: str) -> Dict[str, object]:
-    title = slug.split("/", 1)[-1]
-    return {
-        "id": slug,
-        "title": title,
-        "code_file": notebook_filename,
-        "language": "python",
-        "kernel_type": "notebook",
-        "is_private": True,
-        "enable_gpu": True,          
-        "accelerator": "NvidiaTeslaT4",  # official ID per kaggle-cli docs; belt-and-suspenders # ← ADD: pins T4, not just any GPU
-        "enable_tpu": False,
-        "enable_internet": True,
-        "dataset_sources": ["weirdrunner007/ouroboros-cache"],  # ← ADD: attaches cache
-        "competition_sources": [],
-        "kernel_sources": [],
-        "model_sources": [],
-        "keywords": [],
-    }
+    """Delegate Kaggle metadata construction to the dispatch module."""
+    from ouroboros.diloco.kaggle_dispatch import build_kaggle_kernel_metadata
+
+    return build_kaggle_kernel_metadata(slug=slug, notebook_filename=notebook_filename)
 
 
 def _build_worker_dispatch_cell(
     worker_id: str,
     runtime_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, object]:
-    worker_id = worker_id.strip().upper()
-    if worker_id not in WORKER_IDS:
-        raise ValueError(f"Invalid worker id for notebook dispatch: {worker_id!r}")
+    """Delegate dispatch-cell generation to the dispatch module."""
+    from ouroboros.diloco.kaggle_dispatch import build_worker_dispatch_cell
 
-    payload = _encode_runtime_env_payload(runtime_env or {
-        "DILOCO_WORKER_ID": worker_id,
-        "OUROBOROS_DILOCO_WORKER_ID": worker_id,
-        "WORKER_ID": worker_id,
-        "OUROBOROS_AUTO_TRIGGERED": "1",
-    })
-
-    return {
-        "cell_type": "code",
-        "execution_count": None,
-        "id": "diloco-dispatch-worker-id",
-        "metadata": {"tags": ["diloco-dispatch"]},
-        "outputs": [],
-        "source": [
-            "# AUTO-GENERATED BY DILOCO COORDINATOR. DO NOT EDIT IN REPO.\n",
-            "import base64\n",
-            "import json\n",
-            "import os\n",
-            "import zlib\n",
-            f"_DISPATCH_PAYLOAD = {json.dumps(payload)}\n",
-            "_DISPATCH_ENV = json.loads(zlib.decompress(base64.b64decode(_DISPATCH_PAYLOAD)).decode('utf-8'))\n",
-            "for _dispatch_key, _dispatch_value in _DISPATCH_ENV.items():\n",
-            "    if _dispatch_value is None:\n",
-            "        continue\n",
-            "    os.environ[str(_dispatch_key)] = str(_dispatch_value)\n",
-            "del _DISPATCH_ENV, _DISPATCH_PAYLOAD\n",
-            f"print('[dispatch] Bound notebook to DiLoCo worker {worker_id}')\n",
-        ],
-    }
+    return build_worker_dispatch_cell(worker_id, runtime_env=runtime_env)
 
 def _stage_local_kaggle_kernel(
     notebook_path: Path,
@@ -626,53 +512,16 @@ def _stage_local_kaggle_kernel(
     worker_id: Optional[str] = None,
     runtime_env: Optional[Dict[str, str]] = None,
 ) -> Path:
-    if not notebook_path.exists():
-        raise FileNotFoundError(
-            f"Notebook source not found at {notebook_path}. "
-            "Auto-trigger requires a local kaggle-utils.ipynb checkout."
-        )
+    """Delegate notebook staging to the dispatch module."""
+    from ouroboros.diloco.kaggle_dispatch import stage_local_kaggle_kernel
 
-    staged_notebook = staging_dir / notebook_path.name
-    shutil.copy2(notebook_path, staged_notebook)
-
-    if worker_id:
-        notebook = json.loads(staged_notebook.read_text(encoding="utf-8"))
-        cells = notebook.get("cells")
-        if not isinstance(cells, list):
-            raise ValueError("Kaggle notebook JSON is missing a valid 'cells' list")
-
-        dispatch_cell = _build_worker_dispatch_cell(worker_id, runtime_env=runtime_env)
-        replaced = False
-        for idx, cell in enumerate(cells):
-            if not isinstance(cell, dict):
-                continue
-            source = "".join(cell.get("source", []))
-            tags = cell.get("metadata", {}).get("tags", [])
-            if (
-                "AUTO-GENERATED BY DILOCO COORDINATOR" in source
-                or "diloco-dispatch" in tags
-            ):
-                cells[idx] = dispatch_cell
-                replaced = True
-                break
-        if not replaced:
-            insert_at = 1 if cells and isinstance(cells[0], dict) and cells[0].get("cell_type") == "markdown" else 0
-            cells.insert(insert_at, dispatch_cell)
-
-        staged_notebook.write_text(
-            json.dumps(notebook, indent=1, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-
-    metadata_path = staging_dir / "kernel-metadata.json"
-    metadata_path.write_text(
-        json.dumps(
-            _build_kaggle_kernel_metadata(slug=slug, notebook_filename=staged_notebook.name),
-            indent=2,
-        ),
-        encoding="utf-8",
+    return stage_local_kaggle_kernel(
+        notebook_path,
+        slug,
+        staging_dir,
+        worker_id=worker_id,
+        runtime_env=runtime_env,
     )
-    return staged_notebook
 
 
 def _trigger_single_worker(
@@ -684,75 +533,17 @@ def _trigger_single_worker(
     *,
     injected_env: Optional[Dict[str, str]] = None,
 ) -> bool:
-    """
-    Trigger a Kaggle kernel by pushing the repo-tracked notebook with generated
-    metadata, instead of pulling the live kernel back from Kaggle first.
+    """Delegate Kaggle CLI dispatch to the dispatch module."""
+    from ouroboros.diloco.kaggle_dispatch import trigger_single_worker
 
-    Why this path is safer:
-      - the coordinator logs show `kaggle kernels pull` failing with
-        `Permission 'kernels.get' was denied`, which blocks the old pull→push flow
-        even when the worker has already completed successfully.
-      - `kaggle kernels push` is the supported CLI path for updating and running a
-        kernel; staging the checked-in notebook locally avoids the fragile readback
-        permission entirely.
-    """
-    import os
-    import subprocess
-    import tempfile
-
-    if not username or not key:
-        print(f"[coordinator] No credentials for Worker {worker_id} — skipping trigger.")
-        return False
-
-    expected_owner, _ = WORKER_KAGGLE_SLUGS[worker_id]
-    if username.strip().lower() != expected_owner.lower():
-        print(
-            f"[coordinator] WARNING: Worker {worker_id} expects Kaggle owner "
-            f"{expected_owner}, but received username {username!r}. Trigger may fail."
-        )
-
-    env = os.environ.copy()
-    env["KAGGLE_USERNAME"] = username
-    env["KAGGLE_KEY"] = key
-    env.pop("KAGGLE_CONFIG_DIR", None)
-
-    def _run_kaggle(args: List[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["kaggle"] + args,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            _stage_local_kaggle_kernel(notebook_path, slug, tmp_path, worker_id=worker_id, runtime_env=injected_env)
-
-            # --accelerator requires kaggle>=1.8.4 (added in PR #907).
-            # "NvidiaTeslaT4" is the official accelerator ID per kaggle-cli docs.
-            # This is distinct from the JSON metadata field (also present, belt-and-suspenders).
-            push_args = ["kernels", "push", "-p", str(tmp_path), "--accelerator", "NvidiaTeslaT4"]
-            push = _run_kaggle(push_args)
-            if push.returncode != 0:
-                err = (push.stderr or push.stdout or "").strip()
-                print(f"[coordinator] WARNING: kernels push failed for Worker {worker_id} ({slug}): {err}")
-                return False
-
-        out = (push.stdout or push.stderr or "").strip()
-        print(f"[coordinator] Triggered Worker {worker_id}: {slug}  ({out})")
-        return True
-
-    except subprocess.TimeoutExpired:
-        print(f"[coordinator] WARNING: kaggle CLI timed out for Worker {worker_id} ({slug})")
-        return False
-    except FileNotFoundError as exc:
-        print(f"[coordinator] WARNING: Auto-trigger prerequisites missing for {slug}: {exc}")
-        return False
-    except Exception as exc:
-        print(f"[coordinator] WARNING: Failed to trigger {slug}: {exc}")
-        return False
+    return trigger_single_worker(
+        worker_id,
+        username,
+        key,
+        slug,
+        notebook_path,
+        injected_env=injected_env,
+    )
 
 
 def trigger_kaggle_workers(
@@ -818,63 +609,22 @@ def _reconcile_post_dispatch_state(
     planned_attendance_workers: List[str],
     dispatch_results: Dict[str, str],
 ) -> Optional[Dict[str, Any]]:
-    """
-    Correct round_state after trigger failures.
+    """Delegate post-dispatch correction to the protocol module."""
+    from ouroboros.diloco.protocol import reconcile_post_dispatch_state
 
-    The coordinator must write round_state before dispatch so workers see the new
-    round/stage. If one or more Kaggle pushes fail, the just-written state can
-    incorrectly wait on workers that were never actually launched. This helper
-    demotes failed active workers to attendance, preserves successfully/manual
-    dispatched workers, and clears triggered_at when nothing was really sent.
-    """
-    failed_workers = [w for w, status in dispatch_results.items() if status == "failed"]
-    if not failed_workers:
-        return None
-
-    dispatched_active = [
-        w for w in planned_active_workers if dispatch_results.get(w) in {"success", "manual"}
-    ]
-    dispatched_attendance = [
-        w for w in planned_attendance_workers if dispatch_results.get(w) in {"success", "manual"}
-    ]
-    failed_active = [w for w in planned_active_workers if dispatch_results.get(w) == "failed"]
-    failed_attendance = [w for w in planned_attendance_workers if dispatch_results.get(w) == "failed"]
-
-    corrected_triggered_workers = _ordered_unique_worker_ids(dispatched_active)
-    corrected_attendance_workers = _ordered_unique_worker_ids(
-        dispatched_attendance,
-        failed_active,
-        failed_attendance,
+    corrected = reconcile_post_dispatch_state(
+        state=state,
+        planned_active_workers=planned_active_workers,
+        planned_attendance_workers=planned_attendance_workers,
+        dispatch_results=dispatch_results,
+        now=time.time(),
     )
-
-    corrected_mode = state.get("mode", "complete")
-    if corrected_triggered_workers:
-        corrected_mode = _mode_from_active_workers(corrected_triggered_workers, fallback=corrected_mode)
-    elif corrected_attendance_workers:
-        corrected_mode = "waiting"
-
-    outstanding_dispatches = _ordered_unique_worker_ids(
-        corrected_triggered_workers,
-        corrected_attendance_workers,
-    )
-    successful_or_manual = [
-        w for w in outstanding_dispatches if dispatch_results.get(w) in {"success", "manual"}
-    ]
-
-    corrected_state = {
-        **state,
-        "mode": corrected_mode,
-        "triggered_workers": corrected_triggered_workers,
-        "attendance_workers": corrected_attendance_workers,
-        "triggered_at": time.time() if successful_or_manual else 0.0,
-        "last_updated": time.time(),
-        "dispatch_failures": failed_workers,
-    }
-    print(
-        "[coordinator] Reconciled failed dispatches. "
-        f"triggered={corrected_triggered_workers} attendance={corrected_attendance_workers}"
-    )
-    return corrected_state
+    if corrected is not None:
+        print(
+            "[coordinator] Reconciled failed dispatches. "
+            f"triggered={corrected.get('triggered_workers')} attendance={corrected.get('attendance_workers')}"
+        )
+    return corrected
 
 
 def collect_ready_workers(

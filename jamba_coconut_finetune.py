@@ -147,16 +147,10 @@ def _retry_diloco_io(
 
 
 def _ordered_unique_diloco_workers(*groups: Optional[List[str]]) -> List[str]:
-    ordered: List[str] = []
-    seen = set()
-    for group in groups:
-        for worker_id in group or []:
-            wid = str(worker_id).upper()
-            if wid not in {"A", "B", "C"} or wid in seen:
-                continue
-            ordered.append(wid)
-            seen.add(wid)
-    return ordered
+    """Delegate DiLoCo worker-id normalization to the protocol module."""
+    from ouroboros.diloco.protocol import ordered_unique_worker_ids
+
+    return ordered_unique_worker_ids(*groups)
 
 
 
