@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -15,19 +15,14 @@ class ForwardResult:
 
 
 class LatentReasoner:
-    """Adapter around the model-specific latent forward path.
-
-    The full Jamba/Coconut implementation remains in the legacy script until the
-    behavior is characterized. This seam gives the training runtime a stable name
-    for the concept and a testable interface for future extraction.
-    """
+    """Adapter around the model-specific latent forward path."""
 
     def __init__(self, model: Any) -> None:
+        if not hasattr(model, "__call__"):
+            raise TypeError("LatentReasoner requires a callable model")
         self.model = model
 
     def forward_stage(self, batch: Mapping[str, Any], stage_k: int) -> ForwardResult:
-        if not hasattr(self.model, "__call__"):
-            raise TypeError("LatentReasoner requires a callable model")
         result = self.model(**dict(batch))
         return ForwardResult(
             loss=getattr(result, "loss", None),
@@ -35,3 +30,27 @@ class LatentReasoner:
             hidden_states=getattr(result, "hidden_states", None),
             metrics={"stage_k": float(stage_k)},
         )
+
+
+def build_question_context(question: str, visible_steps: list[str]) -> str:
+    parts = [f"Question: {question.strip()}", "Reasoning:"]
+    parts.extend(step.strip() for step in visible_steps if str(step).strip())
+    return "\n".join(parts).strip()
+
+
+def compute_ce_sum_and_count(loss, labels) -> tuple[object, int]:
+    """Return a comparable CE sum/count without forcing torch at import time."""
+
+    try:
+        count = int((labels != -100).sum().item())
+    except Exception:
+        count = 0
+    return loss * max(count, 1), count
+
+
+__all__ = [
+    "ForwardResult",
+    "LatentReasoner",
+    "build_question_context",
+    "compute_ce_sum_and_count",
+]
