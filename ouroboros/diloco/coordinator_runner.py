@@ -33,6 +33,7 @@ from ouroboros.diloco.protocol import (
 
 WORKER_IDS = ["A", "B", "C"]
 ROUND_STATE_PATH = "diloco_state/round_state.json"
+_SUCCESSFUL_DISPATCH_OUTCOMES = {"success", "manual", "triggered"}
 
 
 def _state_stage(round_state: Mapping[str, Any]) -> int:
@@ -98,6 +99,57 @@ def _partition_ready_workers(
     if len(ready) < int(min_ready_workers):
         return (), tuple(missing or expected)
     return tuple(ready), tuple(missing)
+
+
+def _timeout_round_state(
+    round_state: Mapping[str, Any],
+    *,
+    survivors: Sequence[str],
+    timed_out: Sequence[str],
+    now: float,
+) -> dict[str, Any]:
+    active = ordered_unique_worker_ids(survivors)
+    next_state = dict(round_state)
+    next_state["active_workers"] = active
+    next_state["triggered_workers"] = active
+    next_state["attendance_workers"] = ordered_unique_worker_ids(round_state.get("attendance_workers"), timed_out)
+    next_state["mode"] = _determine_round_mode(active) if active else "waiting"
+    next_state["triggered_at"] = 0.0
+    next_state["timed_out_workers"] = list(timed_out)
+    next_state["last_updated"] = float(now)
+    next_state["updated_at"] = float(now)
+    return next_state
+
+
+def _dispatch_outcome(payload: Any) -> str:
+    if isinstance(payload, Mapping):
+        outcome = str(payload.get("outcome") or ("success" if payload.get("ok") else "failed"))
+    else:
+        outcome = str(payload or "success")
+    if outcome == "True":
+        return "success"
+    if outcome == "False":
+        return "failed"
+    return outcome
+
+
+def _dispatch_timed_out_and_save(args: Any, state: Mapping[str, Any], workers: Sequence[str]) -> dict[str, Any]:
+    next_state = dict(state)
+    if not getattr(args, "skip_trigger", False):
+        dispatched = trigger_kaggle_workers(args, workers, state)
+        outcomes = {str(worker).strip().upper(): _dispatch_outcome(payload) for worker, payload in dispatched.items()}
+        active_success = [
+            worker
+            for worker in ordered_unique_worker_ids(next_state.get("triggered_workers"))
+            if outcomes.get(worker) in _SUCCESSFUL_DISPATCH_OUTCOMES
+        ]
+        next_state["triggered_workers"] = active_success
+        next_state["active_workers"] = active_success
+        next_state["mode"] = _determine_round_mode(active_success) if active_success else str(next_state.get("mode", "waiting"))
+        next_state["triggered_at"] = time.time() if active_success else 0.0
+        next_state["dispatch_results"] = outcomes
+    hub_upload_json(_repo_id_from_args(args), ROUND_STATE_PATH, next_state, token=getattr(args, "hf_token", None))
+    return next_state
 
 
 def _download_json_compat(repo_id: str, path: str, *, token: str | None, default: Any) -> Any:
@@ -285,10 +337,10 @@ def _next_round_state(args: Any, current: Mapping[str, Any], aggregate_result: M
 
 
 def _dispatch_and_save(args: Any, state: Mapping[str, Any], workers: Sequence[str]) -> dict[str, Any]:
-    if getattr(args, "skip_trigger", False):
-        return dict(state)
-    dispatched = trigger_kaggle_workers(args, workers, state)
-    next_state = reconcile_after_dispatch(state, dispatched)
+    next_state = dict(state)
+    if not getattr(args, "skip_trigger", False):
+        dispatched = trigger_kaggle_workers(args, workers, state)
+        next_state = reconcile_after_dispatch(state, dispatched)
     hub_upload_json(_repo_id_from_args(args), ROUND_STATE_PATH, next_state, token=getattr(args, "hf_token", None))
     return next_state
 
@@ -314,36 +366,47 @@ def main(argv: Sequence[str] | None = None) -> None:
         print({"round_state": round_state})
         return
 
-    start = time.time()
-    while True:
-        stage = _state_stage(round_state)
-        round_n = _state_round(round_state)
-        expected = ordered_unique_worker_ids(round_state.get("triggered_workers"), round_state.get("active_workers"))
-        statuses = collect_ready_workers(args, round_state)
-        ready, missing = _partition_ready_workers(
-            statuses,
-            min_ready_workers=int(args.min_ready_workers),
-            expected_workers=expected,
-            stage=stage,
-            round_n=round_n,
+    now = time.time()
+    stage = _state_stage(round_state)
+    round_n = _state_round(round_state)
+    expected = ordered_unique_worker_ids(round_state.get("triggered_workers"), round_state.get("active_workers"))
+    statuses = collect_ready_workers(args, round_state)
+    ready, missing = _partition_ready_workers(
+        statuses,
+        min_ready_workers=int(args.min_ready_workers),
+        expected_workers=expected,
+        stage=stage,
+        round_n=round_n,
+    )
+    triggered_at = float(round_state.get("triggered_at", 0.0) or 0.0)
+
+    if triggered_at <= 0.0 or not expected:
+        _dispatch_and_save(args, round_state, missing or expected)
+        return
+
+    if ready:
+        aggregate_result = _aggregate_ready_workers(args, round_state, statuses, ready)
+        next_state = _next_round_state(args, round_state, aggregate_result)
+        hub_upload_json(repo_id, ROUND_STATE_PATH, next_state, token=getattr(args, "hf_token", None))
+        if next_state.get("active_workers") and not getattr(args, "skip_trigger", False):
+            _dispatch_and_save(args, next_state, next_state.get("active_workers", WORKER_IDS))
+        return
+
+    elapsed = now - triggered_at
+    if missing and elapsed > float(getattr(args, "worker_timeout_hours", 13.0)) * 3600.0:
+        missing_set = set(missing)
+        survivors = [worker for worker in expected if worker not in missing_set]
+        timeout_state = _timeout_round_state(round_state, survivors=survivors, timed_out=missing, now=now)
+        _dispatch_timed_out_and_save(
+            args,
+            timeout_state,
+            ordered_unique_worker_ids(timeout_state.get("attendance_workers"), survivors),
         )
-        if ready:
-            break
+        return
 
-        if expected and float(round_state.get("triggered_at", 0.0) or 0.0) <= 0.0:
-            _dispatch_and_save(args, round_state, missing or expected)
-            return
-
-        if args.max_wait_seconds and time.time() - start >= int(args.max_wait_seconds):
-            _dispatch_and_save(args, round_state, missing or expected)
-            return
-        time.sleep(max(int(args.poll_seconds), 1))
-
-    aggregate_result = _aggregate_ready_workers(args, round_state, statuses, ready)
-    next_state = _next_round_state(args, round_state, aggregate_result)
-    hub_upload_json(repo_id, ROUND_STATE_PATH, next_state, token=getattr(args, "hf_token", None))
-    if next_state.get("active_workers") and not getattr(args, "skip_trigger", False):
-        _dispatch_and_save(args, next_state, next_state.get("active_workers", WORKER_IDS))
+    if missing:
+        print(f"[coordinator] Waiting for workers: {list(missing)} (triggered {elapsed:.0f}s ago)")
+        return
 
 
 __all__ = [
