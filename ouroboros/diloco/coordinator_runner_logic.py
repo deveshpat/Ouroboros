@@ -366,9 +366,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     round_n = _state_round(round_state)
     expected = ordered_unique_worker_ids(round_state.get("triggered_workers"), round_state.get("active_workers"))
     statuses = collect_ready_workers(args, round_state)
+    min_ready_workers = min(int(args.min_ready_workers), len(expected)) if expected else int(args.min_ready_workers)
     ready, missing = _partition_ready_workers(
         statuses,
-        min_ready_workers=int(args.min_ready_workers),
+        min_ready_workers=min_ready_workers,
         expected_workers=expected,
         stage=stage,
         round_n=round_n,
