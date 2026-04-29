@@ -27,8 +27,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min_ready_workers", type=int, default=len(WORKER_IDS))
     parser.add_argument("--min_shard_samples", type=int, default=32)
     parser.add_argument("--worker_timeout_hours", type=float, default=13.0)
-    parser.add_argument("--max_wait_seconds", type=int, default=0)
-    parser.add_argument("--poll_seconds", type=int, default=60)
     parser.add_argument("--force_worker_ids", default=None)
     parser.add_argument("--skip_trigger", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
