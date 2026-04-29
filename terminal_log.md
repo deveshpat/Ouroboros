@@ -3,6 +3,40 @@
 
 ---
 
+## Session 22 — Stage 6 Complete, Stage 7 Round 0 Complete, Wiki Init (2026-04-30)
+
+**Context:** Session resumed with full repo context. Signal files are ground truth.
+
+**Signal reconciliation (sorted by timestamp):**
+
+```
+signals/worker_C_stage_6_round_0.json  timestamp: 1777196960.1909497
+signals/worker_B_stage_6_round_0.json  timestamp: 1777196201.9191017
+signals/worker_A_stage_6_round_0.json  timestamp: 1777202326.317697
+signals/worker_C_stage_7_round_0.json  timestamp: 1777237991.2179217
+signals/worker_B_stage_7_round_0.json  timestamp: 1777241362.5006027
+signals/worker_A_stage_7_round_0.json  timestamp: 1777243684.086035
+```
+
+**Finding:** BLUEPRINT.md listed Stage 6 as 🔄 IN PROGRESS. Signals confirm:
+- Stage 6 round 0: ✅ COMPLETE — all three workers (A, B, C)
+- Stage 7 round 0: ✅ COMPLETE — all three workers (A, B, C)
+
+BLUEPRINT.md was 1 stage behind. Corrected. Signals win.
+
+**Wiki initialised:**
+- `WIKI.md` — schema, page types, conventions
+- `wiki/index.md`, `wiki/log.md`
+- `wiki/concept/coconut-curriculum.md`
+- `wiki/concept/diloco-protocol.md`
+- `wiki/debug/kaggle-gpu-p100-fallback.md`
+- `wiki/debug/wandb-resume-ephemeral-runs.md`
+- `wiki/pattern/coordinator-retry-flow.md`
+
+**No code changes this session.** All systems running autonomously.
+
+---
+
 ## Session 21 — Full Root Cause: kaggle==1.6.17 Predates `--accelerator` Feature (2026-04-22) ⚠️ PATCH PENDING
 
 **Context:** Session 20's `"accelerator": "nvidiaTeslaT4"` patch confirmed non-functional.

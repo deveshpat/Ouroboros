@@ -11,7 +11,7 @@
 ### What this project is
 Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transformer-Mamba hybrid). The Mamba SSM recurrent state acts as compressed scratch-pad across K latent thought passes, replacing token generation during reasoning. Based on Meta's Coconut (arXiv:2412.06769), extended with DGAC (Diversity-Gated Adaptive Coconut) — a novel anti-collapse halt gate.
 
-### Current Status (2026-04-26)
+### Current Status (2026-04-30)
 
 | Curriculum Stage | Status | Notes |
 |---|---|---|
@@ -21,36 +21,35 @@ Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transform
 | Stage 3 — 3 latent passes | ✅ COMPLETE | 6 rounds; A solo r2–r3 (B only signals); C rejoined r5 |
 | Stage 4 — 4 latent passes | ✅ COMPLETE | 1 round, A+B+C all active |
 | Stage 5 — 5 latent passes | ✅ COMPLETE | 1 round, A+B+C all active |
-| Stage 6 — 6 latent passes | 🔄 IN PROGRESS | Round 0 done (A+B+C signals); awaiting coordinator next run |
-| Stages 7–10 | ⬜ NOT STARTED | — |
+| Stage 6 — 6 latent passes | ✅ COMPLETE | 1 round, A+B+C all active |
+| Stage 7 — 7 latent passes | 🔄 IN PROGRESS | Round 0 done (A+B+C signals); awaiting coordinator next run |
+| Stages 8–10 | ⬜ NOT STARTED | — |
 
-**Compute mode: DiLoCo 3-worker (A+B+C all active as of stage 3 round 5. Worker C quota renewed.)**
+**Compute mode: DiLoCo 3-worker (A+B+C all active.)**
 
-**Training velocity:** ~1 stage/day for stages 4–6. System is running autonomously.
+**Training velocity:** ~1 stage/day for stages 4–7. System is running autonomously.
 
 ---
 
 ## Part 0.1 — Immediate Next Steps
 
-### Step 1 — Monitor Stage 6 completion (no action required)
-Stage 6 round 0 completed today (all three worker signals present). The coordinator will aggregate and trigger round 1 automatically within 30 minutes of this read.
+### Step 1 — Monitor Stage 7 completion (no action required)
+Stage 7 round 0 completed (all three worker signals present — verified from signal files).
+The coordinator will aggregate and trigger round 1 automatically within 30 minutes.
 
-No code changes needed. All pending fixes from the previous session are verified deployed and working:
-- ✅ `kaggle>=1.8.4` upgrade — T4 assigned correctly, no P100 fallback observed since
-- ✅ `--accelerator NvidiaTeslaT4` CLI flag + `"NvidiaTeslaT4"` JSON capitalisation fix
-- ✅ GPU fast-fail safety net in `main()` (`cc < (7,5)` → reset `triggered_at=0` + exit)
-- ✅ W&B per-round run IDs + `group=` parameter — dashboard showing separate runs per round
+No code changes needed. All fixes from previous sessions are verified deployed and working.
 
 ### Step 2 — Watch W&B for pre-val accuracy trend
 Pre-val accuracy at stage entry (Worker A round 0):
 - Stage 3: 0.00% (expected — first stage with full latent replacement in effect)
 - Stage 4: ~2%
 - Stage 5: ~3–4%
-- Stage 6: ~4–6% (entering round 0)
+- Stage 6: ~4–6%
+- Stage 7: ~6–8% (expected — monotonic trend continuing)
 
 This is a positive monotonic trend. CE is also in a healthy range (0.4–0.8). No intervention needed.
 
-### Step 3 — Stage 6 close-out & DGAC prep
+### Step 3 — DGAC prep (stages 8–10 remaining before Phase 3.4)
 When stage 10 completes, run Phase 3.4:
 ```bash
 python jamba_coconut_finetune.py \
@@ -69,8 +68,8 @@ Worker A has no signal files for stage 3 rounds 2 and 3. B completed both. This 
 ```
 WeirdRunner/Ouroboros/
   diloco_state/
-    anchor/                         ← Stage 6 Round 0 aggregate (latest coordinator run)
-    round_state.json                ← stage_k=6, round_n=1 (or higher), triggered_workers=[A,B,C]
+    anchor/                                  ← Stage 7 Round 0 aggregate (latest coordinator run)
+    round_state.json                         ← stage_k=7, round_n=1 (or higher), triggered_workers=[A,B,C]
     workers/A/round_0000_stage_3/  ✓
     workers/B/round_0000_stage_3/  ✓
     workers/A/round_0001_stage_3/  ✓ (confirmed — signal present)
@@ -78,6 +77,7 @@ WeirdRunner/Ouroboros/
     workers/{A,B,C}/round_0000_stage_4/  ✓
     workers/{A,B,C}/round_0000_stage_5/  ✓
     workers/{A,B,C}/round_0000_stage_6/  ✓
+    workers/{A,B,C}/round_0000_stage_7/  ✓
 ```
 
 ---
@@ -126,6 +126,7 @@ WeirdRunner/Ouroboros/
 | **`triggered_at=0` semantics** | Canonical signal for "dispatch unconfirmed". Coordinator immediately re-dispatches on next run. ✅ VERIFIED |
 | **Attendance round** | Worker in `attendance_workers` → skips training, uploads status(samples=0), pushes signal. |
 | **Waiting mode** | All credentialed workers in `attendance_workers`. `round_n` frozen. |
+| **Wiki** | `WIKI.md` + `wiki/` directory at repo root. LLM-maintained synthesized understanding layer. Init: 2026-04-30. |
 
 ---
 
@@ -222,7 +223,7 @@ HaltGate: Linear(2·d_model → 1), zero-init
 ```
 Stage 1: ~41s/step  Stage 2: ~48–53s/step  Stage 3: ~69s/step
 Stage 5: ~92s/step  Stage 10: ~149s/step
-Observed velocity (stages 4–6): ~1 stage/day with 3 workers on 12h Kaggle sessions
+Observed velocity (stages 4–7): ~1 stage/day with 3 workers on 12h Kaggle sessions
 ```
 
 ---
@@ -237,6 +238,14 @@ Observed velocity (stages 4–6): ~1 stage/day with 3 workers on 12h Kaggle sess
 | `kaggle-utils.ipynb` Cell 5 | ✅ No changes needed |
 | `prepare_coconut_dataset.py` | ✅ |
 | `build_wheels_kaggle.py` | ✅ |
+| `WIKI.md` | ✅ Wiki schema — init 2026-04-30 |
+| `wiki/index.md` | ✅ Content catalog |
+| `wiki/log.md` | ✅ Append-only operation log |
+| `wiki/concept/coconut-curriculum.md` | ✅ Stage-k mechanics, perf model, DGAC status |
+| `wiki/concept/diloco-protocol.md` | ✅ Round state machine, triggered_at, modes |
+| `wiki/debug/kaggle-gpu-p100-fallback.md` | ✅ P100 root cause + full fix chain |
+| `wiki/debug/wandb-resume-ephemeral-runs.md` | ✅ wandb 0.25.0 resume bug + fix |
+| `wiki/pattern/coordinator-retry-flow.md` | ✅ Decision tree + invariants |
 
 ---
 
@@ -244,11 +253,11 @@ Observed velocity (stages 4–6): ~1 stage/day with 3 workers on 12h Kaggle sess
 
 | Question | Status |
 |---|---|
-| Stage 2 DiLoCo: does aggregated model match sequential baseline? | 🟡 Pre-val acc rising monotonically (0%→2%→4%→6%) — promising signal |
+| Stage 2 DiLoCo: does aggregated model match sequential baseline? | 🟡 Pre-val acc rising monotonically (0%→2%→4%→6%→~8%) — promising signal |
 | Stage 3 rounds 2–3: where are Worker A signals? | 🟡 Likely solo/attendance — B signals present, coordinator handled correctly |
 | TRC GPU quota conversion | 🟡 Email sent — awaiting response |
-| DGAC halt_step distribution at K≥2 | 🔴 Open — primary research question (Phase 3.4, stages 7–10 remaining) |
-| Worker C quota: stable for remainder of curriculum? | 🟢 Active since stage 3 round 5 — appears stable |
+| DGAC halt_step distribution at K≥2 | 🔴 Open — primary research question (Phase 3.4, stages 8–10 remaining) |
+| Worker C quota: stable for remainder of curriculum? | 🟢 Active since stage 3 round 5 — stable through stage 7 |
 | Pre-val accuracy at stage 10: target threshold for DGAC? | 🔴 Open — define success criteria before Phase 3.4 |
 
 ---
@@ -269,3 +278,4 @@ Observed velocity (stages 4–6): ~1 stage/day with 3 workers on 12h Kaggle sess
 | `kaggle==1.6.17` + `enable_gpu:true` + `"accelerator": "nvidiaTeslaT4"` → still P100 | Root cause 1: `--accelerator` CLI flag added in v1.8.4 (predates our pin). Root cause 2: wrong cap. Fix: `kaggle>=1.8.4` + `--accelerator NvidiaTeslaT4` + fix JSON cap + runtime fast-fail. All verified. |
 | `wandb==0.25.0` `resume="allow"` on finished run creates ephemeral run | Per-round run IDs + `group=` for stage-level grouping |
 | W&B dashboard becomes unreadable with many overlapping runs | Unique `id` per round + `group` by stage keeps it navigable |
+| BLUEPRINT.md status table drifts behind signal files between sessions | Signal files are ground truth — always reconcile against `signals/` on session start |
