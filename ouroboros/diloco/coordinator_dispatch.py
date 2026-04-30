@@ -160,8 +160,7 @@ def reconcile_after_dispatch(round_state: Mapping[str, Any], dispatched_workers:
     planned_active = ordered_unique_worker_ids(
         round_state.get("triggered_workers"),
         round_state.get("active_workers"),
-        dispatch_results.keys(),
-    )
+    ) or ordered_unique_worker_ids(dispatch_results.keys())
     planned_attendance = ordered_unique_worker_ids(round_state.get("attendance_workers"))
     now = time.time()
     reconciled = reconcile_post_dispatch_state(

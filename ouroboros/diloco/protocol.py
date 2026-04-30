@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
 
-WORKER_IDS: Tuple[str, ...] = ("A", "B", "C")
+WORKER_IDS = ("A", "B", "C")
 RoundMode = Literal["complete", "solo", "diloco", "waiting"]
 DispatchOutcome = Literal["success", "manual", "failed", "triggered", "missing_credentials", "quota_exhausted"]
 
@@ -65,11 +65,12 @@ class RoundState:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "RoundState":
+        stage_k = int(payload.get("stage_k", payload.get("stage", 0)))
         return cls(
-            stage_k=int(payload.get("stage_k", 0)),
-            round_n=int(payload.get("round_n", 0)),
+            stage_k=stage_k,
+            round_n=int(payload.get("round_n", payload.get("round", 0))),
             mode=str(payload.get("mode", "diloco")),  # type: ignore[arg-type]
-            total_samples_seen={str(k): int(v) for k, v in dict(payload.get("total_samples_seen", {})).items()},
+            total_samples_seen=_coerce_total_samples_seen(payload.get("total_samples_seen", {}), stage_k),
             triggered_workers=tuple(ordered_unique_worker_ids(payload.get("triggered_workers"))),
             attendance_workers=tuple(ordered_unique_worker_ids(payload.get("attendance_workers"))),
             triggered_at=float(payload.get("triggered_at", 0.0) or 0.0),
@@ -108,6 +109,14 @@ class RoundPlan:
     ready_workers: Tuple[str, ...] = ()
     attendance_ready_workers: Tuple[str, ...] = ()
     reason: str = ""
+
+
+def _coerce_total_samples_seen(value: Any, stage_k: int) -> Dict[str, int]:
+    if isinstance(value, Mapping):
+        return {str(k): int(v) for k, v in dict(value).items()}
+    if value is None:
+        return {}
+    return {str(stage_k): int(value or 0)}
 
 
 def _normalize_worker_id(worker_id: Any) -> Optional[str]:
@@ -319,63 +328,75 @@ def plan_next_round(
 
     if expected_workers:
         missing = [w for w in expected_workers if w not in ready_ids]
-        if missing:
-            if state.triggered_at <= 0:
-                return RoundPlan(
-                    mode=state.mode,
-                    active_workers=tuple(expected_workers),
-                    attendance_workers=tuple(attendance_prev),
-                    projected_shards=projected_shards,
-                    should_aggregate=False,
-                    should_dispatch=True,
-                    should_advance_stage=False,
-                    ready_workers=tuple(sorted(ready_ids)),
-                    attendance_ready_workers=tuple(sorted(attendance_ready_ids)),
-                    reason="dispatch timestamp sentinel is zero; retry dispatch",
-                )
-            timed_out = (float(now) - float(state.triggered_at)) > config.worker_timeout_seconds
-            if not timed_out:
-                return RoundPlan(
-                    mode=state.mode,
-                    active_workers=tuple(expected_workers),
-                    attendance_workers=tuple(attendance_prev),
-                    projected_shards=projected_shards,
-                    should_aggregate=False,
-                    should_dispatch=False,
-                    should_advance_stage=False,
-                    ready_workers=tuple(sorted(ready_ids)),
-                    attendance_ready_workers=tuple(sorted(attendance_ready_ids)),
-                    reason=f"waiting for active workers: {missing}",
-                )
-            survivors = [w for w in expected_workers if w in ready_ids]
-            demoted = ordered_unique_worker_ids(attendance_prev, missing)
-            if not survivors:
-                return RoundPlan(
-                    mode="waiting",
-                    active_workers=(),
-                    attendance_workers=tuple(demoted),
-                    projected_shards=projected_shards,
-                    should_aggregate=False,
-                    should_dispatch=True,
-                    should_advance_stage=False,
-                    timed_out_workers=tuple(missing),
-                    ready_workers=tuple(sorted(ready_ids)),
-                    attendance_ready_workers=tuple(sorted(attendance_ready_ids)),
-                    reason="all active workers timed out; enter attendance waiting mode",
-                )
+        if not missing:
             return RoundPlan(
-                mode=mode_from_active_workers(survivors),
-                active_workers=tuple(survivors),
-                attendance_workers=tuple(demoted),
+                mode=state.mode,
+                active_workers=tuple(expected_workers),
+                attendance_workers=tuple(attendance_prev),
                 projected_shards=projected_shards,
                 should_aggregate=True,
+                should_dispatch=True,
+                should_advance_stage=False,
+                ready_workers=tuple(sorted(ready_ids)),
+                attendance_ready_workers=tuple(sorted(attendance_ready_ids)),
+                reason="all active workers ready",
+            )
+        if state.triggered_at <= 0:
+            return RoundPlan(
+                mode=state.mode,
+                active_workers=tuple(expected_workers),
+                attendance_workers=tuple(attendance_prev),
+                projected_shards=projected_shards,
+                should_aggregate=False,
+                should_dispatch=True,
+                should_advance_stage=False,
+                ready_workers=tuple(sorted(ready_ids)),
+                attendance_ready_workers=tuple(sorted(attendance_ready_ids)),
+                reason="dispatch timestamp sentinel is zero; retry dispatch",
+            )
+        timed_out = (float(now) - float(state.triggered_at)) > config.worker_timeout_seconds
+        if not timed_out:
+            return RoundPlan(
+                mode=state.mode,
+                active_workers=tuple(expected_workers),
+                attendance_workers=tuple(attendance_prev),
+                projected_shards=projected_shards,
+                should_aggregate=False,
+                should_dispatch=False,
+                should_advance_stage=False,
+                ready_workers=tuple(sorted(ready_ids)),
+                attendance_ready_workers=tuple(sorted(attendance_ready_ids)),
+                reason=f"waiting for active workers: {missing}",
+            )
+        survivors = [w for w in expected_workers if w in ready_ids]
+        demoted = ordered_unique_worker_ids(attendance_prev, missing)
+        if not survivors:
+            return RoundPlan(
+                mode="waiting",
+                active_workers=(),
+                attendance_workers=tuple(demoted),
+                projected_shards=projected_shards,
+                should_aggregate=False,
                 should_dispatch=True,
                 should_advance_stage=False,
                 timed_out_workers=tuple(missing),
                 ready_workers=tuple(sorted(ready_ids)),
                 attendance_ready_workers=tuple(sorted(attendance_ready_ids)),
-                reason="timed-out workers demoted to attendance",
+                reason="all active workers timed out; enter attendance waiting mode",
             )
+        return RoundPlan(
+            mode=mode_from_active_workers(survivors),
+            active_workers=tuple(survivors),
+            attendance_workers=tuple(demoted),
+            projected_shards=projected_shards,
+            should_aggregate=True,
+            should_dispatch=True,
+            should_advance_stage=False,
+            timed_out_workers=tuple(missing),
+            ready_workers=tuple(sorted(ready_ids)),
+            attendance_ready_workers=tuple(sorted(attendance_ready_ids)),
+            reason="timed-out workers demoted to attendance",
+        )
 
     eligible = [w for w in credentialed_workers if w not in set(attendance_prev)]
     next_mode, active = determine_round_mode(

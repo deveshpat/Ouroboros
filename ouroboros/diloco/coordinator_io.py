@@ -68,7 +68,7 @@ def load_adapter_weights_cpu(path: str | Path) -> dict[str, Any]:
     return {k: v.cpu() for k, v in load_file(str(path), device="cpu").items()}
 
 
-def weighted_average_deltas(worker_weights: Iterable[tuple[Mapping[str, Any], float]]) -> dict[str, Any]:
+def average_weights(worker_weights: Iterable[tuple[Mapping[str, Any], float]]) -> dict[str, Any]:
     weighted = list(worker_weights)
     if not weighted:
         raise ValueError("no worker weights supplied")
@@ -98,17 +98,17 @@ _hub_download_file = hub_download_file
 _hub_download_json = hub_download_json
 _hub_upload_json = hub_upload_json
 _load_adapter_weights_cpu = load_adapter_weights_cpu
-_weighted_average_deltas = weighted_average_deltas
+_average_weights = average_weights
 _save_and_upload_anchor = save_and_upload_anchor
 
 
 __all__ = [
     "ANCHOR_PREFIX",
+    "average_weights",
     "hub_download_file",
     "hub_download_json",
     "hub_upload_json",
     "load_adapter_weights_cpu",
     "retry_io",
     "save_and_upload_anchor",
-    "weighted_average_deltas",
 ]
