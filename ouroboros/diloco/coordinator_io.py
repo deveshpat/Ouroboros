@@ -83,10 +83,6 @@ def average_weights(worker_weights: Iterable[tuple[Mapping[str, Any], float]]) -
     return result
 
 
-# Deprecated compatibility alias; new call sites should use ``average_weights``.
-weighted_average_deltas = average_weights
-
-
 def save_and_upload_anchor(repo_id: str, path_in_repo: str, weights: Mapping[str, Any], *, token: str | None = None) -> None:
     from huggingface_hub import upload_file  # type: ignore
     from safetensors.torch import save_file  # type: ignore
@@ -115,5 +111,4 @@ __all__ = [
     "load_adapter_weights_cpu",
     "retry_io",
     "save_and_upload_anchor",
-    "weighted_average_deltas",
 ]
