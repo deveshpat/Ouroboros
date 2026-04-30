@@ -42,13 +42,16 @@ def test_finetune_runtime_uses_curriculum_module_calls() -> None:
 
 
 def test_collect_ready_workers_uses_hub_state_paths(monkeypatch):
+    import ouroboros.diloco.coordinator_runner as runner
+
     seen_paths: list[str] = []
 
-    def fake_download(repo_id: str, path: str, token: str):
+    def fake_download(repo_id: str, path: str, token: str | None = None, default=None):
         seen_paths.append(path)
         return {"worker_id": "A", "stage_k": 1, "round_n": 2, "status": "done", "samples_seen": 10}
 
-    monkeypatch.setattr(coordinator_runtime, "hub_download_json", fake_download)
-    ready = coordinator_runtime.collect_ready_workers("repo", "token", stage_k=1, round_n=2, expected_workers=["A"])
+    monkeypatch.setattr(runner, "hub_download_json", fake_download)
+    ready = runner.collect_ready_workers("repo", "token", stage_k=1, round_n=2, expected_workers=["A"])
     assert ready and ready[0]["worker_id"] == "A"
+    assert coordinator_runtime.collect_ready_workers is runner.collect_ready_workers
     assert seen_paths == ["diloco_state/workers/A/status.json"]
