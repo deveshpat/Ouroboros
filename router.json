@@ -1,0 +1,249 @@
+{
+  "_meta": {
+    "purpose": "Navigation index for LLM sessions on deveshpat/Ouroboros. Attach to system instructions or paste at session start. Fetch session_ritual.read_first before writing any code. Content lives in the files \u2014 this is just the address book.",
+    "generated": "2026-04-30",
+    "commit": "0a594e2",
+    "refresh": "python generate_router.py  # run from repo root"
+  },
+  "project": {
+    "name": "Ouroboros",
+    "repo": "deveshpat/Ouroboros",
+    "branch": "main"
+  },
+  "session_ritual": {
+    "instruction": "1. Fetch every URL in read_first \u2014 these carry project state, architecture decisions, and domain context. 2. From index, pull specific modules on demand only. 3. Never assume module content; always fetch before editing.",
+    "read_first": [
+      "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/BLUEPRINT.md",
+      "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/CONTEXT.md",
+      "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/WIKI.md"
+    ]
+  },
+  "index": {
+    "infra": [
+      {
+        "path": ".github/workflows/diloco_coordinator.yml",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/.github/workflows/diloco_coordinator.yml"
+      }
+    ],
+    "critical": [
+      {
+        "path": "BLUEPRINT.md",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/BLUEPRINT.md"
+      },
+      {
+        "path": "CONTEXT.md",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/CONTEXT.md"
+      },
+      {
+        "path": "WIKI.md",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/WIKI.md"
+      }
+    ],
+    "root": [
+      {
+        "path": "LICENSE",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/LICENSE"
+      },
+      {
+        "path": "diloco_coordinator.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/diloco_coordinator.py"
+      },
+      {
+        "path": "generate_router.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/generate_router.py"
+      },
+      {
+        "path": "jamba_coconut_finetune.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/jamba_coconut_finetune.py"
+      },
+      {
+        "path": "router.json",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/router.json"
+      },
+      {
+        "path": "terminal_log.md",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/terminal_log.md"
+      }
+    ],
+    "notebooks": [
+      {
+        "path": "kaggle-utils.ipynb",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/kaggle-utils.ipynb"
+      }
+    ],
+    "source": [
+      {
+        "path": "ouroboros/__init__.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/__init__.py"
+      }
+    ],
+    "source.coconut": [
+      {
+        "path": "ouroboros/coconut/__init__.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/coconut/__init__.py"
+      },
+      {
+        "path": "ouroboros/coconut/bootstrap.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/coconut/bootstrap.py"
+      },
+      {
+        "path": "ouroboros/coconut/curriculum.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/coconut/curriculum.py"
+      },
+      {
+        "path": "ouroboros/coconut/dataset_runtime.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/coconut/dataset_runtime.py"
+      },
+      {
+        "path": "ouroboros/coconut/dgac.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/coconut/dgac.py"
+      },
+      {
+        "path": "ouroboros/coconut/finetune_cli.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/coconut/finetune_cli.py"
+      },
+      {
+        "path": "ouroboros/coconut/finetune_runtime.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/coconut/finetune_runtime.py"
+      },
+      {
+        "path": "ouroboros/coconut/latent.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/coconut/latent.py"
+      },
+      {
+        "path": "ouroboros/coconut/training_runtime.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/coconut/training_runtime.py"
+      }
+    ],
+    "source.diloco": [
+      {
+        "path": "ouroboros/diloco/__init__.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/__init__.py"
+      },
+      {
+        "path": "ouroboros/diloco/aggregation.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/aggregation.py"
+      },
+      {
+        "path": "ouroboros/diloco/coordinator_cli.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/coordinator_cli.py"
+      },
+      {
+        "path": "ouroboros/diloco/coordinator_dispatch.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/coordinator_dispatch.py"
+      },
+      {
+        "path": "ouroboros/diloco/coordinator_io.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/coordinator_io.py"
+      },
+      {
+        "path": "ouroboros/diloco/coordinator_runner.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/coordinator_runner.py"
+      },
+      {
+        "path": "ouroboros/diloco/coordinator_runner_logic.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/coordinator_runner_logic.py"
+      },
+      {
+        "path": "ouroboros/diloco/coordinator_runtime.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/coordinator_runtime.py"
+      },
+      {
+        "path": "ouroboros/diloco/hub_state.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/hub_state.py"
+      },
+      {
+        "path": "ouroboros/diloco/kaggle_dispatch.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/kaggle_dispatch.py"
+      },
+      {
+        "path": "ouroboros/diloco/observability.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/observability.py"
+      },
+      {
+        "path": "ouroboros/diloco/protocol.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/protocol.py"
+      },
+      {
+        "path": "ouroboros/diloco/runtime_env.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/runtime_env.py"
+      }
+    ],
+    "tests": [
+      {
+        "path": "tests/test_coconut_curriculum.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_coconut_curriculum.py"
+      },
+      {
+        "path": "tests/test_coordinator_runner.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_coordinator_runner.py"
+      },
+      {
+        "path": "tests/test_dataset_runtime.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_dataset_runtime.py"
+      },
+      {
+        "path": "tests/test_diloco_protocol.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_diloco_protocol.py"
+      },
+      {
+        "path": "tests/test_entrypoint_adapters.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_entrypoint_adapters.py"
+      },
+      {
+        "path": "tests/test_hub_state_paths.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_hub_state_paths.py"
+      },
+      {
+        "path": "tests/test_kaggle_dispatch_metadata.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_kaggle_dispatch_metadata.py"
+      },
+      {
+        "path": "tests/test_observability_identity.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_observability_identity.py"
+      },
+      {
+        "path": "tests/test_runtime_entrypoints_thin.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_runtime_entrypoints_thin.py"
+      },
+      {
+        "path": "tests/test_runtime_env.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_runtime_env.py"
+      },
+      {
+        "path": "tests/test_runtime_module_usage.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_runtime_module_usage.py"
+      }
+    ],
+    "wiki": [
+      {
+        "path": "wiki/concept/coconut-curriculum.md",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/concept/coconut-curriculum.md"
+      },
+      {
+        "path": "wiki/concept/diloco-protocol.md",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/concept/diloco-protocol.md"
+      },
+      {
+        "path": "wiki/debug/kaggle-gpu-p100-fallback.md",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/debug/kaggle-gpu-p100-fallback.md"
+      },
+      {
+        "path": "wiki/debug/wandb-resume-ephemeral-runs.md",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/debug/wandb-resume-ephemeral-runs.md"
+      },
+      {
+        "path": "wiki/index.md",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/index.md"
+      },
+      {
+        "path": "wiki/log.md",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/log.md"
+      },
+      {
+        "path": "wiki/pattern/coordinator-retry-flow.md",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/pattern/coordinator-retry-flow.md"
+      }
+    ]
+  }
+}
