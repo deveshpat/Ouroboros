@@ -6,7 +6,7 @@ import json
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Protocol, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from .protocol import RoundState, WorkerStatus
 
@@ -34,27 +34,6 @@ class HubPaths:
         return worker_weights_prefix(worker_id, stage_k, round_n)
 
 
-class HubStateStore(Protocol):
-    """Coordinator JSON-state seam."""
-
-    paths: HubPaths
-
-    def load_round_state(self) -> Optional[RoundState]:
-        ...
-
-    def save_round_state(self, state: Mapping[str, Any], message: str = "") -> None:
-        ...
-
-    def load_round_state_raw(self) -> Optional[dict[str, Any]]:
-        ...
-
-    def save_round_state_raw(self, state: Mapping[str, Any], message: str = "") -> None:
-        ...
-
-    def load_worker_statuses(self, worker_ids: Sequence[str]) -> list[WorkerStatus]:
-        ...
-
-
 class InMemoryHubStateStore:
     """Test adapter for the Hub state seam."""
 
@@ -63,16 +42,10 @@ class InMemoryHubStateStore:
         self.paths = HubPaths()
 
     def load_round_state(self) -> Optional[RoundState]:
-        payload = self.load_round_state_raw()
+        payload = self.files.get(ROUND_STATE_PATH)
         return RoundState.from_mapping(payload) if payload is not None else None
 
     def save_round_state(self, state: Mapping[str, Any], message: str = "") -> None:
-        self.save_round_state_raw(state, message=message)
-
-    def load_round_state_raw(self) -> Optional[dict[str, Any]]:
-        return dict(self.files[ROUND_STATE_PATH]) if ROUND_STATE_PATH in self.files else None
-
-    def save_round_state_raw(self, state: Mapping[str, Any], message: str = "") -> None:
         self.files[ROUND_STATE_PATH] = dict(state)
 
     def load_worker_statuses(self, worker_ids: Sequence[str]) -> list[WorkerStatus]:
@@ -90,11 +63,11 @@ class InMemoryHubStateStore:
 class HuggingFaceHubStateStore:
     """Production adapter around Hugging Face Hub JSON state.
 
-    Weight artifacts are intentionally kept outside this state seam so heavy
-    tensor dependencies stay outside tests that only exercise JSON state.
+    Weight artifacts are intentionally kept as explicit methods so heavy tensor
+    dependencies stay outside tests that only exercise JSON state.
     """
 
-    def __init__(self, *, repo_id: str, token: str | None) -> None:
+    def __init__(self, *, repo_id: str, token: str) -> None:
         self.repo_id = repo_id
         self.token = token
         self.paths = HubPaths()
@@ -121,23 +94,16 @@ class HuggingFaceHubStateStore:
                 path_in_repo=path,
                 repo_id=self.repo_id,
                 token=self.token,
-                commit_message=message or f"Update {path}",
+                commit_message=message,
             )
         finally:
             Path(tmp).unlink(missing_ok=True)
 
     def load_round_state(self) -> Optional[RoundState]:
-        payload = self.load_round_state_raw()
+        payload = self._download_json(ROUND_STATE_PATH)
         return RoundState.from_mapping(payload) if payload is not None else None
 
-    def save_round_state(self, state: Mapping[str, Any], message: str = "") -> None:
-        self.save_round_state_raw(state, message=message)
-
-    def load_round_state_raw(self) -> Optional[dict[str, Any]]:
-        payload = self._download_json(ROUND_STATE_PATH)
-        return dict(payload) if payload is not None else None
-
-    def save_round_state_raw(self, state: Mapping[str, Any], message: str = "") -> None:
+    def save_round_state(self, state: Mapping[str, Any], message: str) -> None:
         self._upload_json(ROUND_STATE_PATH, state, message)
 
     def load_worker_statuses(self, worker_ids: Sequence[str]) -> list[WorkerStatus]:
