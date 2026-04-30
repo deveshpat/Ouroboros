@@ -10,7 +10,7 @@ def _repo_root() -> Path:
 def test_runtime_entrypoints_stay_thin() -> None:
     root = _repo_root()
     limits = {
-        root / "ouroboros" / "diloco" / "coordinator_runtime.py": 80,
+        root / "ouroboros" / "diloco" / "coordinator_runtime.py": 30,
         root / "ouroboros" / "coconut" / "finetune_runtime.py": 40,
     }
     for path, limit in limits.items():
