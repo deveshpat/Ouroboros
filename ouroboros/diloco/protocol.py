@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
 
-WORKER_IDS: Tuple[str, ...] = ("A", "B", "C")
+WORKER_IDS = ("A", "B", "C")
 RoundMode = Literal["complete", "solo", "diloco", "waiting"]
 DispatchOutcome = Literal["success", "manual", "failed", "triggered", "missing_credentials", "quota_exhausted"]
 
