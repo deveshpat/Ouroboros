@@ -2,7 +2,7 @@
   "_meta": {
     "purpose": "Navigation index for LLM sessions on deveshpat/Ouroboros. Attach to system instructions or paste at session start. Fetch session_ritual.read_first before writing any code. Content lives in the files \u2014 this is just the address book.",
     "generated": "2026-04-30",
-    "commit": "0a594e2",
+    "commit": "61cf9b8",
     "refresh": "python generate_router.py  # run from repo root"
   },
   "project": {
@@ -141,10 +141,6 @@
         "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/coordinator_runner.py"
       },
       {
-        "path": "ouroboros/diloco/coordinator_runner_logic.py",
-        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/coordinator_runner_logic.py"
-      },
-      {
         "path": "ouroboros/diloco/coordinator_runtime.py",
         "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/ouroboros/diloco/coordinator_runtime.py"
       },
@@ -170,6 +166,10 @@
       }
     ],
     "tests": [
+      {
+        "path": "tests/conftest.py",
+        "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/conftest.py"
+      },
       {
         "path": "tests/test_coconut_curriculum.py",
         "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/tests/test_coconut_curriculum.py"
