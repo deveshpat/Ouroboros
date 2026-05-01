@@ -1,0 +1,485 @@
+{
+  "_schema": "llm-router/v1",
+  "_doc": "This file is a machine-readable index of the repository. Use `base_url` + a relative `path` field to fetch any file over HTTP via raw.githubusercontent.com. Filter by `category` or `extension` to find the files you need.",
+  "meta": {
+    "owner": "deveshpat",
+    "repo": "Ouroboros",
+    "branch": "main",
+    "base_url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main",
+    "generated_at": "2026-04-30T18:46:24.679496+00:00",
+    "total_files": 41,
+    "total_dirs": 1
+  },
+  "categories": {
+    "code": [
+      "diloco_coordinator.py",
+      "jamba_coconut_finetune.py"
+    ],
+    "config": [
+      "signals/worker_A_stage_2_round_0.json",
+      "signals/worker_A_stage_2_round_1.json",
+      "signals/worker_A_stage_2_round_2.json",
+      "signals/worker_A_stage_2_round_3.json",
+      "signals/worker_A_stage_2_round_4.json",
+      "signals/worker_A_stage_2_round_5.json",
+      "signals/worker_A_stage_3_round_0.json",
+      "signals/worker_A_stage_3_round_1.json",
+      "signals/worker_A_stage_3_round_4.json",
+      "signals/worker_A_stage_3_round_5.json",
+      "signals/worker_A_stage_4_round_0.json",
+      "signals/worker_A_stage_5_round_0.json",
+      "signals/worker_A_stage_6_round_0.json",
+      "signals/worker_A_stage_7_round_0.json",
+      "signals/worker_B_stage_2_round_0.json",
+      "signals/worker_B_stage_2_round_1.json",
+      "signals/worker_B_stage_2_round_2.json",
+      "signals/worker_B_stage_2_round_3.json",
+      "signals/worker_B_stage_2_round_4.json",
+      "signals/worker_B_stage_2_round_5.json",
+      "signals/worker_B_stage_3_round_0.json",
+      "signals/worker_B_stage_3_round_1.json",
+      "signals/worker_B_stage_3_round_2.json",
+      "signals/worker_B_stage_3_round_3.json",
+      "signals/worker_B_stage_3_round_4.json",
+      "signals/worker_B_stage_3_round_5.json",
+      "signals/worker_B_stage_4_round_0.json",
+      "signals/worker_B_stage_5_round_0.json",
+      "signals/worker_B_stage_6_round_0.json",
+      "signals/worker_B_stage_7_round_0.json",
+      "signals/worker_C_stage_3_round_5.json",
+      "signals/worker_C_stage_4_round_0.json",
+      "signals/worker_C_stage_5_round_0.json",
+      "signals/worker_C_stage_6_round_0.json",
+      "signals/worker_C_stage_7_round_0.json"
+    ],
+    "markdown": [
+      "BLUEPRINT.md",
+      "terminal_log.md"
+    ],
+    "notebook": [
+      "kaggle-utils.ipynb"
+    ],
+    "other": [
+      "LICENSE"
+    ]
+  },
+  "directories": [
+    {
+      "name": "signals",
+      "path": "signals",
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals"
+    }
+  ],
+  "files": [
+    {
+      "name": "BLUEPRINT.md",
+      "path": "BLUEPRINT.md",
+      "extension": ".md",
+      "category": "markdown",
+      "mime": "text/markdown",
+      "size_bytes": 14682,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/BLUEPRINT.md"
+    },
+    {
+      "name": "LICENSE",
+      "path": "LICENSE",
+      "extension": null,
+      "category": "other",
+      "mime": null,
+      "size_bytes": 1069,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/LICENSE"
+    },
+    {
+      "name": "diloco_coordinator.py",
+      "path": "diloco_coordinator.py",
+      "extension": ".py",
+      "category": "code",
+      "mime": "text/x-python",
+      "size_bytes": 48582,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/diloco_coordinator.py"
+    },
+    {
+      "name": "jamba_coconut_finetune.py",
+      "path": "jamba_coconut_finetune.py",
+      "extension": ".py",
+      "category": "code",
+      "mime": "text/x-python",
+      "size_bytes": 161547,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/jamba_coconut_finetune.py"
+    },
+    {
+      "name": "kaggle-utils.ipynb",
+      "path": "kaggle-utils.ipynb",
+      "extension": ".ipynb",
+      "category": "notebook",
+      "mime": null,
+      "size_bytes": 10916,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/kaggle-utils.ipynb"
+    },
+    {
+      "name": "terminal_log.md",
+      "path": "terminal_log.md",
+      "extension": ".md",
+      "category": "markdown",
+      "mime": "text/markdown",
+      "size_bytes": 10095,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/terminal_log.md"
+    },
+    {
+      "name": "worker_A_stage_2_round_0.json",
+      "path": "signals/worker_A_stage_2_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 82,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_2_round_0.json"
+    },
+    {
+      "name": "worker_A_stage_2_round_1.json",
+      "path": "signals/worker_A_stage_2_round_1.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 88,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_2_round_1.json"
+    },
+    {
+      "name": "worker_A_stage_2_round_2.json",
+      "path": "signals/worker_A_stage_2_round_2.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 88,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_2_round_2.json"
+    },
+    {
+      "name": "worker_A_stage_2_round_3.json",
+      "path": "signals/worker_A_stage_2_round_3.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_2_round_3.json"
+    },
+    {
+      "name": "worker_A_stage_2_round_4.json",
+      "path": "signals/worker_A_stage_2_round_4.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 88,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_2_round_4.json"
+    },
+    {
+      "name": "worker_A_stage_2_round_5.json",
+      "path": "signals/worker_A_stage_2_round_5.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_2_round_5.json"
+    },
+    {
+      "name": "worker_A_stage_3_round_0.json",
+      "path": "signals/worker_A_stage_3_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 88,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_3_round_0.json"
+    },
+    {
+      "name": "worker_A_stage_3_round_1.json",
+      "path": "signals/worker_A_stage_3_round_1.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_3_round_1.json"
+    },
+    {
+      "name": "worker_A_stage_3_round_4.json",
+      "path": "signals/worker_A_stage_3_round_4.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_3_round_4.json"
+    },
+    {
+      "name": "worker_A_stage_3_round_5.json",
+      "path": "signals/worker_A_stage_3_round_5.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 88,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_3_round_5.json"
+    },
+    {
+      "name": "worker_A_stage_4_round_0.json",
+      "path": "signals/worker_A_stage_4_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_4_round_0.json"
+    },
+    {
+      "name": "worker_A_stage_5_round_0.json",
+      "path": "signals/worker_A_stage_5_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_5_round_0.json"
+    },
+    {
+      "name": "worker_A_stage_6_round_0.json",
+      "path": "signals/worker_A_stage_6_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 88,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_6_round_0.json"
+    },
+    {
+      "name": "worker_A_stage_7_round_0.json",
+      "path": "signals/worker_A_stage_7_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 88,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_A_stage_7_round_0.json"
+    },
+    {
+      "name": "worker_B_stage_2_round_0.json",
+      "path": "signals/worker_B_stage_2_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 82,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_2_round_0.json"
+    },
+    {
+      "name": "worker_B_stage_2_round_1.json",
+      "path": "signals/worker_B_stage_2_round_1.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_2_round_1.json"
+    },
+    {
+      "name": "worker_B_stage_2_round_2.json",
+      "path": "signals/worker_B_stage_2_round_2.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_2_round_2.json"
+    },
+    {
+      "name": "worker_B_stage_2_round_3.json",
+      "path": "signals/worker_B_stage_2_round_3.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_2_round_3.json"
+    },
+    {
+      "name": "worker_B_stage_2_round_4.json",
+      "path": "signals/worker_B_stage_2_round_4.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_2_round_4.json"
+    },
+    {
+      "name": "worker_B_stage_2_round_5.json",
+      "path": "signals/worker_B_stage_2_round_5.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_2_round_5.json"
+    },
+    {
+      "name": "worker_B_stage_3_round_0.json",
+      "path": "signals/worker_B_stage_3_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_3_round_0.json"
+    },
+    {
+      "name": "worker_B_stage_3_round_1.json",
+      "path": "signals/worker_B_stage_3_round_1.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_3_round_1.json"
+    },
+    {
+      "name": "worker_B_stage_3_round_2.json",
+      "path": "signals/worker_B_stage_3_round_2.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_3_round_2.json"
+    },
+    {
+      "name": "worker_B_stage_3_round_3.json",
+      "path": "signals/worker_B_stage_3_round_3.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_3_round_3.json"
+    },
+    {
+      "name": "worker_B_stage_3_round_4.json",
+      "path": "signals/worker_B_stage_3_round_4.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_3_round_4.json"
+    },
+    {
+      "name": "worker_B_stage_3_round_5.json",
+      "path": "signals/worker_B_stage_3_round_5.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_3_round_5.json"
+    },
+    {
+      "name": "worker_B_stage_4_round_0.json",
+      "path": "signals/worker_B_stage_4_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 87,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_4_round_0.json"
+    },
+    {
+      "name": "worker_B_stage_5_round_0.json",
+      "path": "signals/worker_B_stage_5_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_5_round_0.json"
+    },
+    {
+      "name": "worker_B_stage_6_round_0.json",
+      "path": "signals/worker_B_stage_6_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_6_round_0.json"
+    },
+    {
+      "name": "worker_B_stage_7_round_0.json",
+      "path": "signals/worker_B_stage_7_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_B_stage_7_round_0.json"
+    },
+    {
+      "name": "worker_C_stage_3_round_5.json",
+      "path": "signals/worker_C_stage_3_round_5.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 88,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_C_stage_3_round_5.json"
+    },
+    {
+      "name": "worker_C_stage_4_round_0.json",
+      "path": "signals/worker_C_stage_4_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_C_stage_4_round_0.json"
+    },
+    {
+      "name": "worker_C_stage_5_round_0.json",
+      "path": "signals/worker_C_stage_5_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_C_stage_5_round_0.json"
+    },
+    {
+      "name": "worker_C_stage_6_round_0.json",
+      "path": "signals/worker_C_stage_6_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_C_stage_6_round_0.json"
+    },
+    {
+      "name": "worker_C_stage_7_round_0.json",
+      "path": "signals/worker_C_stage_7_round_0.json",
+      "extension": ".json",
+      "category": "config",
+      "mime": "application/json",
+      "size_bytes": 89,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_C_stage_7_round_0.json"
+    }
+  ]
+}
