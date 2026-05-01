@@ -6,9 +6,9 @@
     "repo": "Ouroboros",
     "branch": "main",
     "base_url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main",
-    "generated_at": "2026-04-30T18:46:24.679496+00:00",
+    "generated_at": "2026-05-01T09:35:01.109607+00:00",
     "total_files": 41,
-    "total_dirs": 1
+    "total_dirs": 2
   },
   "categories": {
     "code": [
@@ -68,6 +68,11 @@
       "name": "signals",
       "path": "signals",
       "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals"
+    },
+    {
+      "name": "skills",
+      "path": "skills",
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/skills"
     }
   ],
   "files": [
