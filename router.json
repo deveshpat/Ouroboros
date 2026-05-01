@@ -6,7 +6,7 @@
     "repo": "Ouroboros",
     "branch": "main",
     "base_url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main",
-    "generated_at": "2026-05-01T09:35:01.109607+00:00",
+    "generated_at": "2026-05-01T09:39:52.698157+00:00",
     "total_files": 41,
     "total_dirs": 2
   },
@@ -102,7 +102,7 @@
       "extension": ".py",
       "category": "code",
       "mime": "text/x-python",
-      "size_bytes": 48582,
+      "size_bytes": 58404,
       "binary": false,
       "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/diloco_coordinator.py"
     },
@@ -112,7 +112,7 @@
       "extension": ".py",
       "category": "code",
       "mime": "text/x-python",
-      "size_bytes": 161547,
+      "size_bytes": 161667,
       "binary": false,
       "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/jamba_coconut_finetune.py"
     },
