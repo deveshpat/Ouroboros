@@ -11,7 +11,7 @@
 ### What this project is
 Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transformer-Mamba hybrid). The Mamba SSM recurrent state acts as compressed scratch-pad across K latent thought passes, replacing token generation during reasoning. Based on Meta's Coconut (arXiv:2412.06769), extended with DGAC (Diversity-Gated Adaptive Coconut) — a novel anti-collapse halt gate.
 
-### Current Status (2026-04-26)
+### Current Status (2026-05-02)
 
 | Curriculum Stage | Status | Notes |
 |---|---|---|
@@ -21,46 +21,53 @@ Coconut-Ouroboros: latent reasoning injection into Jamba Reasoning 3B (Transform
 | Stage 3 — 3 latent passes | ✅ COMPLETE | 6 rounds; A solo r2–r3 (B only signals); C rejoined r5 |
 | Stage 4 — 4 latent passes | ✅ COMPLETE | 1 round, A+B+C all active |
 | Stage 5 — 5 latent passes | ✅ COMPLETE | 1 round, A+B+C all active |
-| Stage 6 — 6 latent passes | 🔄 IN PROGRESS | Round 0 done (A+B+C signals); awaiting coordinator next run |
-| Stages 7–10 | ⬜ NOT STARTED | — |
+| Stage 6 — 6 latent passes | ✅ COMPLETE | 1 round, A+B+C all active |
+| Stage 7 — 7 latent passes | ✅ COMPLETE | 1 round, A+B+C all active (coordinator aggregation pending) |
+| Stage 8 — 8 latent passes | 🔄 IN PROGRESS | Coordinator will dispatch on next run (≤30 min) |
+| Stages 9–10 | ⬜ NOT STARTED | — |
 
-**Compute mode: DiLoCo 3-worker (A+B+C all active as of stage 3 round 5. Worker C quota renewed.)**
+**Compute mode: DiLoCo 3-worker (A+B+C all active, 1 round per stage since stage 4.)**
 
-**Training velocity:** ~1 stage/day for stages 4–6. System is running autonomously.
+**Training velocity:** ~1 stage/day for stages 4–7. Stages 8–10 expected to complete ~2026-05-04.
 
 ---
 
 ## Part 0.1 — Immediate Next Steps
 
-### Step 1 — Monitor Stage 6 completion (no action required)
-Stage 6 round 0 completed today (all three worker signals present). The coordinator will aggregate and trigger round 1 automatically within 30 minutes of this read.
+### Step 1 — Monitor stages 8–10 (no action required)
+Stage 7 round 0 complete for all three workers (signals present). Coordinator will aggregate and dispatch stage 8 automatically. No code changes needed.
 
-No code changes needed. All pending fixes from the previous session are verified deployed and working:
-- ✅ `kaggle>=1.8.4` upgrade — T4 assigned correctly, no P100 fallback observed since
-- ✅ `--accelerator NvidiaTeslaT4` CLI flag + `"NvidiaTeslaT4"` JSON capitalisation fix
-- ✅ GPU fast-fail safety net in `main()` (`cc < (7,5)` → reset `triggered_at=0` + exit)
-- ✅ W&B per-round run IDs + `group=` parameter — dashboard showing separate runs per round
-
-### Step 2 — Watch W&B for pre-val accuracy trend
+### Step 2 — Watch W&B pre-val accuracy trend
 Pre-val accuracy at stage entry (Worker A round 0):
-- Stage 3: 0.00% (expected — first stage with full latent replacement in effect)
-- Stage 4: ~2%
-- Stage 5: ~3–4%
-- Stage 6: ~4–6% (entering round 0)
+- Stage 3: 0.00% → Stage 4: ~2% → Stage 5: ~3–4% → Stage 6: ~4–6% → Stage 7: ~6–8% (expected)
+- Target by Stage 10: define success threshold before DGAC (see Part 4, open question)
 
-This is a positive monotonic trend. CE is also in a healthy range (0.4–0.8). No intervention needed.
+### Step 3 — DGAC prep: fix anchor handoff **[REQUIRED BEFORE PHASE 3.4]**
+⚠️ **Architecture gap identified:** `--use_halt_gate` cannot load DiLoCo-trained weights.
+The current code's `find_latest_resume_checkpoint()` scans for `training_state.pt` in
+`runs/stage3_curriculum/` — DiLoCo mode never writes there. The final anchor lives at
+`diloco_state/anchor/` on Hub.
 
-### Step 3 — Stage 6 close-out & DGAC prep
-When stage 10 completes, run Phase 3.4:
+**Fix required:** Add `--resume_from_diloco_anchor` flag to `jamba_coconut_finetune.py`.
+See coding-agent prompt: `prompts/fix_dgac_anchor_handoff.md`
+
+**DGAC launch command (after fix):**
 ```bash
 python jamba_coconut_finetune.py \
   --use_halt_gate \
-  --resume_from runs/stage3_curriculum/stage_10/best \
-  --output_dir runs/stage3_dgac [...]
+  --resume_from_diloco_anchor \
+  --diloco_state_repo WeirdRunner/Ouroboros \
+  --hf_token "$HF_TOKEN" \
+  --data_dir data/coconut_v1 --use_4bit \
+  --epochs_per_stage 3 \
+  --max_stage 10 \
+  --session_timeout_hours 12.0 \
+  --output_dir runs/stage3_dgac \
+  --wandb_project "ouroboros-stage3-jamba"
 ```
 
 ### Step 4 — Stage 3 rounds 2–3: A signal gap (low priority)
-Worker A has no signal files for stage 3 rounds 2 and 3. B completed both. This likely means A was in solo/attendance mode those rounds (coordinator handled it correctly — B's weights were promoted directly in solo mode). No correctness issue; flag for review in W&B if A's stage 3 CE looks discontinuous.
+Worker A has no signal files for stage 3 rounds 2 and 3. B completed both. Coordinator handled correctly (solo/attendance mode). Flag for W&B review.
 
 ---
 
@@ -69,15 +76,12 @@ Worker A has no signal files for stage 3 rounds 2 and 3. B completed both. This 
 ```
 WeirdRunner/Ouroboros/
   diloco_state/
-    anchor/                         ← Stage 6 Round 0 aggregate (latest coordinator run)
-    round_state.json                ← stage_k=6, round_n=1 (or higher), triggered_workers=[A,B,C]
-    workers/A/round_0000_stage_3/  ✓
-    workers/B/round_0000_stage_3/  ✓
-    workers/A/round_0001_stage_3/  ✓ (confirmed — signal present)
-    workers/B/round_0001_stage_3/  ✓ (confirmed — signal present)
+    anchor/                         ← Stage 7 Round 0 aggregate (latest coordinator run)
+    round_state.json                ← stage_k=8, round_n=0, triggered_workers=[A,B,C]
     workers/{A,B,C}/round_0000_stage_4/  ✓
     workers/{A,B,C}/round_0000_stage_5/  ✓
     workers/{A,B,C}/round_0000_stage_6/  ✓
+    workers/{A,B,C}/round_0000_stage_7/  ✓  (pending coordinator aggregate)
 ```
 
 ---
@@ -126,6 +130,8 @@ WeirdRunner/Ouroboros/
 | **`triggered_at=0` semantics** | Canonical signal for "dispatch unconfirmed". Coordinator immediately re-dispatches on next run. ✅ VERIFIED |
 | **Attendance round** | Worker in `attendance_workers` → skips training, uploads status(samples=0), pushes signal. |
 | **Waiting mode** | All credentialed workers in `attendance_workers`. `round_n` frozen. |
+| **Stages 4–7 structure** | 1 round each (3 workers × 12,302 samples = 36,906 = full stage). Stage complete after round 0. |
+| **DGAC base weights** | Loaded from `diloco_state/anchor/` via `--resume_from_diloco_anchor` (fix pending). |
 
 ---
 
@@ -165,6 +171,7 @@ WeirdRunner/Ouroboros/
 | **`kaggle==1.6.17` predates `--accelerator` feature → P100 assigned** | **Fixed: `kaggle>=1.8.4` + `--accelerator NvidiaTeslaT4` in `push_args` + `"NvidiaTeslaT4"` JSON cap + runtime fast-fail. ✅ VERIFIED WORKING (no P100 since deploy)** |
 | **W&B subsequent rounds not logged (wandb 0.25.0 resume bug)** | **Per-round run IDs + `group=` parameter. ✅ VERIFIED WORKING (dashboard shows separate runs per round)** |
 | Worker C quota exhausted (stages 2–3 early rounds) | Quota renewed; C rejoined at stage 3 round 5. All three workers active from stage 4 onward. ✅ |
+| **DGAC base weights: `--use_halt_gate` cannot find DiLoCo anchor** | **Fix pending: `--resume_from_diloco_anchor` flag. See `prompts/fix_dgac_anchor_handoff.md`** |
 
 ---
 
@@ -213,6 +220,7 @@ Each round:
 ```
 L_total = L_ce + λ₁(t)·L_ponder + λ₂·L_diversity
 HaltGate: Linear(2·d_model → 1), zero-init
+Base weights: loaded from diloco_state/anchor/ via --resume_from_diloco_anchor
 ```
 
 ---
@@ -221,8 +229,9 @@ HaltGate: Linear(2·d_model → 1), zero-init
 
 ```
 Stage 1: ~41s/step  Stage 2: ~48–53s/step  Stage 3: ~69s/step
-Stage 5: ~92s/step  Stage 10: ~149s/step
-Observed velocity (stages 4–6): ~1 stage/day with 3 workers on 12h Kaggle sessions
+Stage 5: ~92s/step  Stage 10: ~149s/step (estimated)
+Observed velocity (stages 4–7): ~1 stage/day with 3 workers on 12h Kaggle sessions
+Stages 8–10 ETA: ~2026-05-04 (3 stages × 1 day, all 3 workers active)
 ```
 
 ---
@@ -231,7 +240,7 @@ Observed velocity (stages 4–6): ~1 stage/day with 3 workers on 12h Kaggle sess
 
 | File | Status |
 |---|---|
-| `jamba_coconut_finetune.py` | ✅ All patches deployed and verified |
+| `jamba_coconut_finetune.py` | ✅ All patches deployed; `--resume_from_diloco_anchor` fix pending |
 | `diloco_coordinator.py` | ✅ All patches deployed and verified |
 | `.github/workflows/diloco_coordinator.yml` | ✅ `kaggle>=1.8.4` deployed |
 | `kaggle-utils.ipynb` Cell 5 | ✅ No changes needed |
@@ -244,10 +253,10 @@ Observed velocity (stages 4–6): ~1 stage/day with 3 workers on 12h Kaggle sess
 
 | Question | Status |
 |---|---|
-| Stage 2 DiLoCo: does aggregated model match sequential baseline? | 🟡 Pre-val acc rising monotonically (0%→2%→4%→6%) — promising signal |
+| Stage 2 DiLoCo: does aggregated model match sequential baseline? | 🟡 Pre-val acc rising monotonically (0%→2%→4%→6%+) — promising signal |
 | Stage 3 rounds 2–3: where are Worker A signals? | 🟡 Likely solo/attendance — B signals present, coordinator handled correctly |
 | TRC GPU quota conversion | 🟡 Email sent — awaiting response |
-| DGAC halt_step distribution at K≥2 | 🔴 Open — primary research question (Phase 3.4, stages 7–10 remaining) |
+| DGAC halt_step distribution at K≥2 | 🔴 Open — primary research question (Phase 3.4, starts after stage 10) |
 | Worker C quota: stable for remainder of curriculum? | 🟢 Active since stage 3 round 5 — appears stable |
 | Pre-val accuracy at stage 10: target threshold for DGAC? | 🔴 Open — define success criteria before Phase 3.4 |
 
@@ -269,3 +278,4 @@ Observed velocity (stages 4–6): ~1 stage/day with 3 workers on 12h Kaggle sess
 | `kaggle==1.6.17` + `enable_gpu:true` + `"accelerator": "nvidiaTeslaT4"` → still P100 | Root cause 1: `--accelerator` CLI flag added in v1.8.4 (predates our pin). Root cause 2: wrong cap. Fix: `kaggle>=1.8.4` + `--accelerator NvidiaTeslaT4` + fix JSON cap + runtime fast-fail. All verified. |
 | `wandb==0.25.0` `resume="allow"` on finished run creates ephemeral run | Per-round run IDs + `group=` for stage-level grouping |
 | W&B dashboard becomes unreadable with many overlapping runs | Unique `id` per round + `group` by stage keeps it navigable |
+| **`--use_halt_gate` starts from random LoRA weights (DiLoCo path)** | **`--resume_from_diloco_anchor` loads `diloco_state/anchor/` before DGAC training (fix pending)** |
