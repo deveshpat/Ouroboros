@@ -1,0 +1,46 @@
+{
+  "name": "Ouroboros Development",
+  "image": "mcr.microsoft.com/devcontainers/universal:latest",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "forwardPorts": [11434, 3000, 8000, 8080],
+  "portsAttributes": {
+    "11434": {
+      "label": "Ollama",
+      "onAutoForward": "ignore"
+    },
+    "3000": {
+      "label": "Dev Server",
+      "onAutoForward": "notify"
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "bash .devcontainer/post-start.sh",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python3",
+        "python.linting.enabled": true,
+        "python.linting.pylintEnabled": true,
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "ms-python.python",
+        "[json]": {
+          "editor.defaultFormatter": "esbenp.prettier-vscode"
+        }
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "esbenp.prettier-vscode",
+        "GitHub.copilot",
+        "ms-vscode.makefile-tools",
+        "charliermarsh.ruff"
+      ]
+    }
+  },
+  "remoteUser": "codespace",
+  "remoteEnv": {
+    "NODE_PATH": "/home/codespace/nvm/current/lib/node_modules"
+  }
+}
