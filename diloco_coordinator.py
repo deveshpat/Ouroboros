@@ -29,16 +29,20 @@ import tempfile
 import time
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-
-T = TypeVar("T")
+from ouroboros.diloco.shared import (
+    WORKER_IDS,
+    RoundState,
+    normalize_text,
+    ordered_unique_workers,
+    retry_io,
+)
 
 ROUND_STATE_PATH = "diloco_state/round_state.json"
 ANCHOR_PREFIX = "diloco_state/anchor"
-WORKER_IDS = ["A", "B", "C"]
 # Maps worker ID -> owning Kaggle username and kernel slug.
 # All three accounts run their own copy of kaggle-utils (no separate notebooks).
 # Slug format: {owner_username}/kaggle-utils
@@ -54,55 +58,9 @@ DEFAULT_IO_RETRIES = 3
 DEFAULT_IO_RETRY_BASE_DELAY_S = 1.5
 
 
-def _retry_io(
-    label: str,
-    fn: Callable[[], T],
-    *,
-    attempts: int = DEFAULT_IO_RETRIES,
-    base_delay_s: float = DEFAULT_IO_RETRY_BASE_DELAY_S,
-    swallow: bool = False,
-    default: Optional[T] = None,
-) -> Optional[T]:
-    """Retry transient coordinator I/O with exponential backoff."""
-    last_exc: Optional[Exception] = None
-    attempts = max(int(attempts), 1)
-    for attempt in range(1, attempts + 1):
-        try:
-            return fn()
-        except Exception as exc:  # noqa: BLE001 - coordinator must keep going on transient I/O errors
-            last_exc = exc
-            if attempt >= attempts:
-                if swallow:
-                    print(
-                        f"[coordinator] {label} failed after {attempts} attempts: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    return default
-                raise
-            delay = base_delay_s * (2 ** (attempt - 1))
-            print(
-                f"[coordinator] {label} failed (attempt {attempt}/{attempts}): "
-                f"{type(exc).__name__}: {exc}. Retrying in {delay:.1f}s..."
-            )
-            time.sleep(delay)
-    if swallow:
-        return default
-    assert last_exc is not None
-    raise last_exc
-
-
-def _normalize_optional_text(value: Optional[Any], *, uppercase: bool = False) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    return text.upper() if uppercase else text
-
-
 def _first_nonempty_text(*values: Optional[Any], uppercase: bool = False) -> Optional[str]:
     for value in values:
-        text = _normalize_optional_text(value, uppercase=uppercase)
+        text = normalize_text(value, uppercase=uppercase)
         if text is not None:
             return text
     return None
@@ -115,7 +73,7 @@ def _set_env_if_present(
     *,
     uppercase: bool = False,
 ) -> None:
-    text = _normalize_optional_text(value, uppercase=uppercase)
+    text = normalize_text(value, uppercase=uppercase)
     if text is not None:
         target[key] = text
 
@@ -150,7 +108,7 @@ def _infer_runtime_repo_commit() -> Optional[str]:
 
 
 def _build_worker_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[str, str]:
-    worker = _normalize_optional_text(worker_id, uppercase=True)
+    worker = normalize_text(worker_id, uppercase=True)
     if worker not in WORKER_IDS:
         raise ValueError(f"Invalid worker id for runtime env injection: {worker_id!r}")
 
@@ -305,21 +263,6 @@ def _determine_round_mode(
     return "diloco", active
 
 
-def _ordered_unique_worker_ids(*groups: Optional[List[str]]) -> List[str]:
-    """Return worker IDs in first-seen order, filtered to known workers."""
-    ordered: List[str] = []
-    seen = set()
-    for group in groups:
-        for worker_id in group or []:
-            wid = str(worker_id).upper()
-            if wid not in WORKER_IDS or wid in seen:
-                continue
-            ordered.append(wid)
-            seen.add(wid)
-    return ordered
-
-
-
 def _partition_ready_workers(
     ready_workers: List[Dict],
     *,
@@ -334,8 +277,8 @@ def _partition_ready_workers(
     If a worker is somehow present in both groups, treat it as active so the
     round still enforces its completion semantics.
     """
-    expected_set = set(_ordered_unique_worker_ids(expected_workers))
-    attendance_set = set(_ordered_unique_worker_ids(attendance_workers))
+    expected_set = set(ordered_unique_workers(expected_workers))
+    attendance_set = set(ordered_unique_workers(attendance_workers))
 
     active_ready: List[Dict] = []
     attendance_ready: List[Dict] = []
@@ -429,8 +372,8 @@ def hub_download_json(repo_id: str, path: str, token: str) -> Optional[Dict]:
         with open(local, encoding="utf-8") as f:
             return json.load(f)
 
-    return _retry_io(
-        f"Download JSON {path}",
+    return retry_io(
+        f"[coordinator] Download JSON {path}",
         _download,
         swallow=True,
         default=None,
@@ -446,8 +389,8 @@ def hub_upload_json(repo_id: str, path: str, data: Dict, token: str, message: st
         json.dump(data, tf, indent=2)
         tmp = tf.name
     try:
-        _retry_io(
-            f"Upload JSON {path}",
+        retry_io(
+            f"[coordinator] Upload JSON {path}",
             lambda: api.upload_file(
                 path_or_fileobj=tmp,
                 path_in_repo=path,
@@ -468,7 +411,7 @@ def hub_download_text(repo_id: str, path: str, token: str) -> str:
         local = hf_hub_download(repo_id=repo_id, filename=path, token=token)
         return Path(local).read_text(encoding="utf-8")
 
-    result = _retry_io(f"Download text {path}", _download)
+    result = retry_io(f"[coordinator] Download text {path}", _download)
     assert result is not None
     return result
 
@@ -487,7 +430,7 @@ def load_adapter_weights_cpu(repo_id: str, weights_path: str, token: str) -> Dic
         )
         return load_file(local, device="cpu")
 
-    result = _retry_io(f"Download adapter weights {weights_path}", _download)
+    result = retry_io(f"[coordinator] Download adapter weights {weights_path}", _download)
     assert result is not None
     return result
 
@@ -546,8 +489,8 @@ def save_and_upload_anchor(
         config_path.write_text(json.dumps(anchor_adapter_config, indent=2), encoding="utf-8")
 
         for fname in ["adapter_model.safetensors", "adapter_config.json"]:
-            _retry_io(
-                f"Upload anchor artifact {fname}",
+            retry_io(
+                f"[coordinator] Upload anchor artifact {fname}",
                 lambda fname=fname: api.upload_file(
                     path_or_fileobj=str(tmp_path / fname),
                     path_in_repo=f"{ANCHOR_PREFIX}/{fname}",
@@ -840,8 +783,8 @@ def _reconcile_post_dispatch_state(
     failed_active = [w for w in planned_active_workers if dispatch_results.get(w) == "failed"]
     failed_attendance = [w for w in planned_attendance_workers if dispatch_results.get(w) == "failed"]
 
-    corrected_triggered_workers = _ordered_unique_worker_ids(dispatched_active)
-    corrected_attendance_workers = _ordered_unique_worker_ids(
+    corrected_triggered_workers = ordered_unique_workers(dispatched_active)
+    corrected_attendance_workers = ordered_unique_workers(
         dispatched_attendance,
         failed_active,
         failed_attendance,
@@ -853,7 +796,7 @@ def _reconcile_post_dispatch_state(
     elif corrected_attendance_workers:
         corrected_mode = "waiting"
 
-    outstanding_dispatches = _ordered_unique_worker_ids(
+    outstanding_dispatches = ordered_unique_workers(
         corrected_triggered_workers,
         corrected_attendance_workers,
     )
@@ -917,25 +860,23 @@ def main() -> None:
     args = parse_args()
 
     print("[coordinator] Reading round state...")
-    state = hub_download_json(args.repo_id, ROUND_STATE_PATH, args.hf_token)
-    if state is None:
+    raw_state = hub_download_json(args.repo_id, ROUND_STATE_PATH, args.hf_token)
+    if raw_state is None:
         print("[coordinator] No round_state.json found. Nothing to aggregate.")
         return
+    state = RoundState.from_dict(raw_state).to_dict()
 
     stage_k = int(state.get("stage_k", 0))
     round_n = int(state.get("round_n", 0))
-    total_samples_seen = {str(k): int(v) for k, v in dict(state.get("total_samples_seen", {})).items()}
-    completed_stages = [int(x) for x in state.get("completed_stages", [])]
+    total_samples_seen = dict(state.get("total_samples_seen", {}))
+    completed_stages = list(state.get("completed_stages", []))
     # Workers that were triggered last round — only check these for ready status.
     # Sanitize/normalize to defend against duplicated, lowercase, or overlapping IDs.
-    expected_workers = _ordered_unique_worker_ids(state.get("triggered_workers"))
+    expected_workers = list(state.get("triggered_workers", []))
     seed = int(state.get("seed", 42))
     current_mode = state.get("mode", "diloco")
     triggered_at = float(state.get("triggered_at", 0.0))
-    attendance_workers_prev = [
-        w for w in _ordered_unique_worker_ids(state.get("attendance_workers"))
-        if w not in set(expected_workers)
-    ]
+    attendance_workers_prev = list(state.get("attendance_workers", []))
     worker_timeout_s = args.worker_timeout_hours * 3600.0
     is_round_timed_out = triggered_at > 0 and (time.time() - triggered_at) > worker_timeout_s
 
@@ -948,7 +889,7 @@ def main() -> None:
 
     force_ids: Optional[List[str]] = None
     if args.force_worker_ids:
-        force_ids = _ordered_unique_worker_ids(
+        force_ids = ordered_unique_workers(
             [w.strip().upper() for w in args.force_worker_ids.split(",") if w.strip()]
         ) or None
 
@@ -1160,7 +1101,7 @@ def main() -> None:
                 print(f"[coordinator] W&B init failed: {_we}")
 
         # ── Collect ready workers from previous round ────────────────────────
-        workers_to_check = _ordered_unique_worker_ids(expected_workers, attendance_workers_prev)
+        workers_to_check = ordered_unique_workers(expected_workers, attendance_workers_prev)
         ready_statuses = collect_ready_workers(
             args.repo_id,
             args.hf_token,

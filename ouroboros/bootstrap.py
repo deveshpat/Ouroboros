@@ -1,0 +1,736 @@
+"""Bootstrap and credential helpers for the Ouroboros training entrypoint."""
+
+from __future__ import annotations
+
+import importlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def __normalize_text(value: Optional[Any], *, uppercase: bool = False) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text.upper() if uppercase else text
+
+
+_HUB_WHEEL_BASES = [
+    "causal_conv1d-1.6.1-cp312-cp312-linux_x86_64",
+    "mamba_ssm-1.2.2-cp312-cp312-linux_x86_64",
+]
+
+
+_HUB_REPO_ID = "WeirdRunner/Ouroboros"
+
+
+_KNOWN_ARCH_SUFFIXES = [
+    "sm60", "sm70", "sm72", "sm75", "sm80", "sm86", "sm87", "sm89",
+    "sm90", "sm100", "sm120", "smunknown",
+]
+
+
+def _maybe_get_kaggle_secret(label: str) -> Optional[str]:
+    try:
+        mod = importlib.import_module("kaggle_secrets")
+        client_cls = getattr(mod, "UserSecretsClient", None)
+        if client_cls is None:
+            return None
+        value = client_cls().get_secret(label)
+    except Exception:
+        return None
+    return _normalize_text(value)
+
+
+def _maybe_get_colab_secret(label: str) -> Optional[str]:
+    try:
+        colab_mod = importlib.import_module("google.colab")
+        userdata = getattr(colab_mod, "userdata", None)
+        if userdata is None:
+            return None
+        value = userdata.get(label)
+    except Exception:
+        return None
+    return _normalize_text(value)
+
+
+def _resolve_hf_token_common(cli_value: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve HF token without importing heavy third-party ML libraries.
+
+    Resolution order:
+      1. Explicit CLI override
+      2. HF_TOKEN / HUGGINGFACE_HUB_TOKEN env vars
+      3. Kaggle secret HF_TOKEN
+      4. Colab userdata HF_TOKEN
+    """
+    token = _normalize_text(cli_value)
+    if token:
+        return token
+
+    for env_name in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+        token = _normalize_text(os.environ.get(env_name))
+        if token:
+            return token
+
+    for secret_name, resolver in (
+        ("HF_TOKEN", _maybe_get_kaggle_secret),
+        ("HF_TOKEN", _maybe_get_colab_secret),
+    ):
+        token = _normalize_text(resolver(secret_name))
+        if token:
+            return token
+    return None
+
+
+def _resolve_github_token_common(cli_value: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the GitHub token used for worker->coordinator signaling.
+
+    Resolution order:
+      1. Explicit CLI override
+      2. GITHUB_TOKEN / GH_TOKEN env vars
+      3. Kaggle secret GITHUB_TOKEN / GH_TOKEN
+      4. Colab userdata GITHUB_TOKEN / GH_TOKEN
+    """
+    token = _normalize_text(cli_value)
+    if token:
+        return token
+
+    for env_name in ("GITHUB_TOKEN", "GH_TOKEN"):
+        token = _normalize_text(os.environ.get(env_name))
+        if token:
+            return token
+
+    for secret_name, resolver in (
+        ("GITHUB_TOKEN", _maybe_get_kaggle_secret),
+        ("GH_TOKEN", _maybe_get_kaggle_secret),
+        ("GITHUB_TOKEN", _maybe_get_colab_secret),
+        ("GH_TOKEN", _maybe_get_colab_secret),
+    ):
+        token = _normalize_text(resolver(secret_name))
+        if token:
+            return token
+    return None
+
+
+def _resolve_diloco_worker_id_common(cli_value: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the DiLoCo worker id from CLI, environment, or notebook secrets.
+
+    Resolution order:
+      1. Explicit CLI override
+      2. DILOCO_WORKER_ID / OUROBOROS_DILOCO_WORKER_ID / WORKER_ID env vars
+      3. Kaggle secret DILOCO_WORKER_ID
+      4. Colab userdata DILOCO_WORKER_ID
+    """
+    for candidate in (
+        cli_value,
+        os.environ.get("DILOCO_WORKER_ID"),
+        os.environ.get("OUROBOROS_DILOCO_WORKER_ID"),
+        os.environ.get("WORKER_ID"),
+    ):
+        worker_id = _normalize_text(candidate, uppercase=True)
+        if worker_id:
+            return worker_id
+
+    for secret_name, resolver in (
+        ("DILOCO_WORKER_ID", _maybe_get_kaggle_secret),
+        ("DILOCO_WORKER_ID", _maybe_get_colab_secret),
+    ):
+        worker_id = _normalize_text(resolver(secret_name), uppercase=True)
+        if worker_id:
+            return worker_id
+    return None
+
+
+def _require_valid_diloco_worker_id(value: Optional[str]) -> str:
+    worker_id = _resolve_diloco_worker_id_common(value)
+    if worker_id is None:
+        raise ValueError(
+            "DiLoCo mode requires a worker id. Provide --diloco_worker_id, set "
+            "DILOCO_WORKER_ID / OUROBOROS_DILOCO_WORKER_ID, or define a "
+            "Kaggle/Colab secret named DILOCO_WORKER_ID."
+        )
+    if worker_id not in ("A", "B", "C"):
+        raise ValueError(
+            f"Invalid DiLoCo worker id {worker_id!r}. "
+            "Expected one of ('A', 'B', 'C')."
+        )
+    return worker_id
+
+
+def _wandb_credentials_available() -> bool:
+    for env_name in ("WANDB_API_KEY", "WANDB_KEY"):
+        if _normalize_text(os.environ.get(env_name)):
+            return True
+
+    try:
+        import netrc as _netrc
+
+        auth = _netrc.netrc().authenticators("api.wandb.ai")
+        if auth is not None and any(auth):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _bootstrap_resolve_token() -> Optional[str]:
+    return _resolve_hf_token_common()
+
+
+def _load_mamba_fast_path_symbols() -> Dict[str, Any]:
+    """Load the exact fast-path symbols Jamba expects, via the stable submodule paths."""
+    import importlib as _il
+    import warnings as _warnings
+
+    _il.invalidate_caches()
+
+    with _warnings.catch_warnings():
+        _warnings.filterwarnings("ignore", category=FutureWarning, module=r"mamba_ssm.*")
+        from mamba_ssm.ops.selective_scan_interface import (  # type: ignore
+            selective_scan_fn,
+            mamba_inner_fn,
+        )
+        from mamba_ssm.ops.triton.selective_state_update import (  # type: ignore
+            selective_state_update,
+        )
+        from causal_conv1d import causal_conv1d_fn, causal_conv1d_update  # type: ignore
+
+    return {
+        "selective_scan_fn": selective_scan_fn,
+        "selective_state_update": selective_state_update,
+        "mamba_inner_fn": mamba_inner_fn,
+        "causal_conv1d_fn": causal_conv1d_fn,
+        "causal_conv1d_update": causal_conv1d_update,
+    }
+
+
+def _patch_kernel_top_level_exports() -> List[str]:
+    """
+    Export the fast-path symbols on the top-level packages.
+
+    Older / current Jamba implementations in transformers resolve kernels from
+    top-level modules (for example via lazy_load_kernel("mamba-ssm")) and look
+    for attributes such as ``selective_state_update`` directly on ``mamba_ssm``.
+    The upstream mamba_ssm==1.2.2 package exposes that symbol only from the
+    Triton submodule, so Jamba can incorrectly conclude that the fast path is
+    unavailable even though the compiled kernels import and execute correctly.
+    """
+    import importlib as _il
+
+    patched: List[str] = []
+    symbols = _load_mamba_fast_path_symbols()
+
+    mamba_ssm = _il.import_module("mamba_ssm")
+    causal_conv1d = _il.import_module("causal_conv1d")
+
+    mamba_exports = {
+        "selective_scan_fn": symbols["selective_scan_fn"],
+        "selective_state_update": symbols["selective_state_update"],
+        "mamba_inner_fn": symbols["mamba_inner_fn"],
+    }
+    conv_exports = {
+        "causal_conv1d_fn": symbols["causal_conv1d_fn"],
+        "causal_conv1d_update": symbols["causal_conv1d_update"],
+    }
+
+    for name, value in mamba_exports.items():
+        if getattr(mamba_ssm, name, None) is not value:
+            setattr(mamba_ssm, name, value)
+            patched.append(f"mamba_ssm.{name}")
+    for name, value in conv_exports.items():
+        if getattr(causal_conv1d, name, None) is not value:
+            setattr(causal_conv1d, name, value)
+            patched.append(f"causal_conv1d.{name}")
+
+    return patched
+
+
+def _bootstrap_verify_fast_path() -> bool:
+    """
+    Hard verification of the Jamba Mamba fast path:
+      1. Import the exact 5 symbols that transformers.models.jamba checks.
+      2. Assert none are None (catches API / packaging mismatches).
+      3. Run tiny real CUDA/Triton ops for causal_conv1d, selective_scan_fn,
+         and selective_state_update.
+    """
+    import torch as _torch
+    import triton.language as _tl
+
+    _syms = _load_mamba_fast_path_symbols()
+    selective_scan_fn = _syms["selective_scan_fn"]
+    selective_state_update = _syms["selective_state_update"]
+    mamba_inner_fn = _syms["mamba_inner_fn"]
+    causal_conv1d_fn = _syms["causal_conv1d_fn"]
+    causal_conv1d_update = _syms["causal_conv1d_update"]
+
+    _none = [k for k, v in _syms.items() if v is None]
+    if _none:
+        raise ImportError(
+            "Fast-path symbols imported but resolved to None: "
+            f"{_none}. This usually means an API / ABI mismatch."
+        )
+
+    _x = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
+    _w = _torch.randn(4, 4, device="cuda", dtype=_torch.float32)
+    _out = causal_conv1d_fn(_x, _w)
+    assert _out.shape == _x.shape, f"Unexpected causal_conv1d_fn shape: {_out.shape}"
+
+    _u = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
+    _delta = _torch.randn(1, 4, 8, device="cuda", dtype=_torch.float32)
+    _A = _torch.randn(4, 3, device="cuda", dtype=_torch.float32)
+    _B = _torch.randn(1, 3, 8, device="cuda", dtype=_torch.float32)
+    _C = _torch.randn(1, 3, 8, device="cuda", dtype=_torch.float32)
+    _D = _torch.randn(4, device="cuda", dtype=_torch.float32)
+    _scan_out = selective_scan_fn(_u, _delta, _A, _B, _C, _D, delta_softplus=True)
+    assert _scan_out.shape == _u.shape, f"Unexpected selective_scan_fn shape: {_scan_out.shape}"
+
+    _state = _torch.randn(1, 4, 3, device="cuda", dtype=_torch.float32)
+    _x_step = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
+    _dt = _torch.randn(1, 4, device="cuda", dtype=_torch.float32)
+    _dt_bias = _torch.zeros(4, device="cuda", dtype=_torch.float32)
+    _A_step = -_torch.rand(4, 3, device="cuda", dtype=_torch.float32) - 1.0
+    _B_step = _torch.randn(1, 3, device="cuda", dtype=_torch.float32)
+    _C_step = _torch.randn(1, 3, device="cuda", dtype=_torch.float32)
+    _has_tl_math_log1p = hasattr(getattr(_tl, "math", None), "log1p")
+    if _has_tl_math_log1p:
+        _step_out = selective_state_update(
+            _state, _x_step, _dt, _A_step, _B_step, _C_step, _D,
+            dt_bias=_dt_bias, dt_softplus=True
+        )
+    else:
+        _dt_pos = _torch.rand(1, 4, device="cuda", dtype=_torch.float32) + 0.05
+        _step_out = selective_state_update(
+            _state, _x_step, _dt_pos, _A_step, _B_step, _C_step, _D,
+            dt_bias=_dt_bias, dt_softplus=False
+        )
+    assert _step_out.shape == _x_step.shape, (
+        f"Unexpected selective_state_update shape: {_step_out.shape}"
+    )
+
+    _torch.cuda.synchronize()
+    return True
+
+
+def _bootstrap_env_rank() -> int:
+    try:
+        return int(os.environ.get("RANK", "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bootstrap_env_world_size() -> int:
+    try:
+        return max(int(os.environ.get("WORLD_SIZE", "1")), 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _bootstrap_env_local_rank() -> int:
+    raw = os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bootstrap_launch_key() -> str:
+    import hashlib as _hashlib
+
+    launch_components = [
+        os.environ.get("TORCHELASTIC_RUN_ID", ""),
+        os.environ.get("MASTER_ADDR", ""),
+        os.environ.get("MASTER_PORT", ""),
+        os.environ.get("WORLD_SIZE", "1"),
+        str(Path(sys.argv[0]).resolve()) if sys.argv else "interactive",
+        sys.executable,
+        ",".join(_HUB_WHEEL_BASES),
+    ]
+    raw = "|".join(launch_components)
+    return _hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _bootstrap_sync_paths() -> Tuple[Path, Path, Path]:
+    root = Path("/tmp/ouroboros_bootstrap_sync") / _bootstrap_launch_key()
+    return root, root / "install.ok.json", root / "install.failed.txt"
+
+
+def _bootstrap_prepare_local_cuda_device(_torch) -> None:
+    if not _torch.cuda.is_available():
+        return
+    local_rank = _bootstrap_env_local_rank()
+    device_count = _torch.cuda.device_count()
+    if device_count <= 0:
+        return
+    device_index = local_rank if 0 <= local_rank < device_count else 0
+    _torch.cuda.set_device(device_index)
+
+
+def _bootstrap_shared_install_phases() -> None:
+    """
+    Run the filesystem-mutating install phases once per launch.
+    """
+    import importlib as _il
+    import torch as _torch
+
+    _bootstrap_prepare_local_cuda_device(_torch)
+
+    print("[bootstrap] Phase 1: pure-Python deps...")
+    _r1 = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q",
+         "transformers>=4.54.0",
+         "peft",
+         "datasets",
+         "tqdm",
+         "wandb",
+         "bitsandbytes>=0.46.1",
+         "accelerate",
+         "huggingface_hub",
+         "einops",
+         "safetensors"],
+        check=False,
+    )
+    if _r1.returncode != 0:
+        print("[bootstrap] WARNING: Phase 1 pip returned non-zero — check output above.")
+
+    print("[bootstrap] Phase 2: arch-aware Hub wheel install...")
+    _hf_token = _bootstrap_resolve_token()
+    if not _hf_token:
+        print("[bootstrap] FATAL: No HF_TOKEN found.")
+        print("            Set HF_TOKEN as a Kaggle Secret or environment variable.")
+        sys.exit(1)
+
+    _il.invalidate_caches()
+    from huggingface_hub import hf_hub_download, HfApi  # installed in Phase 1
+
+    _cc = _torch.cuda.get_device_capability() if _torch.cuda.is_available() else (0, 0)
+    _arch_suffix = f"sm{_cc[0]}{_cc[1]}"
+    _arch_list   = f"{_cc[0]}.{_cc[1]}+PTX"
+    print(f"[bootstrap]   GPU arch: {_arch_suffix}  (TORCH_CUDA_ARCH_LIST={_arch_list} if build needed)")
+
+    _wheel_dir = Path("/tmp/ouroboros_wheels")
+    _wheel_dir.mkdir(exist_ok=True)
+
+    _kaggle_wheel_dir = Path("/kaggle/input/ouroboros-cache/wheels")
+    _kaggle_wheel_cache_active = _arch_suffix == "sm75" and _kaggle_wheel_dir.exists()
+    if _kaggle_wheel_cache_active:
+        print("[bootstrap]   Kaggle dataset wheel cache detected for sm75 fast path ✓")
+    elif _kaggle_wheel_dir.exists():
+        print(f"[bootstrap]   Kaggle dataset wheel cache present but skipped on {_arch_suffix} (sm75-only cache)")
+
+    for _base in _HUB_WHEEL_BASES:
+        _hub_filename   = f"{_base}-{_arch_suffix}.whl"
+        _local_filename = f"{_base}.whl"
+        _local_path     = _wheel_dir / _local_filename
+
+        _downloaded = False
+        if _kaggle_wheel_cache_active:
+            _pkg_prefix = _base.split("-")[0]
+            _matches = list(_kaggle_wheel_dir.glob(f"{_pkg_prefix}*.whl"))
+            if _matches:
+                _kaggle_whl = max(_matches, key=lambda p: p.stat().st_mtime)
+                shutil.copy2(str(_kaggle_whl), str(_local_path))
+                print(f"[bootstrap]   Loaded {_local_path.name} from Kaggle dataset cache ✓")
+                _downloaded = True
+
+        if not _downloaded:
+            try:
+                _dl = hf_hub_download(
+                    repo_id=_HUB_REPO_ID,
+                    filename=_hub_filename,
+                    token=_hf_token,
+                    local_dir=str(_wheel_dir),
+                )
+                shutil.copy2(_dl, str(_local_path))
+                print(f"[bootstrap]   Downloaded {_hub_filename} ✓")
+                _downloaded = True
+            except Exception as _dl_err:
+                print(f"[bootstrap]   {_hub_filename} not on Hub "
+                      f"({type(_dl_err).__name__}). Compiling from source...")
+
+        if not _downloaded:
+            _parts    = _base.split("-")
+            _pkg_name = _parts[0]
+            _pkg_ver  = _parts[1]
+            if _pkg_name == "mamba_ssm":
+                _pip_spec = f"git+https://github.com/state-spaces/mamba.git@v{_pkg_ver}"
+            else:
+                _pip_spec = f"{_pkg_name.replace('_', '-')}=={_pkg_ver}"
+
+            _env_vars = os.environ.copy()
+            _env_vars["MAX_JOBS"] = "4"
+            _env_vars["TORCH_CUDA_ARCH_LIST"] = _arch_list
+
+            print(f"[bootstrap]   Building {_pip_spec} "
+                  f"(TORCH_CUDA_ARCH_LIST={_arch_list}) ...")
+            _build_result = subprocess.run(
+                [sys.executable, "-m", "pip", "wheel", _pip_spec,
+                 "--no-build-isolation", "--no-deps",
+                 "-w", str(_wheel_dir), "--verbose"],
+                env=_env_vars, check=False,
+            )
+            if _build_result.returncode != 0:
+                print(f"[bootstrap] FATAL: Source build failed for {_pip_spec}.")
+                sys.exit(1)
+
+            _found = [
+                f for f in _wheel_dir.glob(f"{_pkg_name}*.whl")
+                if not any(f.name.endswith(f"-{s}.whl") for s in _KNOWN_ARCH_SUFFIXES)
+            ]
+            if not _found:
+                print(f"[bootstrap] FATAL: pip wheel succeeded but no .whl found "
+                      f"for {_pkg_name}.")
+                sys.exit(1)
+            _built_whl = max(_found, key=lambda p: p.stat().st_mtime)
+
+            if _built_whl.resolve() != _local_path.resolve():
+                shutil.copy2(str(_built_whl), str(_local_path))
+
+            print(f"[bootstrap]   Build succeeded: {_built_whl.name}")
+
+            _arch_whl_path = _wheel_dir / _hub_filename
+            shutil.copy2(str(_local_path), str(_arch_whl_path))
+            try:
+                _api = HfApi(token=_hf_token)
+                _api.create_repo(repo_id=_HUB_REPO_ID, repo_type="model",
+                                 private=True, exist_ok=True, token=_hf_token)
+                _api.upload_file(
+                    path_or_fileobj=str(_arch_whl_path),
+                    path_in_repo=_hub_filename,
+                    repo_id=_HUB_REPO_ID,
+                    repo_type="model",
+                    token=_hf_token,
+                    commit_message=f"Add wheel: {_hub_filename}",
+                )
+                print(f"[bootstrap]   Uploaded {_hub_filename} to Hub ✓ "
+                      f"(future sessions on {_arch_suffix} skip compilation)")
+            except Exception as _up_err:
+                print(f"[bootstrap]   [warn] Hub upload failed: {_up_err}")
+
+        _r = subprocess.run(
+            [sys.executable, "-m", "pip", "install",
+             "--force-reinstall", "--no-deps", str(_local_path)],
+            check=False,
+        )
+        if _r.returncode != 0:
+            print(f"[bootstrap] FATAL: pip install failed for {_local_filename}.")
+            sys.exit(1)
+        print(f"[bootstrap]   Installed {_local_filename} ✓")
+
+
+def _bootstrap_wait_for_shared_install() -> None:
+    world_size = _bootstrap_env_world_size()
+    if world_size <= 1:
+        _bootstrap_shared_install_phases()
+        return
+
+    rank = _bootstrap_env_rank()
+    root, success_path, failure_path = _bootstrap_sync_paths()
+    root.mkdir(parents=True, exist_ok=True)
+
+    if rank == 0:
+        if success_path.exists():
+            print("[bootstrap] DDP guard: shared install already completed for this launch.")
+            return
+        failure_path.unlink(missing_ok=True)
+        print("[bootstrap] DDP guard: rank 0 performing shared bootstrap install; other ranks will wait.")
+        try:
+            _bootstrap_shared_install_phases()
+        except BaseException:
+            import traceback as _traceback
+            failure_path.write_text(_traceback.format_exc(), encoding="utf-8")
+            raise
+        else:
+            success_path.write_text(
+                json.dumps(
+                    {
+                        "rank": rank,
+                        "completed_at": time.time(),
+                        "python": sys.executable,
+                        "wheel_bases": _HUB_WHEEL_BASES,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print("[bootstrap] DDP guard: shared bootstrap install complete.")
+        return
+
+    prefix = f"[bootstrap][rank={rank}]"
+    print(f"{prefix} Waiting for rank 0 shared bootstrap install...")
+    deadline = time.time() + (2 * 60 * 60)
+    while True:
+        if success_path.exists():
+            print(f"{prefix} Shared bootstrap install ready; continuing with local shims.")
+            return
+        if failure_path.exists():
+            failure_text = failure_path.read_text(encoding="utf-8", errors="replace").strip()
+            print(f"{prefix} FATAL: rank 0 shared bootstrap install failed.")
+            if failure_text:
+                print(failure_text)
+            sys.exit(1)
+        if time.time() > deadline:
+            print(f"{prefix} FATAL: timed out waiting for rank 0 shared bootstrap install.")
+            sys.exit(1)
+        time.sleep(2.0)
+
+
+def _bootstrap_process_local_finalize() -> None:
+    """
+    Run the process-local bootstrap phases on every rank.
+    """
+    import importlib as _il
+    import torch as _torch
+
+    rank = _bootstrap_env_rank()
+    verbose = _bootstrap_env_world_size() == 1 or rank == 0
+    prefix = "[bootstrap]" if rank == 0 else f"[bootstrap][rank={rank}]"
+
+    def _info(message: str) -> None:
+        if verbose:
+            print(f"{prefix} {message}")
+
+    def _always(message: str) -> None:
+        print(f"{prefix} {message}")
+
+    _bootstrap_prepare_local_cuda_device(_torch)
+    _il.invalidate_caches()
+
+    try:
+        import importlib as _il2
+        _il2.invalidate_caches()
+        import transformers.generation as _tg_mod
+
+        _GENERATION_COMPAT_ALIASES = {
+            "GreedySearchDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
+            "SampleDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
+            "ContrastiveSearchDecoderOnlyOutput": "GenerateDecoderOnlyOutput",
+            "BeamSearchDecoderOnlyOutput": "GenerateBeamDecoderOnlyOutput",
+            "BeamSampleDecoderOnlyOutput": "GenerateBeamDecoderOnlyOutput",
+            "GreedySearchEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
+            "SampleEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
+            "ContrastiveSearchEncoderDecoderOutput": "GenerateEncoderDecoderOutput",
+            "BeamSearchEncoderDecoderOutput": "GenerateBeamEncoderDecoderOutput",
+            "BeamSampleEncoderDecoderOutput": "GenerateBeamEncoderDecoderOutput",
+        }
+        _patched = []
+        for _old, _new in _GENERATION_COMPAT_ALIASES.items():
+            if getattr(_tg_mod, _old, None) is None:
+                _repl = getattr(_tg_mod, _new, None)
+                if _repl is not None:
+                    setattr(_tg_mod, _old, _repl)
+                    _patched.append(_old)
+        if _patched:
+            _info(f"Shim: patched {len(_patched)} removed transformers.generation names ✓")
+        else:
+            _info("Shim: all generation names present (no patch needed)")
+    except ImportError:
+        pass
+    except Exception as _shim_err:
+        _always(f"WARNING: transformers shim failed: {_shim_err}")
+
+    try:
+        _patched_exports = _patch_kernel_top_level_exports()
+        if _patched_exports:
+            _info("Kernel export shim: " + ", ".join(_patched_exports) + " ✓")
+        else:
+            _info("Kernel export shim: already aligned")
+    except Exception as _kernel_patch_err:
+        _always(f"WARNING: kernel export shim failed: {_kernel_patch_err}")
+
+    _info("Phase 3: verifying mamba fast path (symbol + CUDA op)...")
+
+    try:
+        current_device = _torch.cuda.current_device() if _torch.cuda.is_available() else None
+        _cc = _torch.cuda.get_device_capability(current_device) if current_device is not None else (0, 0)
+        _arch_suffix = f"sm{_cc[0]}{_cc[1]}"
+        _gpu_name = _torch.cuda.get_device_name(current_device) if current_device is not None else "no-gpu"
+        _info(
+            f"  ABI fingerprint: GPU={_gpu_name} {_arch_suffix} | "
+            f"CUDA={_torch.version.cuda} | "
+            f"PyTorch={_torch.__version__} | "
+            f"Python=cp{sys.version_info.major}{sys.version_info.minor}"
+        )
+        _info(f"  Wheel bases: {_HUB_WHEEL_BASES}")
+    except Exception:
+        pass
+
+    try:
+        _bootstrap_verify_fast_path()
+        _info("Mamba fast path: ACTIVE ✓ — profile step time empirically.")
+    except Exception as _ve:
+        _always(f"FATAL: Mamba fast path verification FAILED: {_ve}")
+        _always("         Exiting now (no slow-path fallback — 500s/step is unusable).")
+        sys.exit(1)
+
+
+def _bootstrap_run_local_finalize_padded() -> None:
+    world_size = _bootstrap_env_world_size()
+    if world_size <= 1:
+        _bootstrap_process_local_finalize()
+        return
+
+    rank = _bootstrap_env_rank()
+    prefix = "[bootstrap]" if rank == 0 else f"[bootstrap][rank={rank}]"
+    root, _, _ = _bootstrap_sync_paths()
+    phase_dir = root / "local_finalize"
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    ok_path = phase_dir / f"rank_{rank}.ok"
+    fail_path = phase_dir / f"rank_{rank}.failed.txt"
+    ok_path.unlink(missing_ok=True)
+    fail_path.unlink(missing_ok=True)
+
+    try:
+        _bootstrap_process_local_finalize()
+    except BaseException:
+        import traceback as _traceback
+        fail_path.write_text(_traceback.format_exc(), encoding="utf-8")
+        raise
+    else:
+        ok_path.write_text(str(time.time()), encoding="utf-8")
+
+    deadline = time.time() + (30 * 60)
+    while True:
+        failure_files = sorted(phase_dir.glob("rank_*.failed.txt"))
+        if failure_files:
+            failure_text = failure_files[0].read_text(encoding="utf-8", errors="replace").strip()
+            print(f"{prefix} FATAL: bootstrap local finalize failed on {failure_files[0].name}.")
+            if failure_text:
+                print(failure_text)
+            sys.exit(1)
+        if len(list(phase_dir.glob("rank_*.ok"))) >= world_size:
+            return
+        if time.time() > deadline:
+            print(f"{prefix} FATAL: timed out waiting for all ranks to finish bootstrap local finalize.")
+            sys.exit(1)
+        time.sleep(1.0)
+
+
+def _bootstrap() -> None:
+    """
+    Install all dependencies before any third-party imports.
+    """
+    _bootstrap_wait_for_shared_install()
+    _bootstrap_run_local_finalize_padded()
+
+_BOOTSTRAP_COMPLETE = False
+
+
+def ensure_environment() -> None:
+    """Run the original startup bootstrap once, unless argparse is only printing help."""
+    global _BOOTSTRAP_COMPLETE
+    if _BOOTSTRAP_COMPLETE:
+        return
+    if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        return
+    _bootstrap()
+    _BOOTSTRAP_COMPLETE = True
