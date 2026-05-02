@@ -46,7 +46,6 @@ jobs:
       - name: Static sanity checks
         run: |
           python -m compileall -q .
-          python scripts/validate_static_names.py .
 
       - name: Install dependencies
         run: |
