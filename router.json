@@ -6,7 +6,7 @@
     "repo": "Ouroboros",
     "branch": "main",
     "base_url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main",
-    "generated_at": "2026-05-02T09:28:36.023495+00:00",
+    "generated_at": "2026-05-02T11:30:27.063384+00:00",
     "total_files": 41,
     "total_dirs": 2
   },
@@ -82,7 +82,7 @@
       "extension": ".md",
       "category": "markdown",
       "mime": "text/markdown",
-      "size_bytes": 15365,
+      "size_bytes": 3283,
       "binary": false,
       "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/BLUEPRINT.md"
     },
@@ -132,7 +132,7 @@
       "extension": ".md",
       "category": "markdown",
       "mime": "text/markdown",
-      "size_bytes": 10095,
+      "size_bytes": 1275,
       "binary": false,
       "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/terminal_log.md"
     },
