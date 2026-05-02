@@ -42,18 +42,13 @@ Pre-val accuracy at stage entry (Worker A round 0):
 - Stage 3: 0.00% → Stage 4: ~2% → Stage 5: ~3–4% → Stage 6: ~4–6% → Stage 7: ~6–8% (expected)
 - Target by Stage 10: define success threshold before DGAC (see Part 4, open question)
 
-### Step 3 — DGAC prep: fix anchor handoff **[REQUIRED BEFORE PHASE 3.4]**
-⚠️ **Architecture gap identified:** `--use_halt_gate` cannot load DiLoCo-trained weights.
-The current code's `find_latest_resume_checkpoint()` scans for `training_state.pt` in
-`runs/stage3_curriculum/` — DiLoCo mode never writes there. The final anchor lives at
-`diloco_state/anchor/` on Hub.
+### Step 3 — DGAC prep: anchor handoff fixed ✅
+✅ `--use_halt_gate` can now start from DiLoCo-trained stage-10 LoRA weights.
+The `--resume_from_diloco_anchor` flag loads `diloco_state/anchor/` from Hub before DGAC training, bypassing the checkpoint-file resume path.
 
-**Fix required:** Add `--resume_from_diloco_anchor` flag to `jamba_coconut_finetune.py`.
-See coding-agent prompt: `prompts/fix_dgac_anchor_handoff.md`
-
-**DGAC launch command (after fix):**
+**DGAC launch command:**
 ```bash
-python jamba_coconut_finetune.py \
+torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --use_halt_gate \
   --resume_from_diloco_anchor \
   --diloco_state_repo WeirdRunner/Ouroboros \
@@ -61,7 +56,12 @@ python jamba_coconut_finetune.py \
   --data_dir data/coconut_v1 --use_4bit \
   --epochs_per_stage 3 \
   --max_stage 10 \
-  --session_timeout_hours 12.0 \
+  --max_grad_norm 0.3 \
+  --batch_size 4 --grad_accum 8 \
+  --val_batch_size 2 \
+  --val_skip_buffer_minutes 60 \
+  --session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 \
+  --push_to_hub \
   --output_dir runs/stage3_dgac \
   --wandb_project "ouroboros-stage3-jamba"
 ```
@@ -131,7 +131,7 @@ WeirdRunner/Ouroboros/
 | **Attendance round** | Worker in `attendance_workers` → skips training, uploads status(samples=0), pushes signal. |
 | **Waiting mode** | All credentialed workers in `attendance_workers`. `round_n` frozen. |
 | **Stages 4–7 structure** | 1 round each (3 workers × 12,302 samples = 36,906 = full stage). Stage complete after round 0. |
-| **DGAC base weights** | Loaded from `diloco_state/anchor/` via `--resume_from_diloco_anchor` (fix pending). |
+| **DGAC base weights** | Loaded from `diloco_state/anchor/` via `--resume_from_diloco_anchor` ✅ |
 
 ---
 
@@ -171,7 +171,7 @@ WeirdRunner/Ouroboros/
 | **`kaggle==1.6.17` predates `--accelerator` feature → P100 assigned** | **Fixed: `kaggle>=1.8.4` + `--accelerator NvidiaTeslaT4` in `push_args` + `"NvidiaTeslaT4"` JSON cap + runtime fast-fail. ✅ VERIFIED WORKING (no P100 since deploy)** |
 | **W&B subsequent rounds not logged (wandb 0.25.0 resume bug)** | **Per-round run IDs + `group=` parameter. ✅ VERIFIED WORKING (dashboard shows separate runs per round)** |
 | Worker C quota exhausted (stages 2–3 early rounds) | Quota renewed; C rejoined at stage 3 round 5. All three workers active from stage 4 onward. ✅ |
-| **DGAC base weights: `--use_halt_gate` cannot find DiLoCo anchor** | **Fix pending: `--resume_from_diloco_anchor` flag. See `prompts/fix_dgac_anchor_handoff.md`** |
+| **DGAC base weights: `--use_halt_gate` cannot find DiLoCo anchor** | **Fixed: `--resume_from_diloco_anchor` loads `diloco_state/anchor/` from Hub. ✅** |
 
 ---
 
@@ -240,7 +240,7 @@ Stages 8–10 ETA: ~2026-05-04 (3 stages × 1 day, all 3 workers active)
 
 | File | Status |
 |---|---|
-| `jamba_coconut_finetune.py` | ✅ All patches deployed; `--resume_from_diloco_anchor` fix pending |
+| `jamba_coconut_finetune.py` | ✅ All patches deployed; `--resume_from_diloco_anchor` implemented |
 | `diloco_coordinator.py` | ✅ All patches deployed and verified |
 | `.github/workflows/diloco_coordinator.yml` | ✅ `kaggle>=1.8.4` deployed |
 | `kaggle-utils.ipynb` Cell 5 | ✅ No changes needed |
@@ -278,4 +278,4 @@ Stages 8–10 ETA: ~2026-05-04 (3 stages × 1 day, all 3 workers active)
 | `kaggle==1.6.17` + `enable_gpu:true` + `"accelerator": "nvidiaTeslaT4"` → still P100 | Root cause 1: `--accelerator` CLI flag added in v1.8.4 (predates our pin). Root cause 2: wrong cap. Fix: `kaggle>=1.8.4` + `--accelerator NvidiaTeslaT4` + fix JSON cap + runtime fast-fail. All verified. |
 | `wandb==0.25.0` `resume="allow"` on finished run creates ephemeral run | Per-round run IDs + `group=` for stage-level grouping |
 | W&B dashboard becomes unreadable with many overlapping runs | Unique `id` per round + `group` by stage keeps it navigable |
-| **`--use_halt_gate` starts from random LoRA weights (DiLoCo path)** | **`--resume_from_diloco_anchor` loads `diloco_state/anchor/` before DGAC training (fix pending)** |
+| **`--use_halt_gate` starts from random LoRA weights (DiLoCo path)** | **`--resume_from_diloco_anchor` loads `diloco_state/anchor/` before DGAC training. ✅ Fixed** |

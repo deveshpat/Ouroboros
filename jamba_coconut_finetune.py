@@ -53,11 +53,16 @@ Run (Phase 3.1 through 3.K, Kaggle Dual GPU):
     --push_to_hub \
     --output_dir runs/stage3_curriculum
 
-Run (Phase 3.4, DGAC gate, from Stage K best checkpoint):
-  !python jamba_coconut_finetune.py \
+Run (Phase 3.4, DGAC gate, from DiLoCo stage-K anchor):
+  !torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
+    --use_halt_gate --resume_from_diloco_anchor \
+    --diloco_state_repo WeirdRunner/Ouroboros --hf_token "$HF_TOKEN" \
     --data_dir data/coconut_v1 --use_4bit \
-    --use_halt_gate --resume_from runs/stage3_curriculum/stage_10/best \
-    --epochs_per_stage 3 --output_dir runs/stage3_dgac
+    --epochs_per_stage 3 --max_stage 10 --max_grad_norm 0.3 \
+    --batch_size 4 --grad_accum 8 --val_batch_size 2 \
+    --val_skip_buffer_minutes 60 \
+    --session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 \
+    --push_to_hub --output_dir runs/stage3_dgac
 """
 
 import argparse
@@ -1262,6 +1267,17 @@ def parse_args() -> argparse.Namespace:
 
     # DGAC halt gate (Phase 3.4)
     parser.add_argument("--use_halt_gate", action="store_true")
+    parser.add_argument(
+        "--resume_from_diloco_anchor",
+        action="store_true",
+        help=(
+            "Load DiLoCo anchor weights from diloco_state/anchor/ on Hub as the "
+            "base model for DGAC (--use_halt_gate) training. "
+            "Requires --use_halt_gate, --hf_token, and --diloco_state_repo. "
+            "Bypasses find_latest_resume_checkpoint(); halt_gate starts from zero-init. "
+            "Use instead of --resume_from when curriculum was trained via DiLoCo mode."
+        ),
+    )
     parser.add_argument("--halt_threshold", type=float, default=0.5)
     parser.add_argument("--dgac_lambda_ponder_max", type=float, default=0.01)
     parser.add_argument("--dgac_lambda_diversity", type=float, default=0.1)
@@ -3972,6 +3988,11 @@ def run_diloco_worker(
 
 def main() -> None:
     args = parse_args()
+    if getattr(args, "resume_from_diloco_anchor", False) and not args.use_halt_gate:
+        raise ValueError(
+            "--resume_from_diloco_anchor requires --use_halt_gate. "
+            "This flag is only valid for Phase 3.4 DGAC training."
+        )
     if args.diloco_mode:
         args.diloco_worker_id = _require_valid_diloco_worker_id(args.diloco_worker_id)
         os.environ["DILOCO_WORKER_ID"] = args.diloco_worker_id
@@ -3980,6 +4001,11 @@ def main() -> None:
 
     hf_token = _resolve_hf_token(getattr(args, "hf_token", None))
     args._resolved_hf_token = hf_token
+    if getattr(args, "resume_from_diloco_anchor", False) and not hf_token:
+        raise ValueError(
+            "--resume_from_diloco_anchor requires an HF token. "
+            "Provide --hf_token, set HF_TOKEN, or define a Kaggle secret."
+        )
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
         os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", hf_token)
@@ -4147,6 +4173,71 @@ def main() -> None:
             )
             return
 
+        # ── DiLoCo anchor load for DGAC ──────────────────────────────────────────────
+        # When --use_halt_gate + --resume_from_diloco_anchor are set together, load the
+        # DiLoCo stage-10 aggregate from Hub as the base LoRA weights, then run
+        # training directly and return. The outer try/finally handles all cleanup
+        # (destroy_process_group, wandb.finish). Do NOT call them here.
+        if getattr(args, "resume_from_diloco_anchor", False):
+            if not args.use_halt_gate:
+                raise ValueError(
+                    "--resume_from_diloco_anchor requires --use_halt_gate. "
+                    "This flag is only valid for Phase 3.4 DGAC training."
+                )
+            if not hf_token:
+                raise ValueError(
+                    "--resume_from_diloco_anchor requires an HF token. "
+                    "Provide --hf_token, set HF_TOKEN, or define a Kaggle secret."
+                )
+            anchor_repo = getattr(args, "diloco_state_repo", "WeirdRunner/Ouroboros")
+            if is_main:
+                print(
+                    f"\n  [DGAC] Loading DiLoCo anchor from {anchor_repo}/diloco_state/anchor "
+                    "as base weights for Phase 3.4 DGAC training."
+                )
+            diloco_download_anchor(
+                model,
+                hf_token,
+                anchor_repo,
+                "diloco_state/anchor",
+                device,
+            )
+            if is_main:
+                print(
+                    "  [DGAC] Anchor loaded. HaltGate at zero-init. "
+                    "gate_stage will default to curriculum_max_stage. Optimizer starts fresh."
+                )
+            if distributed:
+                broadcast_parameters(get_trainable_parameters(model, halt_gate), src=0)
+                barrier()
+            run_training_stages(
+                model=model,
+                tokenizer=tokenizer,
+                halt_gate=halt_gate,
+                train_samples=train_samples,
+                val_samples=val_samples,
+                lat_token_id=lat_token_id,
+                pad_id=pad_id,
+                args=args,
+                device=device,
+                output_dir=output_dir,
+                session_start=session_start,
+                wandb_run=wandb_run,
+                stages=[curriculum_max_stage],
+                curriculum_max_stage=curriculum_max_stage,
+                resume_path=None,
+                resume_same_stage=False,
+                resume_stage=curriculum_max_stage,
+                resume_epoch=0,
+                resume_step_in_epoch=-1,
+                global_step=0,
+                step_in_phase=0,
+                load_best_between_stages=False,
+                run_generation_at_stage_end=bool(args.gen_every_stage),
+                run_epoch_end_val=True,
+            )
+            return  # finally in main() handles destroy_process_group and wandb.finish
+        # ─────────────────────────────────────────────────────────────────────────────
         requested_resume_path: Optional[Path] = Path(args.resume_from) if args.resume_from else None
         hub_resume_dir = output_dir / ".hub_resume"
         resume_path = _resolve_resume_checkpoint_for_all_ranks(
