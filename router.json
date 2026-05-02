@@ -6,7 +6,7 @@
     "repo": "Ouroboros",
     "branch": "main",
     "base_url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main",
-    "generated_at": "2026-05-02T09:10:05.143855+00:00",
+    "generated_at": "2026-05-02T09:28:36.023495+00:00",
     "total_files": 41,
     "total_dirs": 2
   },
@@ -82,7 +82,7 @@
       "extension": ".md",
       "category": "markdown",
       "mime": "text/markdown",
-      "size_bytes": 15457,
+      "size_bytes": 15365,
       "binary": false,
       "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/BLUEPRINT.md"
     },
@@ -112,7 +112,7 @@
       "extension": ".py",
       "category": "code",
       "mime": "text/x-python",
-      "size_bytes": 161667,
+      "size_bytes": 166267,
       "binary": false,
       "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/jamba_coconut_finetune.py"
     },
