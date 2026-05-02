@@ -6,9 +6,9 @@
     "repo": "Ouroboros",
     "branch": "main",
     "base_url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main",
-    "generated_at": "2026-05-02T11:30:27.063384+00:00",
-    "total_files": 41,
-    "total_dirs": 2
+    "generated_at": "2026-05-02T11:36:40.013910+00:00",
+    "total_files": 49,
+    "total_dirs": 3
   },
   "categories": {
     "code": [
@@ -54,7 +54,15 @@
     ],
     "markdown": [
       "BLUEPRINT.md",
-      "terminal_log.md"
+      "terminal_log.md",
+      "wiki/Checkpoint-Hub-Sync.md",
+      "wiki/Coordinator-State-Machine.md",
+      "wiki/DiLoCo-Protocol.md",
+      "wiki/GPU-Guardrails.md",
+      "wiki/Lessons-Learned.md",
+      "wiki/Mamba-Bootstrap.md",
+      "wiki/STATUS.md",
+      "wiki/SessionLog.md"
     ],
     "notebook": [
       "kaggle-utils.ipynb"
@@ -73,6 +81,11 @@
       "name": "skills",
       "path": "skills",
       "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/skills"
+    },
+    {
+      "name": "wiki",
+      "path": "wiki",
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki"
     }
   ],
   "files": [
@@ -485,6 +498,86 @@
       "size_bytes": 89,
       "binary": false,
       "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/signals/worker_C_stage_7_round_0.json"
+    },
+    {
+      "name": "Checkpoint-Hub-Sync.md",
+      "path": "wiki/Checkpoint-Hub-Sync.md",
+      "extension": ".md",
+      "category": "markdown",
+      "mime": "text/markdown",
+      "size_bytes": 3223,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/Checkpoint-Hub-Sync.md"
+    },
+    {
+      "name": "Coordinator-State-Machine.md",
+      "path": "wiki/Coordinator-State-Machine.md",
+      "extension": ".md",
+      "category": "markdown",
+      "mime": "text/markdown",
+      "size_bytes": 3930,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/Coordinator-State-Machine.md"
+    },
+    {
+      "name": "DiLoCo-Protocol.md",
+      "path": "wiki/DiLoCo-Protocol.md",
+      "extension": ".md",
+      "category": "markdown",
+      "mime": "text/markdown",
+      "size_bytes": 4826,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/DiLoCo-Protocol.md"
+    },
+    {
+      "name": "GPU-Guardrails.md",
+      "path": "wiki/GPU-Guardrails.md",
+      "extension": ".md",
+      "category": "markdown",
+      "mime": "text/markdown",
+      "size_bytes": 2509,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/GPU-Guardrails.md"
+    },
+    {
+      "name": "Lessons-Learned.md",
+      "path": "wiki/Lessons-Learned.md",
+      "extension": ".md",
+      "category": "markdown",
+      "mime": "text/markdown",
+      "size_bytes": 2474,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/Lessons-Learned.md"
+    },
+    {
+      "name": "Mamba-Bootstrap.md",
+      "path": "wiki/Mamba-Bootstrap.md",
+      "extension": ".md",
+      "category": "markdown",
+      "mime": "text/markdown",
+      "size_bytes": 3294,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/Mamba-Bootstrap.md"
+    },
+    {
+      "name": "STATUS.md",
+      "path": "wiki/STATUS.md",
+      "extension": ".md",
+      "category": "markdown",
+      "mime": "text/markdown",
+      "size_bytes": 5310,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/STATUS.md"
+    },
+    {
+      "name": "SessionLog.md",
+      "path": "wiki/SessionLog.md",
+      "extension": ".md",
+      "category": "markdown",
+      "mime": "text/markdown",
+      "size_bytes": 3024,
+      "binary": false,
+      "url": "https://raw.githubusercontent.com/deveshpat/Ouroboros/main/wiki/SessionLog.md"
     }
   ]
 }
