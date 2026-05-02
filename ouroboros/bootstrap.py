@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-def __normalize_text(value: Optional[Any], *, uppercase: bool = False) -> Optional[str]:
+def _normalize_text(value: Optional[Any], *, uppercase: bool = False) -> Optional[str]:
     if value is None:
         return None
     text = str(value).strip()
