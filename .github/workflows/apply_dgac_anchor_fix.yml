@@ -216,3 +216,4 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \\
           git add jamba_coconut_finetune.py BLUEPRINT.md .github/workflows/apply_dgac_anchor_fix.yml
           git commit -m "fix: load DiLoCo anchor for DGAC"
           git push
+# trigger: 2026-05-02T08:55:00Z
