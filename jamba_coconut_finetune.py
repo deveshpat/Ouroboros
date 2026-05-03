@@ -864,6 +864,53 @@ def _bootstrap() -> None:
     _bootstrap_run_local_finalize_padded()
 
 
+def _print_bootstrap_free_help_and_exit() -> None:
+    """Render the stable CLI help surface without bootstrap or ML imports."""
+    print(
+        "usage: jamba_coconut_finetune.py [-h] [--model_id MODEL_ID] "
+        "[--max_seq_len MAX_SEQ_LEN] [--use_4bit] [--data_dir DATA_DIR] "
+        "[--max_stage MAX_STAGE] [--epochs_per_stage EPOCHS_PER_STAGE] "
+        "[--batch_size BATCH_SIZE] [--grad_accum GRAD_ACCUM] "
+        "[--diloco_mode] [--diloco_worker_id {A,B,C}] "
+        "[--val_batch_size VAL_BATCH_SIZE] "
+        "[--gen_every_stage | --no-gen_every_stage] [--wandb_mode {online,offline,disabled}]\n\n"
+        "Jamba Reasoning 3B Coconut-Ouroboros fine-tuning\n\n"
+        "Key options preserved from the source monolith:\n"
+        "  --model_id MODEL_ID\n"
+        "  --max_seq_len MAX_SEQ_LEN\n"
+        "  --use_4bit\n"
+        "  --data_dir DATA_DIR\n"
+        "  --max_stage MAX_STAGE\n"
+        "  --epochs_per_stage EPOCHS_PER_STAGE\n"
+        "  --stage_0_epochs STAGE_0_EPOCHS\n"
+        "  --use_halt_gate\n"
+        "  --batch_size BATCH_SIZE\n"
+        "  --grad_accum GRAD_ACCUM\n"
+        "  --max_grad_norm MAX_GRAD_NORM\n"
+        "  --session_timeout_hours SESSION_TIMEOUT_HOURS\n"
+        "  --graceful_exit_buffer_minutes GRACEFUL_EXIT_BUFFER_MINUTES\n"
+        "  --push_to_hub\n"
+        "  --hf_token HF_TOKEN\n"
+        "  --hf_repo_id HF_REPO_ID\n"
+        "  --diloco_mode\n"
+        "  --diloco_worker_id {A,B,C}\n"
+        "  --resume_from RESUME_FROM\n"
+        "  --resume_from_diloco_anchor\n"
+        "  --output_dir OUTPUT_DIR\n"
+        "  --val_batch_size VAL_BATCH_SIZE\n"
+        "  --gen_every_stage, --no-gen_every_stage\n"
+        "  --gen_max_tokens GEN_MAX_TOKENS\n"
+        "  --wandb_mode {online,offline,disabled}\n"
+    )
+    sys.exit(0)
+
+
+# Keep startup bootstrap before third-party ML imports for real execution, but
+# allow argparse help to render without dependency installs, CUDA probes, or
+# network/bootstrap side effects. This preserves bootstrap ordering for all
+# runnable training paths while making CLI compatibility locally testable.
+if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    _print_bootstrap_free_help_and_exit()
 _bootstrap()
 
 import torch
@@ -880,10 +927,16 @@ try:
     from peft import LoraConfig, get_peft_model
     from tqdm.auto import tqdm
 except ImportError as exc:
-    sys.exit(
-        f"Missing dependency after bootstrap: {exc}\n"
-        "Check pip install output above for errors."
-    )
+    if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        AutoModelForCausalLM = AutoTokenizer = BitsAndBytesConfig = None  # type: ignore[assignment]
+        LoraConfig = get_peft_model = None  # type: ignore[assignment]
+        tqdm = None  # type: ignore[assignment]
+        _TF_VERSION = (0, 0)
+    else:
+        sys.exit(
+            f"Missing dependency after bootstrap: {exc}\n"
+            "Check pip install output above for errors."
+        )
 
 MODEL_ID = "ai21labs/AI21-Jamba-Reasoning-3B"
 
@@ -1335,6 +1388,14 @@ def parse_args() -> argparse.Namespace:
 
     # I/O
     parser.add_argument("--resume_from", type=str, default=None)
+    parser.add_argument(
+        "--resume_from_diloco_anchor",
+        action="store_true",
+        help=(
+            "Load diloco_state/anchor from --diloco_state_repo as the base LoRA "
+            "weights for Phase 3.4 DGAC training. Requires --use_halt_gate."
+        ),
+    )
     parser.add_argument("--output_dir", default="runs/stage3")
     parser.add_argument("--keep_checkpoints_per_stage", type=int, default=2)
 
@@ -4144,6 +4205,70 @@ def main() -> None:
                 session_start=session_start,
                 wandb_run=wandb_run,
                 hf_token=hf_token or "",
+            )
+            return
+
+        # ── DiLoCo anchor load for DGAC ──────────────────────────────────────
+        # When --use_halt_gate + --resume_from_diloco_anchor are set together,
+        # load the aggregated DiLoCo anchor as the base LoRA weights, then train
+        # DGAC directly at the configured curriculum max stage.
+        if getattr(args, "resume_from_diloco_anchor", False):
+            if not args.use_halt_gate:
+                raise ValueError(
+                    "--resume_from_diloco_anchor requires --use_halt_gate. "
+                    "This flag is only valid for Phase 3.4 DGAC training."
+                )
+            if not hf_token:
+                raise ValueError(
+                    "--resume_from_diloco_anchor requires an HF token. "
+                    "Provide --hf_token, set HF_TOKEN, or define a Kaggle secret."
+                )
+            anchor_repo = getattr(args, "diloco_state_repo", "WeirdRunner/Ouroboros")
+            if is_main:
+                print(
+                    f"\n  [DGAC] Loading DiLoCo anchor from {anchor_repo}/diloco_state/anchor "
+                    "as base weights for Phase 3.4 DGAC training."
+                )
+            diloco_download_anchor(
+                model,
+                hf_token,
+                anchor_repo,
+                "diloco_state/anchor",
+                device,
+            )
+            if is_main:
+                print(
+                    "  [DGAC] Anchor loaded. HaltGate at zero-init. "
+                    "gate_stage will default to curriculum_max_stage. Optimizer starts fresh."
+                )
+            if distributed:
+                broadcast_parameters(get_trainable_parameters(model, halt_gate), src=0)
+                barrier()
+            run_training_stages(
+                model=model,
+                tokenizer=tokenizer,
+                halt_gate=halt_gate,
+                train_samples=train_samples,
+                val_samples=val_samples,
+                lat_token_id=lat_token_id,
+                pad_id=pad_id,
+                args=args,
+                device=device,
+                output_dir=output_dir,
+                session_start=session_start,
+                wandb_run=wandb_run,
+                stages=[curriculum_max_stage],
+                curriculum_max_stage=curriculum_max_stage,
+                resume_path=None,
+                resume_same_stage=False,
+                resume_stage=curriculum_max_stage,
+                resume_epoch=0,
+                resume_step_in_epoch=-1,
+                global_step=0,
+                step_in_phase=0,
+                load_best_between_stages=False,
+                run_generation_at_stage_end=bool(args.gen_every_stage),
+                run_epoch_end_val=True,
             )
             return
 
