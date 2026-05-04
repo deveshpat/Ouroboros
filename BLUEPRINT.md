@@ -53,6 +53,8 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
 | [wiki/Checkpoint-Hub-Sync.md](wiki/Checkpoint-Hub-Sync.md) | Checkpoint resume, Hub uploads, DiLoCo anchor |
 | [wiki/Lessons-Learned.md](wiki/Lessons-Learned.md) | Recurring failure debugging |
 | [wiki/SessionLog.md](wiki/SessionLog.md) | Historical coordinator run record |
+| [wiki/Architecture-Extraction.md](wiki/Architecture-Extraction.md) | Completed extraction history, adapter ownership, retired PRD/plan decisions |
+| [wiki/Engineering-Workflow.md](wiki/Engineering-Workflow.md) | PRD → plan → tracer-bullet → TDD loop, commit policy, artifact retirement |
 
 ---
 
@@ -60,15 +62,20 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
 
 | File | Role |
 |---|---|
-| `jamba_coconut_finetune.py` | Worker training script (entrypoint) |
-| `diloco_coordinator.py` | CPU aggregation + Kaggle dispatch |
+| `jamba_coconut_finetune.py` | Thin worker-training compatibility adapter |
+| `diloco_coordinator.py` | Thin coordinator compatibility adapter |
+| `ouroboros/` | Packaged training, worker, coordinator, dispatch, state, and aggregation behavior |
 | `.github/workflows/diloco_coordinator.yml` | CI trigger + dependencies |
-| `kaggle-utils.ipynb` | Kaggle notebook (cloned to worker on each session) |
-| `signals/*.json` | Worker→coordinator trigger files |
-| `wiki/` | Operational knowledge base |
+| `kaggle-utils.ipynb` | Kaggle notebook runtime adapter; preserves `!torchrun` shell magic |
+| `signals/.gitkeep` | Keeps the runtime signal directory present; generated `signals/*.json` files are ignored; signal JSON pushes still trigger the coordinator |
+| `wiki/` | Durable operational and architectural knowledge base |
 | `terminal_log.md` | Last-session verbatim output (rolling, ≤80 lines) |
 
 ---
+
+## Engineering Architecture
+
+Training and coordinator monolith extraction is complete. The root scripts are thin compatibility adapters, while reusable behavior lives in `ouroboros/`. See [wiki/Architecture-Extraction.md](wiki/Architecture-Extraction.md).
 
 ## Architecture Snapshot
 

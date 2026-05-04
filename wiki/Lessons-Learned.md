@@ -12,10 +12,16 @@
 | `kaggle kernels push --accelerator` → unrecognized argument | Upgrade to `kaggle>=1.8.4`; add `--accelerator NvidiaTeslaT4` to push_args |
 | Worker C quota exhausted → coordinator stalls forever | `triggered_at` + 13h timeout + attendance mechanism |
 | Coordinator writes `triggered_workers` but push fails silently | `triggered_at=0` manual reset → immediate re-dispatch on next run |
+| Kaggle CLI prints `Kernel push error`/quota text with non-fatal process behavior | Classify push output strictly: require `successfully pushed`; treat quota/error markers as failed dispatch for immediate reconciliation |
 | `kaggle==1.6.17` + `"accelerator": "nvidiaTeslaT4"` → still P100 | Root cause 1: `--accelerator` added in v1.8.4. Root cause 2: wrong cap. Fix: `kaggle>=1.8.4` + cap fix + runtime fast-fail. All verified. |
 | `wandb==0.25.0` `resume="allow"` on finished run → ephemeral run | Per-round run IDs + `group=` for stage-level grouping |
 | W&B dashboard unreadable with many overlapping runs | Unique `id` per round + `group` by stage |
 | `--use_halt_gate` starts from random LoRA weights in DiLoCo path | `--resume_from_diloco_anchor` loads `diloco_state/anchor/` before DGAC training |
+| Completed PRDs/plans linger in `plans/` and compete with docs | Promote durable decisions into `wiki/`, then delete obsolete planning files |
+| Runtime `signals/*.json` appears in source control | Ignore generated signal JSONs and keep only `signals/.gitkeep` tracked; do not remove the workflow signal trigger until a replacement exists |
+| Root scripts become safer but then risk regrowing into monoliths | Keep adapter guardrail tests that assert root entrypoints delegate into package modules |
+| Test assumes a clean shell but developer/CI has real tokens exported | Clear ambient token/runtime env with `monkeypatch.delenv()` before asserting fake payloads |
+| TDD loop stalls after each tiny red/green step or swings into bulk refactor | Use phase-scoped continuous tracer bullets: one slice at a time, loop until phase completion |
 | `attn_implementation` crash | try/except fallback in `_safe_from_pretrained` |
 | `use_mamba_kernels` old TF | retry without key in `_safe_from_pretrained` |
 | `last_hidden_state` None | assert in all forward paths |

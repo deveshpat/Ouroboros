@@ -1,6 +1,6 @@
 # Project Status — Coconut-Ouroboros
 > **This page is the body. `BLUEPRINT.md` is the index. Load this page after BLUEPRINT.md.**
-> Last updated: 2026-05-02
+> Last updated: 2026-05-04
 
 ---
 
@@ -22,14 +22,31 @@
 **Compute mode:** DiLoCo 3-worker (A+B+C), 1 round per stage since stage 4.
 **Velocity:** ~1 stage/day for stages 4–7. Stages 8–10 ETA ~2026-05-04.
 
+
+---
+
+## Engineering Architecture Status
+
+| Track | Status | Notes |
+|---|---|---|
+| Training monolith extraction | ✅ COMPLETE | `jamba_coconut_finetune.py` is a thin compatibility adapter delegating into `ouroboros.train` and related package modules. |
+| Kaggle launch seam | ✅ COMPLETE | Notebook remains a thin adapter and preserves `!torchrun` shell magic. |
+| Runtime signal tracking cleanup | ✅ COMPLETE | Generated `signals/*.json` files are ignored; only `signals/.gitkeep` belongs in source control; the signal mechanism remains active as the coordinator doorbell. |
+| Coordinator zero-drift extraction | ✅ COMPLETE | `diloco_coordinator.py` is a thin adapter; aggregation, state, dispatch, and orchestration live under `ouroboros.diloco.*`. |
+| Planning artifact retirement | ✅ COMPLETE | Completed PRDs/plans have been promoted into wiki documentation and removed from `plans/`. |
+| Next engineering phase | ⬜ READY | Write latest PRD for Kaggle CPU/API workflow validation, then plan → issues/tracer bullets → TDD loop. |
+
+Canonical architecture record: [Architecture-Extraction](Architecture-Extraction.md).
+Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
+
 ---
 
 ## Immediate Next Steps
 
-1. **Monitor stages 8–10** — no action required. Stage 7 complete for all workers; coordinator auto-dispatches stage 8.
-2. **W&B accuracy trend** — pre-val acc at stage entry: 0% → 2% → 4% → 6% → 8% (est stage 7). Target for stage 10: define before DGAC.
-3. **DGAC prep** — `--resume_from_diloco_anchor` flag ready. Launch command in `BLUEPRINT.md`.
-4. **Stage 3 r2–r3 A gap** — Worker A has no signal files; B completed both. Coordinator handled correctly (solo/attendance). Low priority.
+1. **Start Kaggle CPU/API workflow validation PRD** — use the PRD → plan → tracer-bullet → TDD loop before implementation.
+2. **Monitor stages 8–10** — no action required from the refactor work. Coordinator auto-dispatch behavior remains preserved.
+3. **W&B accuracy trend** — pre-val acc at stage entry: 0% → 2% → 4% → 6% → 8% (est stage 7). Target for stage 10: define before DGAC.
+4. **DGAC prep** — `--resume_from_diloco_anchor` flag ready. Launch command in `BLUEPRINT.md`.
 
 ---
 
@@ -85,6 +102,7 @@ WeirdRunner/Ouroboros/
 | Notebook launch cells | `!torchrun` magic commands only |
 | Worker auto-detection | `DILOCO_WORKER_ID` Kaggle secret per account (`A`/`B`/`C`) |
 | Kaggle trigger mechanism | Local `kernels push` — staged checked-in notebook + generated metadata. No pull needed. ✅ |
+| Kaggle push success detection | Strict parser: requires `successfully pushed`; quota/error output is failed dispatch even with exit code 0. ✅ |
 | Kaggle SDK version | `kaggle>=1.8.4` — first with `--accelerator` for `kernels push` (PR #907). ✅ |
 | `"accelerator"` JSON field | `"NvidiaTeslaT4"` (capital N). Belt-and-suspenders. ✅ |
 | `"accelerator"` CLI flag | `--accelerator NvidiaTeslaT4` in `push_args`. ✅ |

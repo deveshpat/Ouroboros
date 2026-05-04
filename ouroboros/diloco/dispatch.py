@@ -20,6 +20,37 @@ WORKER_KAGGLE_SLUGS: Dict[str, Tuple[str, str]] = {
     "C": ("weirdrunner008", "weirdrunner008/kaggle-utils"),
 }
 
+_KAGGLE_PUSH_SUCCESS_MARKERS = (
+    "successfully pushed",
+)
+_KAGGLE_PUSH_FAILURE_MARKERS = (
+    "kernel push error",
+    "maximum weekly gpu quota",
+    "gpu quota",
+    "quota reached",
+    "error",
+)
+
+
+def _format_kaggle_output(stdout: Optional[str], stderr: Optional[str]) -> str:
+    return "\n".join(part.strip() for part in (stdout or "", stderr or "") if part and part.strip())
+
+
+def _is_successful_kaggle_push(returncode: int, stdout: Optional[str], stderr: Optional[str]) -> bool:
+    """Return True only for an explicitly successful Kaggle push.
+
+    Kaggle can print a human-readable `Kernel push error: ...` while still
+    returning 0. Treating any zero exit code as success leaves workers in
+    `triggered_workers` even though they never launched, which then forces the
+    coordinator to wait for the long worker timeout.
+    """
+    combined = _format_kaggle_output(stdout, stderr).lower()
+    if returncode != 0:
+        return False
+    if any(marker in combined for marker in _KAGGLE_PUSH_FAILURE_MARKERS):
+        return False
+    return any(marker in combined for marker in _KAGGLE_PUSH_SUCCESS_MARKERS)
+
 
 def _normalize_optional_text(value: Optional[Any], *, uppercase: bool = False) -> Optional[str]:
     if value is None:
@@ -345,12 +376,12 @@ def _trigger_single_worker(
             # This is distinct from the JSON metadata field (also present, belt-and-suspenders).
             push_args = ["kernels", "push", "-p", str(tmp_path), "--accelerator", "NvidiaTeslaT4"]
             push = _run_kaggle(push_args)
-            if push.returncode != 0:
-                err = (push.stderr or push.stdout or "").strip()
-                print(f"[coordinator] WARNING: kernels push failed for Worker {worker_id} ({slug}): {err}")
+            out = _format_kaggle_output(push.stdout, push.stderr)
+            if not _is_successful_kaggle_push(push.returncode, push.stdout, push.stderr):
+                detail = out or f"returncode={push.returncode}"
+                print(f"[coordinator] WARNING: kernels push failed for Worker {worker_id} ({slug}): {detail}")
                 return False
 
-        out = (push.stdout or push.stderr or "").strip()
         print(f"[coordinator] Triggered Worker {worker_id}: {slug}  ({out})")
         return True
 

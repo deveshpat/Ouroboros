@@ -38,24 +38,46 @@ def test_coordinator_entrypoint_has_graduated_to_compatibility_adapter():
     assert "def main(" in packaged_source
 
 
-def test_zero_drift_plan_and_adapter_transition_are_checked_in():
-    zero_drift_plan = REPO_ROOT / "plans" / "zero-drift-monolith-extraction.md"
-    adapter_plan = REPO_ROOT / "plans" / "monolith-adapter-thinning.md"
-    coordinator_prd = REPO_ROOT / "plans" / "diloco-coordinator-zero-drift-extraction-prd.md"
-    coordinator_plan = REPO_ROOT / "plans" / "diloco-coordinator-zero-drift-extraction-plan.md"
+def test_completed_extraction_plans_are_promoted_to_wiki_and_retired():
+    architecture_record = REPO_ROOT / "wiki" / "Architecture-Extraction.md"
+    workflow_record = REPO_ROOT / "wiki" / "Engineering-Workflow.md"
 
-    assert zero_drift_plan.exists()
-    assert adapter_plan.exists()
-    assert coordinator_prd.exists()
-    assert coordinator_plan.exists()
+    assert architecture_record.exists()
+    assert workflow_record.exists()
 
-    zero_drift_text = zero_drift_plan.read_text(encoding="utf-8")
-    adapter_text = adapter_plan.read_text(encoding="utf-8")
-    coordinator_plan_text = coordinator_plan.read_text(encoding="utf-8")
+    architecture_text = architecture_record.read_text(encoding="utf-8")
+    workflow_text = workflow_record.read_text(encoding="utf-8")
 
-    assert "Phase 1: Validation/OOM regression tracer bullet" in zero_drift_text
-    assert "Kaggle GPU runs are final confidence validation only" in zero_drift_text
-    assert "training root file is a compatibility adapter" in adapter_text
-    assert "Kaggle notebook becomes the final thin adapter" in adapter_text
-    assert "Phase 1: Aggregation characterization and extraction" in coordinator_plan_text
-    assert "Phase 6: Root adapter thinning and guardrails" in coordinator_plan_text
+    assert "Completed Track: Training Monolith Extraction" in architecture_text
+    assert "Kaggle launch remains an IPython `!torchrun` shell-magic command" in architecture_text
+    assert "Completed Track: Coordinator Zero-Drift Extraction" in architecture_text
+    assert "`plans/zero-drift-monolith-extraction.md`" in architecture_text
+    assert "`plans/diloco-coordinator-zero-drift-extraction-plan.md`" in architecture_text
+    assert "latest PRD" in workflow_text
+    assert "choose one tracer bullet" in workflow_text
+    assert "delete obsolete files from `plans/`" in workflow_text
+
+    obsolete_paths = [
+        REPO_ROOT / "plans" / "zero-drift-monolith-extraction.md",
+        REPO_ROOT / "plans" / "monolith-adapter-thinning.md",
+        REPO_ROOT / "plans" / "diloco-coordinator-zero-drift-extraction-prd.md",
+        REPO_ROOT / "plans" / "diloco-coordinator-zero-drift-extraction-plan.md",
+    ]
+    assert not any(path.exists() for path in obsolete_paths)
+
+
+def test_runtime_signal_artifacts_are_ignored_but_signal_directory_is_kept():
+    gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+
+    assert "signals/*.json" in gitignore
+    assert "!signals/.gitkeep" in gitignore
+    assert (REPO_ROOT / "signals" / ".gitkeep").exists()
+
+
+def test_runtime_signal_mechanism_is_retained_as_coordinator_doorbell():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "diloco_coordinator.yml").read_text(encoding="utf-8")
+    worker_source = (REPO_ROOT / "ouroboros" / "diloco" / "worker.py").read_text(encoding="utf-8")
+
+    assert "signals/*.json" in workflow
+    assert "def diloco_push_signal" in worker_source
+    assert "signals/worker_{worker_id}_stage_{stage_k}_round_{round_n}.json" in worker_source

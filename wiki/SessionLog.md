@@ -5,6 +5,56 @@
 
 ---
 
+## Session 25 — docs retirement + Kaggle dispatch hardening (2026-05-04) ✅
+
+**Decision:** retire obsolete PRDs/plans only after their durable decisions are documented in `wiki/`. Keep the runtime signal mechanism; generated `signals/*.json` files are disposable GitHub Actions doorbells, while `signals/.gitkeep` keeps the directory present.
+
+**Bug found:** Kaggle can print `Kernel push error: Maximum weekly GPU quota...` while the CLI invocation does not behave like a hard process failure. Treating any zero exit code as success leaves workers in `triggered_workers`, making the coordinator wait for the long timeout.
+
+**Fix:** dispatch success now requires a `successfully pushed` marker and rejects quota/error markers. Failed dispatches flow through post-dispatch reconciliation immediately, demoting workers to attendance instead of waiting ~13h.
+
+**Guardrails:** dispatch tests cover success marker classification and zero-exit quota output; source-of-truth tests keep the signal trigger mechanism present while ignoring generated signal JSONs.
+
+---
+
+## Session 24 — source-of-truth docs + obsolete plan retirement (2026-05-04) ✅
+
+**Decision:** completed PRDs/plans are not durable source-of-truth files. Once a phase is implemented, durable decisions move into `wiki/`, then obsolete files under `plans/` are deleted.
+
+**Fix:** added `wiki/Architecture-Extraction.md` and `wiki/Engineering-Workflow.md`, updated `BLUEPRINT.md`/`STATUS.md`, and retired completed training/coordinator PRD/plan files.
+
+**Guardrail:** `tests/test_source_of_truth_contract.py` now checks that completed extraction decisions live in wiki docs and that obsolete plan files are absent.
+
+---
+
+## Session 23 — coordinator zero-drift extraction and adapter thinning (2026-05-04) ✅
+
+**Goal:** extract `diloco_coordinator.py` without changing CLI, Hub state, Kaggle dispatch, aggregation math, or recovery behavior.
+
+**Result:** root `diloco_coordinator.py` became a thin compatibility adapter. Coordinator behavior now lives in:
+- `ouroboros.diloco.aggregation`
+- `ouroboros.diloco.state`
+- `ouroboros.diloco.dispatch`
+- `ouroboros.diloco.coordinator`
+
+**Tests added:** aggregation, state, dispatch, orchestration, adapter, and source-of-truth guardrails.
+
+**Follow-up fix:** dispatch runtime-env test was made hermetic after a developer shell leaked a real `GITHUB_TOKEN`; tests now clear ambient token/runtime env before asserting fake payloads.
+
+---
+
+## Session 22 — training monolith extraction and Kaggle launch seam (2026-05-04) ✅
+
+**Goal:** extract the training monolith while preserving runtime behavior, then thin `jamba_coconut_finetune.py` into a compatibility adapter.
+
+**Result:** reusable behavior moved under `ouroboros/*`; the root training script now owns process startup and delegates to `ouroboros.train.run_cli`.
+
+**Kaggle contract:** `kaggle-utils.ipynb` remains a thin adapter and preserves the `!torchrun` shell-magic launch seam instead of using Python `subprocess.run`.
+
+**Artifact hygiene:** generated `signals/*.json` files are runtime artifacts and should not be tracked; `signals/.gitkeep` keeps the directory present.
+
+---
+
 ## Session 21 — kaggle>=1.8.4 + T4 GPU fix (2026-04-22) ✅ VERIFIED WORKING
 
 **Root cause 1:** `kaggle==1.6.17` predates `--accelerator` (added v1.8.4 PR #907). `KernelPushRequest` had no GPU-type field — `"accelerator"` in JSON silently discarded. Kaggle assigned P100 (default).

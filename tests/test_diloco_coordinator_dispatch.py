@@ -38,6 +38,21 @@ def test_build_kaggle_kernel_metadata_preserves_gpu_and_internet_contract():
     assert metadata["enable_internet"] is True
 
 
+def test_kaggle_push_success_requires_explicit_success_marker():
+    assert dispatch._is_successful_kaggle_push(
+        0,
+        "Kernel version 38 successfully pushed. Please check progress at https://www.kaggle.com/code/x/y",
+        "",
+    ) is True
+    assert dispatch._is_successful_kaggle_push(0, "ok", "") is False
+    assert dispatch._is_successful_kaggle_push(1, "Kernel version 38 successfully pushed.", "") is False
+    assert dispatch._is_successful_kaggle_push(
+        0,
+        "Kernel push error: Maximum weekly GPU quota of 30.00 hours reached.",
+        "",
+    ) is False
+
+
 def test_runtime_env_payload_round_trips_and_runtime_env_uses_expected_aliases(monkeypatch):
     # Keep this contract test hermetic when run from a developer shell or CI
     # where real tokens/runtime overrides may already be exported.
@@ -169,7 +184,7 @@ def test_trigger_single_worker_pushes_with_t4_accelerator(monkeypatch, tmp_path)
 
     class Completed:
         returncode = 0
-        stdout = "ok"
+        stdout = "Kernel version 38 successfully pushed. Please check progress at https://www.kaggle.com/code/x/y"
         stderr = ""
 
     def fake_run(args, **kwargs):
@@ -191,6 +206,27 @@ def test_trigger_single_worker_pushes_with_t4_accelerator(monkeypatch, tmp_path)
     assert seen["env"]["KAGGLE_USERNAME"] == "weirdrunner"
     assert seen["env"]["KAGGLE_KEY"] == "secret"
     assert "KAGGLE_CONFIG_DIR" not in seen["env"]
+
+
+def test_trigger_single_worker_treats_quota_output_as_failed_even_with_zero_returncode(monkeypatch, tmp_path):
+    notebook_path = tmp_path / "kaggle-utils.ipynb"
+    notebook_path.write_text(json.dumps(_minimal_notebook([])), encoding="utf-8")
+
+    class Completed:
+        returncode = 0
+        stdout = "Kernel push error: Maximum weekly GPU quota of 30.00 hours reached."
+        stderr = ""
+
+    monkeypatch.setattr(dispatch.subprocess, "run", lambda *args, **kwargs: Completed())
+
+    assert dispatch._trigger_single_worker(
+        "B",
+        "weirdrunner007",
+        "secret",
+        "weirdrunner007/kaggle-utils",
+        notebook_path,
+        injected_env={"DILOCO_WORKER_ID": "B"},
+    ) is False
 
 
 def test_trigger_kaggle_workers_reports_manual_failed_and_success(monkeypatch, tmp_path):
