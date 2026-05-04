@@ -85,6 +85,7 @@ def _stage_grad_clip_norm(args: argparse.Namespace, stage_k: int) -> float:
     return clip_norm
 
 
+@torch.no_grad()
 def evaluate_stage(
     model,
     val_samples: List[Dict[str, Any]],
@@ -463,6 +464,7 @@ def find_latest_resume_checkpoint(
     return None
 
 
+@torch.no_grad()
 def run_generation_callback(
     model,
     tokenizer,
