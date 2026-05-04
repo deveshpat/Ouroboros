@@ -12,13 +12,14 @@ def _notebook_source() -> str:
     return "\n".join("".join(cell.get("source", [])) for cell in notebook.get("cells", []))
 
 
-def test_kaggle_notebook_uses_packaged_launch_helper_instead_of_inline_training_command():
+def test_kaggle_notebook_keeps_torchrun_shell_magic_not_python_subprocess():
     source = _notebook_source()
 
     assert "from ouroboros.kaggle import" in source
-    assert "build_diloco_training_command" in source
-    assert "subprocess.run(command, check=True)" in source
-    assert "!torchrun --standalone" not in source
+    assert "resolve_diloco_worker_id" in source
+    assert "!torchrun --standalone" in source
+    assert "subprocess.run(command, check=True)" not in source
+    assert "import subprocess" not in source.split("!torchrun --standalone", 1)[0].split("from ouroboros.kaggle import", 1)[-1]
 
 
 def test_kaggle_notebook_describes_itself_as_thin_adapter():

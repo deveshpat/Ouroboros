@@ -16,6 +16,7 @@ The coordinator root file remains monolithic until a separate coordinator extrac
 - `ouroboros.cli` is stdlib-only and safe before bootstrap.
 - `ouroboros.train` owns the training CLI orchestration after bootstrap.
 - Kaggle notebook becomes the final thin adapter after the root adapter is stable.
+- Kaggle launch must remain an IPython `!torchrun` shell-magic command, not a Python `subprocess.run`, because Kaggle GPU failures surface promptly through shell magic while subprocess launches have previously wasted full sessions on hidden failures.
 - No optimization may change training behavior until adapter contract tests are green.
 
 ## Local gate

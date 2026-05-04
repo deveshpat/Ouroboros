@@ -1,0 +1,52 @@
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Local scripts / temporary patch helpers
+git_apply.sh
+*.patch
+*.diff
+
+# Archives / manual transfer bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Jupyter / notebook runtime noise
+.ipynb_checkpoints/
+
+# Runtime signals: keep only the directory marker
+signals/*.json
+!signals/.gitkeep
+
+# Training/runtime artifacts
+checkpoints/
+outputs/
+runs/
+wandb/
+mlruns/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/settings.json
