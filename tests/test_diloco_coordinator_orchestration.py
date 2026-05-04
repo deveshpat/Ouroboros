@@ -111,3 +111,58 @@ def test_packaged_coordinator_advances_stage_with_fake_services(monkeypatch):
     assert new_state["completed_stages"] == [0]
     assert new_state["last_round_workers"] == ["A"]
     assert new_state["last_round_samples"] == 2
+
+
+def test_packaged_coordinator_reconciles_fake_kaggle_failure_after_fake_worker_status(monkeypatch):
+    monkeypatch.setattr(coordinator, "parse_args", lambda: _args(skip_trigger=False, total_train_samples=9))
+    times = iter([1000.0, 1001.0, 1002.0, 1003.0, 1004.0, 1005.0])
+    monkeypatch.setattr(coordinator.time, "time", lambda: next(times, 1006.0))
+    state = {
+        "stage_k": 0,
+        "round_n": 0,
+        "mode": "solo",
+        "triggered_workers": ["A"],
+        "attendance_workers": [],
+        "triggered_at": 900.0,
+        "total_samples_seen": {"0": 0},
+        "completed_stages": [],
+        "seed": 42,
+    }
+    monkeypatch.setattr(coordinator, "hub_download_json", lambda *args, **kwargs: state)
+    monkeypatch.setattr(
+        coordinator,
+        "collect_ready_workers",
+        lambda *args, **kwargs: [
+            {
+                "worker_id": "A",
+                "stage_k": 0,
+                "round_n": 0,
+                "status": "done",
+                "samples_seen": 1,
+                "weights_path": "workers/A",
+            }
+        ],
+    )
+    monkeypatch.setattr(coordinator, "load_adapter_weights_cpu", lambda repo_id, weights_path, token: {"w": weights_path})
+    monkeypatch.setattr(coordinator, "hub_download_text", lambda *args, **kwargs: "{}")
+    monkeypatch.setattr(coordinator, "save_and_upload_anchor", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        coordinator,
+        "trigger_kaggle_workers",
+        lambda *args, **kwargs: {"A": "success", "B": "failed", "C": "manual"},
+    )
+    uploads = []
+    monkeypatch.setattr(coordinator, "hub_upload_json", lambda *args, **kwargs: uploads.append((args, kwargs)))
+
+    coordinator.main()
+
+    assert len(uploads) == 2
+    planned_state = uploads[0][0][2]
+    corrected_state = uploads[1][0][2]
+    assert planned_state["triggered_workers"] == ["A", "B", "C"]
+    assert corrected_state["triggered_workers"] == ["A", "C"]
+    assert corrected_state["attendance_workers"] == ["B"]
+    assert corrected_state["dispatch_failures"] == ["B"]
+    assert corrected_state["mode"] == "diloco"
+    assert corrected_state["last_round_workers"] == ["A"]
+    assert corrected_state["last_round_samples"] == 1

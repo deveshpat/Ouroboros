@@ -30,6 +30,7 @@ _KAGGLE_PUSH_FAILURE_MARKERS = (
     "quota reached",
     "error",
 )
+_CPU_SMOKE_VALIDATION_MODE = "cpu-smoke"
 
 
 def _format_kaggle_output(stdout: Optional[str], stderr: Optional[str]) -> str:
@@ -199,25 +200,33 @@ def _encode_runtime_env_payload(runtime_env: Dict[str, str]) -> str:
     return base64.b64encode(zlib.compress(payload, level=9)).decode("ascii")
 
 
-def _build_kaggle_kernel_metadata(*, slug: str, notebook_filename: str) -> Dict[str, object]:
+def _build_kaggle_kernel_metadata(
+    *,
+    slug: str,
+    notebook_filename: str,
+    enable_gpu: bool = True,
+) -> Dict[str, object]:
     title = slug.split("/", 1)[-1]
-    return {
+    metadata: Dict[str, object] = {
         "id": slug,
         "title": title,
         "code_file": notebook_filename,
         "language": "python",
         "kernel_type": "notebook",
         "is_private": True,
-        "enable_gpu": True,
-        "accelerator": "NvidiaTeslaT4",  # official ID per kaggle-cli docs; belt-and-suspenders # ← ADD: pins T4, not just any GPU
+        "enable_gpu": bool(enable_gpu),
         "enable_tpu": False,
         "enable_internet": True,
-        "dataset_sources": ["weirdrunner007/ouroboros-cache"],  # ← ADD: attaches cache
+        "dataset_sources": ["weirdrunner007/ouroboros-cache"],  # attaches persistent cache
         "competition_sources": [],
         "kernel_sources": [],
         "model_sources": [],
         "keywords": [],
     }
+    if enable_gpu:
+        # Official ID per kaggle-cli docs; belt-and-suspenders with push_args.
+        metadata["accelerator"] = "NvidiaTeslaT4"
+    return metadata
 
 
 def _build_worker_dispatch_cell(
@@ -266,6 +275,7 @@ def _stage_local_kaggle_kernel(
     *,
     worker_id: Optional[str] = None,
     runtime_env: Optional[Dict[str, str]] = None,
+    enable_gpu: bool = True,
 ) -> Path:
     if not notebook_path.exists():
         raise FileNotFoundError(
@@ -308,7 +318,11 @@ def _stage_local_kaggle_kernel(
     metadata_path = staging_dir / "kernel-metadata.json"
     metadata_path.write_text(
         json.dumps(
-            _build_kaggle_kernel_metadata(slug=slug, notebook_filename=staged_notebook.name),
+            _build_kaggle_kernel_metadata(
+                slug=slug,
+                notebook_filename=staged_notebook.name,
+                enable_gpu=enable_gpu,
+            ),
             indent=2,
         ),
         encoding="utf-8",
@@ -324,6 +338,7 @@ def _trigger_single_worker(
     notebook_path: Path,
     *,
     injected_env: Optional[Dict[str, str]] = None,
+    validation_mode: Optional[str] = None,
 ) -> bool:
     """
     Trigger a Kaggle kernel by pushing the repo-tracked notebook with generated
@@ -369,12 +384,24 @@ def _trigger_single_worker(
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
-            _stage_local_kaggle_kernel(notebook_path, slug, tmp_path, worker_id=worker_id, runtime_env=injected_env)
+            validation_mode_normalized = _normalize_optional_text(validation_mode)
+            gpu_enabled = validation_mode_normalized != _CPU_SMOKE_VALIDATION_MODE
+            _stage_local_kaggle_kernel(
+                notebook_path,
+                slug,
+                tmp_path,
+                worker_id=worker_id,
+                runtime_env=injected_env,
+                enable_gpu=gpu_enabled,
+            )
 
             # --accelerator requires kaggle>=1.8.4 (added in PR #907).
             # "NvidiaTeslaT4" is the official accelerator ID per kaggle-cli docs.
-            # This is distinct from the JSON metadata field (also present, belt-and-suspenders).
-            push_args = ["kernels", "push", "-p", str(tmp_path), "--accelerator", "NvidiaTeslaT4"]
+            # CPU-smoke validation intentionally omits both the CLI accelerator
+            # and the metadata accelerator so it cannot consume GPU quota.
+            push_args = ["kernels", "push", "-p", str(tmp_path)]
+            if gpu_enabled:
+                push_args.extend(["--accelerator", "NvidiaTeslaT4"])
             push = _run_kaggle(push_args)
             out = _format_kaggle_output(push.stdout, push.stderr)
             if not _is_successful_kaggle_push(push.returncode, push.stdout, push.stderr):
@@ -429,6 +456,7 @@ def trigger_kaggle_workers(
             if coordinator_args is not None
             else None
         )
+        validation_mode = _normalize_optional_text((injected_env or {}).get("OUROBOROS_WORKFLOW_VALIDATE"))
         results[worker_id] = (
             "success"
             if _trigger_single_worker(
@@ -438,6 +466,7 @@ def trigger_kaggle_workers(
                 slug,
                 notebook_path=notebook_path,
                 injected_env=injected_env,
+                validation_mode=validation_mode,
             )
             else "failed"
         )

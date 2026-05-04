@@ -34,7 +34,7 @@
 | Runtime signal tracking cleanup | ✅ COMPLETE | Generated `signals/*.json` files are ignored; only `signals/.gitkeep` belongs in source control; the signal mechanism remains active as the coordinator doorbell. |
 | Coordinator zero-drift extraction | ✅ COMPLETE | `diloco_coordinator.py` is a thin adapter; aggregation, state, dispatch, and orchestration live under `ouroboros.diloco.*`. |
 | Planning artifact retirement | ✅ COMPLETE | Completed PRDs/plans have been promoted into wiki documentation and removed from `plans/`. |
-| Next engineering phase | ⬜ READY | Write latest PRD for Kaggle CPU/API workflow validation, then plan → issues/tracer bullets → TDD loop. |
+| Kaggle CPU/API workflow validation | ✅ COMPLETE | CPU-smoke validation mode, repo/runtime seams, CPU metadata dispatch, fake coordinator loop tests, and manual API validation docs are in place. |
 
 Canonical architecture record: [Architecture-Extraction](Architecture-Extraction.md).
 Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
@@ -43,8 +43,8 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 
 ## Immediate Next Steps
 
-1. **Start Kaggle CPU/API workflow validation PRD** — use the PRD → plan → tracer-bullet → TDD loop before implementation.
-2. **Monitor stages 8–10** — no action required from the refactor work. Coordinator auto-dispatch behavior remains preserved.
+1. **Use CPU-smoke validation before risky Kaggle runtime changes** — set `OUROBOROS_WORKFLOW_VALIDATE=cpu-smoke` for manual API smoke checks; see `wiki/Kaggle-CPU-API-Workflow-Validation.md`.
+2. **Monitor stages 8–10** — no action required from the validation work. Coordinator auto-dispatch behavior remains preserved.
 3. **W&B accuracy trend** — pre-val acc at stage entry: 0% → 2% → 4% → 6% → 8% (est stage 7). Target for stage 10: define before DGAC.
 4. **DGAC prep** — `--resume_from_diloco_anchor` flag ready. Launch command in `BLUEPRINT.md`.
 

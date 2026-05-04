@@ -38,6 +38,19 @@ def test_build_kaggle_kernel_metadata_preserves_gpu_and_internet_contract():
     assert metadata["enable_internet"] is True
 
 
+
+
+def test_build_kaggle_kernel_metadata_disables_gpu_for_cpu_smoke_validation():
+    metadata = dispatch._build_kaggle_kernel_metadata(
+        slug="weirdrunner/kaggle-utils",
+        notebook_filename="kaggle-utils.ipynb",
+        enable_gpu=False,
+    )
+
+    assert metadata["enable_gpu"] is False
+    assert "accelerator" not in metadata
+
+
 def test_kaggle_push_success_requires_explicit_success_marker():
     assert dispatch._is_successful_kaggle_push(
         0,
@@ -234,8 +247,8 @@ def test_trigger_kaggle_workers_reports_manual_failed_and_success(monkeypatch, t
     notebook_path.write_text(json.dumps(_minimal_notebook([])), encoding="utf-8")
     calls = []
 
-    def fake_trigger(worker_id, username, key, slug, *, notebook_path, injected_env=None):
-        calls.append((worker_id, username, key, slug, injected_env))
+    def fake_trigger(worker_id, username, key, slug, *, notebook_path, injected_env=None, validation_mode=None):
+        calls.append((worker_id, username, key, slug, injected_env, validation_mode))
         return worker_id == "A"
 
     monkeypatch.setattr(dispatch, "_trigger_single_worker", fake_trigger)
@@ -254,4 +267,61 @@ def test_trigger_kaggle_workers_reports_manual_failed_and_success(monkeypatch, t
 
     assert results == {"A": "success", "B": "failed", "C": "manual"}
     assert [call[0] for call in calls] == ["A", "B"]
-    assert calls[0][-1] == {"WORKER_ID": "A"}
+    assert calls[0][-2] == {"WORKER_ID": "A"}
+    assert calls[0][-1] is None
+
+
+def test_trigger_single_worker_cpu_smoke_validation_does_not_request_accelerator(monkeypatch, tmp_path):
+    notebook_path = tmp_path / "kaggle-utils.ipynb"
+    notebook_path.write_text(json.dumps(_minimal_notebook([])), encoding="utf-8")
+    seen = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "Kernel version 39 successfully pushed. Please check progress at https://www.kaggle.com/code/x/y"
+        stderr = ""
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        return Completed()
+
+    monkeypatch.setattr(dispatch.subprocess, "run", fake_run)
+
+    assert dispatch._trigger_single_worker(
+        "A",
+        "weirdrunner",
+        "secret",
+        "weirdrunner/kaggle-utils",
+        notebook_path,
+        injected_env={"DILOCO_WORKER_ID": "A", "OUROBOROS_WORKFLOW_VALIDATE": "cpu-smoke"},
+        validation_mode="cpu-smoke",
+    ) is True
+    assert "--accelerator" not in seen["args"]
+    assert "NvidiaTeslaT4" not in seen["args"]
+
+
+def test_trigger_kaggle_workers_forwards_cpu_smoke_validation_mode(monkeypatch, tmp_path):
+    notebook_path = tmp_path / "kaggle-utils.ipynb"
+    notebook_path.write_text(json.dumps(_minimal_notebook([])), encoding="utf-8")
+    calls = []
+
+    def fake_trigger(worker_id, username, key, slug, *, notebook_path, injected_env=None, validation_mode=None):
+        calls.append((worker_id, injected_env, validation_mode))
+        return True
+
+    monkeypatch.setattr(dispatch, "_trigger_single_worker", fake_trigger)
+    monkeypatch.setattr(
+        dispatch,
+        "_build_worker_runtime_env",
+        lambda args, worker_id: {"WORKER_ID": worker_id, "OUROBOROS_WORKFLOW_VALIDATE": "cpu-smoke"},
+    )
+
+    results = dispatch.trigger_kaggle_workers(
+        {"A": ("weirdrunner", "key-a")},
+        active_workers=["A"],
+        notebook_path=notebook_path,
+        coordinator_args=argparse.Namespace(),
+    )
+
+    assert results == {"A": "success"}
+    assert calls == [("A", {"WORKER_ID": "A", "OUROBOROS_WORKFLOW_VALIDATE": "cpu-smoke"}, "cpu-smoke")]

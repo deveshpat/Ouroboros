@@ -55,6 +55,7 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
 | [wiki/SessionLog.md](wiki/SessionLog.md) | Historical coordinator run record |
 | [wiki/Architecture-Extraction.md](wiki/Architecture-Extraction.md) | Completed extraction history, adapter ownership, retired PRD/plan decisions |
 | [wiki/Engineering-Workflow.md](wiki/Engineering-Workflow.md) | PRD → plan → tracer-bullet → TDD loop, commit policy, artifact retirement |
+| [wiki/Kaggle-CPU-API-Workflow-Validation.md](wiki/Kaggle-CPU-API-Workflow-Validation.md) | CPU-safe Kaggle workflow validation, manual API smoke, dispatch guardrails |
 
 ---
 
@@ -75,7 +76,7 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
 
 ## Engineering Architecture
 
-Training and coordinator monolith extraction is complete. The root scripts are thin compatibility adapters, while reusable behavior lives in `ouroboros/`. See [wiki/Architecture-Extraction.md](wiki/Architecture-Extraction.md).
+Training and coordinator monolith extraction is complete. The root scripts are thin compatibility adapters, while reusable behavior lives in `ouroboros/`. Kaggle CPU/API workflow validation is implemented for quota-safe runtime smoke checks. See [wiki/Architecture-Extraction.md](wiki/Architecture-Extraction.md) and [wiki/Kaggle-CPU-API-Workflow-Validation.md](wiki/Kaggle-CPU-API-Workflow-Validation.md).
 
 ## Architecture Snapshot
 

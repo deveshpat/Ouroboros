@@ -179,12 +179,12 @@ def diloco_download_anchor(
     Download anchor adapter weights from Hub and load them into the model in-place.
     Falls back silently if no anchor exists (first round uses random init).
     """
-    from huggingface_hub import hf_hub_download
-    from peft import set_peft_model_state_dict
-    from safetensors.torch import load_file
-
     try:
         def _download() -> None:
+            from huggingface_hub import hf_hub_download
+            from peft import set_peft_model_state_dict
+            from safetensors.torch import load_file
+
             dl_path = hf_hub_download(
                 repo_id=repo_id,
                 filename=f"{anchor_path}/adapter_model.safetensors",
