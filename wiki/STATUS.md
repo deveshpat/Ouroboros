@@ -36,7 +36,7 @@
 | Coordinator zero-drift extraction | ✅ COMPLETE | `diloco_coordinator.py` is a thin adapter; aggregation, state, dispatch, and orchestration live under `ouroboros.diloco.*`. |
 | Planning artifact retirement | ✅ COMPLETE | Completed PRDs/plans have been promoted into wiki documentation and removed from `plans/`. |
 | Kaggle CPU/API workflow validation | ✅ COMPLETE | CPU-smoke validation mode, repo/runtime seams, CPU metadata dispatch, fake coordinator loop tests, manual API validation docs, and remote Hub artifact verification are in place. |
-| DGAC readiness CPU-smoke gate | ✅ COMPLETE | `workflow_dispatch` exposes `workflow_validate=cpu-smoke`; coordinator validates GitHub Actions → Kaggle → Hub without touching live DiLoCo round state. |
+| DGAC readiness CPU-smoke gate | ✅ PASSED LIVE | GitHub Actions `coordinate #272` ran `workflow_validate=cpu-smoke`, defaulted to Worker A, pushed Kaggle kernel version 39, Kaggle exited before `torchrun`, published Hub artifacts, and coordinator verified validation run `25377312407-1`. |
 
 Canonical architecture record: [Architecture-Extraction](Architecture-Extraction.md).
 Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
@@ -45,12 +45,23 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 
 ## Immediate Next Steps
 
-1. **Run the new workflow-dispatch CPU smoke once** — choose `workflow_validate=cpu-smoke` in GitHub Actions. Leave `force_worker_ids` empty to default to Worker A. Pass only after the coordinator verifies the remote Hub validation artifact.
-2. **Wait for Kaggle GPU quota or use alternate quota** — stage 10 round 1 is waiting/attendance because A/B/C push attempts hit weekly GPU quota.
-3. **Define Stage 10 → DGAC model-quality gates** — pre-val accuracy threshold, CE/accuracy trend, DGAC halt-step distribution checks, W&B metrics, stop/rollback criteria.
-4. **DGAC prep** — `--resume_from_diloco_anchor` flag ready. Launch command in `BLUEPRINT.md`; launch only after CPU smoke and Stage 10 quality gates pass.
+1. **Wait for Kaggle GPU quota or use alternate quota** — stage 10 round 1 is waiting/attendance because A/B/C GPU push attempts hit weekly quota. CPU-smoke validation now provides a no-GPU safety gate while waiting.
+2. **Define Stage 10 → DGAC model-quality gates** — pre-val accuracy threshold, CE/accuracy trend, DGAC halt-step distribution checks, W&B metrics, stop/rollback criteria.
+3. **DGAC prep** — `--resume_from_diloco_anchor` flag ready. Launch command in `BLUEPRINT.md`; launch only after Stage 10 quality gates pass. CPU-smoke workflow-readiness gate has passed live.
+4. **Optional polish** — quiet expected Hugging Face 404 polling noise during validation artifact eventual consistency; not blocking because coordinator already verifies successfully.
 
 ---
+
+
+## Latest Validation Evidence
+
+| Gate | Result | Evidence |
+|---|---|---|
+| GitHub Actions → Kaggle API dispatch | ✅ PASS | `coordinate #272`, `workflow_validate=cpu-smoke`, Worker A default, Kaggle kernel version 39 pushed |
+| Kaggle CPU validation branch | ✅ PASS | Notebook printed `[workflow-validate] CPU smoke validation complete`; exited with `SystemExit: 0` before `torchrun` |
+| Remote Hub validation artifact | ✅ PASS | `diloco_state/workflow_validation/25377312407-1/worker_A_status.json` and `worker_A_report.json` published |
+| Coordinator artifact verification | ✅ PASS | Coordinator printed `CPU-smoke validation verified via remote Hub artifacts: ['A']` |
+| GPU/training-state safety | ✅ PASS | Report shows `gpu_requested=false`, `torchrun_requested=false`, `published=true`; status path stayed under `local_validation/...` |
 
 ## Hub State
 
@@ -59,7 +70,7 @@ WeirdRunner/Ouroboros/
   diloco_state/
     anchor/                              ← Stage 10 path active; stage 10 round 0 contributed by Worker A
     round_state.json                     ← stage_k=10, round_n=1, mode=waiting, triggered_workers=[], attendance_workers=[A,B,C]
-    workflow_validation/<run_id>/        ← CPU-smoke remote status/report namespace
+    workflow_validation/25377312407-1/   ✓ live CPU-smoke status/report verified by coordinator #272
     workers/A/round_0000_stage_10/       ✓ 10,912 samples
     workers/{A,B,C}/round_0001_stage_9/  ✓ historical stage 9 worker outputs visible in W&B
 ```
@@ -76,7 +87,7 @@ WeirdRunner/Ouroboros/
 | DGAC halt_step distribution at K≥2 | 🔴 Open — primary research question (Phase 3.4) |
 | Worker C quota stable for remainder? | 🟢 Active since stage 3 r5 — appears stable |
 | Pre-val accuracy at stage 10: success threshold for DGAC? | 🔴 Open — define before Phase 3.4 |
-| CPU-smoke end-to-end workflow gate before DGAC? | 🟢 Implemented — run `workflow_validate=cpu-smoke` from GitHub Actions |
+| CPU-smoke end-to-end workflow gate before DGAC? | 🟢 Passed live — GitHub Actions `coordinate #272`, validation run `25377312407-1`, Worker A, Hub status/report verified |
 
 ---
 
