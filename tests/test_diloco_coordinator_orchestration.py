@@ -27,10 +27,98 @@ def _args(**overrides):
         wandb_project="project",
         wandb_entity=None,
         total_train_samples=9,
+        workflow_validate=None,
+        workflow_validation_run_id=None,
+        workflow_validation_timeout_s=900.0,
+        workflow_validation_poll_s=10.0,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
 
+
+
+def test_packaged_coordinator_cpu_smoke_validation_defaults_to_worker_a_and_polls_remote_status(monkeypatch):
+    monkeypatch.setattr(
+        coordinator,
+        "parse_args",
+        lambda: _args(
+            workflow_validate="cpu-smoke",
+            workflow_validation_run_id="run-999-1",
+            workflow_validation_timeout_s=1.0,
+            workflow_validation_poll_s=0.1,
+            force_worker_ids=None,
+            skip_trigger=False,
+        ),
+    )
+    triggered = []
+
+    def fake_trigger(kaggle_creds, *, active_workers, notebook_path, coordinator_args):
+        triggered.append((active_workers, notebook_path, coordinator_args.workflow_validate))
+        return {worker_id: "success" for worker_id in active_workers}
+
+    def fake_download(repo_id, path, token):
+        assert path != coordinator.ROUND_STATE_PATH, "workflow validation must not read or mutate live round_state"
+        assert path == "diloco_state/workflow_validation/run-999-1/worker_A_status.json"
+        return {
+            "worker_id": "A",
+            "stage_k": 0,
+            "round_n": 0,
+            "status": "done",
+            "samples_seen": 0,
+            "validation_mode": "cpu-smoke",
+            "validation_run_id": "run-999-1",
+        }
+
+    monkeypatch.setattr(coordinator, "trigger_kaggle_workers", fake_trigger)
+    monkeypatch.setattr(coordinator, "hub_download_json", fake_download)
+    monkeypatch.setattr(
+        coordinator,
+        "hub_upload_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("workflow validation is read-only")),
+    )
+
+    coordinator.main()
+
+    assert triggered == [(["A"], Path("kaggle-utils.ipynb"), "cpu-smoke")]
+
+
+def test_packaged_coordinator_cpu_smoke_validation_respects_force_worker_ids(monkeypatch):
+    monkeypatch.setattr(
+        coordinator,
+        "parse_args",
+        lambda: _args(
+            workflow_validate="cpu-smoke",
+            workflow_validation_run_id="run-force",
+            workflow_validation_timeout_s=1.0,
+            workflow_validation_poll_s=0.1,
+            force_worker_ids="B,C",
+            skip_trigger=False,
+        ),
+    )
+    triggered = []
+
+    def fake_trigger(kaggle_creds, *, active_workers, notebook_path, coordinator_args):
+        triggered.append(active_workers)
+        return {worker_id: "success" for worker_id in active_workers}
+
+    def fake_download(repo_id, path, token):
+        worker = "B" if "worker_B" in path else "C"
+        return {
+            "worker_id": worker,
+            "stage_k": 0,
+            "round_n": 0,
+            "status": "done",
+            "samples_seen": 0,
+            "validation_mode": "cpu-smoke",
+            "validation_run_id": "run-force",
+        }
+
+    monkeypatch.setattr(coordinator, "trigger_kaggle_workers", fake_trigger)
+    monkeypatch.setattr(coordinator, "hub_download_json", fake_download)
+
+    coordinator.main()
+
+    assert triggered == [["B", "C"]]
 
 def test_packaged_coordinator_exits_cleanly_when_round_state_is_missing(monkeypatch):
     monkeypatch.setattr(coordinator, "parse_args", lambda: _args())

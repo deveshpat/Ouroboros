@@ -9,7 +9,7 @@ Ouroboros can now keep the training script, coordinator script, and Kaggle noteb
 
 ## Solution
 
-Add a CPU-safe validation seam that exercises Kaggle workflow plumbing without importing training dependencies, launching `torchrun`, requesting a Kaggle accelerator, pushing checkpoints, or consuming GPU quota. The real GPU path remains unchanged: the Kaggle notebook still keeps its IPython `!torchrun` shell magic, and coordinator dispatch still requests `NvidiaTeslaT4` unless explicit CPU-smoke validation mode is active.
+Add a CPU-safe validation seam that exercises Kaggle workflow plumbing without importing training dependencies, launching `torchrun`, requesting a Kaggle accelerator, pushing checkpoints, or consuming GPU quota. The CPU-smoke path now publishes a remote status/report artifact to Hugging Face so the GitHub coordinator job verifies that the Kaggle notebook actually executed. The real GPU path remains unchanged: the Kaggle notebook still keeps its IPython `!torchrun` shell magic, and coordinator dispatch still requests `NvidiaTeslaT4` unless explicit CPU-smoke validation mode is active.
 
 ## User Stories
 
@@ -17,13 +17,16 @@ Add a CPU-safe validation seam that exercises Kaggle workflow plumbing without i
 2. As the project operator, I want CPU-smoke validation to exit before the real training launch, so that no Jamba/Mamba/CUDA path is accidentally exercised.
 3. As the project operator, I want fake coordinator/worker tests to cover dispatch failure reconciliation, so that quota/push failures do not regress into 13-hour waits.
 4. As the project operator, I want manual Kaggle API validation to be opt-in, so that normal CI stays hermetic and secret-free.
+5. As the project operator, I want CPU-smoke validation to publish a remote Hub status/report, so that the coordinator can confirm notebook execution instead of trusting a push-only result.
 
 ## Implementation Decisions
 
 - `ouroboros.kaggle_runtime` owns testable repo/ref/commit checkout helpers for the Kaggle runtime contract.
-- `ouroboros.workflow_validation` owns the CPU-smoke validation branch and emits a coordinator-compatible local status JSON plus a report JSON.
+- `ouroboros.workflow_validation` owns the CPU-smoke validation branch and emits a coordinator-compatible local status JSON plus a report JSON. When `OUROBOROS_WORKFLOW_VALIDATION_PUBLISH=1`, it also publishes both artifacts to Hub.
 - `ouroboros.workflow_validation_worker` is a tiny stdlib-only fake worker command used as a command-construction contract; it does not import training dependencies.
 - `OUROBOROS_WORKFLOW_VALIDATE=cpu-smoke` is the validation switch.
+- Remote validation artifacts live under `diloco_state/workflow_validation/<run_id>/worker_<id>_status.json` and `diloco_state/workflow_validation/<run_id>/worker_<id>_report.json`.
+- Coordinator validation mode runs before reading `round_state.json`, defaults to Worker A when `force_worker_ids` is empty, and polls those remote artifacts before passing the GitHub Actions job.
 - Coordinator dispatch copies `OUROBOROS_*` env vars into the staged notebook payload. When the payload contains `OUROBOROS_WORKFLOW_VALIDATE=cpu-smoke`, dispatch writes CPU metadata (`enable_gpu=false`) and omits `--accelerator NvidiaTeslaT4` from `kaggle kernels push`.
 - The Kaggle notebook checks CPU-smoke mode after repo sync and worker ID resolution, runs the validation branch, then exits before the real `!torchrun` line.
 - The real GPU path remains T4-pinned by default through both metadata and CLI accelerator flag.
@@ -62,13 +65,15 @@ export OUROBOROS_REPO_REF=<branch-or-tag>
 export OUROBOROS_REPO_COMMIT=<commit-sha>
 ```
 
-3. Run the coordinator through `workflow_dispatch` with the intended worker credentials and, if needed, `force_worker_ids=A` for a single-account smoke.
+3. Run the coordinator through `workflow_dispatch` with `workflow_validate=cpu-smoke`. Leave `force_worker_ids` empty for the default Worker A smoke, or set `force_worker_ids=B,C` for explicit multi-worker validation.
 4. Expected dispatch behavior:
    - staged `kernel-metadata.json` has `enable_gpu=false`;
    - `kaggle kernels push` omits `--accelerator NvidiaTeslaT4`;
    - the generated dispatch cell injects `OUROBOROS_WORKFLOW_VALIDATE=cpu-smoke`;
    - the notebook prints `[workflow-validate] CPU smoke validation complete`;
-   - the notebook exits before the real `!torchrun` line.
+   - the notebook exits before the real `!torchrun` line;
+   - the notebook publishes `worker_<id>_status.json` and `worker_<id>_report.json` under `diloco_state/workflow_validation/<run_id>/`;
+   - the coordinator job prints `[workflow-validate] CPU-smoke validation verified via remote Hub artifacts`.
 
 ## Validation Commands
 
@@ -98,7 +103,8 @@ python -m pytest tests/test_kaggle_cpu_api_workflow_validation.py tests/test_kag
 - CPU/Mamba portability experiments;
 - edge-device inference optimization;
 - deleting the signal mechanism;
-- replacing the real notebook `!torchrun` launch with Python `subprocess.run`.
+- replacing the real notebook `!torchrun` launch with Python `subprocess.run`;
+- mutating `diloco_state/round_state.json`, anchors, worker checkpoint paths, or stage counters during CPU-smoke validation.
 
 ## Notes
 

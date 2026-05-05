@@ -16,11 +16,11 @@ Based on Meta's Coconut (arXiv:2412.06769) + DGAC (Diversity-Gated Adaptive Coco
 
 | Stage | Status |
 |---|---|
-| Stages 0–7 | ✅ COMPLETE |
-| Stage 8 | 🔄 IN PROGRESS |
-| Stages 9–10 | ⬜ NOT STARTED |
+| Stages 0–9 | ✅ COMPLETE |
+| Stage 10 | 🔄 IN PROGRESS — waiting on Kaggle GPU quota |
+| DGAC | ⬜ BLOCKED until Stage 10 quality gate + CPU-smoke workflow gate pass |
 
-**Compute:** DiLoCo 3-worker (A+B+C), 1 round/stage since stage 4. ETA stages 8–10: ~2026-05-04.
+**Compute:** DiLoCo dynamic workers with attendance/waiting fallback. Current stage 10 Hub state shows Worker A contributed 10,912 samples; A/B/C dispatch attempts are blocked by weekly GPU quota.
 
 ---
 
@@ -76,7 +76,7 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
 
 ## Engineering Architecture
 
-Training and coordinator monolith extraction is complete. The root scripts are thin compatibility adapters, while reusable behavior lives in `ouroboros/`. Kaggle CPU/API workflow validation is implemented for quota-safe runtime smoke checks. See [wiki/Architecture-Extraction.md](wiki/Architecture-Extraction.md) and [wiki/Kaggle-CPU-API-Workflow-Validation.md](wiki/Kaggle-CPU-API-Workflow-Validation.md).
+Training and coordinator monolith extraction is complete. The root scripts are thin compatibility adapters, while reusable behavior lives in `ouroboros/`. Kaggle CPU/API workflow validation is implemented for quota-safe runtime smoke checks, including remote Hub artifact verification through `workflow_validate=cpu-smoke`. See [wiki/Architecture-Extraction.md](wiki/Architecture-Extraction.md) and [wiki/Kaggle-CPU-API-Workflow-Validation.md](wiki/Kaggle-CPU-API-Workflow-Validation.md).
 
 ## Architecture Snapshot
 

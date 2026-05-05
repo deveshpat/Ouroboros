@@ -1,6 +1,6 @@
 # Project Status — Coconut-Ouroboros
 > **This page is the body. `BLUEPRINT.md` is the index. Load this page after BLUEPRINT.md.**
-> Last updated: 2026-05-04
+> Last updated: 2026-05-05
 
 ---
 
@@ -15,12 +15,13 @@
 | 4 — 4 latent passes | ✅ COMPLETE | 1 round, A+B+C all active |
 | 5 — 5 latent passes | ✅ COMPLETE | 1 round, A+B+C all active |
 | 6 — 6 latent passes | ✅ COMPLETE | 1 round, A+B+C all active |
-| 7 — 7 latent passes | ✅ COMPLETE | 1 round, A+B+C all active (coordinator aggregation pending) |
-| 8 — 8 latent passes | 🔄 IN PROGRESS | Coordinator will dispatch on next run (≤30 min) |
-| 9–10 | ⬜ NOT STARTED | — |
+| 7 — 7 latent passes | ✅ COMPLETE | 1 round, A+B+C all active |
+| 8 — 8 latent passes | ✅ COMPLETE | Completed and superseded by stage 9/10 Hub state |
+| 9 — 9 latent passes | ✅ COMPLETE | Stage 9 visible in W&B as complete before stage 10 dispatch |
+| 10 — 10 latent passes | 🔄 IN PROGRESS | Round 0: Worker A contributed 10,912 samples; round 1 is waiting/attendance after A/B/C Kaggle GPU quota push failures |
 
-**Compute mode:** DiLoCo 3-worker (A+B+C), 1 round per stage since stage 4.
-**Velocity:** ~1 stage/day for stages 4–7. Stages 8–10 ETA ~2026-05-04.
+**Compute mode:** DiLoCo dynamic workers with attendance/waiting-mode fallback.
+**Current blocker:** Kaggle weekly GPU quota exhausted for A/B/C; coordinator now reconciles failed quota dispatches immediately instead of waiting 13h.
 
 
 ---
@@ -34,7 +35,8 @@
 | Runtime signal tracking cleanup | ✅ COMPLETE | Generated `signals/*.json` files are ignored; only `signals/.gitkeep` belongs in source control; the signal mechanism remains active as the coordinator doorbell. |
 | Coordinator zero-drift extraction | ✅ COMPLETE | `diloco_coordinator.py` is a thin adapter; aggregation, state, dispatch, and orchestration live under `ouroboros.diloco.*`. |
 | Planning artifact retirement | ✅ COMPLETE | Completed PRDs/plans have been promoted into wiki documentation and removed from `plans/`. |
-| Kaggle CPU/API workflow validation | ✅ COMPLETE | CPU-smoke validation mode, repo/runtime seams, CPU metadata dispatch, fake coordinator loop tests, and manual API validation docs are in place. |
+| Kaggle CPU/API workflow validation | ✅ COMPLETE | CPU-smoke validation mode, repo/runtime seams, CPU metadata dispatch, fake coordinator loop tests, manual API validation docs, and remote Hub artifact verification are in place. |
+| DGAC readiness CPU-smoke gate | ✅ COMPLETE | `workflow_dispatch` exposes `workflow_validate=cpu-smoke`; coordinator validates GitHub Actions → Kaggle → Hub without touching live DiLoCo round state. |
 
 Canonical architecture record: [Architecture-Extraction](Architecture-Extraction.md).
 Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
@@ -43,10 +45,10 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 
 ## Immediate Next Steps
 
-1. **Use CPU-smoke validation before risky Kaggle runtime changes** — set `OUROBOROS_WORKFLOW_VALIDATE=cpu-smoke` for manual API smoke checks; see `wiki/Kaggle-CPU-API-Workflow-Validation.md`.
-2. **Monitor stages 8–10** — no action required from the validation work. Coordinator auto-dispatch behavior remains preserved.
-3. **W&B accuracy trend** — pre-val acc at stage entry: 0% → 2% → 4% → 6% → 8% (est stage 7). Target for stage 10: define before DGAC.
-4. **DGAC prep** — `--resume_from_diloco_anchor` flag ready. Launch command in `BLUEPRINT.md`.
+1. **Run the new workflow-dispatch CPU smoke once** — choose `workflow_validate=cpu-smoke` in GitHub Actions. Leave `force_worker_ids` empty to default to Worker A. Pass only after the coordinator verifies the remote Hub validation artifact.
+2. **Wait for Kaggle GPU quota or use alternate quota** — stage 10 round 1 is waiting/attendance because A/B/C push attempts hit weekly GPU quota.
+3. **Define Stage 10 → DGAC model-quality gates** — pre-val accuracy threshold, CE/accuracy trend, DGAC halt-step distribution checks, W&B metrics, stop/rollback criteria.
+4. **DGAC prep** — `--resume_from_diloco_anchor` flag ready. Launch command in `BLUEPRINT.md`; launch only after CPU smoke and Stage 10 quality gates pass.
 
 ---
 
@@ -55,12 +57,11 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 ```
 WeirdRunner/Ouroboros/
   diloco_state/
-    anchor/                              ← Stage 7 Round 0 aggregate (latest)
-    round_state.json                     ← stage_k=8, round_n=0, triggered_workers=[A,B,C]
-    workers/{A,B,C}/round_0000_stage_4/  ✓
-    workers/{A,B,C}/round_0000_stage_5/  ✓
-    workers/{A,B,C}/round_0000_stage_6/  ✓
-    workers/{A,B,C}/round_0000_stage_7/  ✓  (pending coordinator aggregate)
+    anchor/                              ← Stage 10 path active; stage 10 round 0 contributed by Worker A
+    round_state.json                     ← stage_k=10, round_n=1, mode=waiting, triggered_workers=[], attendance_workers=[A,B,C]
+    workflow_validation/<run_id>/        ← CPU-smoke remote status/report namespace
+    workers/A/round_0000_stage_10/       ✓ 10,912 samples
+    workers/{A,B,C}/round_0001_stage_9/  ✓ historical stage 9 worker outputs visible in W&B
 ```
 
 ---
@@ -75,6 +76,7 @@ WeirdRunner/Ouroboros/
 | DGAC halt_step distribution at K≥2 | 🔴 Open — primary research question (Phase 3.4) |
 | Worker C quota stable for remainder? | 🟢 Active since stage 3 r5 — appears stable |
 | Pre-val accuracy at stage 10: success threshold for DGAC? | 🔴 Open — define before Phase 3.4 |
+| CPU-smoke end-to-end workflow gate before DGAC? | 🟢 Implemented — run `workflow_validate=cpu-smoke` from GitHub Actions |
 
 ---
 
@@ -114,7 +116,7 @@ WeirdRunner/Ouroboros/
 | `min_shard_samples` | 32 (1 optimizer step) |
 | Solo mode | 1 active worker → direct weight promotion |
 | Stage close | remaining < `min_shard_samples` per active worker |
-| `workflow_dispatch` inputs | `force_worker_ids`, `skip_trigger`, `dry_run` |
+| `workflow_dispatch` inputs | `force_worker_ids`, `skip_trigger`, `dry_run`, `workflow_validate` |
 | Worker timeout threshold | 13h (Kaggle 12h wall + 1h grace) |
 | `triggered_at=0` semantics | Canonical "dispatch unconfirmed" signal → immediate re-dispatch. ✅ |
 | Attendance round | Worker in `attendance_workers` → skips training, uploads status(samples=0), pushes signal |

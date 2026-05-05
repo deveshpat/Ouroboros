@@ -81,3 +81,15 @@ def test_runtime_signal_mechanism_is_retained_as_coordinator_doorbell():
     assert "signals/*.json" in workflow
     assert "def diloco_push_signal" in worker_source
     assert "signals/worker_{worker_id}_stage_{stage_k}_round_{round_n}.json" in worker_source
+
+
+def test_workflow_dispatch_exposes_cpu_smoke_end_to_end_validation_gate():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "diloco_coordinator.yml").read_text(encoding="utf-8")
+
+    assert "workflow_validate" in workflow
+    assert "cpu-smoke" in workflow
+    assert "OUROBOROS_WORKFLOW_VALIDATE" in workflow
+    assert "OUROBOROS_WORKFLOW_VALIDATION_RUN_ID" in workflow
+    assert "--workflow_validate" in workflow
+    assert "--workflow_validation_run_id" in workflow
+

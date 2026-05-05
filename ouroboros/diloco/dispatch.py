@@ -192,6 +192,44 @@ def _build_worker_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[
         "OUROBOROS_DILOCO_OUTPUT_DIR",
         _first_nonempty_text(os.environ.get("OUROBOROS_DILOCO_OUTPUT_DIR"), "runs/diloco"),
     )
+
+    workflow_validate = _first_nonempty_text(
+        getattr(args, "workflow_validate", None),
+        os.environ.get("OUROBOROS_WORKFLOW_VALIDATE"),
+    )
+    if workflow_validate:
+        runtime_env["OUROBOROS_WORKFLOW_VALIDATE"] = workflow_validate
+        # Remote publication is what turns the Kaggle CPU smoke from a local
+        # notebook branch into an end-to-end GitHub Actions -> Kaggle -> Hub
+        # validation that the coordinator can observe.
+        runtime_env["OUROBOROS_WORKFLOW_VALIDATION_PUBLISH"] = "1"
+        validation_run_id = _first_nonempty_text(
+            getattr(args, "workflow_validation_run_id", None),
+            os.environ.get("OUROBOROS_WORKFLOW_VALIDATION_RUN_ID"),
+        )
+        if validation_run_id is None:
+            github_run_id = _first_nonempty_text(os.environ.get("GITHUB_RUN_ID"))
+            github_attempt = _first_nonempty_text(os.environ.get("GITHUB_RUN_ATTEMPT"))
+            validation_run_id = (
+                f"{github_run_id}-{github_attempt}"
+                if github_run_id and github_attempt
+                else github_run_id
+            )
+        _set_env_if_present(
+            runtime_env,
+            "OUROBOROS_WORKFLOW_VALIDATION_RUN_ID",
+            validation_run_id,
+        )
+        _set_env_if_present(
+            runtime_env,
+            "OUROBOROS_WORKFLOW_VALIDATION_STATE_REPO",
+            _first_nonempty_text(
+                os.environ.get("OUROBOROS_WORKFLOW_VALIDATION_STATE_REPO"),
+                os.environ.get("OUROBOROS_DILOCO_STATE_REPO"),
+                getattr(args, "repo_id", None),
+            ),
+        )
+
     return runtime_env
 
 

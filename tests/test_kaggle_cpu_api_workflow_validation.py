@@ -11,6 +11,7 @@ from ouroboros.workflow_validation import (
     build_cpu_smoke_validation_command,
     is_cpu_smoke_validation_enabled,
     run_cpu_smoke_validation,
+    workflow_validation_remote_paths,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +52,8 @@ def test_cpu_smoke_validation_writes_status_and_report_without_gpu_or_hub(tmp_pa
         "OUROBOROS_REPO_COMMIT": "abc123",
         "OUROBOROS_VALIDATION_STAGE_K": "8",
         "OUROBOROS_VALIDATION_ROUND_N": "0",
+        "OUROBOROS_WORKFLOW_VALIDATION_RUN_ID": "run-123",
+        "OUROBOROS_DILOCO_STATE_REPO": "state/repo",
         "HF_TOKEN": "hf_fake",
         "WANDB_KEY": "wandb_fake",
         "GH_TOKEN": "gh_fake",
@@ -62,6 +65,12 @@ def test_cpu_smoke_validation_writes_status_and_report_without_gpu_or_hub(tmp_pa
     assert is_cpu_smoke_validation_enabled(env) is True
     assert report.mode == CPU_SMOKE_MODE
     assert report.worker_id == "B"
+    assert report.validation_run_id == "run-123"
+    assert report.state_repo == "state/repo"
+    assert report.remote_status_path == "diloco_state/workflow_validation/run-123/worker_B_status.json"
+    assert report.remote_report_path == "diloco_state/workflow_validation/run-123/worker_B_report.json"
+    assert report.publish_requested is False
+    assert report.published is False
     assert report.repo_ref == "feature/cpu-smoke"
     assert report.repo_commit == "abc123"
     assert report.gpu_requested is False
@@ -81,6 +90,8 @@ def test_cpu_smoke_validation_writes_status_and_report_without_gpu_or_hub(tmp_pa
         "timestamp": status["timestamp"],
         "weights_path": "local_validation/workers/B/round_0000_stage_8",
         "validation_mode": CPU_SMOKE_MODE,
+        "validation_run_id": "run-123",
+        "remote_status_path": "diloco_state/workflow_validation/run-123/worker_B_status.json",
     }
     persisted_report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     assert persisted_report["secret_presence"] == {
@@ -122,6 +133,43 @@ def test_cpu_smoke_validation_worker_command_is_executable_without_training_depe
     assert status["samples_seen"] == 0
     assert status["validation_mode"] == CPU_SMOKE_MODE
 
+
+
+def test_cpu_smoke_validation_publishes_remote_status_and_report_when_requested(tmp_path):
+    uploads = []
+
+    def fake_upload(repo_id, token, path, data, message):
+        uploads.append((repo_id, token, path, data, message))
+
+    report = run_cpu_smoke_validation(
+        {
+            "OUROBOROS_WORKFLOW_VALIDATE": CPU_SMOKE_MODE,
+            "OUROBOROS_WORKFLOW_VALIDATION_PUBLISH": "1",
+            "OUROBOROS_WORKFLOW_VALIDATION_RUN_ID": "gh-456-1",
+            "OUROBOROS_DILOCO_STATE_REPO": "state/repo",
+            "DILOCO_WORKER_ID": "A",
+            "HF_TOKEN": "hf_fake",
+        },
+        output_dir=tmp_path,
+        emit=lambda line: None,
+        upload_json=fake_upload,
+    )
+
+    expected_status_path, expected_report_path = workflow_validation_remote_paths(
+        run_id="gh-456-1",
+        worker_id="A",
+    )
+    assert report.publish_requested is True
+    assert report.published is True
+    assert report.remote_status_path == expected_status_path
+    assert report.remote_report_path == expected_report_path
+    assert [upload[2] for upload in uploads] == [expected_status_path, expected_report_path]
+    assert {upload[0] for upload in uploads} == {"state/repo"}
+    assert {upload[1] for upload in uploads} == {"hf_fake"}
+    assert uploads[0][3]["validation_mode"] == CPU_SMOKE_MODE
+    assert uploads[0][3]["validation_run_id"] == "gh-456-1"
+    assert uploads[1][3]["published"] is True
+    assert uploads[1][3]["remote_status_path"] == expected_status_path
 
 def test_kaggle_notebook_validation_branch_exits_before_real_torchrun():
     source = _notebook_source()

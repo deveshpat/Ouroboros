@@ -97,6 +97,8 @@ def test_runtime_env_payload_round_trips_and_runtime_env_uses_expected_aliases(m
         outer_lr=0.9,
         wandb_project="project",
         wandb_entity="entity",
+        workflow_validate=None,
+        workflow_validation_run_id=None,
     )
 
     env = dispatch._build_worker_runtime_env(args, " b ")
@@ -121,6 +123,32 @@ def test_runtime_env_payload_round_trips_and_runtime_env_uses_expected_aliases(m
     assert decoded["OUROBOROS_WANDB_PROJECT"] == "project"
     assert decoded["OUROBOROS_WANDB_ENTITY"] == "entity"
 
+
+
+def test_runtime_env_includes_remote_cpu_smoke_publish_contract(monkeypatch):
+    monkeypatch.delenv("OUROBOROS_WORKFLOW_VALIDATE", raising=False)
+    monkeypatch.delenv("OUROBOROS_WORKFLOW_VALIDATION_RUN_ID", raising=False)
+    monkeypatch.delenv("OUROBOROS_WORKFLOW_VALIDATION_STATE_REPO", raising=False)
+
+    env = dispatch._build_worker_runtime_env(
+        argparse.Namespace(
+            hf_token="hf_fake",
+            wandb_key=None,
+            repo_id="state/repo",
+            outer_lr=0.7,
+            wandb_project=None,
+            wandb_entity=None,
+            workflow_validate="cpu-smoke",
+            workflow_validation_run_id="gh-789-1",
+        ),
+        "A",
+    )
+
+    assert env["OUROBOROS_WORKFLOW_VALIDATE"] == "cpu-smoke"
+    assert env["OUROBOROS_WORKFLOW_VALIDATION_PUBLISH"] == "1"
+    assert env["OUROBOROS_WORKFLOW_VALIDATION_RUN_ID"] == "gh-789-1"
+    assert env["OUROBOROS_WORKFLOW_VALIDATION_STATE_REPO"] == "state/repo"
+    assert env["OUROBOROS_DILOCO_STATE_REPO"] == "state/repo"
 
 def test_stage_local_kaggle_kernel_inserts_dispatch_after_initial_markdown_and_writes_metadata(tmp_path):
     notebook_path = tmp_path / "kaggle-utils.ipynb"

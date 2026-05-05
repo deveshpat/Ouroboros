@@ -5,29 +5,40 @@
 
 ---
 
-## Last Run — Stage 7 Complete / Stage 8 Dispatched (2026-05-02)
+## Last Run — Stage 10 Round 1 Waiting / GPU Quota Dispatch Reconciled (2026-05-05)
 
-*(Coordinator output pending — stage 8 dispatch expected within 30 min of this update.)*
+Observed from GitHub Actions run `coordinate #269` and current Hub `diloco_state/round_state.json`.
 
-All three worker signals present for stage 7 round 0:
-```
-signals/worker_A_stage_7_round_0.json  ts=1777243684.086035
-signals/worker_B_stage_7_round_0.json  ts=1777241362.500602
-signals/worker_C_stage_7_round_0.json  ts=1777237991.217921
+```text
+[coordinator] Reading round state...
+[coordinator] stage=10 round=1 mode=waiting
+[coordinator] Attendance workers: ['A', 'B', 'C']
+[coordinator] Remaining samples for stage 10: 25994
+[coordinator] Projected shards: {'A': 8665, 'B': 8665, 'C': 8664}
+[coordinator] Next round mode: complete  active workers: []
+[coordinator] Worker A: not ready (status={'worker_id': 'A', 'stage_k': 10, 'round_n': 0, 'samples_seen': 10912, 'status': 'done', ...})
+[coordinator] Worker B: not ready (status={'worker_id': 'B', 'stage_k': 9, 'round_n': 1, 'samples_seen': 739, 'status': 'done', ...})
+[coordinator] Worker C: not ready (status={'worker_id': 'C', 'stage_k': 9, 'round_n': 1, 'samples_seen': 739, 'status': 'done', ...})
+[coordinator] Waiting mode: no confirmed dispatch timestamp yet; attempting attendance dispatch now.
+[coordinator] WARNING: kernels push failed for Worker A (***/kaggle-utils): Kernel push error: Maximum weekly GPU quota of 30.00 hours reached.
+[coordinator] WARNING: kernels push failed for Worker B (***/kaggle-utils): Kernel push error: Maximum weekly GPU quota of 30.00 hours reached.
+[coordinator] WARNING: kernels push failed for Worker C (***/kaggle-utils): Kernel push error: Maximum weekly GPU quota of 30.00 hours reached.
+[coordinator] Reconciled failed dispatches. triggered=[] attendance=['A', 'B', 'C']
+[coordinator] Done (waiting mode initial dispatch).
 ```
 
-Expected coordinator run output (template — replace with verbatim on next run):
-```
-[coordinator] stage=7 round=0 mode=diloco
-[coordinator] Worker A: N samples ready
-[coordinator] Worker B: N samples ready
-[coordinator] Worker C: N samples ready
-[coordinator] New anchor uploaded: DiLoCo anchor: stage 7 round 0 (3 workers, ...)
-[coordinator] Stage 7 progress: 36906/36906 samples seen
-[coordinator] Stage 7 COMPLETE. Advancing to stage 8.
-[coordinator] round_state.json updated: stage=8 round=0 mode=diloco
-[coordinator] Triggered Worker A: ...
-[coordinator] Triggered Worker B: ...
-[coordinator] Triggered Worker C: ...
-[coordinator] Done.
+Hub state after reconcile:
+
+```json
+{
+  "stage_k": 10,
+  "round_n": 1,
+  "mode": "waiting",
+  "triggered_workers": [],
+  "attendance_workers": ["A", "B", "C"],
+  "total_samples_seen": {"10": 10912},
+  "last_round_workers": ["A"],
+  "last_round_samples": 10912,
+  "dispatch_failures": ["A", "B", "C"]
+}
 ```
