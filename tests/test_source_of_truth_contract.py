@@ -55,7 +55,7 @@ def test_completed_extraction_plans_are_promoted_to_wiki_and_retired():
     assert "`plans/diloco-coordinator-zero-drift-extraction-plan.md`" in architecture_text
     assert "latest PRD" in workflow_text
     assert "choose one tracer bullet" in workflow_text
-    assert "delete obsolete files from `plans/`" in workflow_text
+    assert "Delete obsolete files from `prds/` and `plans/`" in workflow_text
 
     obsolete_paths = [
         REPO_ROOT / "plans" / "zero-drift-monolith-extraction.md",
@@ -93,3 +93,26 @@ def test_workflow_dispatch_exposes_cpu_smoke_end_to_end_validation_gate():
     assert "--workflow_validate" in workflow
     assert "--workflow_validation_run_id" in workflow
 
+
+
+def test_completed_cpu_smoke_prd_and_plan_are_promoted_to_wiki_and_retired():
+    workflow_validation_record = REPO_ROOT / "wiki" / "Kaggle-CPU-API-Workflow-Validation.md"
+    status_record = REPO_ROOT / "wiki" / "STATUS.md"
+
+    assert workflow_validation_record.exists()
+    assert status_record.exists()
+
+    workflow_validation_text = workflow_validation_record.read_text(encoding="utf-8")
+    status_text = status_record.read_text(encoding="utf-8")
+
+    assert "Durable record for the completed PRD" in workflow_validation_text
+    assert "Live Gate Evidence" in workflow_validation_text
+    assert "coordinate #272" in workflow_validation_text
+    assert "diloco_state/workflow_validation/25377312407-1/" in workflow_validation_text
+    assert "removed from `prds/` and `plans/`" in status_text
+
+    obsolete_paths = [
+        REPO_ROOT / "prds" / "dgac-readiness-cpu-smoke.md",
+        REPO_ROOT / "plans" / "dgac-readiness-cpu-smoke.md",
+    ]
+    assert not any(path.exists() for path in obsolete_paths)

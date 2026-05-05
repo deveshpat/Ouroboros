@@ -18,7 +18,7 @@ Based on Meta's Coconut (arXiv:2412.06769) + DGAC (Diversity-Gated Adaptive Coco
 |---|---|
 | Stages 0–9 | ✅ COMPLETE |
 | Stage 10 | 🔄 IN PROGRESS — waiting on Kaggle GPU quota |
-| DGAC | ⬜ BLOCKED until Stage 10 quality gate + CPU-smoke workflow gate pass |
+| DGAC | ⬜ BLOCKED until Stage 10 quality gate; CPU-smoke workflow gate already passed live |
 
 **Compute:** DiLoCo dynamic workers with attendance/waiting fallback. Current stage 10 Hub state shows Worker A contributed 10,912 samples; A/B/C dispatch attempts are blocked by weekly GPU quota.
 

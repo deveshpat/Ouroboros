@@ -19,7 +19,7 @@
 
 ## Session 24 — source-of-truth docs + obsolete plan retirement (2026-05-04) ✅
 
-**Decision:** completed PRDs/plans are not durable source-of-truth files. Once a phase is implemented, durable decisions move into `wiki/`, then obsolete files under `plans/` are deleted.
+**Decision:** completed PRDs/plans are not durable source-of-truth files. Once a phase is implemented, durable decisions move into `wiki/`, then obsolete files under `prds/` and `plans/` are deleted.
 
 **Fix:** added `wiki/Architecture-Extraction.md` and `wiki/Engineering-Workflow.md`, updated `BLUEPRINT.md`/`STATUS.md`, and retired completed training/coordinator PRD/plan files.
 

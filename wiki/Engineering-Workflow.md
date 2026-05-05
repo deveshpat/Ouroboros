@@ -62,9 +62,9 @@ PRDs and plans are working artifacts, not permanent architecture docs.
 2. Convert it to an implementation plan with phases and tracer bullets.
 3. Execute the plan using TDD.
 4. Promote durable decisions, final ownership, validation gates, and deferred work into `wiki/`.
-5. Delete obsolete files from `plans/` once the wiki has the canonical record; in other words, delete obsolete files from `plans/` after documentation promotion.
+5. Delete obsolete files from `prds/` and `plans/` once the wiki has the canonical record; in other words, delete obsolete planning artifacts after documentation promotion.
 
-The wiki is the durable project memory. The `plans/` directory should not accumulate stale completed plans that compete with the current source of truth.
+The wiki is the durable project memory. The `prds/` and `plans/` directories should not accumulate stale completed artifacts that compete with the current source of truth.
 
 ---
 

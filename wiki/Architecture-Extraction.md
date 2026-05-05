@@ -107,8 +107,10 @@ The following files were intentionally retired after their decisions were promot
 | `plans/monolith-adapter-thinning.md` | This page: Completed Track: Training Monolith Extraction + adapter ownership map |
 | `plans/diloco-coordinator-zero-drift-extraction-prd.md` | This page: Completed Track: Coordinator Zero-Drift Extraction |
 | `plans/diloco-coordinator-zero-drift-extraction-plan.md` | This page + `wiki/Engineering-Workflow.md` |
+| `prds/dgac-readiness-cpu-smoke.md` | `wiki/Kaggle-CPU-API-Workflow-Validation.md` + `wiki/STATUS.md` |
+| `plans/dgac-readiness-cpu-smoke.md` | `wiki/Kaggle-CPU-API-Workflow-Validation.md` + `wiki/STATUS.md` |
 
-Future PRDs and plans are temporary execution artifacts. Once a phase is complete, durable decisions move into `wiki/`, and obsolete planning files should be deleted rather than kept as stale source-of-truth duplicates.
+Future PRDs and plans are temporary execution artifacts. Once a phase is complete, durable decisions move into `wiki/`, and obsolete files under `prds/` and `plans/` should be deleted rather than kept as stale source-of-truth duplicates.
 
 ---
 

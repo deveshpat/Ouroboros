@@ -17,7 +17,7 @@
 | `wandb==0.25.0` `resume="allow"` on finished run → ephemeral run | Per-round run IDs + `group=` for stage-level grouping |
 | W&B dashboard unreadable with many overlapping runs | Unique `id` per round + `group` by stage |
 | `--use_halt_gate` starts from random LoRA weights in DiLoCo path | `--resume_from_diloco_anchor` loads `diloco_state/anchor/` before DGAC training |
-| Completed PRDs/plans linger in `plans/` and compete with docs | Promote durable decisions into `wiki/`, then delete obsolete planning files |
+| Completed PRDs/plans linger in `prds/` or `plans/` and compete with docs | Promote durable decisions into `wiki/`, then delete obsolete planning artifacts |
 | Runtime `signals/*.json` appears in source control | Ignore generated signal JSONs and keep only `signals/.gitkeep` tracked; do not remove the workflow signal trigger until a replacement exists |
 | Root scripts become safer but then risk regrowing into monoliths | Keep adapter guardrail tests that assert root entrypoints delegate into package modules |
 | Test assumes a clean shell but developer/CI has real tokens exported | Clear ambient token/runtime env with `monkeypatch.delenv()` before asserting fake payloads |

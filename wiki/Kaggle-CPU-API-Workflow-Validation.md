@@ -48,7 +48,11 @@ Extended fake coordinator orchestration coverage so a fake completed worker stat
 
 ### Phase 4 — Promote durable documentation
 
-This page is the canonical durable record. No completed PRD/plan files need to remain in `plans/` for this track.
+This page is the canonical durable record. No completed PRD/plan files need to remain in `prds/` or `plans/` for this track.
+
+## Live Gate Evidence
+
+The DGAC readiness CPU-smoke gate passed live on 2026-05-05. GitHub Actions `coordinate #272` ran `workflow_validate=cpu-smoke`, defaulted to Worker A, pushed Kaggle kernel version 39, and verified remote Hub artifacts under `diloco_state/workflow_validation/25377312407-1/`. Kaggle exited with `SystemExit: 0` before the real `!torchrun` launch, and the validation report recorded `gpu_requested=false`, `torchrun_requested=false`, `publish_requested=true`, and `published=true`.
 
 ## Manual Kaggle API Validation
 
