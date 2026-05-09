@@ -17,6 +17,7 @@ def test_kaggle_notebook_keeps_torchrun_shell_magic_not_python_subprocess():
 
     assert "from ouroboros.kaggle import" in source
     assert "resolve_diloco_worker_id" in source
+    assert "resolve_kaggle_run_mode" in source
     assert "!torchrun --standalone" in source
     assert "subprocess.run(command, check=True)" not in source
     assert "import subprocess" not in source.split("!torchrun --standalone", 1)[0].split("from ouroboros.kaggle import", 1)[-1]
@@ -27,3 +28,18 @@ def test_kaggle_notebook_describes_itself_as_thin_adapter():
 
     assert "thin adapter" in source
     assert "Reusable training, checkpoint, DGAC, DiLoCo worker" in source
+
+
+def test_kaggle_notebook_supports_dgac_anchor_eval_mode_without_diloco_training():
+    source = _notebook_source()
+
+    assert "OUROBOROS_KAGGLE_RUN_MODE" in source
+    assert "DGAC_ANCHOR_EVAL_RUN_MODE" in source
+    assert "build_dgac_anchor_eval_command" in source
+    assert "--resume_from_diloco_anchor" in source
+    assert "--eval_only" in source
+    assert "--use_halt_gate" in source
+    assert "runs/stage10_anchor_eval" in source
+    eval_branch = source.split("if run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:", 1)[1].split("elif run_mode == DILOCO_RUN_MODE:", 1)[0]
+    assert "--diloco_mode" not in eval_branch
+    assert "--push_to_hub" not in eval_branch

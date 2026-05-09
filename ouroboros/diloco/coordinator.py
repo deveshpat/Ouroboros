@@ -70,6 +70,8 @@ DEFAULT_KAGGLE_NOTEBOOK_PATH = Path(__file__).resolve().parents[2] / "kaggle-uti
 DEFAULT_IO_RETRIES = 3
 DEFAULT_IO_RETRY_BASE_DELAY_S = 1.5
 DILOCO_TERMINAL_STAGE = 10
+DILOCO_RUN_MODE = "diloco"
+DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
 
 
 def _retry_io(
@@ -213,6 +215,17 @@ def parse_args() -> argparse.Namespace:
             "before promoting a partial attendance set. Default 5.0."
         ),
     )
+    parser.add_argument(
+        "--kaggle_run_mode",
+        default=os.environ.get("OUROBOROS_KAGGLE_RUN_MODE", DILOCO_RUN_MODE),
+        choices=[DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE],
+        help=(
+            "Kaggle notebook launch mode. Use 'dgac-anchor-eval' to push one "
+            "GPU eval-only notebook for the terminal DiLoCo anchor without "
+            "reading or mutating round_state."
+        ),
+    )
+
     # Per-worker Kaggle credentials (each account can only trigger its own notebook)
     parser.add_argument(
         "--kaggle_username_a",
@@ -452,6 +465,45 @@ def _workflow_validation_worker_ids(args: argparse.Namespace) -> List[str]:
     return ["A"]
 
 
+def _kaggle_eval_worker_ids(args: argparse.Namespace) -> List[str]:
+    if args.force_worker_ids:
+        requested = _ordered_unique_worker_ids(
+            [w.strip().upper() for w in str(args.force_worker_ids).split(",") if w.strip()]
+        )
+        if requested:
+            return requested
+    # One anchor eval is sufficient; default to Worker A for a deterministic one-click path.
+    return ["A"]
+
+
+def run_kaggle_anchor_eval(args: argparse.Namespace) -> None:
+    worker_ids = _kaggle_eval_worker_ids(args)
+    kaggle_creds = _build_kaggle_creds(args)
+    print(
+        "[kaggle-eval] Dispatching DGAC anchor eval-only notebook "
+        f"workers={worker_ids} repo={args.repo_id}"
+    )
+    if args.dry_run:
+        print("[kaggle-eval] DRY RUN — no Kaggle dispatch.")
+        return
+
+    dispatch_results = trigger_kaggle_workers(
+        kaggle_creds,
+        active_workers=worker_ids,
+        notebook_path=Path(args.kaggle_notebook_path),
+        coordinator_args=args,
+    )
+    if any(dispatch_results.get(worker_id) != "success" for worker_id in worker_ids):
+        raise RuntimeError(
+            "DGAC anchor eval-only dispatch failed: "
+            f"{dispatch_results}"
+        )
+    print(
+        "[kaggle-eval] Dispatch accepted by Kaggle. Monitor the Kaggle kernel "
+        "and W&B eval_only/* metrics; this mode does not mutate round_state."
+    )
+
+
 def _is_matching_cpu_smoke_status(status: Optional[Dict], *, worker_id: str, run_id: str) -> bool:
     if not isinstance(status, dict):
         return False
@@ -542,6 +594,10 @@ def main() -> None:
 
     if _workflow_validation_mode_from_args(args):
         run_workflow_validation(args)
+        return
+
+    if getattr(args, "kaggle_run_mode", DILOCO_RUN_MODE) == DGAC_ANCHOR_EVAL_RUN_MODE:
+        run_kaggle_anchor_eval(args)
         return
 
     print("[coordinator] Reading round state...")

@@ -13,6 +13,9 @@ from collections.abc import Mapping
 from typing import Optional
 
 _VALID_DILOCO_WORKER_IDS = {"A", "B", "C"}
+DILOCO_RUN_MODE = "diloco"
+DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
+_VALID_KAGGLE_RUN_MODES = {DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE}
 
 
 def _normalize_text(value: object | None, *, uppercase: bool = False) -> Optional[str]:
@@ -58,6 +61,23 @@ def kaggle_secret_presence(env: Mapping[str, str] | None = None) -> dict[str, bo
             ("DILOCO_WORKER_ID", "OUROBOROS_DILOCO_WORKER_ID", "WORKER_ID"),
         ),
     }
+
+
+def resolve_kaggle_run_mode(env: Mapping[str, str] | None = None) -> str:
+    """Resolve the notebook launch mode from runtime env aliases."""
+    env = os.environ if env is None else env
+    mode = _normalize_text(
+        env.get("OUROBOROS_KAGGLE_RUN_MODE") or env.get("OUROBOROS_RUN_MODE")
+    )
+    if mode is None:
+        return DILOCO_RUN_MODE
+    mode = mode.lower()
+    if mode not in _VALID_KAGGLE_RUN_MODES:
+        raise ValueError(
+            f"Invalid Kaggle run mode {mode!r}. Expected one of: "
+            f"{', '.join(sorted(_VALID_KAGGLE_RUN_MODES))}."
+        )
+    return mode
 
 
 def build_diloco_training_command(
@@ -139,14 +159,86 @@ def build_diloco_training_command(
     return command
 
 
+
+def build_dgac_anchor_eval_command(
+    *,
+    script: str = "jamba_coconut_finetune.py",
+    nproc_per_node: int = 2,
+    data_dir: str = "data/coconut_v1",
+    use_4bit: bool = True,
+    max_stage: int = 10,
+    max_grad_norm: float = 0.3,
+    batch_size: int = 4,
+    grad_accum: int = 8,
+    val_batch_size: int = 2,
+    val_skip_buffer_minutes: int = 60,
+    session_timeout_hours: float = 12.0,
+    graceful_exit_buffer_minutes: int = 20,
+    diloco_state_repo: str = "WeirdRunner/Ouroboros",
+    output_dir: str = "runs/stage10_anchor_eval",
+    wandb_project: str | None = "ouroboros-stage3-jamba",
+    wandb_entity: str | None = None,
+    wandb_mode: str | None = None,
+) -> list[str]:
+    """Build the tested Kaggle command for terminal Stage-10 anchor eval-only."""
+    command = [
+        "torchrun",
+        "--standalone",
+        f"--nproc_per_node={int(nproc_per_node)}",
+        script,
+        "--use_halt_gate",
+        "--resume_from_diloco_anchor",
+        "--eval_only",
+        "--diloco_state_repo",
+        diloco_state_repo,
+        "--data_dir",
+        data_dir,
+    ]
+    if use_4bit:
+        command.append("--use_4bit")
+    command.extend(
+        [
+            "--max_stage",
+            str(int(max_stage)),
+            "--max_grad_norm",
+            str(float(max_grad_norm)),
+            "--batch_size",
+            str(int(batch_size)),
+            "--grad_accum",
+            str(int(grad_accum)),
+            "--val_batch_size",
+            str(int(val_batch_size)),
+            "--val_skip_buffer_minutes",
+            str(int(val_skip_buffer_minutes)),
+            "--session_timeout_hours",
+            str(float(session_timeout_hours)),
+            "--graceful_exit_buffer_minutes",
+            str(int(graceful_exit_buffer_minutes)),
+            "--output_dir",
+            output_dir,
+        ]
+    )
+    if wandb_project is not None:
+        command.extend(["--wandb_project", wandb_project])
+    if wandb_entity is not None:
+        command.extend(["--wandb_entity", wandb_entity])
+    if wandb_mode is not None:
+        command.extend(["--wandb_mode", wandb_mode])
+    return command
+
+
 def format_shell_command(command: list[str]) -> str:
     """Render a command list as a pasteable shell command for notebook logs."""
     return " ".join(shlex.quote(part) for part in command)
 
 
 __all__ = [
+    "DGAC_ANCHOR_EVAL_RUN_MODE",
+    "DILOCO_RUN_MODE",
+    "build_dgac_anchor_eval_command",
     "build_diloco_training_command",
     "format_shell_command",
     "kaggle_secret_presence",
     "resolve_diloco_worker_id",
+    "resolve_kaggle_run_mode",
 ]

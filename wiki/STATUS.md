@@ -45,7 +45,7 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 
 ## Immediate Next Steps
 
-1. **Review final Stage 10 anchor quality** — compare W&B `pre-val`, `val_ce`, accuracy trend, and any available sample generations against stage 9/earlier trend before DGAC.
+1. **Run final Stage 10 anchor eval-only quality review** — W&B currently shows Stage 10 `pre_val` / accuracy only from the start of the stage, so run the `--eval_only --resume_from_diloco_anchor` command in `BLUEPRINT.md` before making the DGAC go/no-go decision.
 2. **Define DGAC go/no-go thresholds** — set stop/rollback criteria before launch: CE/accuracy collapse threshold, expected halt-step distribution checks, and minimum acceptable qualitative samples.
 3. **Launch DGAC explicitly if quality passes** — use the command in `BLUEPRINT.md`; coordinator cron has correctly stopped at `mode=terminal` / `dgac_manual_gate=true` and will not auto-dispatch stage 11.
 4. **Optional polish** — quiet expected Hugging Face 404 polling noise during validation artifact eventual consistency; not blocking because coordinator already verifies successfully.

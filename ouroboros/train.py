@@ -543,6 +543,60 @@ def run_generation_callback(
     return mean_uwr
 
 
+def run_eval_only(
+    *,
+    model,
+    tokenizer,
+    halt_gate: Optional[HaltGate],
+    val_samples: List[Dict[str, Any]],
+    lat_token_id: int,
+    stage_k: int,
+    device: torch.device,
+    args: argparse.Namespace,
+    step: int,
+    wandb_run=None,
+    run_generation: bool = True,
+) -> Dict[str, float]:
+    """Run a validation/generation preflight and exit without optimizer steps."""
+    val_ce, val_acc = evaluate_stage(
+        model=model,
+        val_samples=val_samples,
+        tokenizer=tokenizer,
+        lat_token_id=lat_token_id,
+        stage_k=stage_k,
+        device=device,
+        args=args,
+        halt_gate=halt_gate,
+    )
+
+    metrics: Dict[str, float] = {"val_ce": float(val_ce), "val_acc": float(val_acc)}
+    if _is_main_process():
+        print(
+            f"\n  [eval-only] stage={stage_k} val_ce={val_ce:.4f} val_acc={val_acc:.4f}"
+        )
+        if wandb_run is not None:
+            import wandb
+            wandb.log(
+                {"eval_only/ce": val_ce, "eval_only/acc": val_acc, "eval_only/stage": stage_k},
+                step=step,
+            )
+        if run_generation:
+            mean_uwr = run_generation_callback(
+                model=model,
+                tokenizer=tokenizer,
+                halt_gate=halt_gate,
+                stage_k=stage_k,
+                device=device,
+                args=args,
+                step=step,
+                wandb_run=wandb_run,
+            )
+            metrics["gen_mean_uwr"] = float(mean_uwr)
+
+    barrier()
+    return metrics
+
+
 def _best_state_for_stage(stage_dir: Path) -> Tuple[float, float, Optional[Path]]:
     best_dir = stage_dir / "best"
     if not (best_dir / "training_state.pt").exists():
@@ -1316,6 +1370,21 @@ def run_cli(args: argparse.Namespace, *, script_start: float) -> None:
             if distributed:
                 broadcast_parameters(get_trainable_parameters(model, halt_gate), src=0)
                 barrier()
+            if getattr(args, "eval_only", False):
+                run_eval_only(
+                    model=model,
+                    tokenizer=tokenizer,
+                    halt_gate=halt_gate,
+                    val_samples=val_samples,
+                    lat_token_id=lat_token_id,
+                    stage_k=curriculum_max_stage,
+                    device=device,
+                    args=args,
+                    step=0,
+                    wandb_run=wandb_run,
+                    run_generation=bool(args.gen_every_stage),
+                )
+                return
             run_training_stages(
                 model=model,
                 tokenizer=tokenizer,
@@ -1429,6 +1498,24 @@ def run_cli(args: argparse.Namespace, *, script_start: float) -> None:
 
         if distributed:
             broadcast_parameters(get_trainable_parameters(model, halt_gate), src=0)
+
+        if getattr(args, "eval_only", False):
+            eval_stage = stages[0] if stages else (resume_stage if resume_state is not None else curriculum_max_stage)
+            run_eval_only(
+                model=model,
+                tokenizer=tokenizer,
+                halt_gate=halt_gate,
+                val_samples=val_samples,
+                lat_token_id=lat_token_id,
+                stage_k=eval_stage,
+                device=device,
+                args=args,
+                step=global_step,
+                wandb_run=wandb_run,
+                run_generation=bool(args.gen_every_stage),
+            )
+            _cleanup_distributed_resume_artifacts(output_dir, hub_resume_dir, distributed, is_main)
+            return
 
         if is_main and not stages:
             print("  No stages left to run. Nothing to do.")

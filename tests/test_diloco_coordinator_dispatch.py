@@ -81,6 +81,7 @@ def test_runtime_env_payload_round_trips_and_runtime_env_uses_expected_aliases(m
         "OUROBOROS_WANDB_PROJECT",
         "OUROBOROS_WANDB_ENTITY",
         "OUROBOROS_DILOCO_OUTPUT_DIR",
+        "OUROBOROS_KAGGLE_RUN_MODE",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -99,6 +100,7 @@ def test_runtime_env_payload_round_trips_and_runtime_env_uses_expected_aliases(m
         wandb_entity="entity",
         workflow_validate=None,
         workflow_validation_run_id=None,
+        kaggle_run_mode="diloco",
     )
 
     env = dispatch._build_worker_runtime_env(args, " b ")
@@ -109,6 +111,7 @@ def test_runtime_env_payload_round_trips_and_runtime_env_uses_expected_aliases(m
     assert decoded["OUROBOROS_DILOCO_WORKER_ID"] == "B"
     assert decoded["WORKER_ID"] == "B"
     assert decoded["OUROBOROS_AUTO_TRIGGERED"] == "1"
+    assert decoded["OUROBOROS_KAGGLE_RUN_MODE"] == "diloco"
     assert decoded["HF_TOKEN"] == "hf_fake"
     assert decoded["HUGGINGFACE_HUB_TOKEN"] == "hf_fake"
     assert decoded["WANDB_API_KEY"] == "wandb_fake"
@@ -140,6 +143,7 @@ def test_runtime_env_includes_remote_cpu_smoke_publish_contract(monkeypatch):
             wandb_entity=None,
             workflow_validate="cpu-smoke",
             workflow_validation_run_id="gh-789-1",
+            kaggle_run_mode="diloco",
         ),
         "A",
     )
@@ -149,6 +153,28 @@ def test_runtime_env_includes_remote_cpu_smoke_publish_contract(monkeypatch):
     assert env["OUROBOROS_WORKFLOW_VALIDATION_RUN_ID"] == "gh-789-1"
     assert env["OUROBOROS_WORKFLOW_VALIDATION_STATE_REPO"] == "state/repo"
     assert env["OUROBOROS_DILOCO_STATE_REPO"] == "state/repo"
+
+def test_runtime_env_can_select_dgac_anchor_eval_notebook_mode(monkeypatch):
+    monkeypatch.delenv("OUROBOROS_KAGGLE_RUN_MODE", raising=False)
+
+    env = dispatch._build_worker_runtime_env(
+        argparse.Namespace(
+            hf_token="hf_fake",
+            wandb_key=None,
+            repo_id="state/repo",
+            outer_lr=0.7,
+            wandb_project=None,
+            wandb_entity=None,
+            workflow_validate=None,
+            workflow_validation_run_id=None,
+            kaggle_run_mode="dgac-anchor-eval",
+        ),
+        "A",
+    )
+
+    assert env["OUROBOROS_KAGGLE_RUN_MODE"] == "dgac-anchor-eval"
+    assert env["OUROBOROS_DILOCO_STATE_REPO"] == "state/repo"
+
 
 def test_stage_local_kaggle_kernel_inserts_dispatch_after_initial_markdown_and_writes_metadata(tmp_path):
     notebook_path = tmp_path / "kaggle-utils.ipynb"
@@ -353,3 +379,30 @@ def test_trigger_kaggle_workers_forwards_cpu_smoke_validation_mode(monkeypatch, 
 
     assert results == {"A": "success"}
     assert calls == [("A", {"WORKER_ID": "A", "OUROBOROS_WORKFLOW_VALIDATE": "cpu-smoke"}, "cpu-smoke")]
+
+
+def test_trigger_kaggle_workers_forwards_dgac_eval_run_mode_without_cpu_validation(monkeypatch, tmp_path):
+    notebook_path = tmp_path / "kaggle-utils.ipynb"
+    notebook_path.write_text(json.dumps(_minimal_notebook([])), encoding="utf-8")
+    calls = []
+
+    def fake_trigger(worker_id, username, key, slug, *, notebook_path, injected_env=None, validation_mode=None):
+        calls.append((worker_id, injected_env, validation_mode))
+        return True
+
+    monkeypatch.setattr(dispatch, "_trigger_single_worker", fake_trigger)
+    monkeypatch.setattr(
+        dispatch,
+        "_build_worker_runtime_env",
+        lambda args, worker_id: {"WORKER_ID": worker_id, "OUROBOROS_KAGGLE_RUN_MODE": "dgac-anchor-eval"},
+    )
+
+    results = dispatch.trigger_kaggle_workers(
+        {"A": ("weirdrunner", "key-a")},
+        active_workers=["A"],
+        notebook_path=notebook_path,
+        coordinator_args=argparse.Namespace(),
+    )
+
+    assert results == {"A": "success"}
+    assert calls == [("A", {"WORKER_ID": "A", "OUROBOROS_KAGGLE_RUN_MODE": "dgac-anchor-eval"}, None)]

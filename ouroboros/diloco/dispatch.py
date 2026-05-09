@@ -31,6 +31,8 @@ _KAGGLE_PUSH_FAILURE_MARKERS = (
     "error",
 )
 _CPU_SMOKE_VALIDATION_MODE = "cpu-smoke"
+_DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
+_DILOCO_RUN_MODE = "diloco"
 
 
 def _format_kaggle_output(stdout: Optional[str], stderr: Optional[str]) -> str:
@@ -126,6 +128,14 @@ def _build_worker_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[
     _set_env_if_present(runtime_env, "OUROBOROS_DILOCO_WORKER_ID", worker, uppercase=True)
     _set_env_if_present(runtime_env, "WORKER_ID", worker, uppercase=True)
     runtime_env["OUROBOROS_AUTO_TRIGGERED"] = "1"
+
+    kaggle_run_mode = _first_nonempty_text(
+        getattr(args, "kaggle_run_mode", None),
+        os.environ.get("OUROBOROS_KAGGLE_RUN_MODE"),
+        _DILOCO_RUN_MODE,
+    )
+    if kaggle_run_mode:
+        runtime_env["OUROBOROS_KAGGLE_RUN_MODE"] = kaggle_run_mode.lower()
 
     hf_token = _first_nonempty_text(
         getattr(args, "hf_token", None),

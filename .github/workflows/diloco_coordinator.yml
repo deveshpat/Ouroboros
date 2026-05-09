@@ -27,6 +27,10 @@ on:
         description: 'Optional read-only workflow validation mode. Supported: "" or "cpu-smoke". Defaults to Worker A when force_worker_ids is empty.'
         required: false
         default: ''
+      kaggle_run_mode:
+        description: 'Kaggle launch mode. Use "diloco" for normal coordinator dispatch or "dgac-anchor-eval" for the terminal Stage-10 eval-only gate.'
+        required: false
+        default: 'diloco'
       attendance_join_grace_minutes:
         description: 'Waiting-mode attendance barrier grace. Default 5 minutes.'
         required: false
@@ -78,6 +82,7 @@ jobs:
           KAGGLE_KEY_C: ${{ secrets.KAGGLE_KEY_C }}
           OUROBOROS_WORKFLOW_VALIDATE: ${{ github.event.inputs.workflow_validate || '' }}
           OUROBOROS_WORKFLOW_VALIDATION_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          OUROBOROS_KAGGLE_RUN_MODE: ${{ github.event.inputs.kaggle_run_mode || 'diloco' }}
         run: |
           python diloco_coordinator.py \
             --hf_token          "$HF_TOKEN" \
@@ -97,6 +102,7 @@ jobs:
             --min_shard_samples  32 \
             --workflow_validate "$OUROBOROS_WORKFLOW_VALIDATE" \
             --workflow_validation_run_id "$OUROBOROS_WORKFLOW_VALIDATION_RUN_ID" \
+            --kaggle_run_mode "$OUROBOROS_KAGGLE_RUN_MODE" \
             ${{ github.event.inputs.force_worker_ids && format('--force_worker_ids "{0}"', github.event.inputs.force_worker_ids) || '' }} \
             ${{ github.event.inputs.skip_trigger == 'true' && '--skip_trigger' || '' }} \
             ${{ github.event.inputs.dry_run == 'true' && '--dry_run' || '' }}

@@ -94,6 +94,7 @@ def test_cli_defaults_and_worker_normalization_match_source_contract():
         'return worker_id',
         'raise argparse.ArgumentTypeError("DiLoCo worker id cannot be empty")',
         '"--resume_from_diloco_anchor",',
+        '"--eval_only",',
     ):
         assert contract in source
 

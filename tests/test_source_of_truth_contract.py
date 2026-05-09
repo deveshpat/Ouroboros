@@ -96,6 +96,19 @@ def test_workflow_dispatch_exposes_cpu_smoke_end_to_end_validation_gate():
 
 
 
+def test_workflow_dispatch_exposes_dgac_anchor_eval_gate():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "diloco_coordinator.yml").read_text(encoding="utf-8")
+    notebook = (REPO_ROOT / "kaggle-utils.ipynb").read_text(encoding="utf-8")
+
+    assert "kaggle_run_mode" in workflow
+    assert "dgac-anchor-eval" in workflow
+    assert "OUROBOROS_KAGGLE_RUN_MODE" in workflow
+    assert "--kaggle_run_mode" in workflow
+    assert "OUROBOROS_KAGGLE_RUN_MODE" in notebook
+    assert "--resume_from_diloco_anchor" in notebook
+    assert "--eval_only" in notebook
+
+
 def test_completed_cpu_smoke_prd_and_plan_are_promoted_to_wiki_and_retired():
     workflow_validation_record = REPO_ROOT / "wiki" / "Kaggle-CPU-API-Workflow-Validation.md"
     status_record = REPO_ROOT / "wiki" / "STATUS.md"

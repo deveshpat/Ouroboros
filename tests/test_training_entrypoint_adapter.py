@@ -73,4 +73,5 @@ def test_adapter_help_remains_bootstrap_free_after_thinning():
     help_text = bootstrap_free_help_text()
     assert "Jamba Reasoning 3B Coconut-Ouroboros fine-tuning" in help_text
     assert "--resume_from_diloco_anchor" in help_text
+    assert "--eval_only" in help_text
     assert "pip install" not in help_text

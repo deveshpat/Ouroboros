@@ -32,10 +32,67 @@ def _args(**overrides):
         workflow_validation_run_id=None,
         workflow_validation_timeout_s=900.0,
         workflow_validation_poll_s=10.0,
+        kaggle_run_mode="diloco",
     )
     values.update(overrides)
     return argparse.Namespace(**values)
 
+
+
+def test_packaged_coordinator_dgac_anchor_eval_dispatches_one_gpu_notebook_without_round_state(monkeypatch):
+    monkeypatch.setattr(
+        coordinator,
+        "parse_args",
+        lambda: _args(
+            kaggle_run_mode="dgac-anchor-eval",
+            force_worker_ids=None,
+            skip_trigger=False,
+        ),
+    )
+    triggered = []
+
+    def fake_trigger(kaggle_creds, *, active_workers, notebook_path, coordinator_args):
+        triggered.append((active_workers, notebook_path, coordinator_args.kaggle_run_mode))
+        return {worker_id: "success" for worker_id in active_workers}
+
+    monkeypatch.setattr(coordinator, "trigger_kaggle_workers", fake_trigger)
+    monkeypatch.setattr(
+        coordinator,
+        "hub_download_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("anchor eval dispatch must not read round_state")),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "hub_upload_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("anchor eval dispatch must not mutate Hub state")),
+    )
+
+    coordinator.main()
+
+    assert triggered == [(["A"], Path("kaggle-utils.ipynb"), "dgac-anchor-eval")]
+
+
+def test_packaged_coordinator_dgac_anchor_eval_respects_force_worker_ids(monkeypatch):
+    monkeypatch.setattr(
+        coordinator,
+        "parse_args",
+        lambda: _args(
+            kaggle_run_mode="dgac-anchor-eval",
+            force_worker_ids="B",
+            skip_trigger=False,
+        ),
+    )
+    triggered = []
+
+    def fake_trigger(kaggle_creds, *, active_workers, notebook_path, coordinator_args):
+        triggered.append(active_workers)
+        return {worker_id: "success" for worker_id in active_workers}
+
+    monkeypatch.setattr(coordinator, "trigger_kaggle_workers", fake_trigger)
+
+    coordinator.main()
+
+    assert triggered == [["B"]]
 
 
 def test_packaged_coordinator_cpu_smoke_validation_defaults_to_worker_a_and_polls_remote_status(monkeypatch):

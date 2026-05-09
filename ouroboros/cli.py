@@ -62,6 +62,7 @@ def bootstrap_free_help_text() -> str:
         "  --diloco_worker_id {A,B,C}\n"
         "  --resume_from RESUME_FROM\n"
         "  --resume_from_diloco_anchor\n"
+        "  --eval_only\n"
         "  --output_dir OUTPUT_DIR\n"
         "  --val_batch_size VAL_BATCH_SIZE\n"
         "  --gen_every_stage, --no-gen_every_stage\n"
@@ -203,6 +204,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output_dir", default="runs/stage3")
+    parser.add_argument(
+        "--eval_only",
+        action="store_true",
+        help=(
+            "Load the requested checkpoint/DiLoCo anchor, run validation and optional "
+            "generation, then exit without optimizer steps or checkpoint writes."
+        ),
+    )
     parser.add_argument("--keep_checkpoints_per_stage", type=int, default=2)
 
     # Monitoring

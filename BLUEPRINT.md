@@ -24,6 +24,25 @@ Based on Meta's Coconut (arXiv:2412.06769) + DGAC (Diversity-Gated Adaptive Coco
 
 ---
 
+## Stage 10 Anchor Quality Review Command
+
+Use this before launching DGAC because W&B only has Stage 10 `pre_val` / accuracy from the start of the stage, not a final validation pass for the terminal anchor. This loads `diloco_state/anchor`, evaluates at Stage 10, optionally runs the existing generation callback, and exits without optimizer steps or checkpoint writes.
+
+```bash
+torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
+  --use_halt_gate --resume_from_diloco_anchor --eval_only \
+  --diloco_state_repo WeirdRunner/Ouroboros --hf_token "$HF_TOKEN" \
+  --data_dir data/coconut_v1 --use_4bit \
+  --max_stage 10 --max_grad_norm 0.3 \
+  --batch_size 4 --grad_accum 8 --val_batch_size 2 \
+  --val_skip_buffer_minutes 60 \
+  --session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 \
+  --output_dir runs/stage10_anchor_eval \
+  --wandb_project "ouroboros-stage3-jamba"
+```
+
+Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. This pushes one GPU Kaggle notebook in eval-only mode; it does not mutate `round_state` and still loads the latest anchor from `diloco_state/anchor` on Hub.
+
 ## DGAC Launch Command (Phase 3.4 — after Stage 10 quality review)
 
 ```bash

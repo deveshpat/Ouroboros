@@ -3,10 +3,14 @@ from __future__ import annotations
 import os
 
 from ouroboros.kaggle import (
+    DGAC_ANCHOR_EVAL_RUN_MODE,
+    DILOCO_RUN_MODE,
+    build_dgac_anchor_eval_command,
     build_diloco_training_command,
     format_shell_command,
     kaggle_secret_presence,
     resolve_diloco_worker_id,
+    resolve_kaggle_run_mode,
 )
 
 
@@ -68,6 +72,52 @@ def test_build_diloco_training_command_allows_safe_overrides():
     assert command[command.index("--output_dir") + 1] == "runs/smoke"
     assert command[command.index("--wandb_mode") + 1] == "offline"
 
+
+
+def test_resolve_kaggle_run_mode_defaults_to_diloco_and_accepts_eval_mode():
+    assert resolve_kaggle_run_mode({}) == DILOCO_RUN_MODE
+    assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "dgac-anchor-eval"}) == DGAC_ANCHOR_EVAL_RUN_MODE
+    assert resolve_kaggle_run_mode({"OUROBOROS_RUN_MODE": "DILOCO"}) == DILOCO_RUN_MODE
+
+    try:
+        resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "unknown"})
+    except ValueError as exc:
+        assert "Invalid Kaggle run mode" in str(exc)
+    else:  # pragma: no cover - branch exists to make failures explicit
+        raise AssertionError("expected ValueError for invalid run mode")
+
+
+def test_build_dgac_anchor_eval_command_loads_anchor_and_skips_training():
+    command = build_dgac_anchor_eval_command()
+
+    assert command[:4] == ["torchrun", "--standalone", "--nproc_per_node=2", "jamba_coconut_finetune.py"]
+    assert "--use_halt_gate" in command
+    assert "--resume_from_diloco_anchor" in command
+    assert "--eval_only" in command
+    assert "--diloco_state_repo" in command and "WeirdRunner/Ouroboros" in command
+    assert "--data_dir" in command and "data/coconut_v1" in command
+    assert "--use_4bit" in command
+    assert "--max_stage" in command and command[command.index("--max_stage") + 1] == "10"
+    assert "--max_grad_norm" in command and command[command.index("--max_grad_norm") + 1] == "0.3"
+    assert "--output_dir" in command and "runs/stage10_anchor_eval" in command
+    assert "--diloco_mode" not in command
+    assert "--push_to_hub" not in command
+
+
+def test_build_dgac_anchor_eval_command_allows_safe_overrides():
+    command = build_dgac_anchor_eval_command(
+        nproc_per_node=1,
+        use_4bit=False,
+        diloco_state_repo="state/repo",
+        output_dir="runs/eval",
+        wandb_mode="offline",
+    )
+
+    assert "--nproc_per_node=1" in command
+    assert "--use_4bit" not in command
+    assert command[command.index("--diloco_state_repo") + 1] == "state/repo"
+    assert command[command.index("--output_dir") + 1] == "runs/eval"
+    assert command[command.index("--wandb_mode") + 1] == "offline"
 
 def test_format_shell_command_quotes_arguments_for_notebook_logging():
     command = ["python", "jamba_coconut_finetune.py", "--output_dir", "runs/with spaces"]
