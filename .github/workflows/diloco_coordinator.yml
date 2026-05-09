@@ -30,7 +30,7 @@ on:
       kaggle_run_mode:
         description: 'Kaggle launch mode. Use "diloco" for normal coordinator dispatch, "dgac-anchor-eval" for terminal Stage-10 eval-only, or "dgac-train" for Phase 3.4 DGAC launch.'
         required: false
-        default: 'diloco'
+        default: 'dgac-train'
       attendance_join_grace_minutes:
         description: 'Waiting-mode attendance barrier grace. Default 5 minutes.'
         required: false
