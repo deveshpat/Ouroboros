@@ -5,6 +5,20 @@
 
 ---
 
+## Session 26 — Stage 10 terminal aggregation → DGAC manual gate (2026-05-09) ✅
+
+**Evidence:** GitHub Actions coordinator log from 2026-05-09T17:35Z read `stage=10 round=2 mode=diloco`, projected final shards A=8,665, B=8,665, C=8,664, and found all three worker outputs ready.
+
+**Result:** coordinator loaded the anchor and worker weights, aggregated on CPU, logged `coordinator/workers_aggregated=3`, `coordinator/samples_this_round=25994`, `coordinator/total_samples_stage=36906`, `coordinator/pct_stage_done=100`, and uploaded `DiLoCo anchor: stage 10 round 2 (3 workers, 25994 samples, mode=diloco)`.
+
+**Gate:** coordinator printed `Stage 10 COMPLETE (36906/36906 samples). Entering DGAC manual gate.`, then `Stage 10 is terminal for DiLoCo`, then `Done (DGAC manual gate)`. No stage-11 DiLoCo dispatch should run from cron.
+
+**Next action:** review final Stage 10 anchor quality, define DGAC go/no-go thresholds, then launch DGAC explicitly with `--resume_from_diloco_anchor` if quality passes.
+
+**Artifact hygiene:** generated `signals/*.json` files remain disposable runtime doorbells. Keep only `signals/.gitkeep` in source.
+
+---
+
 ## Session 25 — docs retirement + Kaggle dispatch hardening (2026-05-04) ✅
 
 **Decision:** retire obsolete PRDs/plans only after their durable decisions are documented in `wiki/`. Keep the runtime signal mechanism; generated `signals/*.json` files are disposable GitHub Actions doorbells, while `signals/.gitkeep` keeps the directory present.
@@ -109,7 +123,3 @@ First successful end-to-end `kernels push` flow (replacing the broken `kernels p
 ```
 
 ---
-
-## Session 15 — Coordinator Run #2 (2026-04-20) ✅
-
-403 root cause identified: `kaggle==2.0.1` uses gRPC. `KernelsApiService/GetKernel` (pull endpoint) blocked. Fix: pin `kaggle==1.6.17` (later superseded by `>=1.8.4`).

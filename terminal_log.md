@@ -5,61 +5,45 @@
 
 ---
 
-## Last Run — DGAC CPU-Smoke Workflow Validation Passed (2026-05-05)
+## Last Run — Stage 10 Terminal DiLoCo Aggregation → DGAC Manual Gate (2026-05-09)
 
-Observed from GitHub Actions `coordinate #272`, Kaggle notebook output, and Hugging Face Hub validation artifacts.
-
-```text
-[workflow-validate] Starting CPU-smoke validation run_id=25377312407-1 workers=['A'] repo=WeirdRunner/Ouroboros
-[coordinator] Triggered Worker A: ***/kaggle-utils  (Kernel version 39 successfully pushed. Please check progress at https://www.kaggle.com/code/***/kaggle-utils)
-[coordinator] Download JSON diloco_state/workflow_validation/25377312407-1/worker_A_status.json failed (attempt 1/3): RemoteEntryNotFoundError: 404 Client Error
-[coordinator] Download JSON diloco_state/workflow_validation/25377312407-1/worker_A_status.json failed (attempt 2/3): RemoteEntryNotFoundError: 404 Client Error
-[coordinator] Download JSON diloco_state/workflow_validation/25377312407-1/worker_A_status.json failed after 3 attempts: RemoteEntryNotFoundError: 404 Client Error
-[workflow-validate] Waiting for Worker A status at diloco_state/workflow_validation/25377312407-1/worker_A_status.json: None
-...
-[workflow-validate] CPU-smoke validation verified via remote Hub artifacts: ['A']
-```
-
-Kaggle notebook validation branch:
+Observed from GitHub Actions coordinator log in `logs_68228584704.zip`.
 
 ```text
-[workflow-validate] CPU smoke validation complete: runs/workflow_validation/report.json
-[workflow-validate] Published CPU smoke validation artifacts: diloco_state/workflow_validation/25377312407-1/worker_A_status.json, diloco_state/workflow_validation/25377312407-1/worker_A_report.json
-SystemExit: 0
+[coordinator] Reading round state...
+[coordinator] stage=10 round=2 mode=diloco
+[coordinator] Remaining samples for stage 10: 25994
+[coordinator] Projected shards: {'A': 8665, 'B': 8665, 'C': 8664}
+[coordinator] Next round mode: diloco  active workers: ['A', 'B', 'C']
+[coordinator] Worker B: 8665 samples ready
+[coordinator] Worker A: 8665 samples ready
+[coordinator] Worker C: 8664 samples ready
+[coordinator] Loading anchor weights...
+[coordinator] Loading worker weights...
+[coordinator] Aggregating on CPU...
 ```
 
-Hub status artifact:
+W&B summary from the same run:
 
-```json
-{
-  "worker_id": "A",
-  "stage_k": 0,
-  "round_n": 0,
-  "samples_seen": 0,
-  "status": "done",
-  "weights_path": "local_validation/workers/A/round_0000_stage_0",
-  "validation_mode": "cpu-smoke",
-  "validation_run_id": "25377312407-1",
-  "remote_status_path": "diloco_state/workflow_validation/25377312407-1/worker_A_status.json"
-}
+```text
+coordinator/mode diloco
+coordinator/pct_stage_done 100
+coordinator/round 2
+coordinator/samples_this_round 25994
+coordinator/stage_complete 1
+coordinator/total_samples_stage 36906
+coordinator/workers_aggregated 3
 ```
 
-Hub report artifact summary:
+Terminal gate:
 
-```json
-{
-  "mode": "cpu-smoke",
-  "worker_id": "A",
-  "validation_run_id": "25377312407-1",
-  "repo_url": "https://github.com/deveshpat/Ouroboros.git",
-  "repo_ref": "main",
-  "repo_commit": "654cbc32b0d85de8888b9af70e6db4ff918b808e",
-  "state_repo": "WeirdRunner/Ouroboros",
-  "gpu_requested": false,
-  "torchrun_requested": false,
-  "publish_requested": true,
-  "published": true
-}
+```text
+[coordinator] New anchor uploaded: DiLoCo anchor: stage 10 round 2 (3 workers, 25994 samples, mode=diloco)
+[coordinator] Stage 10 progress: 36906/36906 samples seen
+[coordinator] Stage 10 COMPLETE (36906/36906 samples). Entering DGAC manual gate.
+[coordinator] Stage 10 is terminal for DiLoCo. DGAC is ready for manual quality review; no stage-11 DiLoCo dispatch will run.
+[coordinator] DGAC manual gate: review final stage-10 anchor, run CPU-smoke if needed, then launch DGAC explicitly.
+[coordinator] Done (DGAC manual gate).
 ```
 
-Result: GitHub Actions → Kaggle API → Kaggle notebook → Hugging Face artifact → coordinator verification passed without requesting GPU, touching `torchrun`, or mutating live DiLoCo training state.
+Result: Stage 10 is complete, the terminal DiLoCo anchor is uploaded, and the coordinator correctly stopped at the DGAC manual gate instead of dispatching stage 11.

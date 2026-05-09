@@ -17,14 +17,14 @@ Based on Meta's Coconut (arXiv:2412.06769) + DGAC (Diversity-Gated Adaptive Coco
 | Stage | Status |
 |---|---|
 | Stages 0–9 | ✅ COMPLETE |
-| Stage 10 | 🔄 IN PROGRESS — waiting on Kaggle GPU quota |
-| DGAC | ⬜ BLOCKED until Stage 10 quality gate; CPU-smoke workflow gate already passed live |
+| Stage 10 | ✅ COMPLETE — terminal DiLoCo anchor uploaded (2026-05-09) |
+| DGAC | 🟡 MANUAL QUALITY GATE — launch explicitly after final Stage 10 anchor review |
 
-**Compute:** DiLoCo dynamic workers with attendance/waiting fallback. Current stage 10 Hub state shows Worker A contributed 10,912 samples; A/B/C dispatch attempts are blocked by weekly GPU quota.
+**Compute:** DiLoCo dynamic workers with attendance/waiting fallback. The 2026-05-09 coordinator run aggregated Workers A/B/C for stage 10 round 2, reached 36,906/36,906 stage samples, uploaded the terminal DiLoCo anchor, and stopped at the DGAC manual gate with no stage-11 dispatch.
 
 ---
 
-## DGAC Launch Command (Phase 3.4 — after stage 10)
+## DGAC Launch Command (Phase 3.4 — after Stage 10 quality review)
 
 ```bash
 torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \

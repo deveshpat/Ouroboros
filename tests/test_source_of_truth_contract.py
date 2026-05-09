@@ -117,3 +117,28 @@ def test_completed_cpu_smoke_prd_and_plan_are_promoted_to_wiki_and_retired():
         REPO_ROOT / "plans" / "dgac-readiness-cpu-smoke.md",
     ]
     assert not any(path.exists() for path in obsolete_paths)
+
+def test_stage_10_terminal_gate_is_reflected_in_source_of_truth_docs():
+    blueprint = (REPO_ROOT / "BLUEPRINT.md").read_text(encoding="utf-8")
+    status = (REPO_ROOT / "wiki" / "STATUS.md").read_text(encoding="utf-8")
+    session_log = (REPO_ROOT / "wiki" / "SessionLog.md").read_text(encoding="utf-8")
+    terminal_log = (REPO_ROOT / "terminal_log.md").read_text(encoding="utf-8")
+
+    assert "| Stage 10 | ✅ COMPLETE" in blueprint
+    assert "| DGAC | 🟡 MANUAL QUALITY GATE" in blueprint
+    assert "36,906/36,906" in blueprint
+    assert "waiting on Kaggle GPU quota" not in blueprint
+
+    curriculum_section = status.split("## Curriculum Progress", 1)[1].split("## Engineering Architecture Status", 1)[0]
+    assert "| 10 — 10 latent passes | ✅ COMPLETE" in curriculum_section
+    assert "36,906/36,906" in curriculum_section
+    assert "Current gate" in curriculum_section
+    assert "IN PROGRESS" not in curriculum_section
+    assert "Current blocker" not in curriculum_section
+
+    assert "mode=terminal" in status
+    assert "dgac_manual_gate=true" in status
+    assert "Stage 10 terminal aggregation" in status
+    assert "Stage 10 terminal aggregation → DGAC manual gate" in session_log
+    assert "Stage 10 COMPLETE (36906/36906 samples)" in terminal_log
+    assert "no stage-11 DiLoCo dispatch will run" in terminal_log
