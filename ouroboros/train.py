@@ -1189,10 +1189,10 @@ def run_cli(args: argparse.Namespace, *, script_start: float) -> None:
     distributed = world_size > 1
     is_main = rank == 0
 
-    if args.diloco_mode and args.use_halt_gate:
+    if args.diloco_mode and args.use_halt_gate and not getattr(args, "resume_from_diloco_anchor", False):
         raise ValueError(
-            "--diloco_mode and --use_halt_gate should not be combined. "
-            "DiLoCo syncs LoRA adapters only; DGAC should stay on the sequential path."
+            "--diloco_mode + --use_halt_gate is only supported for DGAC DiLoCo "
+            "workers launched with --resume_from_diloco_anchor."
         )
 
     if distributed:

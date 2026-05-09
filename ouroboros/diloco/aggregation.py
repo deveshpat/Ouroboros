@@ -76,6 +76,36 @@ def load_adapter_weights_cpu(repo_id: str, weights_path: str, token: str) -> Dic
     return result
 
 
+
+
+def load_torch_state_cpu(repo_id: str, file_path: str, token: str) -> Optional[Dict]:
+    """Load a torch state-dict artifact from Hub to CPU, returning None if absent."""
+    from huggingface_hub import hf_hub_download
+    import torch
+
+    def _download() -> Dict:
+        local = hf_hub_download(
+            repo_id=repo_id,
+            filename=file_path,
+            token=token,
+        )
+        return torch.load(local, map_location="cpu")
+
+    result = _retry_io(
+        f"Download torch state {file_path}",
+        _download,
+        swallow=True,
+        default=None,
+    )
+    return result
+
+
+def zero_like_state(reference: Dict) -> Dict:
+    """Create a zero-valued state dict matching a worker state dict."""
+    import torch
+
+    return {key: torch.zeros_like(value) for key, value in reference.items()}
+
 def weighted_average_deltas(
     anchor_weights: Dict,
     worker_weights: List[Dict],
@@ -136,6 +166,7 @@ def save_and_upload_anchor(
     repo_id: str,
     token: str,
     message: str,
+    halt_gate_state: Optional[Dict] = None,
 ) -> None:
     from huggingface_hub import HfApi
     from safetensors.torch import save_file
@@ -147,8 +178,14 @@ def save_and_upload_anchor(
         config_path = tmp_path / "adapter_config.json"
         save_file(new_weights, str(weights_path))
         config_path.write_text(json.dumps(anchor_adapter_config, indent=2), encoding="utf-8")
+        upload_files = ["adapter_model.safetensors", "adapter_config.json"]
+        if halt_gate_state is not None:
+            import torch
 
-        for fname in ["adapter_model.safetensors", "adapter_config.json"]:
+            torch.save(halt_gate_state, tmp_path / "halt_gate.pt")
+            upload_files.append("halt_gate.pt")
+
+        for fname in upload_files:
             _retry_io(
                 f"Upload anchor artifact {fname}",
                 lambda fname=fname: api.upload_file(

@@ -37,8 +37,10 @@ from ouroboros.diloco.aggregation import (
     ANCHOR_PREFIX,
     aggregate_worker_updates,
     load_adapter_weights_cpu,
+    load_torch_state_cpu,
     save_and_upload_anchor,
     weighted_average_deltas,
+    zero_like_state,
 )
 from ouroboros.diloco.dispatch import (
     WORKER_KAGGLE_SLUGS,
@@ -73,6 +75,8 @@ DILOCO_TERMINAL_STAGE = 10
 DILOCO_RUN_MODE = "diloco"
 DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
 DGAC_TRAIN_RUN_MODE = "dgac-train"
+DGAC_DILOCO_RUN_MODE = "dgac-diloco"
+DGAC_COMPLETE_MODE = "dgac-complete"
 
 
 def _retry_io(
@@ -219,12 +223,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kaggle_run_mode",
         default=os.environ.get("OUROBOROS_KAGGLE_RUN_MODE", DILOCO_RUN_MODE),
-        choices=[DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE, DGAC_TRAIN_RUN_MODE],
+        choices=[DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE, DGAC_TRAIN_RUN_MODE, DGAC_DILOCO_RUN_MODE],
         help=(
             "Kaggle notebook launch mode. Use 'dgac-anchor-eval' to push one "
             "GPU eval-only notebook for the terminal DiLoCo anchor; use "
-            "'dgac-train' to launch Phase 3.4 DGAC from the terminal anchor. "
-            "Both modes skip DiLoCo round_state reads/mutations."
+            "'dgac-train' to launch Phase 3.4 DGAC from the terminal anchor, "
+            "or 'dgac-diloco' to initialize DGAC as a DiLoCo worker round. "
+            "Anchor eval and dgac-train skip DiLoCo round_state mutations; dgac-diloco intentionally uses them."
         ),
     )
 
@@ -491,6 +496,18 @@ def _kaggle_dgac_worker_ids(args: argparse.Namespace) -> List[str]:
     return ["A"]
 
 
+def _kaggle_dgac_diloco_worker_ids(args: argparse.Namespace) -> List[str]:
+    if args.force_worker_ids:
+        requested = _ordered_unique_worker_ids(
+            [w.strip().upper() for w in str(args.force_worker_ids).split(",") if w.strip()]
+        )
+        if requested:
+            return requested
+    kaggle_creds = _build_kaggle_creds(args)
+    credentialed = [worker_id for worker_id in WORKER_IDS if kaggle_creds[worker_id][0] and kaggle_creds[worker_id][1]]
+    return credentialed or ["A"]
+
+
 def run_kaggle_anchor_eval(args: argparse.Namespace) -> None:
     worker_ids = _kaggle_eval_worker_ids(args)
     kaggle_creds = _build_kaggle_creds(args)
@@ -545,6 +562,102 @@ def run_kaggle_dgac_train(args: argparse.Namespace) -> None:
         "[kaggle-dgac] Dispatch accepted by Kaggle. Monitor the Kaggle kernel, "
         "W&B train/val/gen metrics, and Hub runs/stage3_dgac checkpoints; "
         "this mode does not mutate DiLoCo round_state."
+    )
+
+
+def _initial_dgac_diloco_state(
+    *,
+    previous_state: Optional[Dict[str, Any]],
+    worker_ids: List[str],
+    projected_shards: Dict[str, int],
+    seed: int,
+) -> Dict[str, Any]:
+    previous_state = dict(previous_state or {})
+    return {
+        "stage_k": DILOCO_TERMINAL_STAGE,
+        "round_n": 0,
+        "mode": DGAC_DILOCO_RUN_MODE,
+        "triggered_workers": worker_ids,
+        "attendance_workers": [],
+        "projected_shards": projected_shards,
+        "anchor_path": ANCHOR_PREFIX,
+        "total_samples_seen": {str(DILOCO_TERMINAL_STAGE): 0},
+        "completed_stages": sorted({int(x) for x in previous_state.get("completed_stages", [])} | {DILOCO_TERMINAL_STAGE}),
+        "dgac_manual_gate": False,
+        "dgac_diloco": True,
+        "pre_dgac_total_samples_seen": previous_state.get("total_samples_seen", {}),
+        "last_updated": time.time(),
+        "triggered_at": time.time(),
+        "dispatch_failures": [],
+        "last_round_workers": [],
+        "last_round_samples": 0,
+        "seed": seed,
+    }
+
+
+def run_kaggle_dgac_diloco(args: argparse.Namespace) -> None:
+    worker_ids = _kaggle_dgac_diloco_worker_ids(args)
+    kaggle_creds = _build_kaggle_creds(args)
+    seed = int(getattr(args, "seed", 42))
+    projected_shards = _compute_projected_shards(
+        total_samples=args.total_train_samples,
+        stage_k=DILOCO_TERMINAL_STAGE,
+        round_n=0,
+        seed=seed,
+        total_samples_seen=0,
+    )
+    print(
+        "[kaggle-dgac-diloco] Initializing Phase 3.4 DGAC as a DiLoCo round "
+        f"workers={worker_ids} repo={args.repo_id}"
+    )
+    if args.dry_run:
+        print("[kaggle-dgac-diloco] DRY RUN — no round_state mutation or Kaggle dispatch.")
+        print(f"  projected_shards={projected_shards}")
+        return
+
+    previous_state = hub_download_json(args.repo_id, ROUND_STATE_PATH, args.hf_token)
+    new_state = _initial_dgac_diloco_state(
+        previous_state=previous_state,
+        worker_ids=worker_ids,
+        projected_shards=projected_shards,
+        seed=seed,
+    )
+    hub_upload_json(
+        args.repo_id,
+        ROUND_STATE_PATH,
+        new_state,
+        args.hf_token,
+        message=f"DGAC DiLoCo start: workers={worker_ids}",
+    )
+
+    dispatch_results = trigger_kaggle_workers(
+        kaggle_creds,
+        active_workers=worker_ids,
+        notebook_path=Path(args.kaggle_notebook_path),
+        coordinator_args=args,
+    )
+    corrected_state = _reconcile_post_dispatch_state(
+        state=new_state,
+        planned_active_workers=worker_ids,
+        planned_attendance_workers=[],
+        dispatch_results=dispatch_results,
+    )
+    if corrected_state is not None:
+        hub_upload_json(
+            args.repo_id,
+            ROUND_STATE_PATH,
+            corrected_state,
+            args.hf_token,
+            message=f"DGAC DiLoCo dispatch reconcile: mode={corrected_state['mode']}",
+        )
+    if any(dispatch_results.get(worker_id) != "success" for worker_id in worker_ids):
+        raise RuntimeError(
+            "DGAC DiLoCo dispatch failed: "
+            f"{dispatch_results}"
+        )
+    print(
+        "[kaggle-dgac-diloco] Dispatch accepted. Worker signals will resume the "
+        "normal coordinator aggregation loop and aggregate adapter + HaltGate anchors."
     )
 
 
@@ -647,6 +760,9 @@ def main() -> None:
     if kaggle_run_mode == DGAC_TRAIN_RUN_MODE:
         run_kaggle_dgac_train(args)
         return
+    if kaggle_run_mode == DGAC_DILOCO_RUN_MODE:
+        run_kaggle_dgac_diloco(args)
+        return
 
     print("[coordinator] Reading round state...")
     state = hub_download_json(args.repo_id, ROUND_STATE_PATH, args.hf_token)
@@ -663,7 +779,14 @@ def main() -> None:
     expected_workers = _ordered_unique_worker_ids(state.get("triggered_workers"))
     seed = int(state.get("seed", 42))
     current_mode = state.get("mode", "diloco")
+    if bool(state.get("dgac_diloco")) and current_mode != DGAC_COMPLETE_MODE:
+        args.kaggle_run_mode = DGAC_DILOCO_RUN_MODE
     triggered_at = float(state.get("triggered_at", 0.0))
+
+    if current_mode == DGAC_COMPLETE_MODE or bool(state.get("dgac_diloco_complete")):
+        print(f"[coordinator] stage={stage_k} round={round_n} mode={current_mode}")
+        print("[coordinator] DGAC DiLoCo is complete. Review W&B/Hub final anchor before downstream packaging.")
+        return
 
     if current_mode == "terminal" or bool(state.get("dgac_manual_gate")):
         print(f"[coordinator] stage={stage_k} round={round_n} mode={current_mode}")
@@ -1134,11 +1257,23 @@ def main() -> None:
             )
             print("[coordinator] Loading worker weights...")
             worker_weights_list = []
+            worker_halt_gate_list = []
             worker_samples_list = []
+            requires_halt_gate = mode_this_round == DGAC_DILOCO_RUN_MODE or bool(state.get("dgac_diloco"))
             for status in contributing_workers:
                 worker_weights_list.append(
                     load_adapter_weights_cpu(args.repo_id, status["weights_path"], args.hf_token)
                 )
+                if requires_halt_gate:
+                    halt_gate_path = status.get("halt_gate_path")
+                    if not halt_gate_path:
+                        raise RuntimeError(
+                            f"DGAC DiLoCo worker {status.get('worker_id')} did not upload halt_gate.pt"
+                        )
+                    gate_state = load_torch_state_cpu(args.repo_id, halt_gate_path, args.hf_token)
+                    if gate_state is None:
+                        raise RuntimeError(f"DGAC DiLoCo missing halt gate artifact: {halt_gate_path}")
+                    worker_halt_gate_list.append(gate_state)
                 worker_samples_list.append(int(status["samples_seen"]))
 
             print("[coordinator] Aggregating on CPU...")
@@ -1151,6 +1286,22 @@ def main() -> None:
                 args.outer_lr,
                 mode=mode_this_round,
             )
+            new_halt_gate = None
+            if requires_halt_gate:
+                anchor_halt_gate = load_torch_state_cpu(
+                    args.repo_id,
+                    f"{ANCHOR_PREFIX}/halt_gate.pt",
+                    args.hf_token,
+                )
+                if anchor_halt_gate is None:
+                    anchor_halt_gate = zero_like_state(worker_halt_gate_list[0])
+                new_halt_gate = aggregate_worker_updates(
+                    anchor_halt_gate,
+                    worker_halt_gate_list,
+                    worker_samples_list,
+                    args.outer_lr,
+                    mode=mode_this_round,
+                )
 
             save_and_upload_anchor(
                 new_anchor,
@@ -1161,6 +1312,7 @@ def main() -> None:
                     f"DiLoCo anchor: stage {stage_k} round {round_n} "
                     f"({len(contributing_workers)} workers, {sum(worker_samples_list)} samples, mode={mode_this_round})"
                 ),
+                halt_gate_state=new_halt_gate,
             )
 
             # ── Update stage sample counts ───────────────────────────────────
@@ -1238,6 +1390,48 @@ def main() -> None:
         next_round_n = round_n + 1
         if stage_complete:
             if stage_k >= DILOCO_TERMINAL_STAGE:
+                if current_mode == DGAC_DILOCO_RUN_MODE or bool(state.get("dgac_diloco")):
+                    print(
+                        f"[coordinator] DGAC DiLoCo COMPLETE "
+                        f"({final_stage_samples}/{args.total_train_samples} samples)."
+                    )
+                    completed = sorted(set([int(stage) for stage in completed_stages] + [stage_k]))
+                    terminal_state = {
+                        **state,
+                        "stage_k": DILOCO_TERMINAL_STAGE,
+                        "round_n": 0,
+                        "mode": DGAC_COMPLETE_MODE,
+                        "triggered_workers": [],
+                        "attendance_workers": [],
+                        "projected_shards": {},
+                        "anchor_path": ANCHOR_PREFIX,
+                        "total_samples_seen": total_samples_seen,
+                        "completed_stages": completed,
+                        "dgac_manual_gate": False,
+                        "dgac_diloco": True,
+                        "dgac_diloco_complete": True,
+                        "last_updated": time.time(),
+                        "triggered_at": 0.0,
+                        "dispatch_failures": [],
+                        "last_round_workers": [w["worker_id"] for w in contributing_workers] if contributing_workers else [],
+                        "last_round_samples": sum(w.get("samples_seen", 0) for w in contributing_workers) if contributing_workers else 0,
+                        "seed": seed,
+                    }
+                    hub_upload_json(
+                        args.repo_id,
+                        ROUND_STATE_PATH,
+                        terminal_state,
+                        args.hf_token,
+                        message="DGAC DiLoCo complete: final anchor uploaded",
+                    )
+                    if coordinator_wandb_run is not None:
+                        import wandb
+                        wandb.log({"coordinator/dgac_diloco_complete": 1}, step=round_n)
+                        wandb.finish()
+                        coordinator_wandb_run = None
+                    print("[coordinator] Done (DGAC DiLoCo complete).")
+                    return
+
                 print(
                     f"[coordinator] Stage {stage_k} COMPLETE "
                     f"({final_stage_samples}/{args.total_train_samples} samples). "
@@ -1312,6 +1506,9 @@ def main() -> None:
             "anchor_path": ANCHOR_PREFIX,
             "total_samples_seen": total_samples_seen,
             "completed_stages": completed_stages,
+            "dgac_manual_gate": False if bool(state.get("dgac_diloco")) else bool(state.get("dgac_manual_gate", False)),
+            "dgac_diloco": bool(state.get("dgac_diloco", False)),
+            "pre_dgac_total_samples_seen": state.get("pre_dgac_total_samples_seen", {}),
             "last_updated": time.time(),
             "triggered_at": time.time() if (next_active_workers or next_attendance_workers) else 0.0,
             "last_round_workers": [w["worker_id"] for w in contributing_workers] if contributing_workers else [],

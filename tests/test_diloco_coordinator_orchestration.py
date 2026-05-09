@@ -151,6 +151,64 @@ def test_packaged_coordinator_dgac_anchor_eval_respects_force_worker_ids(monkeyp
     assert triggered == [["B"]]
 
 
+
+def test_packaged_coordinator_dgac_diloco_initializes_round_state_and_dispatches_all_forced_workers(monkeypatch):
+    monkeypatch.setattr(
+        coordinator,
+        "parse_args",
+        lambda: _args(
+            kaggle_run_mode="dgac-diloco",
+            force_worker_ids="A,C",
+            skip_trigger=False,
+            total_train_samples=9,
+        ),
+    )
+    triggered = []
+    uploads = []
+
+    def fake_trigger(kaggle_creds, *, active_workers, notebook_path, coordinator_args):
+        triggered.append((active_workers, notebook_path, coordinator_args.kaggle_run_mode))
+        return {worker_id: "success" for worker_id in active_workers}
+
+    monkeypatch.setattr(coordinator, "trigger_kaggle_workers", fake_trigger)
+    monkeypatch.setattr(coordinator, "hub_download_json", lambda *args, **kwargs: {
+        "stage_k": 10,
+        "round_n": 0,
+        "mode": "terminal",
+        "total_samples_seen": {"10": 36906},
+        "completed_stages": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    })
+    monkeypatch.setattr(coordinator, "hub_upload_json", lambda *args, **kwargs: uploads.append((args, kwargs)))
+
+    coordinator.main()
+
+    assert triggered == [(["A", "C"], Path("kaggle-utils.ipynb"), "dgac-diloco")]
+    state = uploads[0][0][2]
+    assert state["mode"] == "dgac-diloco"
+    assert state["triggered_workers"] == ["A", "C"]
+    assert state["dgac_diloco"] is True
+    assert state["total_samples_seen"] == {"10": 0}
+    assert state["pre_dgac_total_samples_seen"] == {"10": 36906}
+
+
+def test_initial_dgac_diloco_state_preserves_previous_totals_and_resets_stage_counter():
+    state = coordinator._initial_dgac_diloco_state(
+        previous_state={
+            "total_samples_seen": {"10": 36906},
+            "completed_stages": [0, 1, 10],
+        },
+        worker_ids=["A", "B", "C"],
+        projected_shards={"A": 3, "B": 3, "C": 3},
+        seed=123,
+    )
+
+    assert state["mode"] == "dgac-diloco"
+    assert state["total_samples_seen"] == {"10": 0}
+    assert state["pre_dgac_total_samples_seen"] == {"10": 36906}
+    assert state["completed_stages"] == [0, 1, 10]
+    assert state["triggered_workers"] == ["A", "B", "C"]
+    assert state["seed"] == 123
+
 def test_packaged_coordinator_cpu_smoke_validation_defaults_to_worker_a_and_polls_remote_status(monkeypatch):
     monkeypatch.setattr(
         coordinator,

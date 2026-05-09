@@ -16,7 +16,13 @@ _VALID_DILOCO_WORKER_IDS = {"A", "B", "C"}
 DILOCO_RUN_MODE = "diloco"
 DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
 DGAC_TRAIN_RUN_MODE = "dgac-train"
-_VALID_KAGGLE_RUN_MODES = {DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE, DGAC_TRAIN_RUN_MODE}
+DGAC_DILOCO_RUN_MODE = "dgac-diloco"
+_VALID_KAGGLE_RUN_MODES = {
+    DILOCO_RUN_MODE,
+    DGAC_ANCHOR_EVAL_RUN_MODE,
+    DGAC_TRAIN_RUN_MODE,
+    DGAC_DILOCO_RUN_MODE,
+}
 
 
 def _normalize_text(value: object | None, *, uppercase: bool = False) -> Optional[str]:
@@ -103,8 +109,17 @@ def build_diloco_training_command(
     output_dir: str = "runs/diloco",
     push_to_hub: bool = True,
     wandb_mode: str | None = None,
+    use_halt_gate: bool = False,
+    resume_from_diloco_anchor: bool = False,
+    max_grad_norm: float | None = None,
 ) -> list[str]:
-    """Build the tested Kaggle Dual-GPU DiLoCo training command."""
+    """Build the tested Kaggle Dual-GPU DiLoCo training command.
+
+    When use_halt_gate/resume_from_diloco_anchor are enabled, the same
+    DiLoCo worker contract is used for DGAC shard training: workers load the
+    terminal anchor, train HaltGate + adapters on their shard, then upload
+    worker artifacts for coordinator aggregation.
+    """
     normalized_worker_id = _normalize_text(worker_id, uppercase=True)
     if normalized_worker_id not in _VALID_DILOCO_WORKER_IDS:
         raise ValueError(
@@ -121,6 +136,10 @@ def build_diloco_training_command(
     ]
     if use_4bit:
         command.append("--use_4bit")
+    if use_halt_gate:
+        command.append("--use_halt_gate")
+    if resume_from_diloco_anchor:
+        command.append("--resume_from_diloco_anchor")
     command.extend(
         [
             "--stage_0_epochs",
@@ -152,6 +171,8 @@ def build_diloco_training_command(
             diloco_signal_repo,
         ]
     )
+    if max_grad_norm is not None:
+        command.extend(["--max_grad_norm", str(float(max_grad_norm))])
     if push_to_hub:
         command.append("--push_to_hub")
     command.extend(["--output_dir", output_dir])
@@ -309,6 +330,7 @@ def format_shell_command(command: list[str]) -> str:
 __all__ = [
     "DGAC_ANCHOR_EVAL_RUN_MODE",
     "DGAC_TRAIN_RUN_MODE",
+    "DGAC_DILOCO_RUN_MODE",
     "DILOCO_RUN_MODE",
     "build_dgac_anchor_eval_command",
     "build_dgac_training_command",

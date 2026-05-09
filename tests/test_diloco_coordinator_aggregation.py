@@ -91,3 +91,17 @@ def test_aggregate_worker_updates_promotes_single_or_solo_worker_directly():
 def test_aggregate_worker_updates_rejects_empty_contributor_list():
     with pytest.raises(ValueError, match="worker_weights must contain"):
         aggregation.aggregate_worker_updates({"x": torch.tensor([1.0])}, [], [], 0.7)
+
+
+def test_zero_like_state_matches_worker_halt_gate_state():
+    reference = {
+        "gate.weight": torch.tensor([[1.0, -2.0]], dtype=torch.float32),
+        "gate.bias": torch.tensor([3.0], dtype=torch.float16),
+    }
+
+    zeroed = aggregation.zero_like_state(reference)
+
+    assert set(zeroed) == set(reference)
+    for key, value in reference.items():
+        assert zeroed[key].dtype == value.dtype
+        torch.testing.assert_close(zeroed[key], torch.zeros_like(value))

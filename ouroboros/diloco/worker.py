@@ -112,6 +112,7 @@ def diloco_upload_worker_state(
     samples_seen: int,
     hf_token: str,
     repo_id: str,
+    halt_gate=None,
 ) -> None:
     """
     Upload worker adapter weights and status to Hub.
@@ -125,7 +126,14 @@ def diloco_upload_worker_state(
     api = HfApi(token=hf_token)
     remote_prefix = f"diloco_state/workers/{worker_id}/round_{round_n:04d}_stage_{stage_k}"
 
-    for fname in ["adapter_model.safetensors", "adapter_config.json"]:
+    if halt_gate is not None:
+        torch.save(halt_gate.state_dict(), adapter_dir / "halt_gate.pt")
+
+    uploaded_files = ["adapter_model.safetensors", "adapter_config.json"]
+    if (adapter_dir / "halt_gate.pt").exists():
+        uploaded_files.append("halt_gate.pt")
+
+    for fname in uploaded_files:
         fpath = adapter_dir / fname
         if fpath.exists():
             retry_io(
@@ -149,6 +157,8 @@ def diloco_upload_worker_state(
         "timestamp": time.time(),
         "weights_path": remote_prefix,
     }
+    if (adapter_dir / "halt_gate.pt").exists():
+        status["halt_gate_path"] = f"{remote_prefix}/halt_gate.pt"
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tf:
         json.dump(status, tf, indent=2)
         tmp_path = tf.name
@@ -174,9 +184,12 @@ def diloco_download_anchor(
     repo_id: str,
     anchor_path: str,
     device: torch.device,
+    halt_gate=None,
 ) -> None:
     """
     Download anchor adapter weights from Hub and load them into the model in-place.
+    If a DGAC halt gate is supplied, also attempts to load anchor_path/halt_gate.pt;
+    absence is allowed so the first DGAC DiLoCo round can start from zero-init.
     Falls back silently if no anchor exists (first round uses random init).
     """
     try:
@@ -196,6 +209,29 @@ def diloco_download_anchor(
         retry_io(f"  [diloco] Download anchor {anchor_path}", _download, verbose=_is_main_process())
         if _is_main_process():
             print(f"  [diloco] Loaded anchor weights from {anchor_path}")
+
+        if halt_gate is not None:
+            def _download_halt_gate() -> None:
+                from huggingface_hub import hf_hub_download
+
+                gate_path = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=f"{anchor_path}/halt_gate.pt",
+                    token=hf_token,
+                )
+                halt_gate.load_state_dict(torch.load(gate_path, map_location=device))
+
+            gate_loaded = retry_io(
+                f"  [diloco] Download halt gate {anchor_path}",
+                _download_halt_gate,
+                swallow=True,
+                default=False,
+                verbose=_is_main_process(),
+            )
+            if gate_loaded is not False and _is_main_process():
+                print(f"  [diloco] Loaded halt gate from {anchor_path}/halt_gate.pt")
+            elif _is_main_process():
+                print("  [diloco] No halt gate anchor found; using zero-init HaltGate.")
     except Exception as exc:
         if _is_main_process():
             print(f"  [diloco] No anchor found at {anchor_path} ({exc}); using current weights.")
@@ -337,11 +373,10 @@ def run_diloco_worker(
     wandb_run,
     hf_token: str,
 ) -> Dict[str, Any]:
-    if args.use_halt_gate:
-        raise ValueError(
-            "DiLoCo mode currently syncs LoRA adapter weights only. "
-            "DGAC halt-gate training should remain on the sequential path."
-        )
+    if args.use_halt_gate and halt_gate is None:
+        raise ValueError("--use_halt_gate in DiLoCo mode requires a HaltGate instance")
+    if args.use_halt_gate and not getattr(args, "resume_from_diloco_anchor", False):
+        raise ValueError("DGAC DiLoCo requires --resume_from_diloco_anchor so workers share the terminal anchor")
     if args.diloco_worker_id is None:
         raise ValueError("--diloco_worker_id required with --diloco_mode")
     if not hf_token:
@@ -400,7 +435,7 @@ def run_diloco_worker(
                 f"  [diloco] Worker {args.diloco_worker_id} in attendance mode — "
                 f"signaling presence (no training this round)."
             )
-            diloco_download_anchor(model, hf_token, args.diloco_state_repo, anchor_path, device)
+            diloco_download_anchor(model, hf_token, args.diloco_state_repo, anchor_path, device, halt_gate=halt_gate)
 
             _attend_dir = (
                 output_dir / "diloco_worker_upload"
@@ -416,6 +451,7 @@ def run_diloco_worker(
                 samples_seen=0,
                 hf_token=hf_token,
                 repo_id=args.diloco_state_repo,
+                halt_gate=halt_gate if args.use_halt_gate else None,
             )
             github_token = _resolve_github_token_common()
             if github_token and args.diloco_signal_repo:
@@ -447,11 +483,11 @@ def run_diloco_worker(
         print(f"  [diloco] Worker {args.diloco_worker_id} | stage={stage_k} round={round_n}")
         if args.push_to_hub:
             print("  [diloco] Regular stage checkpoint Hub sync is disabled in DiLoCo mode; worker uploads go to diloco_state/ only.")
-        diloco_download_anchor(model, hf_token, args.diloco_state_repo, anchor_path, device)
+        diloco_download_anchor(model, hf_token, args.diloco_state_repo, anchor_path, device, halt_gate=halt_gate)
     barrier()
 
     if _world_size() > 1:
-        broadcast_parameters(get_trainable_parameters(model, None), src=0)
+        broadcast_parameters(get_trainable_parameters(model, halt_gate if args.use_halt_gate else None), src=0)
         barrier()
 
     stage_samples_seen = int(round_state.get("total_samples_seen", {}).get(str(stage_k), 0))
@@ -490,6 +526,7 @@ def run_diloco_worker(
                 samples_seen=0,
                 hf_token=hf_token,
                 repo_id=args.diloco_state_repo,
+                halt_gate=halt_gate if args.use_halt_gate else None,
             )
             github_token = _resolve_github_token_common()
             if github_token and args.diloco_signal_repo:
@@ -546,7 +583,7 @@ def run_diloco_worker(
                     "stage_k": stage_k,
                     "round_n": round_n,
                     "worker_id": args.diloco_worker_id,
-                    "mode": "diloco",
+                    "mode": "dgac-diloco" if args.use_halt_gate else "diloco",
                     "shard_step_estimate": shard_step_estimate,
                     "wandb_round_step_span": round_step_span,
                     "remaining_stage_samples": remaining_stage_samples,
@@ -575,7 +612,7 @@ def run_diloco_worker(
             stage_k=stage_k,
             device=device,
             args=args,
-            halt_gate=None,
+            halt_gate=halt_gate if args.use_halt_gate else None,
         )
         if _is_main_process():
             print(f"  [diloco] Pre-training val: stage={stage_k} ce={val_ce:.4f} acc={val_acc:.4f}")
@@ -598,9 +635,10 @@ def run_diloco_worker(
     original_gen_every_stage = args.gen_every_stage
 
     args.push_to_hub = False
-    args.epochs_per_stage = 1
-    if stage_k == 0:
-        args.stage_0_epochs = 1
+    if not args.use_halt_gate:
+        args.epochs_per_stage = 1
+        if stage_k == 0:
+            args.stage_0_epochs = 1
     args.gen_every_stage = False
 
     try:
@@ -609,7 +647,7 @@ def run_diloco_worker(
         result = run_training_stages(
             model=model,
             tokenizer=tokenizer,
-            halt_gate=None,
+            halt_gate=halt_gate if args.use_halt_gate else None,
             train_samples=train_shard,
             val_samples=val_samples,
             lat_token_id=lat_token_id,
@@ -656,6 +694,7 @@ def run_diloco_worker(
             samples_seen=samples_seen_this_round,
             hf_token=hf_token,
             repo_id=args.diloco_state_repo,
+            halt_gate=halt_gate if args.use_halt_gate else None,
         )
 
         github_token = _resolve_github_token_common()

@@ -4,6 +4,7 @@ import os
 
 from ouroboros.kaggle import (
     DGAC_ANCHOR_EVAL_RUN_MODE,
+    DGAC_DILOCO_RUN_MODE,
     DGAC_TRAIN_RUN_MODE,
     DILOCO_RUN_MODE,
     build_dgac_anchor_eval_command,
@@ -76,10 +77,30 @@ def test_build_diloco_training_command_allows_safe_overrides():
 
 
 
+
+def test_build_diloco_training_command_can_launch_dgac_diloco_worker():
+    command = build_diloco_training_command(
+        worker_id="c",
+        epochs_per_stage=3,
+        output_dir="runs/dgac_diloco",
+        use_halt_gate=True,
+        resume_from_diloco_anchor=True,
+        max_grad_norm=0.3,
+    )
+
+    assert "--diloco_mode" in command
+    assert "--use_halt_gate" in command
+    assert "--resume_from_diloco_anchor" in command
+    assert command[command.index("--diloco_worker_id") + 1] == "C"
+    assert command[command.index("--epochs_per_stage") + 1] == "3"
+    assert command[command.index("--max_grad_norm") + 1] == "0.3"
+    assert command[command.index("--output_dir") + 1] == "runs/dgac_diloco"
+
 def test_resolve_kaggle_run_mode_defaults_to_diloco_and_accepts_dgac_modes():
     assert resolve_kaggle_run_mode({}) == DILOCO_RUN_MODE
     assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "dgac-anchor-eval"}) == DGAC_ANCHOR_EVAL_RUN_MODE
     assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "dgac-train"}) == DGAC_TRAIN_RUN_MODE
+    assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "dgac-diloco"}) == DGAC_DILOCO_RUN_MODE
     assert resolve_kaggle_run_mode({"OUROBOROS_RUN_MODE": "DILOCO"}) == DILOCO_RUN_MODE
 
     try:

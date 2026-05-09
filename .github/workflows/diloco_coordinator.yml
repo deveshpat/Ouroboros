@@ -28,7 +28,7 @@ on:
         required: false
         default: ''
       kaggle_run_mode:
-        description: 'Kaggle launch mode. Use "diloco" for normal coordinator dispatch, "dgac-anchor-eval" for terminal Stage-10 eval-only, or "dgac-train" for Phase 3.4 DGAC launch.'
+        description: 'Kaggle launch mode. Use "diloco" for normal coordinator dispatch, "dgac-anchor-eval" for terminal Stage-10 eval-only, "dgac-train" for sequential DGAC fallback, or "dgac-diloco" for parallel DGAC worker rounds.'
         required: false
         default: 'dgac-train'
       attendance_join_grace_minutes:

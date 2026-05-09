@@ -103,12 +103,15 @@ def test_workflow_dispatch_exposes_dgac_anchor_eval_and_train_gates():
     assert "kaggle_run_mode" in workflow
     assert "dgac-anchor-eval" in workflow
     assert "dgac-train" in workflow
+    assert "dgac-diloco" in workflow
     assert "OUROBOROS_KAGGLE_RUN_MODE" in workflow
     assert "--kaggle_run_mode" in workflow
     assert "OUROBOROS_KAGGLE_RUN_MODE" in notebook
     assert "--resume_from_diloco_anchor" in notebook
     assert "--eval_only" in notebook
     assert "runs/stage3_dgac" in notebook
+    assert "DGAC_DILOCO_RUN_MODE" in notebook
+    assert "runs/dgac_diloco" in notebook
 
 
 def test_completed_cpu_smoke_prd_and_plan_are_promoted_to_wiki_and_retired():

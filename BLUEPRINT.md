@@ -47,6 +47,29 @@ Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle
 
 ## DGAC Launch Command (Phase 3.4 — Stage 10 quality gate passed)
 
+**Recommended path: parallel DGAC DiLoCo.** Cancel/stop any older single-worker `dgac-train` Kaggle run before using this, otherwise it will burn quota while the parallel workers train from the same anchor. This path initializes `round_state` for DGAC, resets the Stage-10 DGAC sample counter to 0 while preserving the pre-DGAC totals under `pre_dgac_total_samples_seen`, dispatches all selected workers, and aggregates both LoRA adapter weights and `halt_gate.pt` into `diloco_state/anchor`.
+
+Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-diloco`, `force_worker_ids=A,B,C` (or empty to use every credentialed worker), `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. Worker signals resume the normal coordinator loop until DGAC reaches 36,906/36,906 Stage-10 samples and writes `mode=dgac-complete`.
+
+Equivalent worker command shape:
+
+```bash
+torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
+  --data_dir data/coconut_v1 --use_4bit \
+  --use_halt_gate --resume_from_diloco_anchor \
+  --stage_0_epochs 1 --epochs_per_stage 3 --max_stage 10 --max_grad_norm 0.3 \
+  --batch_size 4 --grad_accum 8 --val_batch_size 2 \
+  --val_skip_buffer_minutes 60 \
+  --session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 \
+  --diloco_mode --diloco_worker_id "$DILOCO_WORKER_ID" \
+  --diloco_outer_lr "$OUROBOROS_DILOCO_OUTER_LR" \
+  --diloco_state_repo WeirdRunner/Ouroboros \
+  --diloco_signal_repo deveshpat/Ouroboros \
+  --push_to_hub --output_dir runs/dgac_diloco
+```
+
+**Fallback path: sequential single-worker DGAC.** Use only when you intentionally want one worker to train DGAC without mutating DiLoCo `round_state`.
+
 ```bash
 torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --use_halt_gate --resume_from_diloco_anchor \
@@ -60,7 +83,7 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --wandb_project "ouroboros-stage3-jamba"
 ```
 
-Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-train`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. This pushes one GPU Kaggle notebook for Phase 3.4 DGAC training, loads the terminal DiLoCo anchor, writes local checkpoints under `runs/stage3_dgac`, pushes Hub checkpoints under `runs/stage3_dgac`, and does not mutate DiLoCo `round_state`.
+Workflow fallback: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-train`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. This pushes one GPU Kaggle notebook, loads the terminal DiLoCo anchor, writes local checkpoints under `runs/stage3_dgac`, pushes Hub checkpoints under `runs/stage3_dgac`, and does not mutate DiLoCo `round_state`.
 
 ---
 

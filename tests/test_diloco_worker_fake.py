@@ -10,7 +10,7 @@ import torch
 
 from ouroboros.diloco import worker as worker_module
 from ouroboros.diloco.shared import RoundState, ordered_unique_workers
-from tests.fakes.eval_fakes import FakeCausalLM, FakeTokenizer
+from tests.fakes.eval_fakes import FakeCausalLM, FakeHaltGate, FakeTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,7 +37,7 @@ def test_diloco_worker_core_ast_matches_monolith_source_of_truth():
         "samples_seen",
         "weights_path",
         "diloco_signal_repo",
-        "DGAC halt-gate training should remain on the sequential path",
+        "DGAC DiLoCo requires --resume_from_diloco_anchor",
     ):
         assert contract in modular_source
 
@@ -47,6 +47,7 @@ def _args(worker_id: str = "A", **overrides) -> argparse.Namespace:
         use_halt_gate=False,
         diloco_worker_id=worker_id,
         resume_from=None,
+        resume_from_diloco_anchor=False,
         diloco_state_repo="fake/state",
         diloco_signal_repo="fake/signal",
         seed=42,
@@ -166,7 +167,7 @@ def test_attendance_only_worker_uploads_zero_sample_status_without_training(monk
         "total_samples_seen": {},
         "seed": 42,
     })
-    monkeypatch.setattr(worker_module, "diloco_download_anchor", lambda *args: calls["download"].append(args))
+    monkeypatch.setattr(worker_module, "diloco_download_anchor", lambda *args, **kwargs: calls["download"].append((args, kwargs)))
     monkeypatch.setattr(worker_module, "diloco_upload_worker_state", lambda **kwargs: calls["upload"].append(kwargs))
     monkeypatch.setattr(worker_module, "_resolve_github_token_common", lambda: "gh_fake")
     monkeypatch.setattr(worker_module, "diloco_push_signal", lambda *args: calls["signal"].append(args))
@@ -207,7 +208,7 @@ def test_diloco_worker_fake_smoke_trains_uploads_status_and_never_uses_network(m
         "total_samples_seen": {},
         "seed": 42,
     })
-    monkeypatch.setattr(worker_module, "diloco_download_anchor", lambda *args: calls["download"].append(args))
+    monkeypatch.setattr(worker_module, "diloco_download_anchor", lambda *args, **kwargs: calls["download"].append((args, kwargs)))
     monkeypatch.setattr(worker_module, "diloco_upload_worker_state", lambda **kwargs: calls["upload"].append(kwargs))
     monkeypatch.setattr(worker_module, "_resolve_github_token_common", lambda: "gh_fake")
     monkeypatch.setattr(worker_module, "diloco_push_signal", lambda *args: calls["signal"].append(args))
@@ -244,12 +245,12 @@ def test_diloco_worker_fake_smoke_trains_uploads_status_and_never_uses_network(m
     assert calls["signal"]
 
 
-def test_diloco_rejects_halt_gate_combination():
-    with pytest.raises(ValueError, match="DGAC halt-gate"):
+def test_dgac_diloco_requires_resume_from_anchor():
+    with pytest.raises(ValueError, match="DGAC DiLoCo requires --resume_from_diloco_anchor"):
         worker_module.run_diloco_worker(
             model=FakeCausalLM(),
             tokenizer=FakeTokenizer(),
-            halt_gate=None,
+            halt_gate=FakeHaltGate(),
             train_samples=[],
             val_samples=[],
             curriculum_max_stage=0,
@@ -262,3 +263,66 @@ def test_diloco_rejects_halt_gate_combination():
             wandb_run=None,
             hf_token="hf_fake",
         )
+
+
+def test_dgac_diloco_worker_preserves_local_epochs_and_uploads_halt_gate(monkeypatch, tmp_path):
+    calls: dict[str, list] = {"download": [], "upload": [], "signal": [], "train": []}
+    monkeypatch.setattr(worker_module, "barrier", lambda: None)
+    monkeypatch.setattr(worker_module, "diloco_read_round_state", lambda hf_token, repo_id: {
+        "stage_k": 10,
+        "round_n": 0,
+        "mode": "dgac-diloco",
+        "anchor_path": "diloco_state/anchor",
+        "triggered_workers": ["A", "B", "C"],
+        "attendance_workers": [],
+        "total_samples_seen": {"10": 0},
+        "dgac_diloco": True,
+        "seed": 42,
+    })
+    monkeypatch.setattr(worker_module, "diloco_download_anchor", lambda *args, **kwargs: calls["download"].append((args, kwargs)))
+    monkeypatch.setattr(worker_module, "diloco_upload_worker_state", lambda **kwargs: calls["upload"].append(kwargs))
+    monkeypatch.setattr(worker_module, "_resolve_github_token_common", lambda: "gh_fake")
+    monkeypatch.setattr(worker_module, "diloco_push_signal", lambda *args: calls["signal"].append(args))
+
+    from ouroboros import train as train_module
+
+    def fake_run_training_stages(**kwargs):
+        calls["train"].append(kwargs)
+        assert kwargs["halt_gate"] is not None
+        assert kwargs["args"].epochs_per_stage == 3
+        return {
+            "samples_seen": len(kwargs["train_samples"]),
+            "global_step": 1,
+            "timeout_triggered": False,
+            "val_budget_triggered": False,
+            "stages": [10],
+        }
+
+    monkeypatch.setattr(train_module, "run_training_stages", fake_run_training_stages)
+
+    result = worker_module.run_diloco_worker(
+        model=FakeCausalLM(),
+        tokenizer=FakeTokenizer(),
+        halt_gate=FakeHaltGate(),
+        train_samples=[
+            {"question": f"Q{i}", "steps": ["s"], "answer_full": "a", "answer_norm": "a"}
+            for i in range(6)
+        ],
+        val_samples=[],
+        curriculum_max_stage=10,
+        lat_token_id=6,
+        pad_id=0,
+        args=_args(worker_id="A", use_halt_gate=True, resume_from_diloco_anchor=True, epochs_per_stage=3),
+        device=torch.device("cpu"),
+        output_dir=tmp_path,
+        session_start=time.perf_counter(),
+        wandb_run=None,
+        hf_token="hf_fake",
+    )
+
+    assert result["stage_k"] == 10
+    assert result["samples_seen"] > 0
+    assert calls["download"][0][1]["halt_gate"] is not None
+    assert calls["train"]
+    assert calls["upload"][0]["halt_gate"] is not None
+    assert calls["signal"]
