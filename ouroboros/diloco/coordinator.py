@@ -388,6 +388,7 @@ def _terminal_stage_state(
         "dgac_manual_gate": True,
         "last_updated": time.time(),
         "triggered_at": 0.0,
+        "dispatch_failures": [],
         "last_round_workers": last_round_workers,
         "last_round_samples": last_round_samples,
         "seed": seed,
@@ -634,7 +635,12 @@ def main() -> None:
                     "[coordinator] Waiting mode: no confirmed dispatch timestamp yet; "
                     "attempting attendance dispatch now."
                 )
-                new_state = {**state, "triggered_at": time.time(), "last_updated": time.time()}
+                new_state = {
+                    **state,
+                    "triggered_at": time.time(),
+                    "last_updated": time.time(),
+                    "dispatch_failures": [],
+                }
                 hub_upload_json(
                     args.repo_id,
                     ROUND_STATE_PATH,
@@ -672,7 +678,12 @@ def main() -> None:
                 print("[coordinator] Waiting mode: no responses yet, standing by.")
                 return
             print(f"[coordinator] Waiting mode: re-dispatching attendance to {attendance_workers_prev}")
-            new_state = {**state, "triggered_at": time.time(), "last_updated": time.time()}
+            new_state = {
+                **state,
+                "triggered_at": time.time(),
+                "last_updated": time.time(),
+                "dispatch_failures": [],
+            }
             hub_upload_json(
                 args.repo_id,
                 ROUND_STATE_PATH,
@@ -754,6 +765,7 @@ def main() -> None:
             "total_samples_seen": total_samples_seen,
             "last_updated": time.time(),
             "triggered_at": time.time(),
+            "dispatch_failures": [],
             "last_round_workers": responded_list,
             "last_round_samples": 0,
             "seed": seed,
@@ -893,6 +905,7 @@ def main() -> None:
                         "attendance_workers": repaired_attendance_workers,
                         "last_updated": time.time(),
                         "triggered_at": time.time(),
+                        "dispatch_failures": [],
                     }
                     hub_upload_json(
                         args.repo_id,
@@ -949,7 +962,12 @@ def main() -> None:
                         f"[coordinator] Round {round_n}: {missing_workers} marked triggered but "
                         f"triggered_at=0 (unconfirmed dispatch). Re-dispatching now."
                     )
-                    new_state = {**state, "triggered_at": time.time(), "last_updated": time.time()}
+                    new_state = {
+                        **state,
+                        "triggered_at": time.time(),
+                        "last_updated": time.time(),
+                        "dispatch_failures": [],
+                    }
                     hub_upload_json(
                         args.repo_id,
                         ROUND_STATE_PATH,

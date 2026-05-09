@@ -270,6 +270,7 @@ def test_force_repair_adds_missing_workers_without_dropping_active_worker(monkey
         "total_samples_seen": {"10": 0},
         "completed_stages": list(range(1, 10)),
         "seed": 42,
+        "dispatch_failures": ["A", "B", "C"],
     }
     monkeypatch.setattr(coordinator, "hub_download_json", lambda *args, **kwargs: state)
     monkeypatch.setattr(
@@ -303,6 +304,7 @@ def test_force_repair_adds_missing_workers_without_dropping_active_worker(monkey
     assert repaired_state["mode"] == "diloco"
     assert repaired_state["stage_k"] == 10
     assert repaired_state["round_n"] == 2
+    assert repaired_state["dispatch_failures"] == []
 
 
 def test_force_repair_abc_only_triggers_workers_missing_from_active_set(monkeypatch):
@@ -467,6 +469,7 @@ def test_stage_10_completion_enters_terminal_manual_gate_without_dispatch(monkey
         "total_samples_seen": {"10": 0},
         "completed_stages": list(range(1, 10)),
         "seed": 42,
+        "dispatch_failures": ["A", "B", "C"],
     }
     monkeypatch.setattr(coordinator, "hub_download_json", lambda *args, **kwargs: state)
     monkeypatch.setattr(
@@ -497,6 +500,7 @@ def test_stage_10_completion_enters_terminal_manual_gate_without_dispatch(monkey
     assert terminal_state["attendance_workers"] == []
     assert terminal_state["dgac_manual_gate"] is True
     assert terminal_state["triggered_at"] == 0.0
+    assert terminal_state["dispatch_failures"] == []
     assert 10 in terminal_state["completed_stages"]
 
 
