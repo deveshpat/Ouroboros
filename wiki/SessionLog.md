@@ -5,6 +5,18 @@
 
 ---
 
+## Session 27 — Stage 10 terminal anchor eval-only → DGAC cleared (2026-05-09) ✅
+
+**Evidence:** Kaggle GPU eval-only run loaded `WeirdRunner/Ouroboros/diloco_state/anchor` after the terminal DiLoCo aggregation and reported `stage=10 val_ce=0.4863 val_acc=0.0889`.
+
+**Generation check:** arithmetic/code/factual/explanatory prompts were coherent, with `Mean UWR=0.733`. All samples used `k_actual=10`, which is expected before DGAC because HaltGate starts at zero-init and has not learned adaptive halting yet.
+
+**Decision:** quality gate passes. Add workflow-dispatched `dgac-train` mode so Phase 3.4 can launch from GitHub Actions without manually editing the Kaggle notebook.
+
+**Next action:** run GitHub Actions → `coordinate` with `kaggle_run_mode=dgac-train`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`; monitor W&B train/val/gen metrics and Hub checkpoints under `runs/stage3_dgac`.
+
+---
+
 ## Session 26 — Stage 10 terminal aggregation → DGAC manual gate (2026-05-09) ✅
 
 **Evidence:** GitHub Actions coordinator log from 2026-05-09T17:35Z read `stage=10 round=2 mode=diloco`, projected final shards A=8,665, B=8,665, C=8,664, and found all three worker outputs ready.
@@ -13,7 +25,7 @@
 
 **Gate:** coordinator printed `Stage 10 COMPLETE (36906/36906 samples). Entering DGAC manual gate.`, then `Stage 10 is terminal for DiLoCo`, then `Done (DGAC manual gate)`. No stage-11 DiLoCo dispatch should run from cron.
 
-**Next action:** review final Stage 10 anchor quality, define DGAC go/no-go thresholds, then launch DGAC explicitly with `--resume_from_diloco_anchor` if quality passes.
+**Next action:** superseded by Session 27; terminal anchor quality passed and DGAC is cleared for explicit launch via `kaggle_run_mode=dgac-train`.
 
 **Artifact hygiene:** generated `signals/*.json` files remain disposable runtime doorbells. Keep only `signals/.gitkeep` in source.
 

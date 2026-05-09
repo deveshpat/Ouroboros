@@ -72,6 +72,7 @@ DEFAULT_IO_RETRY_BASE_DELAY_S = 1.5
 DILOCO_TERMINAL_STAGE = 10
 DILOCO_RUN_MODE = "diloco"
 DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
+DGAC_TRAIN_RUN_MODE = "dgac-train"
 
 
 def _retry_io(
@@ -218,11 +219,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kaggle_run_mode",
         default=os.environ.get("OUROBOROS_KAGGLE_RUN_MODE", DILOCO_RUN_MODE),
-        choices=[DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE],
+        choices=[DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE, DGAC_TRAIN_RUN_MODE],
         help=(
             "Kaggle notebook launch mode. Use 'dgac-anchor-eval' to push one "
-            "GPU eval-only notebook for the terminal DiLoCo anchor without "
-            "reading or mutating round_state."
+            "GPU eval-only notebook for the terminal DiLoCo anchor; use "
+            "'dgac-train' to launch Phase 3.4 DGAC from the terminal anchor. "
+            "Both modes skip DiLoCo round_state reads/mutations."
         ),
     )
 
@@ -476,6 +478,19 @@ def _kaggle_eval_worker_ids(args: argparse.Namespace) -> List[str]:
     return ["A"]
 
 
+def _kaggle_dgac_worker_ids(args: argparse.Namespace) -> List[str]:
+    if args.force_worker_ids:
+        requested = _ordered_unique_worker_ids(
+            [w.strip().upper() for w in str(args.force_worker_ids).split(",") if w.strip()]
+        )
+        if requested:
+            # DGAC is a single training job, not a DiLoCo quorum. Honor the first
+            # requested worker only to avoid duplicate jobs racing Hub checkpoint writes.
+            return [requested[0]]
+    # DGAC is a single training job, not a DiLoCo quorum. Default to Worker A.
+    return ["A"]
+
+
 def run_kaggle_anchor_eval(args: argparse.Namespace) -> None:
     worker_ids = _kaggle_eval_worker_ids(args)
     kaggle_creds = _build_kaggle_creds(args)
@@ -501,6 +516,35 @@ def run_kaggle_anchor_eval(args: argparse.Namespace) -> None:
     print(
         "[kaggle-eval] Dispatch accepted by Kaggle. Monitor the Kaggle kernel "
         "and W&B eval_only/* metrics; this mode does not mutate round_state."
+    )
+
+
+def run_kaggle_dgac_train(args: argparse.Namespace) -> None:
+    worker_ids = _kaggle_dgac_worker_ids(args)
+    kaggle_creds = _build_kaggle_creds(args)
+    print(
+        "[kaggle-dgac] Dispatching Phase 3.4 DGAC training notebook "
+        f"workers={worker_ids} repo={args.repo_id}"
+    )
+    if args.dry_run:
+        print("[kaggle-dgac] DRY RUN — no Kaggle dispatch.")
+        return
+
+    dispatch_results = trigger_kaggle_workers(
+        kaggle_creds,
+        active_workers=worker_ids,
+        notebook_path=Path(args.kaggle_notebook_path),
+        coordinator_args=args,
+    )
+    if any(dispatch_results.get(worker_id) != "success" for worker_id in worker_ids):
+        raise RuntimeError(
+            "DGAC training dispatch failed: "
+            f"{dispatch_results}"
+        )
+    print(
+        "[kaggle-dgac] Dispatch accepted by Kaggle. Monitor the Kaggle kernel, "
+        "W&B train/val/gen metrics, and Hub runs/stage3_dgac checkpoints; "
+        "this mode does not mutate DiLoCo round_state."
     )
 
 
@@ -596,8 +640,12 @@ def main() -> None:
         run_workflow_validation(args)
         return
 
-    if getattr(args, "kaggle_run_mode", DILOCO_RUN_MODE) == DGAC_ANCHOR_EVAL_RUN_MODE:
+    kaggle_run_mode = getattr(args, "kaggle_run_mode", DILOCO_RUN_MODE)
+    if kaggle_run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:
         run_kaggle_anchor_eval(args)
+        return
+    if kaggle_run_mode == DGAC_TRAIN_RUN_MODE:
+        run_kaggle_dgac_train(args)
         return
 
     print("[coordinator] Reading round state...")

@@ -21,7 +21,7 @@
 | 10 — 10 latent passes | ✅ COMPLETE | Stage 10 round 2 aggregated A/B/C (8,665 + 8,665 + 8,664 samples), reached 36,906/36,906 samples, uploaded terminal DiLoCo anchor, and entered DGAC manual gate |
 
 **Compute mode:** DiLoCo dynamic workers with attendance/waiting-mode fallback.
-**Current gate:** Stage 10 DiLoCo is complete. DGAC must be launched manually only after final anchor quality review; coordinator cron must not dispatch stage 11.
+**Current gate:** Stage 10 DiLoCo is complete and the final anchor eval-only quality review passed. DGAC is cleared for explicit workflow launch; coordinator cron must not dispatch stage 11.
 
 
 ---
@@ -45,9 +45,9 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 
 ## Immediate Next Steps
 
-1. **Run final Stage 10 anchor eval-only quality review** — W&B currently shows Stage 10 `pre_val` / accuracy only from the start of the stage, so run the `--eval_only --resume_from_diloco_anchor` command in `BLUEPRINT.md` before making the DGAC go/no-go decision.
-2. **Define DGAC go/no-go thresholds** — set stop/rollback criteria before launch: CE/accuracy collapse threshold, expected halt-step distribution checks, and minimum acceptable qualitative samples.
-3. **Launch DGAC explicitly if quality passes** — use the command in `BLUEPRINT.md`; coordinator cron has correctly stopped at `mode=terminal` / `dgac_manual_gate=true` and will not auto-dispatch stage 11.
+1. **Launch DGAC explicitly via workflow** — use GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-train`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. This pushes one GPU Kaggle notebook, loads the terminal anchor, writes local checkpoints under `runs/stage3_dgac`, and pushes Hub checkpoints under `runs/stage3_dgac`.
+2. **Monitor DGAC stop/rollback criteria** — halt if CE spikes materially above the Stage 10 terminal anchor baseline (`val_ce=0.4863`), generated samples collapse/repeat, GPU errors appear, or no healthy checkpoint is pushed before session timeout.
+3. **Review DGAC research signal** — inspect HaltGate behavior / halt-step distribution and compare post-DGAC `val_ce`, `val_acc`, and generations against the terminal anchor baseline.
 4. **Optional polish** — quiet expected Hugging Face 404 polling noise during validation artifact eventual consistency; not blocking because coordinator already verifies successfully.
 
 ---
@@ -59,6 +59,7 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 |---|---|---|
 | Stage 10 terminal aggregation | ✅ PASS | 2026-05-09 coordinator run read `stage=10 round=2`, found A/B/C ready, aggregated 3 workers on CPU, logged `samples_this_round=25994`, `total_samples_stage=36906`, `pct_stage_done=100`, and printed `Stage 10 COMPLETE ... Entering DGAC manual gate.` |
 | Stage 11 dispatch prevention | ✅ PASS | Same run printed `Stage 10 is terminal for DiLoCo` and `Done (DGAC manual gate)` after uploading the stage 10 round 2 anchor. |
+| Stage 10 terminal anchor eval-only | ✅ PASS | 2026-05-09 eval loaded `diloco_state/anchor`, reported `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples for arithmetic/code/factual/explanatory prompts, and `Mean UWR=0.733`; `k_actual=10` is expected before DGAC because HaltGate starts zero-init. |
 | GitHub Actions → Kaggle API dispatch | ✅ PASS | `coordinate #272`, `workflow_validate=cpu-smoke`, Worker A default, Kaggle kernel version 39 pushed |
 | Kaggle CPU validation branch | ✅ PASS | Notebook printed `[workflow-validate] CPU smoke validation complete`; exited with `SystemExit: 0` before `torchrun` |
 | Remote Hub validation artifact | ✅ PASS | `diloco_state/workflow_validation/25377312407-1/worker_A_status.json` and `worker_A_report.json` published |
@@ -86,9 +87,9 @@ WeirdRunner/Ouroboros/
 | Stage 2 DiLoCo: aggregated model vs sequential baseline? | 🟡 Pre-val acc rising monotonically — promising |
 | Stage 3 rounds 2–3: Worker A signals absent | 🟡 Solo/attendance handled correctly by coordinator |
 | TRC GPU quota conversion | 🟡 Email sent — awaiting |
-| DGAC halt_step distribution at K≥2 | 🔴 Open — primary research question (Phase 3.4) |
+| DGAC halt_step distribution at K≥2 | 🟡 Ready to measure — launch Phase 3.4 DGAC via `kaggle_run_mode=dgac-train` |
 | Worker quota for DiLoCo stage 10 | ✅ No longer blocking — final A/B/C round aggregated on 2026-05-09 |
-| Pre-val accuracy at stage 10: success threshold for DGAC? | 🔴 Open — define before Phase 3.4 |
+| Stage 10 terminal anchor quality gate | ✅ Passed — `val_ce=0.4863`, `val_acc=0.0889`, coherent generation, `Mean UWR=0.733` |
 | CPU-smoke end-to-end workflow gate before DGAC? | 🟢 Passed live — GitHub Actions `coordinate #272`, validation run `25377312407-1`, Worker A, Hub status/report verified |
 
 ---
@@ -108,7 +109,8 @@ WeirdRunner/Ouroboros/
 | val accuracy samples | 50 |
 | `--val_skip_buffer_minutes` | 60 |
 | NCCL timeout | `timedelta(hours=4)` |
-| `--epochs_per_stage` | 1 |
+| DiLoCo `--epochs_per_stage` | 1 |
+| DGAC `--epochs_per_stage` | 3 |
 | `--batch_size` | 4 (2 per GPU on Dual T4) |
 | amp_dtype T4 (sm75) | FP16 |
 | amp_dtype A100+ (sm80+) | BF16 |
@@ -129,7 +131,7 @@ WeirdRunner/Ouroboros/
 | `min_shard_samples` | 32 (1 optimizer step) |
 | Solo mode | 1 active worker → direct weight promotion |
 | Stage close | remaining < `min_shard_samples` per active worker |
-| `workflow_dispatch` inputs | `force_worker_ids`, `skip_trigger`, `dry_run`, `workflow_validate` |
+| `workflow_dispatch` inputs | `force_worker_ids`, `skip_trigger`, `dry_run`, `workflow_validate`, `kaggle_run_mode` |
 | Worker timeout threshold | 13h (Kaggle 12h wall + 1h grace) |
 | `triggered_at=0` semantics | Canonical "dispatch unconfirmed" signal → immediate re-dispatch. ✅ |
 | Attendance round | Worker in `attendance_workers` → skips training, uploads status(samples=0), pushes signal |

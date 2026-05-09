@@ -40,6 +40,21 @@ def test_kaggle_notebook_supports_dgac_anchor_eval_mode_without_diloco_training(
     assert "--eval_only" in source
     assert "--use_halt_gate" in source
     assert "runs/stage10_anchor_eval" in source
-    eval_branch = source.split("if run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:", 1)[1].split("elif run_mode == DILOCO_RUN_MODE:", 1)[0]
+    eval_branch = source.split("elif run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:", 1)[1].split("elif run_mode == DILOCO_RUN_MODE:", 1)[0]
     assert "--diloco_mode" not in eval_branch
     assert "--push_to_hub" not in eval_branch
+
+
+def test_kaggle_notebook_supports_dgac_training_mode_without_diloco_or_eval_only():
+    source = _notebook_source()
+
+    assert "DGAC_TRAIN_RUN_MODE" in source
+    assert "build_dgac_training_command" in source
+    assert "runs/stage3_dgac" in source
+    train_branch = source.split("if run_mode == DGAC_TRAIN_RUN_MODE:", 1)[1].split("elif run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:", 1)[0]
+    assert "--use_halt_gate" in train_branch
+    assert "--resume_from_diloco_anchor" in train_branch
+    assert "--push_to_hub" in train_branch
+    assert "--hf_stage_subdir" in train_branch
+    assert "--eval_only" not in train_branch
+    assert "--diloco_mode" not in train_branch

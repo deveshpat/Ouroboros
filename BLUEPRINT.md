@@ -18,9 +18,9 @@ Based on Meta's Coconut (arXiv:2412.06769) + DGAC (Diversity-Gated Adaptive Coco
 |---|---|
 | Stages 0–9 | ✅ COMPLETE |
 | Stage 10 | ✅ COMPLETE — terminal DiLoCo anchor uploaded (2026-05-09) |
-| DGAC | 🟡 MANUAL QUALITY GATE — launch explicitly after final Stage 10 anchor review |
+| DGAC | 🟢 CLEARED FOR LAUNCH — Stage 10 terminal anchor eval passed; launch explicitly via workflow |
 
-**Compute:** DiLoCo dynamic workers with attendance/waiting fallback. The 2026-05-09 coordinator run aggregated Workers A/B/C for stage 10 round 2, reached 36,906/36,906 stage samples, uploaded the terminal DiLoCo anchor, and stopped at the DGAC manual gate with no stage-11 dispatch.
+**Compute:** DiLoCo dynamic workers with attendance/waiting fallback. The 2026-05-09 coordinator run aggregated Workers A/B/C for stage 10 round 2, reached 36,906/36,906 stage samples, uploaded the terminal DiLoCo anchor, and stopped at the DGAC manual gate with no stage-11 dispatch. The follow-up anchor eval-only run loaded `diloco_state/anchor` and reported `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, and `Mean UWR=0.733`, so Phase 3.4 DGAC is cleared for explicit launch.
 
 ---
 
@@ -43,7 +43,9 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
 
 Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. This pushes one GPU Kaggle notebook in eval-only mode; it does not mutate `round_state` and still loads the latest anchor from `diloco_state/anchor` on Hub.
 
-## DGAC Launch Command (Phase 3.4 — after Stage 10 quality review)
+**Latest eval result:** PASS — `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, `Mean UWR=0.733`. `k_actual=10` for all samples is expected before DGAC because HaltGate starts at zero-init.
+
+## DGAC Launch Command (Phase 3.4 — Stage 10 quality gate passed)
 
 ```bash
 torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
@@ -57,6 +59,8 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --push_to_hub --output_dir runs/stage3_dgac \
   --wandb_project "ouroboros-stage3-jamba"
 ```
+
+Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-train`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. This pushes one GPU Kaggle notebook for Phase 3.4 DGAC training, loads the terminal DiLoCo anchor, writes local checkpoints under `runs/stage3_dgac`, pushes Hub checkpoints under `runs/stage3_dgac`, and does not mutate DiLoCo `round_state`.
 
 ---
 

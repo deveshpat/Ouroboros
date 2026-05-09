@@ -96,17 +96,19 @@ def test_workflow_dispatch_exposes_cpu_smoke_end_to_end_validation_gate():
 
 
 
-def test_workflow_dispatch_exposes_dgac_anchor_eval_gate():
+def test_workflow_dispatch_exposes_dgac_anchor_eval_and_train_gates():
     workflow = (REPO_ROOT / ".github" / "workflows" / "diloco_coordinator.yml").read_text(encoding="utf-8")
     notebook = (REPO_ROOT / "kaggle-utils.ipynb").read_text(encoding="utf-8")
 
     assert "kaggle_run_mode" in workflow
     assert "dgac-anchor-eval" in workflow
+    assert "dgac-train" in workflow
     assert "OUROBOROS_KAGGLE_RUN_MODE" in workflow
     assert "--kaggle_run_mode" in workflow
     assert "OUROBOROS_KAGGLE_RUN_MODE" in notebook
     assert "--resume_from_diloco_anchor" in notebook
     assert "--eval_only" in notebook
+    assert "runs/stage3_dgac" in notebook
 
 
 def test_completed_cpu_smoke_prd_and_plan_are_promoted_to_wiki_and_retired():
@@ -138,7 +140,7 @@ def test_stage_10_terminal_gate_is_reflected_in_source_of_truth_docs():
     terminal_log = (REPO_ROOT / "terminal_log.md").read_text(encoding="utf-8")
 
     assert "| Stage 10 | ✅ COMPLETE" in blueprint
-    assert "| DGAC | 🟡 MANUAL QUALITY GATE" in blueprint
+    assert "| DGAC | 🟢 CLEARED FOR LAUNCH" in blueprint
     assert "36,906/36,906" in blueprint
     assert "waiting on Kaggle GPU quota" not in blueprint
 
@@ -152,6 +154,8 @@ def test_stage_10_terminal_gate_is_reflected_in_source_of_truth_docs():
     assert "mode=terminal" in status
     assert "dgac_manual_gate=true" in status
     assert "Stage 10 terminal aggregation" in status
+    assert "Stage 10 terminal anchor eval-only" in status
     assert "Stage 10 terminal aggregation → DGAC manual gate" in session_log
-    assert "Stage 10 COMPLETE (36906/36906 samples)" in terminal_log
-    assert "no stage-11 DiLoCo dispatch will run" in terminal_log
+    assert "Stage 10 terminal anchor eval-only → DGAC cleared" in session_log
+    assert "[eval-only] stage=10 val_ce=0.4863 val_acc=0.0889" in terminal_log
+    assert "Mean UWR: 0.733" in terminal_log

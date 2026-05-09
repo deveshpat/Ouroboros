@@ -176,6 +176,28 @@ def test_runtime_env_can_select_dgac_anchor_eval_notebook_mode(monkeypatch):
     assert env["OUROBOROS_DILOCO_STATE_REPO"] == "state/repo"
 
 
+def test_runtime_env_can_select_dgac_training_notebook_mode(monkeypatch):
+    monkeypatch.delenv("OUROBOROS_KAGGLE_RUN_MODE", raising=False)
+
+    env = dispatch._build_worker_runtime_env(
+        argparse.Namespace(
+            hf_token="hf_fake",
+            wandb_key=None,
+            repo_id="state/repo",
+            outer_lr=0.7,
+            wandb_project=None,
+            wandb_entity=None,
+            workflow_validate=None,
+            workflow_validation_run_id=None,
+            kaggle_run_mode="dgac-train",
+        ),
+        "A",
+    )
+
+    assert env["OUROBOROS_KAGGLE_RUN_MODE"] == "dgac-train"
+    assert env["OUROBOROS_DILOCO_STATE_REPO"] == "state/repo"
+
+
 def test_stage_local_kaggle_kernel_inserts_dispatch_after_initial_markdown_and_writes_metadata(tmp_path):
     notebook_path = tmp_path / "kaggle-utils.ipynb"
     notebook_path.write_text(
@@ -406,3 +428,30 @@ def test_trigger_kaggle_workers_forwards_dgac_eval_run_mode_without_cpu_validati
 
     assert results == {"A": "success"}
     assert calls == [("A", {"WORKER_ID": "A", "OUROBOROS_KAGGLE_RUN_MODE": "dgac-anchor-eval"}, None)]
+
+
+def test_trigger_kaggle_workers_forwards_dgac_train_run_mode_without_cpu_validation(monkeypatch, tmp_path):
+    notebook_path = tmp_path / "kaggle-utils.ipynb"
+    notebook_path.write_text(json.dumps(_minimal_notebook([])), encoding="utf-8")
+    calls = []
+
+    def fake_trigger(worker_id, username, key, slug, *, notebook_path, injected_env=None, validation_mode=None):
+        calls.append((worker_id, injected_env, validation_mode))
+        return True
+
+    monkeypatch.setattr(dispatch, "_trigger_single_worker", fake_trigger)
+    monkeypatch.setattr(
+        dispatch,
+        "_build_worker_runtime_env",
+        lambda args, worker_id: {"WORKER_ID": worker_id, "OUROBOROS_KAGGLE_RUN_MODE": "dgac-train"},
+    )
+
+    results = dispatch.trigger_kaggle_workers(
+        {"A": ("weirdrunner", "key-a")},
+        active_workers=["A"],
+        notebook_path=notebook_path,
+        coordinator_args=argparse.Namespace(),
+    )
+
+    assert results == {"A": "success"}
+    assert calls == [("A", {"WORKER_ID": "A", "OUROBOROS_KAGGLE_RUN_MODE": "dgac-train"}, None)]

@@ -15,7 +15,8 @@ from typing import Optional
 _VALID_DILOCO_WORKER_IDS = {"A", "B", "C"}
 DILOCO_RUN_MODE = "diloco"
 DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
-_VALID_KAGGLE_RUN_MODES = {DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE}
+DGAC_TRAIN_RUN_MODE = "dgac-train"
+_VALID_KAGGLE_RUN_MODES = {DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE, DGAC_TRAIN_RUN_MODE}
 
 
 def _normalize_text(value: object | None, *, uppercase: bool = False) -> Optional[str]:
@@ -160,6 +161,79 @@ def build_diloco_training_command(
 
 
 
+def build_dgac_training_command(
+    *,
+    script: str = "jamba_coconut_finetune.py",
+    nproc_per_node: int = 2,
+    data_dir: str = "data/coconut_v1",
+    use_4bit: bool = True,
+    epochs_per_stage: int = 3,
+    max_stage: int = 10,
+    max_grad_norm: float = 0.3,
+    batch_size: int = 4,
+    grad_accum: int = 8,
+    val_batch_size: int = 2,
+    val_skip_buffer_minutes: int = 60,
+    session_timeout_hours: float = 12.0,
+    graceful_exit_buffer_minutes: int = 20,
+    diloco_state_repo: str = "WeirdRunner/Ouroboros",
+    output_dir: str = "runs/stage3_dgac",
+    hf_stage_subdir: str | None = None,
+    push_to_hub: bool = True,
+    wandb_project: str | None = "ouroboros-stage3-jamba",
+    wandb_entity: str | None = None,
+    wandb_mode: str | None = None,
+) -> list[str]:
+    """Build the tested Kaggle command for Phase 3.4 DGAC training."""
+    command = [
+        "torchrun",
+        "--standalone",
+        f"--nproc_per_node={int(nproc_per_node)}",
+        script,
+        "--use_halt_gate",
+        "--resume_from_diloco_anchor",
+        "--diloco_state_repo",
+        diloco_state_repo,
+        "--data_dir",
+        data_dir,
+    ]
+    if use_4bit:
+        command.append("--use_4bit")
+    command.extend(
+        [
+            "--epochs_per_stage",
+            str(int(epochs_per_stage)),
+            "--max_stage",
+            str(int(max_stage)),
+            "--max_grad_norm",
+            str(float(max_grad_norm)),
+            "--batch_size",
+            str(int(batch_size)),
+            "--grad_accum",
+            str(int(grad_accum)),
+            "--val_batch_size",
+            str(int(val_batch_size)),
+            "--val_skip_buffer_minutes",
+            str(int(val_skip_buffer_minutes)),
+            "--session_timeout_hours",
+            str(float(session_timeout_hours)),
+            "--graceful_exit_buffer_minutes",
+            str(int(graceful_exit_buffer_minutes)),
+        ]
+    )
+    if push_to_hub:
+        command.append("--push_to_hub")
+    command.extend(["--output_dir", output_dir])
+    command.extend(["--hf_stage_subdir", hf_stage_subdir or output_dir])
+    if wandb_project is not None:
+        command.extend(["--wandb_project", wandb_project])
+    if wandb_entity is not None:
+        command.extend(["--wandb_entity", wandb_entity])
+    if wandb_mode is not None:
+        command.extend(["--wandb_mode", wandb_mode])
+    return command
+
+
 def build_dgac_anchor_eval_command(
     *,
     script: str = "jamba_coconut_finetune.py",
@@ -234,8 +308,10 @@ def format_shell_command(command: list[str]) -> str:
 
 __all__ = [
     "DGAC_ANCHOR_EVAL_RUN_MODE",
+    "DGAC_TRAIN_RUN_MODE",
     "DILOCO_RUN_MODE",
     "build_dgac_anchor_eval_command",
+    "build_dgac_training_command",
     "build_diloco_training_command",
     "format_shell_command",
     "kaggle_secret_presence",
