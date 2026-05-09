@@ -6,9 +6,9 @@ on:
       - main
     paths:
       - 'signals/*.json'
-  #schedule:
+  schedule:
     # Watchdog for missed GitHub signals and worker-timeout demotion.
-    #- cron: '*/30 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       force_worker_ids:
@@ -30,7 +30,7 @@ on:
       kaggle_run_mode:
         description: 'Kaggle launch mode. Use "diloco" for normal coordinator dispatch, "dgac-anchor-eval" for terminal Stage-10 eval-only, "dgac-train" for sequential DGAC fallback, or "dgac-diloco" for parallel DGAC worker rounds.'
         required: false
-        default: 'dgac-train'
+        default: 'dgac-diloco'
       attendance_join_grace_minutes:
         description: 'Waiting-mode attendance barrier grace. Default 5 minutes.'
         required: false
