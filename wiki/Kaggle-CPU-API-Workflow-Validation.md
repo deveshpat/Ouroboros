@@ -9,7 +9,7 @@ Ouroboros can now keep the training script, coordinator script, and Kaggle noteb
 
 ## Solution
 
-Add a CPU-safe validation seam that exercises Kaggle workflow plumbing without importing training dependencies, launching `torchrun`, requesting a Kaggle accelerator, pushing checkpoints, or consuming GPU quota. The CPU-smoke path now publishes a remote status/report artifact to Hugging Face so the GitHub coordinator job verifies that the Kaggle notebook actually executed. The real GPU path remains unchanged: the Kaggle notebook still keeps its IPython `!torchrun` shell magic, and coordinator dispatch still requests `NvidiaTeslaT4` unless explicit CPU-smoke validation mode is active.
+Add a CPU-safe validation seam that exercises Kaggle workflow plumbing without importing training dependencies, launching `torchrun`, requesting a Kaggle accelerator, pushing checkpoints, starting DGAC, or consuming GPU quota. The CPU-smoke path now publishes a remote status/report artifact to Hugging Face so the GitHub coordinator job verifies that the Kaggle notebook actually executed. The real GPU path remains unchanged: the Kaggle notebook still keeps its IPython `!torchrun` shell magic, and coordinator dispatch still requests `NvidiaTeslaT4` unless explicit CPU-smoke validation mode is active.
 
 ## User Stories
 

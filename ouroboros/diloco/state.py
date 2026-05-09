@@ -54,18 +54,16 @@ def _determine_round_mode(
         mode: "complete" | "solo" | "diloco"
         active_workers: list of worker IDs to trigger
     """
-    if force_worker_ids:
-        # Manual override: trigger exactly the specified workers, no threshold check
-        active = [w for w in force_worker_ids if w in credentialed_workers]
-        if not active:
-            return "complete", []
-        mode = "solo" if len(active) == 1 else "diloco"
-        return mode, active
-
     active = [
         w for w in credentialed_workers
         if projected_shards.get(w, 0) >= min_shard_samples
     ]
+
+    if force_worker_ids:
+        # Manual repair is additive: it fills missing workers without replacing
+        # workers that the normal shard plan would already run.
+        forced_active = [w for w in force_worker_ids if w in credentialed_workers]
+        active = _ordered_unique_worker_ids(active, forced_active)
 
     if not active:
         return "complete", []
@@ -142,11 +140,17 @@ def _reconcile_post_dispatch_state(
     if not failed_workers:
         return None
 
+    already_active = set(_ordered_unique_worker_ids(state.get("triggered_workers")))
+    already_attending = set(_ordered_unique_worker_ids(state.get("attendance_workers")))
     dispatched_active = [
-        w for w in planned_active_workers if dispatch_results.get(w) in {"success", "manual"}
+        w for w in planned_active_workers
+        if dispatch_results.get(w) in {"success", "manual"}
+        or (w in already_active and w not in dispatch_results)
     ]
     dispatched_attendance = [
-        w for w in planned_attendance_workers if dispatch_results.get(w) in {"success", "manual"}
+        w for w in planned_attendance_workers
+        if dispatch_results.get(w) in {"success", "manual"}
+        or (w in already_attending and w not in dispatch_results)
     ]
     failed_active = [w for w in planned_active_workers if dispatch_results.get(w) == "failed"]
     failed_attendance = [w for w in planned_attendance_workers if dispatch_results.get(w) == "failed"]

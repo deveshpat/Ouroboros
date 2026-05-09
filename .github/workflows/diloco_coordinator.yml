@@ -27,6 +27,10 @@ on:
         description: 'Optional read-only workflow validation mode. Supported: "" or "cpu-smoke". Defaults to Worker A when force_worker_ids is empty.'
         required: false
         default: ''
+      attendance_join_grace_minutes:
+        description: 'Waiting-mode attendance barrier grace. Default 5 minutes.'
+        required: false
+        default: '5'
 
 concurrency:
   group: diloco-coordinate
@@ -80,6 +84,7 @@ jobs:
             --repo_id           "WeirdRunner/Ouroboros" \
             --outer_lr          0.7 \
             --worker_timeout_hours 13.0 \
+            --attendance_join_grace_minutes "${{ github.event.inputs.attendance_join_grace_minutes || '5' }}" \
             --wandb_key         "$WANDB_KEY" \
             --wandb_project     "ouroboros-stage3-jamba" \
             --kaggle_username_a "$KAGGLE_USERNAME_A" \

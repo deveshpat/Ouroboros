@@ -26,6 +26,10 @@ def test_worker_ordering_mode_selection_and_projected_shards_match_coordinator_c
         "solo",
         ["B"],
     )
+    assert state._determine_round_mode({"A": 4, "B": 4, "C": 1}, ["A", "B", "C"], 3, force_worker_ids=["C"]) == (
+        "diloco",
+        ["A", "B", "C"],
+    )
 
 
 def test_partition_ready_workers_keeps_active_precedence_over_attendance():
@@ -90,3 +94,19 @@ def test_reconcile_post_dispatch_state_is_noop_without_failed_dispatches():
         planned_attendance_workers=[],
         dispatch_results={"A": "manual"},
     ) is None
+
+
+def test_reconcile_post_dispatch_state_preserves_already_active_workers_without_retrigger_result(monkeypatch):
+    monkeypatch.setattr(state.time, "time", lambda: 789.0)
+
+    corrected = state._reconcile_post_dispatch_state(
+        state={"mode": "diloco", "triggered_workers": ["B"], "attendance_workers": []},
+        planned_active_workers=["B", "A", "C"],
+        planned_attendance_workers=[],
+        dispatch_results={"A": "success", "C": "failed"},
+    )
+
+    assert corrected is not None
+    assert corrected["triggered_workers"] == ["B", "A"]
+    assert corrected["attendance_workers"] == ["C"]
+    assert corrected["dispatch_failures"] == ["C"]

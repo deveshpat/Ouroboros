@@ -72,6 +72,7 @@ def test_runtime_signal_artifacts_are_ignored_but_signal_directory_is_kept():
     assert "signals/*.json" in gitignore
     assert "!signals/.gitkeep" in gitignore
     assert (REPO_ROOT / "signals" / ".gitkeep").exists()
+    assert list((REPO_ROOT / "signals").glob("*.json")) == []
 
 
 def test_runtime_signal_mechanism_is_retained_as_coordinator_doorbell():

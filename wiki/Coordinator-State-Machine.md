@@ -9,7 +9,7 @@
 |---|---|
 | `push` to `signals/*.json` | Normal round completion signal |
 | `schedule` (every 30 min) | Watchdog: timeout demotion, waiting mode re-dispatch |
-| `workflow_dispatch` | Manual: `force_worker_ids`, `skip_trigger`, `dry_run` |
+| `workflow_dispatch` | Manual: `force_worker_ids`, `skip_trigger`, `dry_run`, `workflow_validate=cpu-smoke` |
 
 Concurrency: `group: diloco-coordinate`, `cancel-in-progress: false` — runs serialize, never race.
 
@@ -23,6 +23,7 @@ Concurrency: `group: diloco-coordinate`, `cancel-in-progress: false` — runs se
 3. collect_ready_workers(triggered_workers + attendance_workers)
 4. Partition: active_ready vs attendance_ready
 5. Check missing triggered workers:
+   a0. `force_worker_ids` present → add only missing available/done forced workers to active set
    a. triggered_at == 0  → re-dispatch immediately (unconfirmed path)
    b. elapsed < 13h      → print "waiting", return
    c. elapsed > 13h      → demote to attendance_workers
@@ -39,6 +40,17 @@ Concurrency: `group: diloco-coordinate`, `cancel-in-progress: false` — runs se
 14. Trigger Kaggle workers (kernels push)
 15. _reconcile_post_dispatch_state if any push failed
 ```
+
+`force_worker_ids` is additive manual repair. It does **not** replace
+`triggered_workers`, does **not** filter aggregation, and does **not** discard
+already-running or already-completed work. In the common stuck state
+`triggered_workers=["B"]`, `attendance_workers=["A", "C"]`, running
+`--force_worker_ids A,C` writes `triggered_workers=["B", "A", "C"]` and only
+dispatches A/C.
+
+Active worker statuses with `samples_seen=0` are not useful training output and
+do not satisfy active-round completion. Zero-sample statuses remain valid as
+attendance check-ins.
 
 ---
 
@@ -69,6 +81,28 @@ After `trigger_kaggle_workers()`, for any worker with status `"failed"`:
 - Re-upload corrected `round_state.json`
 
 This prevents the coordinator from waiting 13h for a worker that was never launched.
+
+Force-repair dispatch reconciliation preserves already-active workers that were
+not re-triggered in the repair run. Example: if B was already running and force
+repair dispatches A/C, a C push failure leaves `triggered_workers=["B", "A"]`
+and moves C back to `attendance_workers`.
+
+---
+
+## Stage 10 Terminal Gate
+
+Stage 10 is terminal for DiLoCo. When stage 10 completes, the coordinator:
+
+- keeps `stage_k=10` and sets `round_n=0`;
+- sets `mode="terminal"` and `dgac_manual_gate=true`;
+- clears `triggered_workers` and `attendance_workers`;
+- sets `triggered_at=0`;
+- preserves the final stage-10 anchor;
+- prints the DGAC manual-gate reminder;
+- exits without pushing Kaggle kernels.
+
+DGAC is launched manually after quality review. Cron must never auto-dispatch a
+stage-11 DiLoCo round.
 
 ---
 
@@ -103,5 +137,6 @@ Logged per round:
 |---|---|---|
 | Coordinator loops "Waiting for workers" indefinitely | triggered_at > 0 but workers never ran | Manual: set `triggered_at: 0` in round_state.json |
 | Worker status "done" but coordinator ignores it | Worker not in `triggered_workers` list | Use `--force_worker_ids` or check attendance_workers |
+| Force-trigger appears to drop a running worker | Bug — force must be additive | Preserve existing active workers and dispatch only missing forced workers |
 | `kernels push` returns 0 but worker assigned P100 | kaggle < 1.8.4 or wrong capitalisation | Verify `kaggle>=1.8.4`, `"NvidiaTeslaT4"` in metadata, `--accelerator NvidiaTeslaT4` in push_args |
 | Stage never closes | Geometric remainder < min_shard_samples | Normal — coordinator declares stage complete automatically |
