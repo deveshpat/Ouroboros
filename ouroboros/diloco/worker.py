@@ -598,10 +598,16 @@ def run_diloco_worker(
         except Exception as _we:
             print(f"  [diloco] W&B init failed: {_we}")
 
+    is_dgac_diloco = bool(args.use_halt_gate and getattr(args, "resume_from_diloco_anchor", False))
     should_run_pre_val = bool(
-        args.diloco_run_val
-        or (round_n == 0 and is_new_stage and args.diloco_worker_id == "A")
+        (not is_dgac_diloco)
+        and (
+            args.diloco_run_val
+            or (round_n == 0 and is_new_stage and args.diloco_worker_id == "A")
+        )
     )
+    if is_dgac_diloco and _is_main_process():
+        print("  [dgac-diloco] Skipping worker pre-val; anchor eval already covers val/gen.")
     if should_run_pre_val and val_samples:
         from ouroboros.train import evaluate_stage
         val_ce, val_acc = evaluate_stage(
@@ -635,10 +641,9 @@ def run_diloco_worker(
     original_gen_every_stage = args.gen_every_stage
 
     args.push_to_hub = False
-    if not args.use_halt_gate:
-        args.epochs_per_stage = 1
-        if stage_k == 0:
-            args.stage_0_epochs = 1
+    args.epochs_per_stage = 1
+    if stage_k == 0:
+        args.stage_0_epochs = 1
     args.gen_every_stage = False
 
     try:

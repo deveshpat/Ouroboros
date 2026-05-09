@@ -81,7 +81,7 @@ def test_build_diloco_training_command_allows_safe_overrides():
 def test_build_diloco_training_command_can_launch_dgac_diloco_worker():
     command = build_diloco_training_command(
         worker_id="c",
-        epochs_per_stage=3,
+        epochs_per_stage=1,
         output_dir="runs/dgac_diloco",
         use_halt_gate=True,
         resume_from_diloco_anchor=True,
@@ -92,9 +92,24 @@ def test_build_diloco_training_command_can_launch_dgac_diloco_worker():
     assert "--use_halt_gate" in command
     assert "--resume_from_diloco_anchor" in command
     assert command[command.index("--diloco_worker_id") + 1] == "C"
-    assert command[command.index("--epochs_per_stage") + 1] == "3"
+    assert command[command.index("--epochs_per_stage") + 1] == "1"
     assert command[command.index("--max_grad_norm") + 1] == "0.3"
     assert command[command.index("--output_dir") + 1] == "runs/dgac_diloco"
+
+
+def test_build_diloco_training_command_rejects_multi_epoch_dgac_diloco_worker():
+    try:
+        build_diloco_training_command(
+            worker_id="A",
+            epochs_per_stage=3,
+            output_dir="runs/dgac_diloco",
+            use_halt_gate=True,
+            resume_from_diloco_anchor=True,
+        )
+    except ValueError as exc:
+        assert "DGAC DiLoCo runs exactly one local epoch" in str(exc)
+    else:  # pragma: no cover - failure branch kept explicit
+        raise AssertionError("expected ValueError for multi-epoch DGAC DiLoCo")
 
 def test_resolve_kaggle_run_mode_defaults_to_diloco_and_accepts_dgac_modes():
     assert resolve_kaggle_run_mode({}) == DILOCO_RUN_MODE

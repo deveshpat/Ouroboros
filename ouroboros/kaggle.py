@@ -126,6 +126,14 @@ def build_diloco_training_command(
             f"Invalid DiLoCo worker id {normalized_worker_id!r}. Expected one of A, B, or C."
         )
 
+    is_dgac_diloco = bool(use_halt_gate and resume_from_diloco_anchor)
+    if is_dgac_diloco and int(epochs_per_stage) != 1:
+        raise ValueError(
+            "DGAC DiLoCo runs exactly one local epoch per worker round. "
+            "Launch another dgac-diloco pass from the aggregated anchor if more "
+            "HaltGate training is needed."
+        )
+
     command = [
         "torchrun",
         "--standalone",

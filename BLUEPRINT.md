@@ -47,9 +47,9 @@ Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle
 
 ## DGAC Launch Command (Phase 3.4 — Stage 10 quality gate passed)
 
-**Recommended path: parallel DGAC DiLoCo.** Cancel/stop any older single-worker `dgac-train` Kaggle run before using this, otherwise it will burn quota while the parallel workers train from the same anchor. This path initializes `round_state` for DGAC, resets the Stage-10 DGAC sample counter to 0 while preserving the pre-DGAC totals under `pre_dgac_total_samples_seen`, dispatches all selected workers, and aggregates both LoRA adapter weights and `halt_gate.pt` into `diloco_state/anchor`.
+**Recommended path: parallel DGAC DiLoCo.** Cancel/stop any older single-worker `dgac-train` Kaggle run before using this, otherwise it will burn quota while the parallel workers train from the same anchor. This path initializes `round_state` for DGAC, resets the Stage-10 DGAC sample counter to 0 while preserving the pre-DGAC totals under `pre_dgac_total_samples_seen`, dispatches all selected workers, runs one local DGAC epoch per worker shard without redundant worker pre-val/gen, and aggregates both LoRA adapter weights and `halt_gate.pt` into `diloco_state/anchor`.
 
-Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-diloco`, `force_worker_ids=A,B,C` (or empty to use every credentialed worker), `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. Worker signals resume the normal coordinator loop until DGAC reaches 36,906/36,906 Stage-10 samples and writes `mode=dgac-complete`.
+Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-diloco`, `force_worker_ids=A,B,C` (or empty to use every credentialed worker), `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. Worker signals resume the normal coordinator loop until DGAC reaches 36,906/36,906 Stage-10 samples and writes `mode=dgac-complete`. Launch another `dgac-diloco` pass from the aggregated anchor only if the post-DGAC eval says HaltGate needs more training.
 
 Equivalent worker command shape:
 
@@ -57,7 +57,7 @@ Equivalent worker command shape:
 torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --data_dir data/coconut_v1 --use_4bit \
   --use_halt_gate --resume_from_diloco_anchor \
-  --stage_0_epochs 1 --epochs_per_stage 3 --max_stage 10 --max_grad_norm 0.3 \
+  --stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 --max_grad_norm 0.3 \
   --batch_size 4 --grad_accum 8 --val_batch_size 2 \
   --val_skip_buffer_minutes 60 \
   --session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 \
