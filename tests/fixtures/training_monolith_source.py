@@ -3350,7 +3350,13 @@ def run_training_stages(
 
     timeout_triggered = False
     val_budget_triggered = False
+    max_train_steps_triggered = False
     samples_seen_total = 0
+    max_train_steps = getattr(args, "max_train_steps", None)
+    max_train_steps = int(max_train_steps) if max_train_steps is not None else None
+    if max_train_steps is not None and max_train_steps <= 0:
+        raise ValueError("--max_train_steps must be positive when provided")
+    train_steps_this_run = 0
 
     for stage_k in stages:
         if args.use_halt_gate:
@@ -3511,6 +3517,7 @@ def run_training_stages(
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                train_steps_this_run += 1
                 if args.use_halt_gate:
                     step_in_phase += 1
 
@@ -3537,12 +3544,38 @@ def run_training_stages(
                         import wandb
                         wandb.log(log_payload, step=global_step)
 
+                if max_train_steps is not None and train_steps_this_run >= max_train_steps:
+                    max_train_steps_triggered = True
+                    if is_main:
+                        tqdm.write(
+                            f"  [canary] reached --max_train_steps={max_train_steps}; "
+                            "saving checkpoint and exiting before val/gen."
+                        )
+                        save_checkpoint(
+                            output_dir=output_dir,
+                            step=global_step,
+                            epoch=epoch,
+                            step_in_epoch=step_idx,
+                            step_in_phase=step_in_phase,
+                            stage_k=stage_k,
+                            model=model,
+                            halt_gate=halt_gate,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            args=args,
+                            val_ce=None,
+                            val_acc=None,
+                            tag="canary",
+                        )
+                    barrier()
+                    break
+
             if pbar is not None:
                 pbar.close()
 
             stage_start_step_in_epoch = -1
 
-            if timeout_triggered:
+            if timeout_triggered or max_train_steps_triggered:
                 break
 
             should_budget_guard = run_epoch_end_val or run_generation_at_stage_end
@@ -3667,7 +3700,7 @@ def run_training_stages(
 
             barrier()
 
-        if timeout_triggered or stage_val_budget_triggered:
+        if timeout_triggered or stage_val_budget_triggered or max_train_steps_triggered:
             val_budget_triggered = val_budget_triggered or stage_val_budget_triggered
             break
 
@@ -3713,6 +3746,7 @@ def run_training_stages(
         "step_in_phase": step_in_phase,
         "timeout_triggered": timeout_triggered,
         "val_budget_triggered": val_budget_triggered,
+        "max_train_steps_triggered": max_train_steps_triggered,
         "samples_seen": int(samples_seen_total),
         "stages": list(stages),
     }

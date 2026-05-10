@@ -45,6 +45,24 @@ def test_kaggle_notebook_supports_dgac_anchor_eval_mode_without_diloco_training(
     assert "--push_to_hub" not in eval_branch
 
 
+
+def test_kaggle_notebook_supports_bounded_dgac_canary_mode():
+    source = _notebook_source()
+
+    assert "DGAC_CANARY_RUN_MODE" in source
+    assert "build_dgac_canary_command" in source
+    canary_branch = source.split("if run_mode == DGAC_CANARY_RUN_MODE:", 1)[1].split("elif run_mode == DGAC_TRAIN_RUN_MODE:", 1)[0]
+    assert "--use_halt_gate" in canary_branch
+    assert "--resume_from_diloco_anchor" in canary_branch
+    assert "--max_samples 512" in canary_branch
+    assert "--max_train_steps 20" in canary_branch
+    assert "--log_every 1" in canary_branch
+    assert "--no-gen_every_stage" in canary_branch
+    assert "--push_to_hub" not in canary_branch
+    assert "--eval_only" not in canary_branch
+    assert "--diloco_mode" not in canary_branch
+
+
 def test_kaggle_notebook_supports_dgac_training_mode_without_diloco_or_eval_only():
     source = _notebook_source()
 

@@ -167,6 +167,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--warmup_steps", type=int, default=50)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=None,
+        help=(
+            "Stop training after this many optimizer steps in the current run. "
+            "Intended for GPU canaries/debug runs; None means run the planned epochs."
+        ),
+    )
+    parser.add_argument(
         "--max_grad_norm",
         type=float,
         default=1.0,

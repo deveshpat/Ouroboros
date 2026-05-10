@@ -4,10 +4,12 @@ import os
 
 from ouroboros.kaggle import (
     DGAC_ANCHOR_EVAL_RUN_MODE,
+    DGAC_CANARY_RUN_MODE,
     DGAC_DILOCO_RUN_MODE,
     DGAC_TRAIN_RUN_MODE,
     DILOCO_RUN_MODE,
     build_dgac_anchor_eval_command,
+    build_dgac_canary_command,
     build_dgac_training_command,
     build_diloco_training_command,
     format_shell_command,
@@ -115,6 +117,7 @@ def test_resolve_kaggle_run_mode_defaults_to_diloco_and_accepts_dgac_modes():
     assert resolve_kaggle_run_mode({}) == DILOCO_RUN_MODE
     assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "dgac-anchor-eval"}) == DGAC_ANCHOR_EVAL_RUN_MODE
     assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "dgac-train"}) == DGAC_TRAIN_RUN_MODE
+    assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "dgac-canary"}) == DGAC_CANARY_RUN_MODE
     assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "dgac-diloco"}) == DGAC_DILOCO_RUN_MODE
     assert resolve_kaggle_run_mode({"OUROBOROS_RUN_MODE": "DILOCO"}) == DILOCO_RUN_MODE
 
@@ -164,6 +167,24 @@ def test_build_dgac_training_command_allows_safe_overrides():
     assert command[command.index("--hf_stage_subdir") + 1] == "runs/custom-dgac"
     assert "--push_to_hub" not in command
     assert command[command.index("--wandb_mode") + 1] == "offline"
+
+
+
+def test_build_dgac_canary_command_is_bounded_and_does_not_push_checkpoints():
+    command = build_dgac_canary_command()
+
+    assert command[:4] == ["torchrun", "--standalone", "--nproc_per_node=2", "jamba_coconut_finetune.py"]
+    assert "--use_halt_gate" in command
+    assert "--resume_from_diloco_anchor" in command
+    assert "--eval_only" not in command
+    assert "--diloco_mode" not in command
+    assert command[command.index("--epochs_per_stage") + 1] == "1"
+    assert command[command.index("--max_samples") + 1] == "512"
+    assert command[command.index("--max_train_steps") + 1] == "20"
+    assert command[command.index("--log_every") + 1] == "1"
+    assert "--no-gen_every_stage" in command
+    assert "--push_to_hub" not in command
+    assert command[command.index("--output_dir") + 1] == "runs/stage3_dgac_canary"
 
 
 def test_build_dgac_anchor_eval_command_loads_anchor_and_skips_training():

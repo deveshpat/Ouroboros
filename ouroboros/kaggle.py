@@ -16,11 +16,13 @@ _VALID_DILOCO_WORKER_IDS = {"A", "B", "C"}
 DILOCO_RUN_MODE = "diloco"
 DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
 DGAC_TRAIN_RUN_MODE = "dgac-train"
+DGAC_CANARY_RUN_MODE = "dgac-canary"
 DGAC_DILOCO_RUN_MODE = "dgac-diloco"
 _VALID_KAGGLE_RUN_MODES = {
     DILOCO_RUN_MODE,
     DGAC_ANCHOR_EVAL_RUN_MODE,
     DGAC_TRAIN_RUN_MODE,
+    DGAC_CANARY_RUN_MODE,
     DGAC_DILOCO_RUN_MODE,
 }
 
@@ -198,6 +200,10 @@ def build_dgac_training_command(
     use_4bit: bool = True,
     epochs_per_stage: int = 3,
     max_stage: int = 10,
+    max_samples: int | None = None,
+    max_train_steps: int | None = None,
+    log_every: int | None = None,
+    gen_every_stage: bool | None = None,
     max_grad_norm: float = 0.3,
     batch_size: int = 4,
     grad_accum: int = 8,
@@ -250,6 +256,14 @@ def build_dgac_training_command(
             str(int(graceful_exit_buffer_minutes)),
         ]
     )
+    if max_samples is not None:
+        command.extend(["--max_samples", str(int(max_samples))])
+    if max_train_steps is not None:
+        command.extend(["--max_train_steps", str(int(max_train_steps))])
+    if log_every is not None:
+        command.extend(["--log_every", str(int(log_every))])
+    if gen_every_stage is not None:
+        command.append("--gen_every_stage" if gen_every_stage else "--no-gen_every_stage")
     if push_to_hub:
         command.append("--push_to_hub")
     command.extend(["--output_dir", output_dir])
@@ -262,6 +276,59 @@ def build_dgac_training_command(
         command.extend(["--wandb_mode", wandb_mode])
     return command
 
+
+
+def build_dgac_canary_command(
+    *,
+    script: str = "jamba_coconut_finetune.py",
+    nproc_per_node: int = 2,
+    data_dir: str = "data/coconut_v1",
+    use_4bit: bool = True,
+    max_stage: int = 10,
+    max_samples: int = 512,
+    max_train_steps: int = 20,
+    max_grad_norm: float = 0.3,
+    batch_size: int = 4,
+    grad_accum: int = 8,
+    val_batch_size: int = 2,
+    val_skip_buffer_minutes: int = 720,
+    session_timeout_hours: float = 12.0,
+    graceful_exit_buffer_minutes: int = 20,
+    diloco_state_repo: str = "WeirdRunner/Ouroboros",
+    output_dir: str = "runs/stage3_dgac_canary",
+    hf_stage_subdir: str | None = None,
+    push_to_hub: bool = False,
+    wandb_project: str | None = "ouroboros-stage3-jamba",
+    wandb_entity: str | None = None,
+    wandb_mode: str | None = None,
+) -> list[str]:
+    """Build a bounded DGAC canary command that exits before full-epoch training."""
+    return build_dgac_training_command(
+        script=script,
+        nproc_per_node=nproc_per_node,
+        data_dir=data_dir,
+        use_4bit=use_4bit,
+        epochs_per_stage=1,
+        max_stage=max_stage,
+        max_samples=max_samples,
+        max_train_steps=max_train_steps,
+        log_every=1,
+        gen_every_stage=False,
+        max_grad_norm=max_grad_norm,
+        batch_size=batch_size,
+        grad_accum=grad_accum,
+        val_batch_size=val_batch_size,
+        val_skip_buffer_minutes=val_skip_buffer_minutes,
+        session_timeout_hours=session_timeout_hours,
+        graceful_exit_buffer_minutes=graceful_exit_buffer_minutes,
+        diloco_state_repo=diloco_state_repo,
+        output_dir=output_dir,
+        hf_stage_subdir=hf_stage_subdir or output_dir,
+        push_to_hub=push_to_hub,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
+        wandb_mode=wandb_mode,
+    )
 
 def build_dgac_anchor_eval_command(
     *,
@@ -339,10 +406,12 @@ def format_shell_command(command: list[str]) -> str:
 __all__ = [
     "DGAC_ANCHOR_EVAL_RUN_MODE",
     "DGAC_TRAIN_RUN_MODE",
+    "DGAC_CANARY_RUN_MODE",
     "DGAC_DILOCO_RUN_MODE",
     "DILOCO_RUN_MODE",
     "build_dgac_anchor_eval_command",
     "build_dgac_training_command",
+    "build_dgac_canary_command",
     "build_diloco_training_command",
     "format_shell_command",
     "kaggle_secret_presence",

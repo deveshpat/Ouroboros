@@ -75,6 +75,7 @@ DILOCO_TERMINAL_STAGE = 10
 DILOCO_RUN_MODE = "diloco"
 DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
 DGAC_TRAIN_RUN_MODE = "dgac-train"
+DGAC_CANARY_RUN_MODE = "dgac-canary"
 DGAC_DILOCO_RUN_MODE = "dgac-diloco"
 DGAC_COMPLETE_MODE = "dgac-complete"
 
@@ -223,11 +224,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kaggle_run_mode",
         default=os.environ.get("OUROBOROS_KAGGLE_RUN_MODE", DILOCO_RUN_MODE),
-        choices=[DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE, DGAC_TRAIN_RUN_MODE, DGAC_DILOCO_RUN_MODE],
+        choices=[DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE, DGAC_TRAIN_RUN_MODE, DGAC_CANARY_RUN_MODE, DGAC_DILOCO_RUN_MODE],
         help=(
             "Kaggle notebook launch mode. Use 'dgac-anchor-eval' to push one "
             "GPU eval-only notebook for the terminal DiLoCo anchor; use "
             "'dgac-train' to launch Phase 3.4 DGAC from the terminal anchor, "
+            "'dgac-canary' to launch a bounded short DGAC objective canary, "
             "or 'dgac-diloco' to initialize DGAC as a DiLoCo worker round. "
             "Anchor eval and dgac-train skip DiLoCo round_state mutations; dgac-diloco intentionally uses them."
         ),
@@ -539,8 +541,10 @@ def run_kaggle_anchor_eval(args: argparse.Namespace) -> None:
 def run_kaggle_dgac_train(args: argparse.Namespace) -> None:
     worker_ids = _kaggle_dgac_worker_ids(args)
     kaggle_creds = _build_kaggle_creds(args)
+    run_mode = getattr(args, "kaggle_run_mode", DGAC_TRAIN_RUN_MODE)
+    label = "DGAC canary" if run_mode == DGAC_CANARY_RUN_MODE else "Phase 3.4 DGAC training"
     print(
-        "[kaggle-dgac] Dispatching Phase 3.4 DGAC training notebook "
+        f"[kaggle-dgac] Dispatching {label} notebook "
         f"workers={worker_ids} repo={args.repo_id}"
     )
     if args.dry_run:
@@ -560,7 +564,7 @@ def run_kaggle_dgac_train(args: argparse.Namespace) -> None:
         )
     print(
         "[kaggle-dgac] Dispatch accepted by Kaggle. Monitor the Kaggle kernel, "
-        "W&B train/val/gen metrics, and Hub runs/stage3_dgac checkpoints; "
+        "W&B train metrics, and any mode-specific output directory; "
         "this mode does not mutate DiLoCo round_state."
     )
 
@@ -757,7 +761,7 @@ def main() -> None:
     if kaggle_run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:
         run_kaggle_anchor_eval(args)
         return
-    if kaggle_run_mode == DGAC_TRAIN_RUN_MODE:
+    if kaggle_run_mode in {DGAC_TRAIN_RUN_MODE, DGAC_CANARY_RUN_MODE}:
         run_kaggle_dgac_train(args)
         return
     if kaggle_run_mode == DGAC_DILOCO_RUN_MODE:
