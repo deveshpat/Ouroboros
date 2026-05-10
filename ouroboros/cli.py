@@ -63,6 +63,7 @@ def bootstrap_free_help_text() -> str:
         "  --resume_from RESUME_FROM\n"
         "  --resume_from_diloco_anchor\n"
         "  --eval_only\n"
+        "  --dgac_diagnostics\n"
         "  --output_dir OUTPUT_DIR\n"
         "  --val_batch_size VAL_BATCH_SIZE\n"
         "  --gen_every_stage, --no-gen_every_stage\n"
@@ -210,6 +211,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "Load the requested checkpoint/DiLoCo anchor, run validation and optional "
             "generation, then exit without optimizer steps or checkpoint writes."
+        ),
+    )
+    parser.add_argument(
+        "--dgac_diagnostics",
+        action="store_true",
+        help=(
+            "During eval-only HaltGate runs, log DGAC diagnostics: k_actual "
+            "histogram plus forced-k and gated validation CE comparisons."
         ),
     )
     parser.add_argument("--keep_checkpoints_per_stage", type=int, default=2)

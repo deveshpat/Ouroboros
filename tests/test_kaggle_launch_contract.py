@@ -173,6 +173,7 @@ def test_build_dgac_anchor_eval_command_loads_anchor_and_skips_training():
     assert "--use_halt_gate" in command
     assert "--resume_from_diloco_anchor" in command
     assert "--eval_only" in command
+    assert "--dgac_diagnostics" in command
     assert "--diloco_state_repo" in command and "WeirdRunner/Ouroboros" in command
     assert "--data_dir" in command and "data/coconut_v1" in command
     assert "--use_4bit" in command

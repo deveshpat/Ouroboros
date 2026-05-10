@@ -543,6 +543,285 @@ def run_generation_callback(
     return mean_uwr
 
 
+def _evaluate_ce_for_sample_stage_pairs(
+    *,
+    model,
+    tokenizer,
+    sample_stage_pairs: List[Tuple[Dict[str, Any], int]],
+    lat_token_id: int,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> float:
+    """Evaluate CE for already-sharded samples with per-sample latent counts."""
+    _maybe_empty_cuda_cache()
+    model.eval()
+    pad_id = tokenizer.pad_token_id or 0
+    batch_size = max(int(args.val_batch_size), 1)
+
+    ce_numer = 0.0
+    ce_denom = 0
+
+    for start in range(0, len(sample_stage_pairs), batch_size):
+        batch_pairs = sample_stage_pairs[start : start + batch_size]
+        built = []
+        max_stage_for_batch = 0
+        for sample, sample_stage in batch_pairs:
+            stage_i = max(0, int(sample_stage))
+            item = build_sample_at_stage(tokenizer, sample, stage_i, lat_token_id, args.max_seq_len)
+            if item is None:
+                continue
+            built.append(item)
+            max_stage_for_batch = max(max_stage_for_batch, int(item["n_latent"]))
+        if not built:
+            continue
+        batch = collate_stage_k(built, pad_id)
+        loss, _ = coconut_forward(
+            model=model,
+            batch=batch,
+            stage_k=max_stage_for_batch,
+            device=device,
+            halt_gate=None,
+            args=args,
+            step_in_phase=0,
+        )
+        valid_tokens = int((batch["labels"][:, 1:].contiguous().view(-1) != -100).sum().item())
+        ce_numer += float(loss.item()) * valid_tokens
+        ce_denom += valid_tokens
+
+    ce_numer, ce_denom = _ddp_sum([ce_numer, ce_denom], device)
+    ce_denom = int(round(ce_denom))
+    model.train()
+    return ce_numer / max(ce_denom, 1)
+
+
+@torch.no_grad()
+def _collect_local_halt_gate_stage_plan(
+    *,
+    model,
+    tokenizer,
+    halt_gate: HaltGate,
+    val_samples: List[Dict[str, Any]],
+    lat_token_id: int,
+    stage_k: int,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> Tuple[List[Tuple[Dict[str, Any], int]], List[int]]:
+    """Return this rank's validation samples paired with HaltGate-selected k_actual."""
+    _maybe_empty_cuda_cache()
+    model.eval()
+    halt_gate.eval()
+
+    rank = _rank()
+    world_size = _world_size()
+    local_val_samples = val_samples[rank::world_size]
+    batch_size = max(int(args.val_batch_size), 1)
+    pad_id = tokenizer.pad_token_id or 0
+    embed_fn = _get_embed_tokens(model)
+    amp_dtype = _amp_dtype(device)
+
+    local_pairs: List[Tuple[Dict[str, Any], int]] = []
+    local_ks: List[int] = []
+
+    for start in range(0, len(local_val_samples), batch_size):
+        batch_raw = local_val_samples[start : start + batch_size]
+        built_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for sample in batch_raw:
+            item = build_sample_at_stage(tokenizer, sample, stage_k, lat_token_id, args.max_seq_len)
+            if item is not None:
+                built_pairs.append((sample, item))
+        if not built_pairs:
+            continue
+
+        batch = collate_stage_k([item for _, item in built_pairs], pad_id)
+        input_ids = batch["input_ids"].to(device)
+        q_lens = batch["q_lens"].to(device)
+
+        with _autocast_ctx(device, amp_dtype):
+            all_embeds = embed_fn(input_ids)
+        max_q_len = int(q_lens.max().item()) if q_lens.numel() > 0 else 0
+        if max_q_len <= 0:
+            actual_values = [0] * len(built_pairs)
+        else:
+            ctx = all_embeds[:, :max_q_len, :].clone()
+            positions = torch.arange(max_q_len, device=device).unsqueeze(0)
+            ctx_mask = positions < q_lens.unsqueeze(1)
+            ctx = torch.where(
+                ctx_mask.unsqueeze(-1),
+                ctx,
+                ctx.new_zeros((1, 1, ctx.size(-1))),
+            )
+            _, _, actual_k = _run_latent_passes(
+                model=model,
+                ctx=ctx,
+                ctx_mask=ctx_mask,
+                n_latent=stage_k,
+                halt_gate=halt_gate,
+                args=args,
+                device=device,
+                amp_dtype=amp_dtype,
+            )
+            if isinstance(actual_k, torch.Tensor):
+                actual_values = [int(v) for v in actual_k.detach().cpu().tolist()]
+            else:
+                actual_values = [int(actual_k)] * len(built_pairs)
+
+        for (sample, _), actual in zip(built_pairs, actual_values):
+            clipped = max(0, min(int(stage_k), int(actual)))
+            local_pairs.append((sample, clipped))
+            local_ks.append(clipped)
+
+    model.train()
+    halt_gate.train()
+    return local_pairs, local_ks
+
+
+def _percentile_from_histogram(counts: List[float], percentile: float) -> int:
+    total = sum(counts)
+    if total <= 0:
+        return 0
+    threshold = total * float(percentile)
+    cumulative = 0.0
+    for idx, count in enumerate(counts):
+        cumulative += count
+        if cumulative >= threshold:
+            return idx
+    return len(counts) - 1
+
+
+def _summarize_halt_histogram(local_ks: List[int], stage_k: int, device: torch.device) -> Dict[str, Any]:
+    max_bucket = max(int(stage_k), 0)
+    local_counts = [0.0 for _ in range(max_bucket + 1)]
+    for value in local_ks:
+        bucket = max(0, min(max_bucket, int(value)))
+        local_counts[bucket] += 1.0
+
+    counts = _ddp_sum(local_counts, device)
+    total = float(sum(counts))
+    weighted = sum(float(idx) * float(count) for idx, count in enumerate(counts))
+    k_mean = weighted / max(total, 1.0)
+    pct_at_1 = counts[1] / total if total > 0 and len(counts) > 1 else 0.0
+    pct_2_4 = sum(counts[2 : min(4, max_bucket) + 1]) / total if total > 0 and max_bucket >= 2 else 0.0
+    pct_5_plus = sum(counts[5:]) / total if total > 0 and max_bucket >= 5 else 0.0
+
+    return {
+        "samples": int(round(total)),
+        "histogram": {idx: int(round(count)) for idx, count in enumerate(counts)},
+        "k_mean": float(k_mean),
+        "k_p50": float(_percentile_from_histogram(counts, 0.50)),
+        "k_p90": float(_percentile_from_histogram(counts, 0.90)),
+        "pct_at_1": float(pct_at_1),
+        "pct_2_4": float(pct_2_4),
+        "pct_5_plus": float(pct_5_plus),
+    }
+
+
+def run_dgac_diagnostics(
+    *,
+    model,
+    tokenizer,
+    halt_gate: HaltGate,
+    val_samples: List[Dict[str, Any]],
+    lat_token_id: int,
+    stage_k: int,
+    device: torch.device,
+    args: argparse.Namespace,
+    step: int,
+    wandb_run=None,
+    val_ce_forced_kmax: Optional[float] = None,
+) -> Dict[str, float]:
+    """Log HaltGate adaptivity diagnostics without mutating checkpoints or state."""
+    if halt_gate is None:
+        raise ValueError("--dgac_diagnostics requires --use_halt_gate")
+    if stage_k <= 0:
+        raise ValueError("--dgac_diagnostics requires a positive stage")
+
+    local_gate_pairs, local_ks = _collect_local_halt_gate_stage_plan(
+        model=model,
+        tokenizer=tokenizer,
+        halt_gate=halt_gate,
+        val_samples=val_samples,
+        lat_token_id=lat_token_id,
+        stage_k=stage_k,
+        device=device,
+        args=args,
+    )
+    summary = _summarize_halt_histogram(local_ks, stage_k, device)
+
+    rank = _rank()
+    world_size = _world_size()
+    local_val_samples = val_samples[rank::world_size]
+    local_forced_k1_pairs = [(sample, 1) for sample in local_val_samples]
+    forced_k1_ce = _evaluate_ce_for_sample_stage_pairs(
+        model=model,
+        tokenizer=tokenizer,
+        sample_stage_pairs=local_forced_k1_pairs,
+        lat_token_id=lat_token_id,
+        device=device,
+        args=args,
+    )
+    gated_ce = _evaluate_ce_for_sample_stage_pairs(
+        model=model,
+        tokenizer=tokenizer,
+        sample_stage_pairs=local_gate_pairs,
+        lat_token_id=lat_token_id,
+        device=device,
+        args=args,
+    )
+    forced_kmax_ce = float(val_ce_forced_kmax) if val_ce_forced_kmax is not None else _evaluate_ce_for_sample_stage_pairs(
+        model=model,
+        tokenizer=tokenizer,
+        sample_stage_pairs=[(sample, stage_k) for sample in local_val_samples],
+        lat_token_id=lat_token_id,
+        device=device,
+        args=args,
+    )
+
+    metrics: Dict[str, float] = {
+        "dgac_diag/val_ce_forced_k1": float(forced_k1_ce),
+        "dgac_diag/val_ce_gated": float(gated_ce),
+        f"dgac_diag/val_ce_forced_k{stage_k}": float(forced_kmax_ce),
+        "dgac_diag/k_mean": float(summary["k_mean"]),
+        "dgac_diag/k_p50": float(summary["k_p50"]),
+        "dgac_diag/k_p90": float(summary["k_p90"]),
+        "dgac_diag/pct_at_1": float(summary["pct_at_1"]),
+        "dgac_diag/pct_2_4": float(summary["pct_2_4"]),
+        "dgac_diag/pct_5_plus": float(summary["pct_5_plus"]),
+        "dgac_diag/samples": float(summary["samples"]),
+    }
+    for k_value, count in summary["histogram"].items():
+        metrics[f"dgac_diag/hist_k{k_value}"] = float(count)
+
+    if _is_main_process():
+        hist_text = " ".join(
+            f"k{k_value}={summary['histogram'].get(k_value, 0)}"
+            for k_value in range(1, stage_k + 1)
+        )
+        print(
+            f"\n  [DGAC diagnostic] stage={stage_k} samples={summary['samples']}"
+        )
+        print(f"  [DGAC diagnostic] k_actual histogram: {hist_text}")
+        print(
+            "  [DGAC diagnostic] "
+            f"k_mean={summary['k_mean']:.3f} "
+            f"p50={summary['k_p50']:.0f} "
+            f"p90={summary['k_p90']:.0f} "
+            f"pct_at_1={summary['pct_at_1']:.3f} "
+            f"pct_2_4={summary['pct_2_4']:.3f} "
+            f"pct_5_plus={summary['pct_5_plus']:.3f}"
+        )
+        print(
+            "  [DGAC diagnostic] "
+            f"val_ce_forced_k1={forced_k1_ce:.4f} "
+            f"val_ce_gated={gated_ce:.4f} "
+            f"val_ce_forced_k{stage_k}={forced_kmax_ce:.4f}\n"
+        )
+        if wandb_run is not None:
+            import wandb
+            wandb.log(metrics, step=step)
+
+    return metrics
+
+
 def run_eval_only(
     *,
     model,
@@ -592,6 +871,26 @@ def run_eval_only(
                 wandb_run=wandb_run,
             )
             metrics["gen_mean_uwr"] = float(mean_uwr)
+
+    barrier()
+    if bool(getattr(args, "dgac_diagnostics", False)):
+        if halt_gate is None:
+            raise ValueError("--dgac_diagnostics requires --use_halt_gate")
+        metrics.update(
+            run_dgac_diagnostics(
+                model=model,
+                tokenizer=tokenizer,
+                halt_gate=halt_gate,
+                val_samples=val_samples,
+                lat_token_id=lat_token_id,
+                stage_k=stage_k,
+                device=device,
+                args=args,
+                step=step,
+                wandb_run=wandb_run,
+                val_ce_forced_kmax=float(val_ce),
+            )
+        )
 
     barrier()
     return metrics

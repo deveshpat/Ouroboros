@@ -292,6 +292,7 @@ def build_dgac_anchor_eval_command(
         "--use_halt_gate",
         "--resume_from_diloco_anchor",
         "--eval_only",
+        "--dgac_diagnostics",
         "--diloco_state_repo",
         diloco_state_repo,
         "--data_dir",
