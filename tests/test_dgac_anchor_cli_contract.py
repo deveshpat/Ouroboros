@@ -88,10 +88,13 @@ def test_dgac_anchor_eval_only_loads_anchor_evaluates_and_skips_training(monkeyp
     monkeypatch.setattr(train_module, "load_model_and_tokenizer", fake_load_model_and_tokenizer)
     monkeypatch.setattr(train_module, "_resolve_hf_token", lambda token: "hf_fake")
     monkeypatch.setattr(train_module, "_wandb_credentials_available", lambda: False)
+    def fake_diloco_download_anchor(model, hf_token, repo, subdir, device, *, halt_gate=None):
+        calls.append(("anchor", hf_token, repo, subdir, halt_gate is not None))
+
     monkeypatch.setattr(
         train_module,
         "diloco_download_anchor",
-        lambda model, hf_token, repo, subdir, device: calls.append(("anchor", hf_token, repo, subdir)),
+        fake_diloco_download_anchor,
     )
     monkeypatch.setattr(
         train_module,
@@ -121,7 +124,7 @@ def test_dgac_anchor_eval_only_loads_anchor_evaluates_and_skips_training(monkeyp
     train_module.run_cli(args, script_start=time.perf_counter())
 
     assert calls == [
-        ("anchor", "hf_fake", "fake/state", "diloco_state/anchor"),
+        ("anchor", "hf_fake", "fake/state", "diloco_state/anchor", True),
         ("evaluate", 10, True),
         ("generation", 10, True),
     ]

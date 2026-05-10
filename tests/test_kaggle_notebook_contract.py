@@ -39,7 +39,7 @@ def test_kaggle_notebook_supports_dgac_anchor_eval_mode_without_diloco_training(
     assert "--resume_from_diloco_anchor" in source
     assert "--eval_only" in source
     assert "--use_halt_gate" in source
-    assert "runs/stage10_anchor_eval" in source
+    assert "runs/dgac_anchor_eval" in source
     eval_branch = source.split("elif run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:", 1)[1].split("elif run_mode == DILOCO_RUN_MODE:", 1)[0]
     assert "--diloco_mode" not in eval_branch
     assert "--push_to_hub" not in eval_branch

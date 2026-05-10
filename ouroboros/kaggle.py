@@ -278,12 +278,12 @@ def build_dgac_anchor_eval_command(
     session_timeout_hours: float = 12.0,
     graceful_exit_buffer_minutes: int = 20,
     diloco_state_repo: str = "WeirdRunner/Ouroboros",
-    output_dir: str = "runs/stage10_anchor_eval",
+    output_dir: str = "runs/dgac_anchor_eval",
     wandb_project: str | None = "ouroboros-stage3-jamba",
     wandb_entity: str | None = None,
     wandb_mode: str | None = None,
 ) -> list[str]:
-    """Build the tested Kaggle command for terminal Stage-10 anchor eval-only."""
+    """Build the tested Kaggle command for current DGAC/DiLoCo anchor eval-only."""
     command = [
         "torchrun",
         "--standalone",

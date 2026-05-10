@@ -1361,11 +1361,13 @@ def run_cli(args: argparse.Namespace, *, script_start: float) -> None:
                 anchor_repo,
                 "diloco_state/anchor",
                 device,
+                halt_gate=halt_gate,
             )
             if is_main:
                 print(
-                    "  [DGAC] Anchor loaded. HaltGate at zero-init. "
-                    "gate_stage will default to curriculum_max_stage. Optimizer starts fresh."
+                    "  [DGAC] Anchor load complete. If the anchor contains halt_gate.pt, "
+                    "HaltGate was restored; otherwise it remains zero-init. "
+                    "Optimizer starts fresh unless this is eval-only."
                 )
             if distributed:
                 broadcast_parameters(get_trainable_parameters(model, halt_gate), src=0)

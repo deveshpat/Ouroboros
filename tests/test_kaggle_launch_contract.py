@@ -178,7 +178,7 @@ def test_build_dgac_anchor_eval_command_loads_anchor_and_skips_training():
     assert "--use_4bit" in command
     assert "--max_stage" in command and command[command.index("--max_stage") + 1] == "10"
     assert "--max_grad_norm" in command and command[command.index("--max_grad_norm") + 1] == "0.3"
-    assert "--output_dir" in command and "runs/stage10_anchor_eval" in command
+    assert "--output_dir" in command and "runs/dgac_anchor_eval" in command
     assert "--diloco_mode" not in command
     assert "--push_to_hub" not in command
 

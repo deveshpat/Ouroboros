@@ -18,15 +18,15 @@ Based on Meta's Coconut (arXiv:2412.06769) + DGAC (Diversity-Gated Adaptive Coco
 |---|---|
 | Stages 0–9 | ✅ COMPLETE |
 | Stage 10 | ✅ COMPLETE — terminal DiLoCo anchor uploaded (2026-05-09) |
-| DGAC | 🟢 CLEARED FOR LAUNCH — Stage 10 terminal anchor eval passed; launch explicitly via workflow |
+| DGAC | ✅ COMPLETE — aggregated anchor uploaded; post-DGAC eval must be rerun after HaltGate-load patch |
 
-**Compute:** DiLoCo dynamic workers with attendance/waiting fallback. The 2026-05-09 coordinator run aggregated Workers A/B/C for stage 10 round 2, reached 36,906/36,906 stage samples, uploaded the terminal DiLoCo anchor, and stopped at the DGAC manual gate with no stage-11 dispatch. The follow-up anchor eval-only run loaded `diloco_state/anchor` and reported `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, and `Mean UWR=0.733`, so Phase 3.4 DGAC is cleared for explicit launch.
+**Compute:** DiLoCo dynamic workers with attendance/waiting fallback. The 2026-05-09 coordinator run aggregated Workers A/B/C for stage 10 round 2, reached 36,906/36,906 stage samples, uploaded the terminal DiLoCo anchor, and stopped at the DGAC manual gate with no stage-11 dispatch. The pre-DGAC anchor eval-only run loaded `diloco_state/anchor` and reported `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, and `Mean UWR=0.733`. The 2026-05-10 DGAC DiLoCo coordinator run then completed 36,906/36,906 samples and uploaded a new aggregated anchor. Rerun anchor eval after the HaltGate-load patch before deciding whether another DGAC pass is needed.
 
 ---
 
-## Stage 10 Anchor Quality Review Command
+## Current Anchor Quality Review Command
 
-Use this before launching DGAC because W&B only has Stage 10 `pre_val` / accuracy from the start of the stage, not a final validation pass for the terminal anchor. This loads `diloco_state/anchor`, evaluates at Stage 10, optionally runs the existing generation callback, and exits without optimizer steps or checkpoint writes.
+Use this for both pre-DGAC terminal-anchor review and post-DGAC aggregated-anchor review. It loads `diloco_state/anchor`, restores `halt_gate.pt` when the anchor contains it, evaluates at Stage 10, optionally runs the existing generation callback, and exits without optimizer steps or checkpoint writes.
 
 ```bash
 torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
@@ -37,19 +37,19 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --batch_size 4 --grad_accum 8 --val_batch_size 2 \
   --val_skip_buffer_minutes 60 \
   --session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 \
-  --output_dir runs/stage10_anchor_eval \
+  --output_dir runs/dgac_anchor_eval \
   --wandb_project "ouroboros-stage3-jamba"
 ```
 
-Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. This pushes one GPU Kaggle notebook in eval-only mode; it does not mutate `round_state` and still loads the latest anchor from `diloco_state/anchor` on Hub.
+Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. This pushes one GPU Kaggle notebook in eval-only mode; it does not mutate `round_state` and loads the latest adapter + `halt_gate.pt` from `diloco_state/anchor` on Hub when present.
 
-**Latest eval result:** PASS — `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, `Mean UWR=0.733`. `k_actual=10` for all samples is expected before DGAC because HaltGate starts at zero-init.
+**Latest completed eval result:** Stage 10 terminal anchor PASS — `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, `Mean UWR=0.733`. `k_actual=10` for all samples was expected before DGAC because HaltGate started at zero-init. After DGAC aggregation, rerun this same command and require `diloco` logs to show `Loaded halt gate from diloco_state/anchor/halt_gate.pt` before trusting halt-step distribution.
 
-## DGAC Launch Command (Phase 3.4 — Stage 10 quality gate passed)
+## DGAC Launch Command (Phase 3.4 — available if another pass is needed)
 
 **Recommended path: parallel DGAC DiLoCo.** Cancel/stop any older single-worker `dgac-train` Kaggle run before using this, otherwise it will burn quota while the parallel workers train from the same anchor. This path initializes `round_state` for DGAC, resets the Stage-10 DGAC sample counter to 0 while preserving the pre-DGAC totals under `pre_dgac_total_samples_seen`, dispatches all selected workers, runs one local DGAC epoch per worker shard without redundant worker pre-val/gen, and aggregates both LoRA adapter weights and `halt_gate.pt` into `diloco_state/anchor`.
 
-Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-diloco`, `force_worker_ids=A,B,C` (or empty to use every credentialed worker), `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. Worker signals resume the normal coordinator loop until DGAC reaches 36,906/36,906 Stage-10 samples and writes `mode=dgac-complete`. Launch another `dgac-diloco` pass from the aggregated anchor only if the post-DGAC eval says HaltGate needs more training.
+Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-diloco`, `force_worker_ids=A,B,C` (or empty to use every credentialed worker), `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. Worker signals resume the normal coordinator loop until DGAC reaches 36,906/36,906 Stage-10 samples and writes `mode=dgac-complete`. Do not launch another `dgac-diloco` pass unless the post-DGAC eval says HaltGate needs more training.
 
 Equivalent worker command shape:
 

@@ -5,6 +5,16 @@
 
 ---
 
+
+## Session 28 — DGAC complete; anchor eval loader bug found (2026-05-10) ✅
+
+**Evidence:** Coordinator printed `DGAC DiLoCo COMPLETE (36906/36906 samples)` and uploaded `DiLoCo anchor: stage 10 round 1 (3 workers, 1386 samples, mode=diloco)`.
+
+**Bug found before post-DGAC eval:** `--resume_from_diloco_anchor --eval_only` loaded adapter weights from `diloco_state/anchor` but did not pass the live `HaltGate` into `diloco_download_anchor`, so eval logs said `HaltGate at zero-init` and could not measure the aggregated post-DGAC halt gate.
+
+**Decision:** Patch eval/training anchor load so the current `diloco_state/anchor/halt_gate.pt` is restored when present. Rerun `kaggle_run_mode=dgac-anchor-eval` after the patch; trust the result only if logs include `Loaded halt gate from diloco_state/anchor/halt_gate.pt`.
+
+---
 ## Session 27 — Stage 10 terminal anchor eval-only → DGAC cleared (2026-05-09) ✅
 
 **Evidence:** Kaggle GPU eval-only run loaded `WeirdRunner/Ouroboros/diloco_state/anchor` after the terminal DiLoCo aggregation and reported `stage=10 val_ce=0.4863 val_acc=0.0889`.

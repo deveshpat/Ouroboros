@@ -143,7 +143,7 @@ def test_stage_10_terminal_gate_is_reflected_in_source_of_truth_docs():
     terminal_log = (REPO_ROOT / "terminal_log.md").read_text(encoding="utf-8")
 
     assert "| Stage 10 | ✅ COMPLETE" in blueprint
-    assert "| DGAC | 🟢 CLEARED FOR LAUNCH" in blueprint
+    assert "| DGAC | ✅ COMPLETE" in blueprint
     assert "36,906/36,906" in blueprint
     assert "waiting on Kaggle GPU quota" not in blueprint
 
@@ -154,11 +154,12 @@ def test_stage_10_terminal_gate_is_reflected_in_source_of_truth_docs():
     assert "IN PROGRESS" not in curriculum_section
     assert "Current blocker" not in curriculum_section
 
-    assert "mode=terminal" in status
-    assert "dgac_manual_gate=true" in status
+    assert "mode=dgac-complete" in status
+    assert "dgac_diloco_complete=true" in status
     assert "Stage 10 terminal aggregation" in status
     assert "Stage 10 terminal anchor eval-only" in status
+    assert "post-DGAC `dgac-anchor-eval`" in status
     assert "Stage 10 terminal aggregation → DGAC manual gate" in session_log
     assert "Stage 10 terminal anchor eval-only → DGAC cleared" in session_log
-    assert "[eval-only] stage=10 val_ce=0.4863 val_acc=0.0889" in terminal_log
-    assert "Mean UWR: 0.733" in terminal_log
+    assert "DGAC DiLoCo COMPLETE" in terminal_log
+    assert "Loaded halt gate from diloco_state/anchor/halt_gate.pt" in terminal_log
