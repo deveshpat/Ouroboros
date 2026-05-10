@@ -5,6 +5,17 @@
 
 ---
 
+## Session 29 — DGAC HaltGate objective corrected (2026-05-10) ✅
+
+**Problem:** DGAC diagnostics could show `k_actual=1` across visible samples even when the base anchor quality was usable. The old training objective let HaltGate behavior be driven by ponder/diversity pressure instead of a correctness-aware stop target.
+
+**Fix:** DGAC now constructs supervised halt targets from forced-depth CE probes (`1,2,4,stage_k` by default): choose the smallest latent depth within CE tolerance of full stage-`k`, train `continue` before that depth and `halt` at that depth, and keep ponder/diversity as separate regularizers.
+
+**Metrics:** Training logs now expose `train/dgac_halt_loss`, `train/dgac_ponder`, `train/dgac_diversity`, `train/dgac_halt_step_mean`, plus target/support diagnostics. Existing eval-only forced/gated/full CE diagnostics remain unchanged.
+
+**Validation:** CPU fake tests cover target construction, clipped probe depths, no early-halt reward when CE is worse, HaltGate gradients from supervised halt loss, CLI defaults, and existing DGAC diagnostics.
+
+---
 
 ## Session 28 — DGAC complete; anchor eval loader bug found (2026-05-10) ✅
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re as _re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -42,6 +42,162 @@ def compute_dgac_lambda1(step: int, warmup: int, ramp: int, lmax: float) -> floa
     if step < warmup:
         return 0.0
     return lmax * min((step - warmup) / max(ramp, 1), 1.0)
+
+
+def build_dgac_halt_probe_depths(stage_k: int, probe_steps: str | Sequence[int] | None) -> List[int]:
+    """Return sorted unique DGAC CE-probe depths, always including full stage_k."""
+    max_depth = max(int(stage_k), 0)
+    if max_depth <= 0:
+        return []
+
+    raw_steps: Iterable[Any]
+    if probe_steps is None:
+        raw_steps = (1, 2, 4, max_depth)
+    elif isinstance(probe_steps, str):
+        raw_steps = [part.strip() for part in probe_steps.split(",") if part.strip()]
+    else:
+        raw_steps = probe_steps
+
+    depths: List[int] = []
+    for raw in raw_steps:
+        if isinstance(raw, str):
+            token = raw.strip().lower().replace("-", "_")
+            if token in {"stage", "stage_k", "max", "k", "full", "full_k"}:
+                depth = max_depth
+            else:
+                depth = int(token)
+        else:
+            depth = int(raw)
+        if depth <= 0:
+            continue
+        depths.append(min(depth, max_depth))
+
+    depths.append(max_depth)
+    return sorted(set(depths))
+
+
+def construct_dgac_halt_targets(
+    *,
+    ce_by_probe_depth: Mapping[int, torch.Tensor],
+    full_ce: torch.Tensor,
+    full_depths: torch.Tensor,
+    tolerance: float,
+) -> torch.Tensor:
+    """Choose the smallest CE-preserving halt depth for each sample.
+
+    Probe depths may be larger than a sample's available latent depth; those
+    probes are interpreted as the sample's full depth for that row.
+    """
+    if not ce_by_probe_depth:
+        return full_depths.to(dtype=torch.long).clone()
+
+    device = full_depths.device
+    target_depths = full_depths.to(device=device, dtype=torch.long).clone()
+    full_ce = full_ce.to(device=device, dtype=torch.float32).view(-1)
+    full_depths = full_depths.to(device=device, dtype=torch.long).view(-1)
+    tol = float(tolerance)
+
+    sorted_probe_depths = sorted(int(depth) for depth in ce_by_probe_depth)
+    batch_size = int(full_depths.numel())
+    for row in range(batch_size):
+        row_full_depth = max(int(full_depths[row].item()), 0)
+        if row_full_depth <= 0:
+            target_depths[row] = 0
+            continue
+        seen_depths: set[int] = set()
+        allowed_ce = float(full_ce[row].item()) + tol
+        for probe_depth in sorted_probe_depths:
+            candidate_depth = max(0, min(int(probe_depth), row_full_depth))
+            if candidate_depth <= 0 or candidate_depth in seen_depths:
+                continue
+            seen_depths.add(candidate_depth)
+            probe_ce = ce_by_probe_depth[probe_depth].to(device=device, dtype=torch.float32).view(-1)
+            if float(probe_ce[row].item()) <= allowed_ce:
+                target_depths[row] = candidate_depth
+                break
+    return target_depths
+
+
+def build_halt_supervision_labels(
+    target_depths: torch.Tensor,
+    *,
+    max_depth: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build continue/halt labels for available HaltGate decisions.
+
+    Decision depth `d` means: after `d` latent states exist, halt before
+    appending the next one. A full-depth target has no positive halt label
+    because there is no extra latent proposal after the configured maximum.
+    """
+    target_depths = target_depths.to(dtype=torch.long).view(-1)
+    batch_size = int(target_depths.numel())
+    n_decisions = max(int(max_depth) - 1, 0)
+    labels = torch.zeros((batch_size, n_decisions), dtype=torch.float32, device=target_depths.device)
+    mask = torch.zeros_like(labels, dtype=torch.bool)
+    if n_decisions == 0:
+        return labels, mask
+
+    decision_depths = torch.arange(1, int(max_depth), dtype=torch.long, device=target_depths.device)
+    for row in range(batch_size):
+        target = max(int(target_depths[row].item()), 0)
+        if target <= 0:
+            continue
+        active = decision_depths <= min(target, int(max_depth) - 1)
+        mask[row, active] = True
+        halt_column = (decision_depths == target).nonzero(as_tuple=False).flatten()
+        if halt_column.numel() > 0:
+            labels[row, halt_column[0]] = 1.0
+    return labels, mask
+
+
+def _compute_ce_mean_by_row(logits: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    shift_logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
+    shift_labels = labels[:, 1:].contiguous().view(-1)
+    losses = F.cross_entropy(shift_logits, shift_labels, reduction="none", ignore_index=-100)
+    losses = losses.view(labels.size(0), -1)
+    valid = labels[:, 1:] != -100
+    counts = valid.sum(dim=1)
+    ce_by_row = losses.sum(dim=1) / counts.clamp_min(1).to(dtype=losses.dtype)
+    return ce_by_row.to(dtype=torch.float32), counts
+
+
+def _compute_supervised_halt_loss(
+    *,
+    hidden_sequences: List[List[torch.Tensor]],
+    target_depths: torch.Tensor,
+    halt_gate: HaltGate,
+) -> Optional[Dict[str, Any]]:
+    bce_terms: List[torch.Tensor] = []
+    target_terms: List[torch.Tensor] = []
+    supervised_decisions = 0
+
+    for row, hidden_at_q_end in enumerate(hidden_sequences):
+        if len(hidden_at_q_end) < 2:
+            continue
+        target_depth = int(target_depths[row].item())
+        if target_depth <= 0:
+            continue
+
+        for idx in range(1, len(hidden_at_q_end)):
+            if idx > target_depth:
+                break
+            h_curr = hidden_at_q_end[idx].to(dtype=torch.float32)
+            h_prev = hidden_at_q_end[idx - 1].to(dtype=torch.float32)
+            halt_prob = halt_gate(h_curr, h_prev).clamp(1e-6, 1.0 - 1e-6)
+            target = torch.ones_like(halt_prob) if idx == target_depth else torch.zeros_like(halt_prob)
+            bce_terms.append(F.binary_cross_entropy(halt_prob, target))
+            supervised_decisions += int(halt_prob.numel())
+
+        target_terms.append(torch.tensor(float(target_depth), device=target_depths.device))
+
+    if not bce_terms:
+        return None
+
+    return {
+        "halt_loss": torch.stack(bce_terms).mean(),
+        "halt_target_mean": torch.stack(target_terms).mean(),
+        "halt_supervised_count": float(supervised_decisions),
+    }
 
 
 def _compute_ce_sum_and_count(logits: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, int]:
@@ -313,11 +469,16 @@ def _forward_batched_latent(
         logits = lm_head_fn(hidden).float()
 
     ce_sum, n_valid = _compute_ce_sum_and_count(logits, labels)
+    ce_by_row, valid_by_row = _compute_ce_mean_by_row(logits, labels)
     ce_value = float(ce_sum.item() / max(n_valid, 1))
     result: Dict[str, Any] = {
         "ce_sum": ce_sum,
         "n_valid": n_valid,
         "ce": ce_value,
+        "ce_by_row": ce_by_row,
+        "valid_by_row": valid_by_row,
+        "actual_n_latents": actual_n_latents,
+        "hidden_sequences": None,
         "ponder": None,
         "diversity": None,
         "halt_step_mean": None,
@@ -328,6 +489,7 @@ def _forward_batched_latent(
         return result
 
     hidden_sequences = _collect_latent_hidden_sequences(latent_ctx, max_q_len, actual_n_latents)
+    result["hidden_sequences"] = hidden_sequences
     halt_metrics = _compute_batched_halt_metrics(
         hidden_sequences=hidden_sequences,
         actual_n_latents=actual_n_latents,
@@ -383,6 +545,63 @@ def coconut_forward(
     total_loss = ce
     metrics: Dict[str, float] = {"ce": float(ce.item())}
 
+    if halt_gate is not None:
+        halt_supervision_weight = float(getattr(args, "dgac_halt_supervision_weight", 0.0))
+        hidden_sequences = result.get("hidden_sequences")
+        actual_n_latents = result.get("actual_n_latents")
+        if halt_supervision_weight > 0.0 and hidden_sequences is not None and actual_n_latents is not None:
+            probe_depths = build_dgac_halt_probe_depths(
+                stage_k=stage_k,
+                probe_steps=getattr(args, "dgac_halt_probe_steps", None),
+            )
+            ce_by_probe_depth: Dict[int, torch.Tensor] = {}
+            with torch.no_grad():
+                for probe_depth in probe_depths:
+                    if int(probe_depth) >= int(stage_k):
+                        continue
+                    probe_n_latents = torch.minimum(
+                        torch.full_like(n_latents, int(probe_depth)),
+                        n_latents,
+                    )
+                    probe_result = _forward_batched_latent(
+                        model=model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        q_lens=q_lens,
+                        n_latents=probe_n_latents,
+                        pad_id=pad_id,
+                        device=device,
+                        halt_gate=None,
+                        args=args,
+                        step_in_phase=step_in_phase,
+                        amp_dtype=amp_dtype,
+                    )
+                    ce_by_probe_depth[int(probe_depth)] = probe_result["ce_by_row"].detach()
+            target_depths = construct_dgac_halt_targets(
+                ce_by_probe_depth=ce_by_probe_depth,
+                full_ce=result["ce_by_row"].detach(),
+                full_depths=actual_n_latents.detach(),
+                tolerance=float(getattr(args, "dgac_halt_ce_tolerance", 0.02)),
+            )
+            supervised = _compute_supervised_halt_loss(
+                hidden_sequences=hidden_sequences,
+                target_depths=target_depths,
+                halt_gate=halt_gate,
+            )
+            if supervised is not None:
+                total_loss = total_loss + halt_supervision_weight * supervised["halt_loss"]
+                halt_loss_value = float(supervised["halt_loss"].item())
+                halt_target_mean = float(supervised["halt_target_mean"].item())
+                metrics.update(
+                    {
+                        "dgac_halt_loss": halt_loss_value,
+                        "dgac_halt_target_mean": halt_target_mean,
+                        "dgac_halt_supervised_count": float(supervised["halt_supervised_count"]),
+                        "halt_loss": halt_loss_value,
+                    }
+                )
+
     if halt_gate is not None and result["diversity"] is not None:
         total_loss = total_loss + result["lambda1"] * result["ponder"] + args.dgac_lambda_diversity * result["diversity"]
         metrics.update(
@@ -391,6 +610,10 @@ def coconut_forward(
                 "diversity": float(result["diversity"].item()),
                 "halt_step_mean": float(result["halt_step_mean"].item()),
                 "lambda1": float(result["lambda1"]),
+                "dgac_ponder": float(result["ponder"].item()),
+                "dgac_diversity": float(result["diversity"].item()),
+                "dgac_halt_step_mean": float(result["halt_step_mean"].item()),
+                "dgac_lambda1": float(result["lambda1"]),
             }
         )
 

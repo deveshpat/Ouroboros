@@ -21,7 +21,7 @@
 | 10 — 10 latent passes | ✅ COMPLETE | Terminal DiLoCo and DGAC DiLoCo both reached 36,906/36,906 samples; latest anchor is the aggregated post-DGAC anchor |
 
 **Compute mode:** DiLoCo dynamic workers with attendance/waiting-mode fallback.
-**Current gate:** DGAC DiLoCo is complete. Patch and rerun `dgac-anchor-eval` so eval loads both latest adapter weights and `diloco_state/anchor/halt_gate.pt`; coordinator cron must not dispatch stage 11.
+**Current gate:** DGAC DiLoCo is complete, but the halt objective has been corrected after diagnostics showed early-halting risk. Run a short DGAC canary with correctness-aware HaltGate supervision, then rerun `dgac-anchor-eval`; coordinator cron must not dispatch stage 11.
 
 
 ---
@@ -46,10 +46,10 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 
 ## Immediate Next Steps
 
-1. **Patch post-DGAC anchor eval** — `--resume_from_diloco_anchor --eval_only` must pass the live `HaltGate` into `diloco_download_anchor`, so `halt_gate.pt` is restored from `diloco_state/anchor` when present.
-2. **Rerun `dgac-anchor-eval` once patched** — use GitHub Actions → `coordinate` with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`; trust it only if logs include `Loaded halt gate from diloco_state/anchor/halt_gate.pt`.
-3. **Review DGAC research signal** — inspect HaltGate behavior / halt-step distribution and compare post-DGAC `val_ce`, `val_acc`, and generations against the terminal anchor baseline.
-4. **Decide next branch** — if val/gen/halt distribution is good, move to benchmark + packaging PRD; if mixed, run another DGAC DiLoCo pass from the aggregated anchor; if bad, rollback or inspect DGAC loss/instrumentation.
+1. **Run a short DGAC canary with the corrected halt objective** — use the normal DGAC path, but inspect early metrics before spending a full epoch. Require `train/dgac_halt_loss`, `train/dgac_ponder`, `train/dgac_diversity`, and `train/dgac_halt_step_mean` to log separately.
+2. **Rerun `dgac-anchor-eval` after the canary or corrected pass** — use GitHub Actions → `coordinate` with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`; trust it only if logs include `Loaded halt gate from diloco_state/anchor/halt_gate.pt`.
+3. **Review DGAC research signal** — inspect HaltGate behavior / halt-step distribution and compare post-DGAC `val_ce`, `val_acc`, and generations against the terminal anchor baseline. `pct_at_1≈1.0` is acceptable only if forced-`k1` CE is near forced-full CE.
+4. **Decide next branch** — if val/gen/halt distribution is good, move to benchmark + packaging PRD; if mixed, run another corrected DGAC DiLoCo pass from the aggregated anchor; if bad, rollback or inspect DGAC loss/instrumentation.
 5. **Deferred research note** — JEPA-style latent prediction and multimodal input/output architecture are documented for later; do not implement before DGAC and baseline evaluations are stable.
 
 ---
@@ -114,6 +114,7 @@ WeirdRunner/Ouroboros/
 | NCCL timeout | `timedelta(hours=4)` |
 | DiLoCo `--epochs_per_stage` | 1 |
 | DGAC `--epochs_per_stage` | 3 |
+| DGAC halt supervision | `--dgac_halt_supervision_weight 0.1`, `--dgac_halt_ce_tolerance 0.02`, `--dgac_halt_probe_steps 1,2,4,stage_k` |
 | `--batch_size` | 4 (2 per GPU on Dual T4) |
 | amp_dtype T4 (sm75) | FP16 |
 | amp_dtype A100+ (sm80+) | BF16 |

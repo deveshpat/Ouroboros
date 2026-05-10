@@ -64,6 +64,9 @@ def bootstrap_free_help_text() -> str:
         "  --resume_from_diloco_anchor\n"
         "  --eval_only\n"
         "  --dgac_diagnostics\n"
+        "  --dgac_halt_supervision_weight DGAC_HALT_SUPERVISION_WEIGHT\n"
+        "  --dgac_halt_ce_tolerance DGAC_HALT_CE_TOLERANCE\n"
+        "  --dgac_halt_probe_steps DGAC_HALT_PROBE_STEPS\n"
         "  --output_dir OUTPUT_DIR\n"
         "  --val_batch_size VAL_BATCH_SIZE\n"
         "  --gen_every_stage, --no-gen_every_stage\n"
@@ -129,6 +132,32 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--dgac_tau", type=float, default=0.9)
     parser.add_argument("--dgac_warmup_steps", type=int, default=200)
     parser.add_argument("--dgac_ramp_steps", type=int, default=300)
+    parser.add_argument(
+        "--dgac_halt_supervision_weight",
+        type=float,
+        default=0.1,
+        help=(
+            "Weight for correctness-aware supervised HaltGate loss. Set to 0 to "
+            "fall back to ponder/diversity-only DGAC regularization."
+        ),
+    )
+    parser.add_argument(
+        "--dgac_halt_ce_tolerance",
+        type=float,
+        default=0.02,
+        help="CE tolerance for choosing the smallest depth that preserves full-k quality.",
+    )
+    parser.add_argument(
+        "--dgac_halt_probe_steps",
+        default="1,2,4,stage_k",
+        help="Comma-separated CE probe depths for supervised HaltGate targets.",
+    )
+    parser.add_argument(
+        "--dgac_halt_target_mode",
+        choices=["ce_within_tolerance"],
+        default="ce_within_tolerance",
+        help="Strategy for constructing supervised HaltGate targets.",
+    )
 
     # Training
     parser.add_argument("--batch_size", type=int, default=2)

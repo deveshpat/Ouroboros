@@ -2178,6 +2178,63 @@ def coconut_forward(
     total_loss = ce
     metrics: Dict[str, float] = {"ce": float(ce.item())}
 
+    if halt_gate is not None:
+        halt_supervision_weight = float(getattr(args, "dgac_halt_supervision_weight", 0.0))
+        hidden_sequences = result.get("hidden_sequences")
+        actual_n_latents = result.get("actual_n_latents")
+        if halt_supervision_weight > 0.0 and hidden_sequences is not None and actual_n_latents is not None:
+            probe_depths = build_dgac_halt_probe_depths(
+                stage_k=stage_k,
+                probe_steps=getattr(args, "dgac_halt_probe_steps", None),
+            )
+            ce_by_probe_depth: Dict[int, torch.Tensor] = {}
+            with torch.no_grad():
+                for probe_depth in probe_depths:
+                    if int(probe_depth) >= int(stage_k):
+                        continue
+                    probe_n_latents = torch.minimum(
+                        torch.full_like(n_latents, int(probe_depth)),
+                        n_latents,
+                    )
+                    probe_result = _forward_batched_latent(
+                        model=model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        q_lens=q_lens,
+                        n_latents=probe_n_latents,
+                        pad_id=pad_id,
+                        device=device,
+                        halt_gate=None,
+                        args=args,
+                        step_in_phase=step_in_phase,
+                        amp_dtype=amp_dtype,
+                    )
+                    ce_by_probe_depth[int(probe_depth)] = probe_result["ce_by_row"].detach()
+            target_depths = construct_dgac_halt_targets(
+                ce_by_probe_depth=ce_by_probe_depth,
+                full_ce=result["ce_by_row"].detach(),
+                full_depths=actual_n_latents.detach(),
+                tolerance=float(getattr(args, "dgac_halt_ce_tolerance", 0.02)),
+            )
+            supervised = _compute_supervised_halt_loss(
+                hidden_sequences=hidden_sequences,
+                target_depths=target_depths,
+                halt_gate=halt_gate,
+            )
+            if supervised is not None:
+                total_loss = total_loss + halt_supervision_weight * supervised["halt_loss"]
+                halt_loss_value = float(supervised["halt_loss"].item())
+                halt_target_mean = float(supervised["halt_target_mean"].item())
+                metrics.update(
+                    {
+                        "dgac_halt_loss": halt_loss_value,
+                        "dgac_halt_target_mean": halt_target_mean,
+                        "dgac_halt_supervised_count": float(supervised["halt_supervised_count"]),
+                        "halt_loss": halt_loss_value,
+                    }
+                )
+
     if halt_gate is not None and result["diversity"] is not None:
         total_loss = total_loss + result["lambda1"] * result["ponder"] + args.dgac_lambda_diversity * result["diversity"]
         metrics.update(
@@ -2186,6 +2243,10 @@ def coconut_forward(
                 "diversity": float(result["diversity"].item()),
                 "halt_step_mean": float(result["halt_step_mean"].item()),
                 "lambda1": float(result["lambda1"]),
+                "dgac_ponder": float(result["ponder"].item()),
+                "dgac_diversity": float(result["diversity"].item()),
+                "dgac_halt_step_mean": float(result["halt_step_mean"].item()),
+                "dgac_lambda1": float(result["lambda1"]),
             }
         )
 

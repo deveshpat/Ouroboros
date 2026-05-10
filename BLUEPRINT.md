@@ -51,6 +51,8 @@ Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle
 
 Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-diloco`, `force_worker_ids=A,B,C` (or empty to use every credentialed worker), `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. Worker signals resume the normal coordinator loop until DGAC reaches 36,906/36,906 Stage-10 samples and writes `mode=dgac-complete`. Do not launch another `dgac-diloco` pass unless the post-DGAC eval says HaltGate needs more training.
 
+DGAC training now uses correctness-aware HaltGate supervision by default. The target halt depth is the smallest probed latent depth whose CE is within tolerance of the full stage-`k` path, with ponder/diversity retained as regularizers. Defaults: `--dgac_halt_supervision_weight 0.1`, `--dgac_halt_ce_tolerance 0.02`, `--dgac_halt_probe_steps 1,2,4,stage_k`, `--dgac_halt_target_mode ce_within_tolerance`.
+
 Equivalent worker command shape:
 
 ```bash
@@ -58,6 +60,8 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --data_dir data/coconut_v1 --use_4bit \
   --use_halt_gate --resume_from_diloco_anchor \
   --stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 --max_grad_norm 0.3 \
+  --dgac_halt_supervision_weight 0.1 --dgac_halt_ce_tolerance 0.02 \
+  --dgac_halt_probe_steps 1,2,4,stage_k \
   --batch_size 4 --grad_accum 8 --val_batch_size 2 \
   --val_skip_buffer_minutes 60 \
   --session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 \
@@ -76,6 +80,8 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --diloco_state_repo WeirdRunner/Ouroboros --hf_token "$HF_TOKEN" \
   --data_dir data/coconut_v1 --use_4bit \
   --epochs_per_stage 3 --max_stage 10 --max_grad_norm 0.3 \
+  --dgac_halt_supervision_weight 0.1 --dgac_halt_ce_tolerance 0.02 \
+  --dgac_halt_probe_steps 1,2,4,stage_k \
   --batch_size 4 --grad_accum 8 --val_batch_size 2 \
   --val_skip_buffer_minutes 60 \
   --session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 \
