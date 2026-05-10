@@ -37,6 +37,7 @@
 | Planning artifact retirement | ✅ COMPLETE | Completed PRDs/plans have been promoted into wiki documentation and removed from `prds/` and `plans/`. |
 | Kaggle CPU/API workflow validation | ✅ COMPLETE | CPU-smoke validation mode, repo/runtime seams, CPU metadata dispatch, fake coordinator loop tests, manual API validation docs, and remote Hub artifact verification are in place. |
 | DGAC readiness CPU-smoke gate | ✅ PASSED LIVE | GitHub Actions `coordinate #272` ran `workflow_validate=cpu-smoke`, defaulted to Worker A, pushed Kaggle kernel version 39, Kaggle exited before `torchrun`, published Hub artifacts, and coordinator verified validation run `25377312407-1`. |
+| JEPA-style latent prediction / multimodal Ouroboros | 🧊 DEFERRED | Direction documented in [Future-JEPA-Multimodal-Latent](Future-JEPA-Multimodal-Latent.md). No code changes until DGAC, evaluation, benchmarking, and core correctness gates are stable. |
 
 Canonical architecture record: [Architecture-Extraction](Architecture-Extraction.md).
 Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
@@ -49,6 +50,7 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 2. **Monitor DGAC stop/rollback criteria** — halt if CE spikes materially above the Stage 10 terminal anchor baseline (`val_ce=0.4863`), generated samples collapse/repeat, GPU errors appear, or no healthy checkpoint is pushed before session timeout.
 3. **Review DGAC research signal** — inspect HaltGate behavior / halt-step distribution and compare post-DGAC `val_ce`, `val_acc`, and generations against the terminal anchor baseline.
 4. **Optional polish** — quiet expected Hugging Face 404 polling noise during validation artifact eventual consistency; not blocking because coordinator already verifies successfully.
+5. **Deferred research note** — JEPA-style latent prediction and multimodal input/output architecture are documented for later; do not implement before DGAC and baseline evaluations are stable.
 
 ---
 
@@ -91,6 +93,7 @@ WeirdRunner/Ouroboros/
 | Worker quota for DiLoCo stage 10 | ✅ No longer blocking — final A/B/C round aggregated on 2026-05-09 |
 | Stage 10 terminal anchor quality gate | ✅ Passed — `val_ce=0.4863`, `val_acc=0.0889`, coherent generation, `Mean UWR=0.733` |
 | CPU-smoke end-to-end workflow gate before DGAC? | 🟢 Passed live — GitHub Actions `coordinate #272`, validation run `25377312407-1`, Worker A, Hub status/report verified |
+| JEPA-style latent prediction / multimodal output direction? | 🧊 Deferred — document only for now; future PRD should start with text-only Reasoning-JEPA v1 after DGAC evaluation |
 
 ---
 

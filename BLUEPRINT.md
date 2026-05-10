@@ -102,6 +102,7 @@ Workflow fallback: GitHub Actions → `coordinate` → **Run workflow** with `ka
 | [wiki/Architecture-Extraction.md](wiki/Architecture-Extraction.md) | Completed extraction history, adapter ownership, retired PRD/plan decisions |
 | [wiki/Engineering-Workflow.md](wiki/Engineering-Workflow.md) | PRD → plan → tracer-bullet → TDD loop, commit policy, artifact retirement |
 | [wiki/Kaggle-CPU-API-Workflow-Validation.md](wiki/Kaggle-CPU-API-Workflow-Validation.md) | CPU-safe Kaggle workflow validation, manual API smoke, dispatch guardrails |
+| [wiki/Future-JEPA-Multimodal-Latent.md](wiki/Future-JEPA-Multimodal-Latent.md) | Deferred JEPA-style latent prediction, shared multimodal latent bus, output-head roadmap |
 
 ---
 
