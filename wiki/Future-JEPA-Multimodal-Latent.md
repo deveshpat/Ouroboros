@@ -83,16 +83,20 @@ This should be an auxiliary loss, not a replacement for the existing CE/DGAC los
 
 ## Current Repo Seams
 
-The current text-only integration seam is `ouroboros/dgac.py`.
+The current text-only latent execution seam is `ouroboros/latent.py`. `ouroboros/dgac.py` remains the DGAC/HaltGate policy seam and public training-loss contract.
 
 Relevant functions:
 
 | Function | Current role | Future JEPA relevance |
 |---|---|---|
-| `_run_latent_passes(...)` | Builds the continuous latent trajectory from question context. | Source of latent states to train with representation prediction. |
-| `_forward_batched_latent(...)` | Injects latent states into `<|lat|>` positions, runs full forward, computes CE, then DGAC metrics. | Natural place to compute `jepa_loss` once target representations exist. |
-| `_collect_latent_hidden_sequences(...)` | Collects latent hidden states for halt/diversity metrics. | Can be reused or extended for JEPA target alignment. |
-| `coconut_forward(...)` | Combines CE and DGAC losses into the training loss. | Future location for `total_loss += jepa_lambda * jepa_loss`. |
+| `prepare_latent_runtime(...)` | Resolves the model runtime handles used by latent execution. | Lets future objectives reuse latent execution without importing model-private helpers. |
+| `run_latent_passes(...)` | Builds the continuous latent trajectory from question context, including optional HaltGate shortening. | Source of latent states to train with representation prediction. |
+| `forward_latent_batch(...)` | Injects latent states into `<|lat|>` positions, runs full forward, computes CE, and returns latent artifacts. | Natural place to expose target/prediction tensors for `jepa_loss` once target representations exist. |
+| `collect_latent_hidden_sequences(...)` | Collects latent hidden states from the latent context. | Can be reused or extended for JEPA target alignment. |
+| `decode_from_latent_context(...)` | Greedy-decodes from a precomputed latent context. | Keeps generation/evaluation from duplicating latent decode internals. |
+| `dgac.coconut_forward(...)` | Combines CE and DGAC losses into the training loss. | Future location for `total_loss += jepa_lambda * jepa_loss` while JEPA mechanics stay behind `ouroboros.latent`. |
+
+Future JEPA work should target public `ouroboros.latent` functions rather than private DGAC compatibility wrappers such as `_run_latent_passes` or `_forward_batched_latent`.
 
 The current data seam is `ouroboros/data.py`.
 

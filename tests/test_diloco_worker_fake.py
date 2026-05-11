@@ -284,7 +284,7 @@ def test_dgac_diloco_worker_forces_one_local_epoch_and_uploads_halt_gate(monkeyp
     monkeypatch.setattr(worker_module, "_resolve_github_token_common", lambda: "gh_fake")
     monkeypatch.setattr(worker_module, "diloco_push_signal", lambda *args: calls["signal"].append(args))
 
-    from ouroboros import train as train_module
+    from ouroboros.training import stage_runner as stage_runner_module
 
     def fake_run_training_stages(**kwargs):
         calls["train"].append(kwargs)
@@ -298,7 +298,7 @@ def test_dgac_diloco_worker_forces_one_local_epoch_and_uploads_halt_gate(monkeyp
             "stages": [10],
         }
 
-    monkeypatch.setattr(train_module, "run_training_stages", fake_run_training_stages)
+    monkeypatch.setattr(stage_runner_module, "run_training_stages", fake_run_training_stages)
 
     result = worker_module.run_diloco_worker(
         model=FakeCausalLM(),
@@ -347,9 +347,10 @@ def test_dgac_diloco_worker_skips_pre_val_even_for_worker_a_first_round(monkeypa
     monkeypatch.setattr(worker_module, "_resolve_github_token_common", lambda: "gh_fake")
     monkeypatch.setattr(worker_module, "diloco_push_signal", lambda *args: calls["signal"].append(args))
 
-    from ouroboros import train as train_module
+    from ouroboros.training import evaluation as evaluation_module
+    from ouroboros.training import stage_runner as stage_runner_module
 
-    monkeypatch.setattr(train_module, "evaluate_stage", lambda **kwargs: calls["eval"].append(kwargs))
+    monkeypatch.setattr(evaluation_module, "evaluate_stage", lambda **kwargs: calls["eval"].append(kwargs))
 
     def fake_run_training_stages(**kwargs):
         calls["train"].append(kwargs)
@@ -361,7 +362,7 @@ def test_dgac_diloco_worker_skips_pre_val_even_for_worker_a_first_round(monkeypa
             "stages": [10],
         }
 
-    monkeypatch.setattr(train_module, "run_training_stages", fake_run_training_stages)
+    monkeypatch.setattr(stage_runner_module, "run_training_stages", fake_run_training_stages)
 
     worker_module.run_diloco_worker(
         model=FakeCausalLM(),

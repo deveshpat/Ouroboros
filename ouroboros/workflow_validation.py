@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from ouroboros.kaggle import kaggle_secret_presence, resolve_diloco_worker_id
+from ouroboros.runtime_env import env_bool, env_int, normalize_text, resolve_env_alias, resolve_hf_token
 from ouroboros.kaggle_runtime import KaggleRepoSpec, resolve_kaggle_repo_spec
 
 CPU_SMOKE_MODE = "cpu-smoke"
@@ -58,8 +59,8 @@ class CpuSmokeValidationReport:
 def workflow_validation_mode(env: Mapping[str, str] | None = None) -> str | None:
     """Return the requested validation mode, if any."""
     env = os.environ if env is None else env
-    value = str(env.get("OUROBOROS_WORKFLOW_VALIDATE", "")).strip().lower()
-    return value or None
+    value = normalize_text(env.get("OUROBOROS_WORKFLOW_VALIDATE"))
+    return value.lower() if value else None
 
 
 def is_cpu_smoke_validation_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -69,12 +70,7 @@ def is_cpu_smoke_validation_enabled(env: Mapping[str, str] | None = None) -> boo
 def is_validation_publish_enabled(env: Mapping[str, str] | None = None) -> bool:
     """Return True when CPU smoke should publish remote validation artifacts."""
     env = os.environ if env is None else env
-    return str(env.get("OUROBOROS_WORKFLOW_VALIDATION_PUBLISH", "")).strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return env_bool(env, "OUROBOROS_WORKFLOW_VALIDATION_PUBLISH")
 
 
 def resolve_workflow_validation_run_id(env: Mapping[str, str] | None = None) -> str:
@@ -93,11 +89,10 @@ def resolve_workflow_validation_run_id(env: Mapping[str, str] | None = None) -> 
 def resolve_workflow_validation_state_repo(env: Mapping[str, str] | None = None) -> str:
     """Resolve the Hub repo that stores validation artifacts."""
     env = os.environ if env is None else env
-    for key in ("OUROBOROS_WORKFLOW_VALIDATION_STATE_REPO", "OUROBOROS_DILOCO_STATE_REPO"):
-        value = str(env.get(key, "")).strip()
-        if value:
-            return value
-    return DEFAULT_STATE_REPO
+    return resolve_env_alias(
+        env,
+        ("OUROBOROS_WORKFLOW_VALIDATION_STATE_REPO", "OUROBOROS_DILOCO_STATE_REPO"),
+    ) or DEFAULT_STATE_REPO
 
 
 def workflow_validation_remote_paths(
@@ -119,14 +114,11 @@ def workflow_validation_remote_paths(
 
 
 def _int_from_env(env: Mapping[str, str], name: str, default: int) -> int:
-    try:
-        return int(str(env.get(name, "")).strip() or default)
-    except ValueError:
-        return default
+    return env_int(env, name, default=default)
 
 
 def _token_from_env(env: Mapping[str, str]) -> str:
-    return str(env.get("HF_TOKEN") or env.get("HUGGINGFACE_HUB_TOKEN") or "").strip()
+    return resolve_hf_token(env=env) or ""
 
 
 def build_cpu_smoke_validation_command(

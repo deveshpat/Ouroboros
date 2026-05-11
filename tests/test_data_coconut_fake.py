@@ -22,15 +22,22 @@ def _function_ast_dump(path: Path, function_name: str) -> str:
     raise AssertionError(f"{function_name} not found in {path}")
 
 
-def test_data_and_coconut_core_ast_match_monolith_source_of_truth():
+def test_data_ast_matches_monolith_and_coconut_contract_routes_through_latent():
     monolith_path = REPO_ROOT / "tests" / "fixtures" / "training_monolith_source.py"
-    for module_rel, function_names in {
-        "ouroboros/data.py": ("build_sample_at_stage", "collate_stage_k"),
-        "ouroboros/dgac.py": ("compute_dgac_lambda1", "coconut_forward", "normalize_pred"),
-    }.items():
-        module_path = REPO_ROOT / module_rel
-        for function_name in function_names:
-            assert _function_ast_dump(module_path, function_name) == _function_ast_dump(monolith_path, function_name)
+
+    for function_name in ("build_sample_at_stage", "collate_stage_k"):
+        assert _function_ast_dump(REPO_ROOT / "ouroboros" / "data.py", function_name) == _function_ast_dump(
+            monolith_path, function_name
+        )
+    for function_name in ("compute_dgac_lambda1", "normalize_pred"):
+        assert _function_ast_dump(REPO_ROOT / "ouroboros" / "dgac.py", function_name) == _function_ast_dump(
+            monolith_path, function_name
+        )
+
+    dgac_source = (REPO_ROOT / "ouroboros" / "dgac.py").read_text(encoding="utf-8")
+    assert "def coconut_forward(" in dgac_source
+    assert "forward_latent_batch" in dgac_source
+    assert "prepare_latent_runtime" in dgac_source
 
 
 def test_stage_sample_construction_handles_native_and_json_steps_and_masks_question_latents():

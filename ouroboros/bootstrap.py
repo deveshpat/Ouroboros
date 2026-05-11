@@ -12,14 +12,19 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.runtime_env import (
+    WANDB_KEY_ALIASES,
+    normalize_text,
+    require_known_worker_id,
+    resolve_env_alias,
+    resolve_github_token,
+    resolve_hf_token,
+    resolve_worker_id,
+)
+
 
 def _normalize_text(value: Optional[Any], *, uppercase: bool = False) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    return text.upper() if uppercase else text
+    return normalize_text(value, uppercase=uppercase)
 
 
 _HUB_WHEEL_BASES = [
@@ -71,14 +76,9 @@ def _resolve_hf_token_common(cli_value: Optional[str] = None) -> Optional[str]:
       3. Kaggle secret HF_TOKEN
       4. Colab userdata HF_TOKEN
     """
-    token = _normalize_text(cli_value)
+    token = resolve_hf_token(cli_value)
     if token:
         return token
-
-    for env_name in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
-        token = _normalize_text(os.environ.get(env_name))
-        if token:
-            return token
 
     for secret_name, resolver in (
         ("HF_TOKEN", _maybe_get_kaggle_secret),
@@ -100,14 +100,9 @@ def _resolve_github_token_common(cli_value: Optional[str] = None) -> Optional[st
       3. Kaggle secret GITHUB_TOKEN / GH_TOKEN
       4. Colab userdata GITHUB_TOKEN / GH_TOKEN
     """
-    token = _normalize_text(cli_value)
+    token = resolve_github_token(cli_value)
     if token:
         return token
-
-    for env_name in ("GITHUB_TOKEN", "GH_TOKEN"):
-        token = _normalize_text(os.environ.get(env_name))
-        if token:
-            return token
 
     for secret_name, resolver in (
         ("GITHUB_TOKEN", _maybe_get_kaggle_secret),
@@ -131,15 +126,9 @@ def _resolve_diloco_worker_id_common(cli_value: Optional[str] = None) -> Optiona
       3. Kaggle secret DILOCO_WORKER_ID
       4. Colab userdata DILOCO_WORKER_ID
     """
-    for candidate in (
-        cli_value,
-        os.environ.get("DILOCO_WORKER_ID"),
-        os.environ.get("OUROBOROS_DILOCO_WORKER_ID"),
-        os.environ.get("WORKER_ID"),
-    ):
-        worker_id = _normalize_text(candidate, uppercase=True)
-        if worker_id:
-            return worker_id
+    worker_id = resolve_worker_id(cli_value=cli_value)
+    if worker_id:
+        return worker_id
 
     for secret_name, resolver in (
         ("DILOCO_WORKER_ID", _maybe_get_kaggle_secret),
@@ -159,18 +148,12 @@ def _require_valid_diloco_worker_id(value: Optional[str]) -> str:
             "DILOCO_WORKER_ID / OUROBOROS_DILOCO_WORKER_ID, or define a "
             "Kaggle/Colab secret named DILOCO_WORKER_ID."
         )
-    if worker_id not in ("A", "B", "C"):
-        raise ValueError(
-            f"Invalid DiLoCo worker id {worker_id!r}. "
-            "Expected one of ('A', 'B', 'C')."
-        )
-    return worker_id
+    return require_known_worker_id(worker_id)
 
 
 def _wandb_credentials_available() -> bool:
-    for env_name in ("WANDB_API_KEY", "WANDB_KEY"):
-        if _normalize_text(os.environ.get(env_name)):
-            return True
+    if resolve_env_alias(os.environ, WANDB_KEY_ALIASES):
+        return True
 
     try:
         import netrc as _netrc

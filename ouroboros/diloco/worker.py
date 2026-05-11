@@ -18,6 +18,7 @@ import torch
 
 from ouroboros.bootstrap import _resolve_github_token_common
 from ouroboros.diloco.shared import RoundState, ordered_unique_workers, retry_io
+from ouroboros.worker_lifecycle import WorkerLifecycleKind, classify_worker_lifecycle
 from ouroboros.model import (
     _is_main_process,
     _world_size,
@@ -411,7 +412,15 @@ def run_diloco_worker(
         args.diloco_worker_id in attendance_workers and not is_selected_for_training
     )
 
-    if triggered_workers is not None and not is_selected_for_training and not is_attendance_only:
+    lifecycle_schedule = classify_worker_lifecycle(
+        worker_id=args.diloco_worker_id,
+        round_state=round_state,
+        shard_samples=1,
+        use_halt_gate=bool(args.use_halt_gate),
+        resume_from_diloco_anchor=bool(getattr(args, "resume_from_diloco_anchor", False)),
+    )
+
+    if lifecycle_schedule.kind == WorkerLifecycleKind.NOOP:
         if _is_main_process():
             print(
                 f"  [diloco] Worker {args.diloco_worker_id} not scheduled for "
@@ -429,7 +438,7 @@ def run_diloco_worker(
             "skipped_not_scheduled": True,
         }
 
-    if is_attendance_only:
+    if lifecycle_schedule.kind == WorkerLifecycleKind.ATTENDANCE_ONLY:
         if _is_main_process():
             print(
                 f"  [diloco] Worker {args.diloco_worker_id} in attendance mode — "
@@ -511,7 +520,15 @@ def run_diloco_worker(
         print(f"  [diloco] Remaining global samples: {remaining_stage_samples}")
         print(f"  [diloco] Shard size: {len(train_shard)} samples")
 
-    if not train_shard:
+    lifecycle_plan = classify_worker_lifecycle(
+        worker_id=args.diloco_worker_id,
+        round_state=round_state,
+        shard_samples=len(train_shard),
+        use_halt_gate=bool(args.use_halt_gate),
+        resume_from_diloco_anchor=bool(getattr(args, "resume_from_diloco_anchor", False)),
+    )
+
+    if lifecycle_plan.kind == WorkerLifecycleKind.EMPTY_SHARD_PASSTHROUGH:
         if _is_main_process():
             print("  [diloco] Empty shard — uploading passthrough status and signal.")
             # Save current adapter (anchor weights, unchanged) for status upload
@@ -598,9 +615,9 @@ def run_diloco_worker(
         except Exception as _we:
             print(f"  [diloco] W&B init failed: {_we}")
 
-    is_dgac_diloco = bool(args.use_halt_gate and getattr(args, "resume_from_diloco_anchor", False))
+    is_dgac_diloco = lifecycle_plan.kind == WorkerLifecycleKind.DGAC_DILOCO_WORKER
     should_run_pre_val = bool(
-        (not is_dgac_diloco)
+        (not lifecycle_plan.skip_pre_validation)
         and (
             args.diloco_run_val
             or (round_n == 0 and is_new_stage and args.diloco_worker_id == "A")
@@ -609,7 +626,7 @@ def run_diloco_worker(
     if is_dgac_diloco and _is_main_process():
         print("  [dgac-diloco] Skipping worker pre-val; anchor eval already covers val/gen.")
     if should_run_pre_val and val_samples:
-        from ouroboros.train import evaluate_stage
+        from ouroboros.training.evaluation import evaluate_stage
         val_ce, val_acc = evaluate_stage(
             model=model,
             val_samples=val_samples,
@@ -647,7 +664,7 @@ def run_diloco_worker(
     args.gen_every_stage = False
 
     try:
-        from ouroboros.train import run_training_stages
+        from ouroboros.training.stage_runner import run_training_stages
 
         result = run_training_stages(
             model=model,

@@ -13,6 +13,16 @@ import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.kaggle_contract import CPU_SMOKE_MODE, DILOCO_RUN_MODE
+from ouroboros.kaggle_launch_matrix import requires_kaggle_gpu
+from ouroboros.runtime_env import (
+    normalize_text,
+    require_known_worker_id,
+    resolve_github_token,
+    resolve_hf_token,
+    resolve_wandb_key,
+)
+
 WORKER_IDS = ["A", "B", "C"]
 WORKER_KAGGLE_SLUGS: Dict[str, Tuple[str, str]] = {
     "A": ("weirdrunner", "weirdrunner/kaggle-utils"),
@@ -30,9 +40,6 @@ _KAGGLE_PUSH_FAILURE_MARKERS = (
     "quota reached",
     "error",
 )
-_CPU_SMOKE_VALIDATION_MODE = "cpu-smoke"
-_DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
-_DILOCO_RUN_MODE = "diloco"
 
 
 def _format_kaggle_output(stdout: Optional[str], stderr: Optional[str]) -> str:
@@ -56,12 +63,7 @@ def _is_successful_kaggle_push(returncode: int, stdout: Optional[str], stderr: O
 
 
 def _normalize_optional_text(value: Optional[Any], *, uppercase: bool = False) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    return text.upper() if uppercase else text
+    return normalize_text(value, uppercase=uppercase)
 
 
 def _first_nonempty_text(*values: Optional[Any], uppercase: bool = False) -> Optional[str]:
@@ -114,9 +116,7 @@ def _infer_runtime_repo_commit() -> Optional[str]:
 
 
 def _build_worker_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[str, str]:
-    worker = _normalize_optional_text(worker_id, uppercase=True)
-    if worker not in WORKER_IDS:
-        raise ValueError(f"Invalid worker id for runtime env injection: {worker_id!r}")
+    worker = require_known_worker_id(worker_id)
 
     runtime_env: Dict[str, str] = {}
 
@@ -132,33 +132,22 @@ def _build_worker_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[
     kaggle_run_mode = _first_nonempty_text(
         getattr(args, "kaggle_run_mode", None),
         os.environ.get("OUROBOROS_KAGGLE_RUN_MODE"),
-        _DILOCO_RUN_MODE,
+        DILOCO_RUN_MODE,
     )
     if kaggle_run_mode:
         runtime_env["OUROBOROS_KAGGLE_RUN_MODE"] = kaggle_run_mode.lower()
 
-    hf_token = _first_nonempty_text(
-        getattr(args, "hf_token", None),
-        os.environ.get("HF_TOKEN"),
-        os.environ.get("HUGGINGFACE_HUB_TOKEN"),
-    )
+    hf_token = resolve_hf_token(getattr(args, "hf_token", None))
     if hf_token:
         runtime_env["HF_TOKEN"] = hf_token
         runtime_env["HUGGINGFACE_HUB_TOKEN"] = hf_token
 
-    wandb_key = _first_nonempty_text(
-        getattr(args, "wandb_key", None),
-        os.environ.get("WANDB_API_KEY"),
-        os.environ.get("WANDB_KEY"),
-    )
+    wandb_key = resolve_wandb_key(getattr(args, "wandb_key", None))
     if wandb_key:
         runtime_env["WANDB_API_KEY"] = wandb_key
         runtime_env["WANDB_KEY"] = wandb_key
 
-    github_token = _first_nonempty_text(
-        os.environ.get("GITHUB_TOKEN"),
-        os.environ.get("GH_TOKEN"),
-    )
+    github_token = resolve_github_token()
     if github_token:
         runtime_env["GITHUB_TOKEN"] = github_token
         runtime_env["GH_TOKEN"] = github_token
@@ -433,7 +422,7 @@ def _trigger_single_worker(
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             validation_mode_normalized = _normalize_optional_text(validation_mode)
-            gpu_enabled = validation_mode_normalized != _CPU_SMOKE_VALIDATION_MODE
+            gpu_enabled = requires_kaggle_gpu(validation_mode_normalized or DILOCO_RUN_MODE)
             _stage_local_kaggle_kernel(
                 notebook_path,
                 slug,

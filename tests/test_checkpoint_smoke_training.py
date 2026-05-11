@@ -23,15 +23,15 @@ def _function_ast_dump(path: Path, function_name: str) -> str:
 
 def test_checkpoint_and_timeout_core_ast_match_monolith_source_of_truth():
     monolith_path = REPO_ROOT / "tests" / "fixtures" / "training_monolith_source.py"
-    modular_path = REPO_ROOT / "ouroboros" / "train.py"
-    for function_name in (
-        "save_checkpoint",
-        "load_checkpoint",
-        "prune_epoch_checkpoints",
-        "make_timeout_checker",
-        "run_training_stages",
-    ):
-        assert _function_ast_dump(modular_path, function_name) == _function_ast_dump(monolith_path, function_name)
+    owner_paths = {
+        "save_checkpoint": REPO_ROOT / "ouroboros" / "training" / "checkpointing.py",
+        "load_checkpoint": REPO_ROOT / "ouroboros" / "training" / "checkpointing.py",
+        "prune_epoch_checkpoints": REPO_ROOT / "ouroboros" / "training" / "checkpointing.py",
+        "make_timeout_checker": REPO_ROOT / "ouroboros" / "training" / "stage_runner.py",
+        "run_training_stages": REPO_ROOT / "ouroboros" / "training" / "stage_runner.py",
+    }
+    for function_name, owner_path in owner_paths.items():
+        assert _function_ast_dump(owner_path, function_name) == _function_ast_dump(monolith_path, function_name)
 
 
 def _training_args(**overrides) -> argparse.Namespace:

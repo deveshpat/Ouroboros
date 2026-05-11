@@ -12,81 +12,61 @@ import shlex
 from collections.abc import Mapping
 from typing import Optional
 
-_VALID_DILOCO_WORKER_IDS = {"A", "B", "C"}
-DILOCO_RUN_MODE = "diloco"
-DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
-DGAC_TRAIN_RUN_MODE = "dgac-train"
-DGAC_CANARY_RUN_MODE = "dgac-canary"
-DGAC_DILOCO_RUN_MODE = "dgac-diloco"
-_VALID_KAGGLE_RUN_MODES = {
-    DILOCO_RUN_MODE,
+from ouroboros.kaggle_contract import (
     DGAC_ANCHOR_EVAL_RUN_MODE,
-    DGAC_TRAIN_RUN_MODE,
     DGAC_CANARY_RUN_MODE,
     DGAC_DILOCO_RUN_MODE,
-}
+    DGAC_TRAIN_RUN_MODE,
+    DILOCO_RUN_MODE,
+    known_kaggle_launch_modes,
+    resolve_kaggle_launch_contract,
+)
+from ouroboros.runtime_env import (
+    GITHUB_TOKEN_ALIASES,
+    HF_TOKEN_ALIASES,
+    WANDB_KEY_ALIASES,
+    WORKER_ID_ALIASES,
+    WORKER_IDS,
+    normalize_text,
+    require_known_worker_id,
+    require_worker_id,
+    resolve_env_alias,
+)
+
+_VALID_DILOCO_WORKER_IDS = set(WORKER_IDS)
+_VALID_KAGGLE_RUN_MODES = set(known_kaggle_launch_modes())
 
 
 def _normalize_text(value: object | None, *, uppercase: bool = False) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    return text.upper() if uppercase else text
+    return normalize_text(value, uppercase=uppercase)
 
 
 def _env_has_any(env: Mapping[str, str], names: tuple[str, ...]) -> bool:
-    return any(_normalize_text(env.get(name)) is not None for name in names)
+    return resolve_env_alias(env, names) is not None
 
 
 def resolve_diloco_worker_id(env: Mapping[str, str] | None = None) -> str:
     """Resolve and validate the DiLoCo worker id from notebook/runtime env aliases."""
-    env = os.environ if env is None else env
-    for env_name in ("DILOCO_WORKER_ID", "OUROBOROS_DILOCO_WORKER_ID", "WORKER_ID"):
-        worker_id = _normalize_text(env.get(env_name), uppercase=True)
-        if worker_id is None:
-            continue
-        if worker_id not in _VALID_DILOCO_WORKER_IDS:
-            raise ValueError(
-                f"Invalid DiLoCo worker id {worker_id!r}. Expected one of A, B, or C."
-            )
-        return worker_id
-    raise ValueError(
-        "DiLoCo worker id is required. Set DILOCO_WORKER_ID, "
-        "OUROBOROS_DILOCO_WORKER_ID, or WORKER_ID."
-    )
+    return require_worker_id(os.environ if env is None else env)
 
 
 def kaggle_secret_presence(env: Mapping[str, str] | None = None) -> dict[str, bool]:
     """Return secret availability booleans without exposing secret values."""
     env = os.environ if env is None else env
     return {
-        "HF_TOKEN": _env_has_any(env, ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN")),
-        "WANDB_KEY": _env_has_any(env, ("WANDB_API_KEY", "WANDB_KEY")),
-        "GITHUB_TOKEN": _env_has_any(env, ("GITHUB_TOKEN", "GH_TOKEN")),
-        "DILOCO_WORKER_ID": _env_has_any(
-            env,
-            ("DILOCO_WORKER_ID", "OUROBOROS_DILOCO_WORKER_ID", "WORKER_ID"),
-        ),
+        "HF_TOKEN": _env_has_any(env, HF_TOKEN_ALIASES),
+        "WANDB_KEY": _env_has_any(env, WANDB_KEY_ALIASES),
+        "GITHUB_TOKEN": _env_has_any(env, GITHUB_TOKEN_ALIASES),
+        "DILOCO_WORKER_ID": _env_has_any(env, WORKER_ID_ALIASES),
     }
 
 
 def resolve_kaggle_run_mode(env: Mapping[str, str] | None = None) -> str:
     """Resolve the notebook launch mode from runtime env aliases."""
-    env = os.environ if env is None else env
-    mode = _normalize_text(
-        env.get("OUROBOROS_KAGGLE_RUN_MODE") or env.get("OUROBOROS_RUN_MODE")
-    )
-    if mode is None:
-        return DILOCO_RUN_MODE
-    mode = mode.lower()
-    if mode not in _VALID_KAGGLE_RUN_MODES:
-        raise ValueError(
-            f"Invalid Kaggle run mode {mode!r}. Expected one of: "
-            f"{', '.join(sorted(_VALID_KAGGLE_RUN_MODES))}."
-        )
-    return mode
+    try:
+        return resolve_kaggle_launch_contract(os.environ if env is None else env).mode
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("Kaggle launch mode", "Kaggle run mode")) from exc
 
 
 def build_diloco_training_command(
@@ -122,11 +102,7 @@ def build_diloco_training_command(
     terminal anchor, train HaltGate + adapters on their shard, then upload
     worker artifacts for coordinator aggregation.
     """
-    normalized_worker_id = _normalize_text(worker_id, uppercase=True)
-    if normalized_worker_id not in _VALID_DILOCO_WORKER_IDS:
-        raise ValueError(
-            f"Invalid DiLoCo worker id {normalized_worker_id!r}. Expected one of A, B, or C."
-        )
+    normalized_worker_id = require_known_worker_id(worker_id)
 
     is_dgac_diloco = bool(use_halt_gate and resume_from_diloco_anchor)
     if is_dgac_diloco and int(epochs_per_stage) != 1:

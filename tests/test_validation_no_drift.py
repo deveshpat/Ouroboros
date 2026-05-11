@@ -20,7 +20,7 @@ def _decorator_prefix(function_name: str, source: str) -> str:
 
 def test_evaluation_and_generation_preserve_monolith_no_grad_decorators():
     monolith_source = (REPO_ROOT / "tests" / "fixtures" / "training_monolith_source.py").read_text(encoding="utf-8")
-    modular_source = (REPO_ROOT / "ouroboros" / "train.py").read_text(encoding="utf-8")
+    modular_source = (REPO_ROOT / "ouroboros" / "training" / "evaluation.py").read_text(encoding="utf-8")
 
     for function_name in ("evaluate_stage", "run_generation_callback"):
         assert "@torch.no_grad()" in _decorator_prefix(function_name, monolith_source)
@@ -37,12 +37,21 @@ def _function_ast_dump(path: Path, function_name: str) -> str:
     raise AssertionError(f"{function_name} not found in {path}")
 
 
-def test_validation_and_generation_ast_match_monolith_source_of_truth():
-    monolith_path = REPO_ROOT / "tests" / "fixtures" / "training_monolith_source.py"
-    modular_path = REPO_ROOT / "ouroboros" / "train.py"
+def test_validation_and_generation_route_through_latent_execution_seam():
+    modular_source = (REPO_ROOT / "ouroboros" / "training" / "evaluation.py").read_text(encoding="utf-8")
 
-    for function_name in ("evaluate_stage", "run_generation_callback"):
-        assert _function_ast_dump(modular_path, function_name) == _function_ast_dump(monolith_path, function_name)
+    assert "prepare_latent_runtime" in modular_source
+    assert "run_latent_passes" in modular_source
+    assert "decode_from_latent_context" in modular_source
+    for forbidden in [
+        "_get_backbone",
+        "_get_embed_tokens",
+        "_get_lm_head",
+        "_autocast_ctx",
+        "_extract_last_hidden_state",
+        "_run_latent_passes",
+    ]:
+        assert forbidden not in modular_source
 
 
 def test_evaluate_stage_uses_no_grad_and_restores_train_modes_on_cpu():

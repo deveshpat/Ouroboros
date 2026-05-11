@@ -33,6 +33,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import requests
 
+from ouroboros.coordinator_decision import (
+    CoordinatorTransitionDecision,
+    plan_dispatch_reconciliation,
+    plan_missing_worker_transition,
+    plan_post_aggregation_transition,
+    plan_round_start,
+    plan_waiting_mode_transition,
+)
 from ouroboros.diloco.aggregation import (
     ANCHOR_PREFIX,
     aggregate_worker_updates,
@@ -57,10 +65,8 @@ from ouroboros.diloco.state import (
     WORKER_IDS,
     _compute_projected_shards,
     _determine_round_mode,
-    _mode_from_active_workers,
     _ordered_unique_worker_ids,
     _partition_ready_workers,
-    _reconcile_post_dispatch_state,
 )
 from ouroboros.workflow_validation import CPU_SMOKE_MODE, workflow_validation_remote_paths
 
@@ -385,38 +391,6 @@ def _positive_ready_worker_ids(statuses: List[Dict]) -> set[str]:
     }
 
 
-def _terminal_stage_state(
-    *,
-    state: Dict[str, Any],
-    stage_k: int,
-    completed_stages: List[int],
-    total_samples_seen: Dict[str, int],
-    seed: int,
-    last_round_workers: List[str],
-    last_round_samples: int,
-) -> Dict[str, Any]:
-    completed = sorted(set([int(stage) for stage in completed_stages] + [stage_k]))
-    return {
-        **state,
-        "stage_k": stage_k,
-        "round_n": 0,
-        "mode": "terminal",
-        "triggered_workers": [],
-        "attendance_workers": [],
-        "projected_shards": {},
-        "anchor_path": ANCHOR_PREFIX,
-        "total_samples_seen": total_samples_seen,
-        "completed_stages": completed,
-        "dgac_manual_gate": True,
-        "last_updated": time.time(),
-        "triggered_at": 0.0,
-        "dispatch_failures": [],
-        "last_round_workers": last_round_workers,
-        "last_round_samples": last_round_samples,
-        "seed": seed,
-    }
-
-
 def _print_dgac_manual_gate_message(stage_k: int) -> None:
     print(
         f"[coordinator] Stage {stage_k} is terminal for DiLoCo. "
@@ -426,6 +400,80 @@ def _print_dgac_manual_gate_message(stage_k: int) -> None:
         "[coordinator] DGAC manual gate: review final stage-10 anchor, run CPU-smoke if needed, "
         "then launch DGAC explicitly."
     )
+
+
+def _transition_dispatch_workers(decision: CoordinatorTransitionDecision) -> List[str]:
+    return decision.workers_to_dispatch
+
+
+def _format_transition_reconcile_message(
+    template: str,
+    *,
+    corrected_state: Dict[str, Any],
+) -> str:
+    if not template:
+        return "Dispatch reconcile"
+    return template.format(
+        mode=corrected_state.get("mode"),
+        attendance_workers=corrected_state.get("attendance_workers", []),
+        triggered_workers=corrected_state.get("triggered_workers", []),
+    )
+
+
+def _upload_transition_state(
+    *,
+    args: argparse.Namespace,
+    decision: CoordinatorTransitionDecision,
+) -> None:
+    if decision.should_write_state and decision.state is not None:
+        hub_upload_json(
+            args.repo_id,
+            ROUND_STATE_PATH,
+            decision.state,
+            args.hf_token,
+            message=decision.hub_message,
+        )
+
+
+def _dispatch_transition(
+    *,
+    args: argparse.Namespace,
+    kaggle_creds: Dict[str, Tuple[Optional[str], Optional[str]]],
+    decision: CoordinatorTransitionDecision,
+    require_active_workers: bool = False,
+) -> None:
+    workers_to_dispatch = _transition_dispatch_workers(decision)
+    if args.skip_trigger:
+        return
+    if require_active_workers and not decision.dispatch_active_workers:
+        return
+    if not workers_to_dispatch:
+        return
+    dispatch_results = trigger_kaggle_workers(
+        kaggle_creds,
+        active_workers=workers_to_dispatch,
+        notebook_path=Path(args.kaggle_notebook_path),
+        coordinator_args=args,
+    )
+    if decision.state is None:
+        return
+    reconcile_plan = plan_dispatch_reconciliation(
+        state=decision.state,
+        planned_active_workers=decision.reconcile_active_workers,
+        planned_attendance_workers=decision.reconcile_attendance_workers,
+        dispatch_results=dispatch_results,
+    )
+    if reconcile_plan.corrected_state is not None:
+        hub_upload_json(
+            args.repo_id,
+            ROUND_STATE_PATH,
+            reconcile_plan.corrected_state,
+            args.hf_token,
+            message=_format_transition_reconcile_message(
+                decision.dispatch_reconcile_message,
+                corrected_state=reconcile_plan.corrected_state,
+            ),
+        )
 
 
 
@@ -640,19 +688,19 @@ def run_kaggle_dgac_diloco(args: argparse.Namespace) -> None:
         notebook_path=Path(args.kaggle_notebook_path),
         coordinator_args=args,
     )
-    corrected_state = _reconcile_post_dispatch_state(
+    reconcile_plan = plan_dispatch_reconciliation(
         state=new_state,
         planned_active_workers=worker_ids,
         planned_attendance_workers=[],
         dispatch_results=dispatch_results,
     )
-    if corrected_state is not None:
+    if reconcile_plan.corrected_state is not None:
         hub_upload_json(
             args.repo_id,
             ROUND_STATE_PATH,
-            corrected_state,
+            reconcile_plan.corrected_state,
             args.hf_token,
-            message=f"DGAC DiLoCo dispatch reconcile: mode={corrected_state['mode']}",
+            message=f"DGAC DiLoCo dispatch reconcile: mode={reconcile_plan.corrected_state['mode']}",
         )
     if any(dispatch_results.get(worker_id) != "success" for worker_id in worker_ids):
         raise RuntimeError(
@@ -774,15 +822,24 @@ def main() -> None:
         print("[coordinator] No round_state.json found. Nothing to aggregate.")
         return
 
-    stage_k = int(state.get("stage_k", 0))
-    round_n = int(state.get("round_n", 0))
+    kaggle_creds = _build_kaggle_creds(args)
+    credentialed = [w for w in WORKER_IDS if kaggle_creds[w][0] and kaggle_creds[w][1]]
+
+    round_plan = plan_round_start(
+        state=state,
+        total_train_samples=args.total_train_samples,
+        min_shard_samples=args.min_shard_samples,
+        credentialed_workers=credentialed,
+        force_worker_ids=args.force_worker_ids,
+        worker_timeout_hours=args.worker_timeout_hours,
+    )
+    stage_k = round_plan.stage_k
+    round_n = round_plan.round_n
     total_samples_seen = {str(k): int(v) for k, v in dict(state.get("total_samples_seen", {})).items()}
     completed_stages = [int(x) for x in state.get("completed_stages", [])]
-    # Workers that were triggered last round — only check these for ready status.
-    # Sanitize/normalize to defend against duplicated, lowercase, or overlapping IDs.
-    expected_workers = _ordered_unique_worker_ids(state.get("triggered_workers"))
+    expected_workers = round_plan.expected_workers
     seed = int(state.get("seed", 42))
-    current_mode = state.get("mode", "diloco")
+    current_mode = round_plan.current_mode
     if bool(state.get("dgac_diloco")) and current_mode != DGAC_COMPLETE_MODE:
         args.kaggle_run_mode = DGAC_DILOCO_RUN_MODE
     triggered_at = float(state.get("triggered_at", 0.0))
@@ -797,46 +854,21 @@ def main() -> None:
         _print_dgac_manual_gate_message(min(stage_k, DILOCO_TERMINAL_STAGE))
         return
 
-    attendance_workers_prev = [
-        w for w in _ordered_unique_worker_ids(state.get("attendance_workers"))
-        if w not in set(expected_workers)
-    ]
-    worker_timeout_s = args.worker_timeout_hours * 3600.0
-    is_round_timed_out = triggered_at > 0 and (time.time() - triggered_at) > worker_timeout_s
-
-    kaggle_creds = _build_kaggle_creds(args)
-    credentialed = [w for w in WORKER_IDS if kaggle_creds[w][0] and kaggle_creds[w][1]]
-
-    force_ids: Optional[List[str]] = None
-    if args.force_worker_ids:
-        force_ids = _ordered_unique_worker_ids(
-            [w.strip().upper() for w in args.force_worker_ids.split(",") if w.strip()]
-        ) or None
+    attendance_workers_prev = round_plan.attendance_workers
+    is_round_timed_out = round_plan.is_round_timed_out
+    force_ids: Optional[List[str]] = round_plan.force_worker_ids or None
+    projected_shards = round_plan.projected_shards
+    remaining = round_plan.remaining_samples
+    stage_samples_seen = int(total_samples_seen.get(str(stage_k), 0))
+    next_mode = round_plan.next_mode
+    next_active_workers = round_plan.next_active_workers
+    next_attendance_workers = round_plan.next_attendance_workers
 
     print(f"[coordinator] stage={stage_k} round={round_n} mode={current_mode}")
     if attendance_workers_prev:
         print(f"[coordinator] Attendance workers: {attendance_workers_prev}")
-
-    stage_samples_seen = int(total_samples_seen.get(str(stage_k), 0))
-    projected_shards = _compute_projected_shards(
-        total_samples=args.total_train_samples,
-        stage_k=stage_k,
-        round_n=round_n,
-        seed=seed,
-        total_samples_seen=stage_samples_seen,
-    )
-    remaining = max(args.total_train_samples - stage_samples_seen, 0)
     print(f"[coordinator] Remaining samples for stage {stage_k}: {remaining}")
     print(f"[coordinator] Projected shards: {projected_shards}")
-
-    eligible_for_training_now = [w for w in credentialed if w not in attendance_workers_prev]
-    next_mode, next_active_workers = _determine_round_mode(
-        projected_shards=projected_shards,
-        credentialed_workers=eligible_for_training_now,
-        min_shard_samples=args.min_shard_samples,
-        force_worker_ids=force_ids,
-    )
-    next_attendance_workers = list(attendance_workers_prev)
     print(f"[coordinator] Next round mode: {next_mode}  active workers: {next_active_workers}")
 
     if args.dry_run:
@@ -857,183 +889,58 @@ def main() -> None:
             round_n,
             expected_workers=attendance_workers_prev,
         )
-        responded_ids = {str(w.get("worker_id", "")).upper() for w in responded_in_waiting}
-        still_absent = [w for w in attendance_workers_prev if w not in responded_ids]
+        waiting_decision = plan_waiting_mode_transition(
+            state=state,
+            round_plan=round_plan,
+            responded_worker_ids=[str(w.get("worker_id", "")).upper() for w in responded_in_waiting],
+            credentialed_workers=credentialed,
+            total_train_samples=args.total_train_samples,
+            min_shard_samples=args.min_shard_samples,
+            attendance_join_grace_minutes=args.attendance_join_grace_minutes,
+            now=time.time(),
+        )
 
-        if not responded_ids:
-            if triggered_at <= 0:
-                print(
-                    "[coordinator] Waiting mode: no confirmed dispatch timestamp yet; "
-                    "attempting attendance dispatch now."
-                )
-                new_state = {
-                    **state,
-                    "triggered_at": time.time(),
-                    "last_updated": time.time(),
-                    "dispatch_failures": [],
-                }
-                hub_upload_json(
-                    args.repo_id,
-                    ROUND_STATE_PATH,
-                    new_state,
-                    args.hf_token,
-                    message=f"Waiting mode: initial attendance dispatch round={round_n}",
-                )
-                if not args.skip_trigger and not args.dry_run:
-                    dispatch_results = trigger_kaggle_workers(
-                        kaggle_creds,
-                        active_workers=attendance_workers_prev,
-                        notebook_path=Path(args.kaggle_notebook_path),
-                        coordinator_args=args,
-                    )
-                    corrected_state = _reconcile_post_dispatch_state(
-                        state=new_state,
-                        planned_active_workers=[],
-                        planned_attendance_workers=attendance_workers_prev,
-                        dispatch_results=dispatch_results,
-                    )
-                    if corrected_state is not None:
-                        hub_upload_json(
-                            args.repo_id,
-                            ROUND_STATE_PATH,
-                            corrected_state,
-                            args.hf_token,
-                            message=(
-                                f"Waiting mode dispatch reconcile: stage={stage_k} round={round_n} "
-                                f"attendance={corrected_state['attendance_workers']}"
-                            ),
-                        )
-                print("[coordinator] Done (waiting mode initial dispatch).")
-                return
-            if not is_round_timed_out:
-                print("[coordinator] Waiting mode: no responses yet, standing by.")
-                return
-            print(f"[coordinator] Waiting mode: re-dispatching attendance to {attendance_workers_prev}")
-            new_state = {
-                **state,
-                "triggered_at": time.time(),
-                "last_updated": time.time(),
-                "dispatch_failures": [],
-            }
-            hub_upload_json(
-                args.repo_id,
-                ROUND_STATE_PATH,
-                new_state,
-                args.hf_token,
-                message=f"Waiting mode: re-dispatch attendance round={round_n}",
+        if waiting_decision.kind == "waiting_initial_dispatch":
+            print(
+                "[coordinator] Waiting mode: no confirmed dispatch timestamp yet; "
+                "attempting attendance dispatch now."
             )
-            if not args.skip_trigger and not args.dry_run:
-                dispatch_results = trigger_kaggle_workers(
-                    kaggle_creds,
-                    active_workers=attendance_workers_prev,
-                    notebook_path=Path(args.kaggle_notebook_path),
-                    coordinator_args=args,
-                )
-                corrected_state = _reconcile_post_dispatch_state(
-                    state=new_state,
-                    planned_active_workers=[],
-                    planned_attendance_workers=attendance_workers_prev,
-                    dispatch_results=dispatch_results,
-                )
-                if corrected_state is not None:
-                    hub_upload_json(
-                        args.repo_id,
-                        ROUND_STATE_PATH,
-                        corrected_state,
-                        args.hf_token,
-                        message=(
-                            f"Waiting mode re-dispatch reconcile: round={round_n} "
-                            f"attendance={corrected_state['attendance_workers']}"
-                        ),
-                    )
-            print("[coordinator] Done (waiting mode re-dispatch).")
+        elif waiting_decision.kind == "waiting_standby":
+            print("[coordinator] Waiting mode: no responses yet, standing by.")
             return
-
-        attendance_grace_s = max(float(args.attendance_join_grace_minutes), 0.0) * 60.0
-        waiting_elapsed_s = (time.time() - triggered_at) if triggered_at > 0 else 0.0
-        all_attendance_responded = not still_absent
-        grace_expired = triggered_at > 0 and waiting_elapsed_s >= attendance_grace_s
-        if not all_attendance_responded and not grace_expired:
+        elif waiting_decision.kind == "waiting_redispatch":
+            print(f"[coordinator] Waiting mode: re-dispatching attendance to {attendance_workers_prev}")
+        elif waiting_decision.kind == "waiting_grace":
             print(
                 "[coordinator] Waiting mode: attendance responders received "
-                f"{sorted(responded_ids)}, still waiting for {still_absent} "
+                f"{waiting_decision.metadata['responded_workers']}, "
+                f"still waiting for {waiting_decision.metadata['still_absent_workers']} "
                 f"within {args.attendance_join_grace_minutes:g}m join grace."
             )
             return
+        elif waiting_decision.kind == "waiting_promote":
+            print(f"[coordinator] Waiting mode exit: promoting {waiting_decision.metadata['responded_workers']}")
 
-        responded_list = sorted(responded_ids)
-        print(f"[coordinator] Waiting mode exit: promoting {responded_list}")
-        total_samples_seen[str(stage_k)] = stage_samples_seen
-        next_round_n = round_n + 1
-        next_stage_k = stage_k
-        projected_shards_next = _compute_projected_shards(
-            total_samples=args.total_train_samples,
-            stage_k=next_stage_k,
-            round_n=next_round_n,
-            seed=seed,
-            total_samples_seen=stage_samples_seen,
-        )
-        eligible_for_training = [w for w in credentialed if w in responded_ids]
-        next_mode, next_active_workers = _determine_round_mode(
-            projected_shards=projected_shards_next,
-            credentialed_workers=eligible_for_training,
-            min_shard_samples=args.min_shard_samples,
-            force_worker_ids=force_ids,
-        )
-        next_attendance_workers = still_absent
-        if not next_active_workers:
-            next_mode = "waiting"
-            next_attendance_workers = attendance_workers_prev
-
-        new_state = {
-            **state,
-            "stage_k": next_stage_k,
-            "round_n": next_round_n,
-            "mode": next_mode,
-            "triggered_workers": next_active_workers,
-            "attendance_workers": next_attendance_workers,
-            "projected_shards": projected_shards_next,
-            "total_samples_seen": total_samples_seen,
-            "last_updated": time.time(),
-            "triggered_at": time.time(),
-            "dispatch_failures": [],
-            "last_round_workers": responded_list,
-            "last_round_samples": 0,
-            "seed": seed,
-        }
-        hub_upload_json(
-            args.repo_id,
-            ROUND_STATE_PATH,
-            new_state,
-            args.hf_token,
-            message=f"Waiting mode resolved: stage={next_stage_k} round={next_round_n} mode={next_mode}",
-        )
-        print(f"[coordinator] round_state updated: stage={next_stage_k} round={next_round_n} mode={next_mode}")
-        if not args.skip_trigger and next_active_workers:
-            dispatch_results = trigger_kaggle_workers(
-                kaggle_creds,
-                active_workers=next_active_workers + next_attendance_workers,
-                notebook_path=Path(args.kaggle_notebook_path),
-                coordinator_args=args,
+        _upload_transition_state(args=args, decision=waiting_decision)
+        if waiting_decision.state is not None:
+            print(
+                f"[coordinator] round_state updated: "
+                f"stage={waiting_decision.state.get('stage_k')} "
+                f"round={waiting_decision.state.get('round_n')} "
+                f"mode={waiting_decision.state.get('mode')}"
             )
-            corrected_state = _reconcile_post_dispatch_state(
-                state=new_state,
-                planned_active_workers=next_active_workers,
-                planned_attendance_workers=next_attendance_workers,
-                dispatch_results=dispatch_results,
-            )
-            if corrected_state is not None:
-                hub_upload_json(
-                    args.repo_id,
-                    ROUND_STATE_PATH,
-                    corrected_state,
-                    args.hf_token,
-                    message=(
-                        f"Waiting mode resolved dispatch reconcile: stage={next_stage_k} "
-                        f"round={next_round_n} mode={corrected_state['mode']}"
-                    ),
-                )
-        print("[coordinator] Done (waiting mode resolved).")
+        _dispatch_transition(
+            args=args,
+            kaggle_creds=kaggle_creds,
+            decision=waiting_decision,
+            require_active_workers=waiting_decision.kind == "waiting_promote",
+        )
+        if waiting_decision.kind == "waiting_initial_dispatch":
+            print("[coordinator] Done (waiting mode initial dispatch).")
+        elif waiting_decision.kind == "waiting_redispatch":
+            print("[coordinator] Done (waiting mode re-dispatch).")
+        elif waiting_decision.kind == "waiting_promote":
+            print("[coordinator] Done (waiting mode resolved).")
         return
 
     # ── W&B init ─────────────────────────────────────────────────────────────
@@ -1075,7 +982,6 @@ def main() -> None:
             attendance_workers=attendance_workers_prev,
         )
         ready_ids = _positive_ready_worker_ids(ready_workers)
-        ready_or_attendance_ids = ready_ids | _positive_ready_worker_ids(attendance_ready_workers)
         attendance_ready_ids = {str(w.get("worker_id", "")) for w in attendance_ready_workers}
         zero_sample_active = sorted(
             str(w.get("worker_id", "")).upper()
@@ -1095,154 +1001,79 @@ def main() -> None:
         if expected_workers:
             missing_workers = [w for w in expected_workers if w not in ready_ids]
             if missing_workers:
-                force_dispatch_workers: List[str] = []
-                force_already_done: List[str] = []
-                force_unavailable: List[str] = []
-                if force_ids:
-                    for worker_id in force_ids:
-                        if worker_id in expected_workers:
-                            continue
-                        if worker_id in ready_or_attendance_ids:
-                            force_already_done.append(worker_id)
-                            continue
-                        if worker_id not in credentialed:
-                            force_unavailable.append(worker_id)
-                            continue
-                        force_dispatch_workers.append(worker_id)
-
-                if force_unavailable:
+                missing_decision = plan_missing_worker_transition(
+                    state=state,
+                    stage_k=stage_k,
+                    round_n=round_n,
+                    expected_workers=expected_workers,
+                    attendance_workers=attendance_workers_prev,
+                    missing_workers=missing_workers,
+                    force_worker_ids=force_ids or [],
+                    ready_worker_ids=ready_ids,
+                    attendance_ready_ids=_positive_ready_worker_ids(attendance_ready_workers),
+                    credentialed_workers=credentialed,
+                    is_round_timed_out=is_round_timed_out,
+                    now=time.time(),
+                )
+                repair_plan = missing_decision.metadata.get("repair_plan")
+                if repair_plan is not None and repair_plan.unavailable_workers:
                     print(
                         "[coordinator] Force repair skipped unavailable workers: "
-                        f"{force_unavailable}"
+                        f"{repair_plan.unavailable_workers}"
                     )
 
-                force_added_workers = _ordered_unique_worker_ids(
-                    force_already_done,
-                    force_dispatch_workers,
-                )
-                if force_added_workers:
-                    repaired_active_workers = _ordered_unique_worker_ids(
-                        expected_workers,
-                        force_added_workers,
-                    )
-                    repaired_attendance_workers = [
-                        w for w in attendance_workers_prev
-                        if w not in set(repaired_active_workers)
-                    ]
-                    repaired_state = {
-                        **state,
-                        "mode": _mode_from_active_workers(repaired_active_workers),
-                        "triggered_workers": repaired_active_workers,
-                        "attendance_workers": repaired_attendance_workers,
-                        "last_updated": time.time(),
-                        "triggered_at": time.time(),
-                        "dispatch_failures": [],
-                    }
-                    hub_upload_json(
-                        args.repo_id,
-                        ROUND_STATE_PATH,
-                        repaired_state,
-                        args.hf_token,
-                        message=(
-                            f"Force repair dispatch: stage={stage_k} round={round_n} "
-                            f"active={repaired_active_workers}"
-                        ),
-                    )
-                    if force_already_done:
+                if missing_decision.kind == "force_repair":
+                    assert repair_plan is not None
+                    _upload_transition_state(args=args, decision=missing_decision)
+                    if repair_plan.already_done_workers:
                         print(
                             "[coordinator] Force repair counted already-done workers without re-dispatch: "
-                            f"{force_already_done}"
+                            f"{repair_plan.already_done_workers}"
                         )
-                    if force_dispatch_workers:
+                    if repair_plan.dispatch_workers:
                         print(
                             "[coordinator] Force repair dispatching missing workers: "
-                            f"{force_dispatch_workers}; preserving active workers: {expected_workers}"
+                            f"{repair_plan.dispatch_workers}; preserving active workers: {expected_workers}"
                         )
-                    if force_dispatch_workers and not args.skip_trigger:
-                        dispatch_results = trigger_kaggle_workers(
-                            kaggle_creds,
-                            active_workers=force_dispatch_workers,
-                            notebook_path=Path(args.kaggle_notebook_path),
-                            coordinator_args=args,
-                        )
-                        corrected_state = _reconcile_post_dispatch_state(
-                            state=repaired_state,
-                            planned_active_workers=repaired_active_workers,
-                            planned_attendance_workers=repaired_attendance_workers,
-                            dispatch_results=dispatch_results,
-                        )
-                        if corrected_state is not None:
-                            hub_upload_json(
-                                args.repo_id,
-                                ROUND_STATE_PATH,
-                                corrected_state,
-                                args.hf_token,
-                                message=(
-                                    f"Force repair dispatch reconcile: stage={stage_k} "
-                                    f"round={round_n} mode={corrected_state['mode']}"
-                                ),
-                            )
+                    _dispatch_transition(
+                        args=args,
+                        kaggle_creds=kaggle_creds,
+                        decision=missing_decision,
+                    )
                     print(f"[coordinator] Done (force repair round {round_n}).")
                     return
 
-                if triggered_at <= 0:
-                    # triggered_at=0 means this round's dispatch was never confirmed —
-                    # the Kaggle push may have failed silently, or the state was manually reset.
-                    # Re-dispatch immediately instead of waiting up to 13h for the timeout.
+                if missing_decision.kind == "force_repair_unavailable":
+                    return
+
+                if missing_decision.kind == "unconfirmed_redispatch":
                     print(
                         f"[coordinator] Round {round_n}: {missing_workers} marked triggered but "
                         f"triggered_at=0 (unconfirmed dispatch). Re-dispatching now."
                     )
-                    new_state = {
-                        **state,
-                        "triggered_at": time.time(),
-                        "last_updated": time.time(),
-                        "dispatch_failures": [],
-                    }
-                    hub_upload_json(
-                        args.repo_id,
-                        ROUND_STATE_PATH,
-                        new_state,
-                        args.hf_token,
-                        message=f"Re-dispatch unconfirmed: stage={stage_k} round={round_n}",
+                    _upload_transition_state(args=args, decision=missing_decision)
+                    _dispatch_transition(
+                        args=args,
+                        kaggle_creds=kaggle_creds,
+                        decision=missing_decision,
                     )
-                    if not args.skip_trigger:
-                        all_to_trigger = expected_workers + [
-                            w for w in attendance_workers_prev if w not in expected_workers
-                        ]
-                        dispatch_results = trigger_kaggle_workers(
-                            kaggle_creds,
-                            active_workers=all_to_trigger,
-                            notebook_path=Path(args.kaggle_notebook_path),
-                            coordinator_args=args,
-                        )
-                        post_corrected = _reconcile_post_dispatch_state(
-                            state=new_state,
-                            planned_active_workers=expected_workers,
-                            planned_attendance_workers=attendance_workers_prev,
-                            dispatch_results=dispatch_results,
-                        )
-                        if post_corrected is not None:
-                            hub_upload_json(
-                                args.repo_id,
-                                ROUND_STATE_PATH,
-                                post_corrected,
-                                args.hf_token,
-                                message=f"Re-dispatch reconcile: stage={stage_k} round={round_n}",
-                            )
                     print(f"[coordinator] Done (re-dispatch unconfirmed round {round_n}).")
                     return
-                elif not is_round_timed_out:
+
+                if missing_decision.kind == "wait_for_missing_workers":
                     print(f"[coordinator] Waiting for workers to finish this round: {missing_workers}")
                     return
-                newly_demoted = [w for w in missing_workers if w not in attendance_workers_prev]
-                still_absent = [w for w in missing_workers if w in attendance_workers_prev]
-                if newly_demoted:
-                    print(
-                        f"[coordinator] Timed out (>{args.worker_timeout_hours}h): {newly_demoted} — demoting to attendance"
-                    )
-                if still_absent:
-                    print(f"[coordinator] Still absent after attendance: {still_absent} — retrying")
+
+                if missing_decision.kind == "timeout_continue":
+                    newly_demoted = missing_decision.metadata.get("newly_demoted_workers", [])
+                    still_absent = missing_decision.metadata.get("still_absent_workers", [])
+                    if newly_demoted:
+                        print(
+                            f"[coordinator] Timed out (>{args.worker_timeout_hours}h): "
+                            f"{newly_demoted} — demoting to attendance"
+                        )
+                    if still_absent:
+                        print(f"[coordinator] Still absent after attendance: {still_absent} — retrying")
 
         # Filter to workers that actually did work (samples_seen > 0) for aggregation
         contributing_workers = [w for w in ready_workers if int(w.get("samples_seen", 0)) > 0]
@@ -1348,219 +1179,102 @@ def main() -> None:
         if attendance_promoted:
             print(f"[coordinator] Attendance workers responded, promoting next round: {attendance_promoted}")
 
-        newly_demoted = [
-            w for w in (expected_workers or [])
-            if w not in ready_ids and w not in attendance_workers_prev
-        ] if is_round_timed_out else []
-
-        still_attending = [w for w in attendance_workers_prev if w not in attendance_ready_ids]
-        next_attendance_workers = [
-            w for w in WORKER_IDS if w in set(newly_demoted + still_attending)
-        ]
-
-        # ── Re-check remaining after aggregation ─────────────────────────────
-        final_stage_samples = int(total_samples_seen.get(str(stage_k), stage_samples_seen))
-        remaining_after = max(args.total_train_samples - final_stage_samples, 0)
-
-        # Recompute mode for next round based on updated sample counts
-        projected_shards_next = _compute_projected_shards(
-            total_samples=args.total_train_samples,
+        post_decision = plan_post_aggregation_transition(
+            state=state,
             stage_k=stage_k,
-            round_n=round_n + 1,
-            seed=seed,
-            total_samples_seen=final_stage_samples,
-        )
-        completion_mode, _ = _determine_round_mode(
-            projected_shards=projected_shards_next,
+            round_n=round_n,
+            current_mode=current_mode,
+            total_train_samples=args.total_train_samples,
+            min_shard_samples=args.min_shard_samples,
             credentialed_workers=credentialed,
-            min_shard_samples=args.min_shard_samples,
-            force_worker_ids=None,
+            force_worker_ids=force_ids,
+            expected_workers=expected_workers,
+            attendance_workers=attendance_workers_prev,
+            attendance_ready_ids=attendance_ready_ids,
+            ready_worker_ids=ready_ids,
+            is_round_timed_out=is_round_timed_out,
+            total_samples_seen=total_samples_seen,
+            stage_samples_seen=stage_samples_seen,
+            completed_stages=completed_stages,
+            seed=seed,
+            contributing_workers=contributing_workers,
+            anchor_path=ANCHOR_PREFIX,
+            terminal_stage=DILOCO_TERMINAL_STAGE,
+            dgac_complete_mode=DGAC_COMPLETE_MODE,
+            now=time.time(),
         )
-        eligible_for_training = [w for w in credentialed if w not in next_attendance_workers]
-        planning_force_ids = force_ids if not expected_workers and not contributing_workers else None
-        next_mode, next_active_workers = _determine_round_mode(
-            projected_shards=projected_shards_next,
-            credentialed_workers=eligible_for_training,
-            min_shard_samples=args.min_shard_samples,
-            force_worker_ids=planning_force_ids,
-        )
+        final_stage_samples = int(post_decision.metadata.get("final_stage_samples", stage_samples_seen))
+        stage_complete = bool(post_decision.metadata.get("stage_complete", False))
 
-        # ── Stage advance check ───────────────────────────────────────────────
-        stage_complete = (
-            final_stage_samples >= args.total_train_samples
-            or completion_mode == "complete"
-        )
-        next_stage_k = stage_k
-        next_round_n = round_n + 1
-        if stage_complete:
-            if stage_k >= DILOCO_TERMINAL_STAGE:
-                if current_mode == DGAC_DILOCO_RUN_MODE or bool(state.get("dgac_diloco")):
-                    print(
-                        f"[coordinator] DGAC DiLoCo COMPLETE "
-                        f"({final_stage_samples}/{args.total_train_samples} samples)."
-                    )
-                    completed = sorted(set([int(stage) for stage in completed_stages] + [stage_k]))
-                    terminal_state = {
-                        **state,
-                        "stage_k": DILOCO_TERMINAL_STAGE,
-                        "round_n": 0,
-                        "mode": DGAC_COMPLETE_MODE,
-                        "triggered_workers": [],
-                        "attendance_workers": [],
-                        "projected_shards": {},
-                        "anchor_path": ANCHOR_PREFIX,
-                        "total_samples_seen": total_samples_seen,
-                        "completed_stages": completed,
-                        "dgac_manual_gate": False,
-                        "dgac_diloco": True,
-                        "dgac_diloco_complete": True,
-                        "last_updated": time.time(),
-                        "triggered_at": 0.0,
-                        "dispatch_failures": [],
-                        "last_round_workers": [w["worker_id"] for w in contributing_workers] if contributing_workers else [],
-                        "last_round_samples": sum(w.get("samples_seen", 0) for w in contributing_workers) if contributing_workers else 0,
-                        "seed": seed,
-                    }
-                    hub_upload_json(
-                        args.repo_id,
-                        ROUND_STATE_PATH,
-                        terminal_state,
-                        args.hf_token,
-                        message="DGAC DiLoCo complete: final anchor uploaded",
-                    )
-                    if coordinator_wandb_run is not None:
-                        import wandb
-                        wandb.log({"coordinator/dgac_diloco_complete": 1}, step=round_n)
-                        wandb.finish()
-                        coordinator_wandb_run = None
-                    print("[coordinator] Done (DGAC DiLoCo complete).")
-                    return
-
-                print(
-                    f"[coordinator] Stage {stage_k} COMPLETE "
-                    f"({final_stage_samples}/{args.total_train_samples} samples). "
-                    "Entering DGAC manual gate."
-                )
-                terminal_state = _terminal_stage_state(
-                    state=state,
-                    stage_k=DILOCO_TERMINAL_STAGE,
-                    completed_stages=completed_stages,
-                    total_samples_seen=total_samples_seen,
-                    seed=seed,
-                    last_round_workers=[w["worker_id"] for w in contributing_workers] if contributing_workers else [],
-                    last_round_samples=sum(w.get("samples_seen", 0) for w in contributing_workers) if contributing_workers else 0,
-                )
-                hub_upload_json(
-                    args.repo_id,
-                    ROUND_STATE_PATH,
-                    terminal_state,
-                    args.hf_token,
-                    message="DiLoCo terminal gate: stage 10 complete, DGAC manual",
-                )
-                _print_dgac_manual_gate_message(DILOCO_TERMINAL_STAGE)
-                if coordinator_wandb_run is not None:
-                    import wandb
-                    wandb.log({"coordinator/stage_complete": 1}, step=round_n)
-                    wandb.finish()
-                    coordinator_wandb_run = None
-                print("[coordinator] Done (DGAC manual gate).")
-                return
-
+        if post_decision.kind == "dgac_diloco_complete":
             print(
-                f"[coordinator] Stage {stage_k} COMPLETE ({final_stage_samples}/{args.total_train_samples} samples). Advancing to stage {stage_k + 1}."
+                f"[coordinator] DGAC DiLoCo COMPLETE "
+                f"({final_stage_samples}/{args.total_train_samples} samples)."
             )
-            if stage_k not in completed_stages:
-                completed_stages.append(stage_k)
-            completed_stages = sorted(set(completed_stages))
-            next_stage_k = stage_k + 1
-            next_round_n = 0
-            projected_shards_next = _compute_projected_shards(
-                total_samples=args.total_train_samples,
-                stage_k=next_stage_k,
-                round_n=0,
-                seed=seed,
-                total_samples_seen=0,
-            )
-            eligible_for_training = [w for w in credentialed if w not in next_attendance_workers]
-            next_mode, next_active_workers = _determine_round_mode(
-                projected_shards=projected_shards_next,
-                credentialed_workers=eligible_for_training,
-                min_shard_samples=args.min_shard_samples,
-                force_worker_ids=force_ids,
-            )
+            _upload_transition_state(args=args, decision=post_decision)
+            if coordinator_wandb_run is not None:
+                import wandb
+                wandb.log({"coordinator/dgac_diloco_complete": 1}, step=round_n)
+                wandb.finish()
+                coordinator_wandb_run = None
+            print("[coordinator] Done (DGAC DiLoCo complete).")
+            return
 
+        if post_decision.kind == "terminal_manual_gate":
+            print(
+                f"[coordinator] Stage {stage_k} COMPLETE "
+                f"({final_stage_samples}/{args.total_train_samples} samples). "
+                "Entering DGAC manual gate."
+            )
+            _upload_transition_state(args=args, decision=post_decision)
+            _print_dgac_manual_gate_message(DILOCO_TERMINAL_STAGE)
+            if coordinator_wandb_run is not None:
+                import wandb
+                wandb.log({"coordinator/stage_complete": 1}, step=round_n)
+                wandb.finish()
+                coordinator_wandb_run = None
+            print("[coordinator] Done (DGAC manual gate).")
+            return
+
+        if post_decision.kind == "stage_advance":
+            next_stage_k = post_decision.state["stage_k"] if post_decision.state else stage_k + 1
+            print(
+                f"[coordinator] Stage {stage_k} COMPLETE "
+                f"({final_stage_samples}/{args.total_train_samples} samples). "
+                f"Advancing to stage {next_stage_k}."
+            )
             if coordinator_wandb_run is not None:
                 import wandb
                 wandb.log({"coordinator/stage_complete": 1}, step=round_n)
 
-        if not stage_complete and not next_active_workers and next_attendance_workers:
+        if post_decision.kind == "all_absent_waiting":
             print("[coordinator] All workers absent — entering waiting mode. Coordinator idles until workers signal presence.")
-            next_mode = "waiting"
-            next_round_n = round_n
-            next_stage_k = stage_k
 
-        # ── Write round_state.json ────────────────────────────────────────────
-        new_state = {
-            "stage_k": next_stage_k,
-            "round_n": next_round_n,
-            "mode": next_mode,
-            "triggered_workers": next_active_workers,
-            "attendance_workers": next_attendance_workers,
-            "projected_shards": projected_shards_next,
-            "anchor_path": ANCHOR_PREFIX,
-            "total_samples_seen": total_samples_seen,
-            "completed_stages": completed_stages,
-            "dgac_manual_gate": False if bool(state.get("dgac_diloco")) else bool(state.get("dgac_manual_gate", False)),
-            "dgac_diloco": bool(state.get("dgac_diloco", False)),
-            "pre_dgac_total_samples_seen": state.get("pre_dgac_total_samples_seen", {}),
-            "last_updated": time.time(),
-            "triggered_at": time.time() if (next_active_workers or next_attendance_workers) else 0.0,
-            "last_round_workers": [w["worker_id"] for w in contributing_workers] if contributing_workers else [],
-            "last_round_samples": sum(w.get("samples_seen", 0) for w in contributing_workers) if contributing_workers else 0,
-            "seed": seed,
-        }
-        hub_upload_json(
-            args.repo_id,
-            ROUND_STATE_PATH,
-            new_state,
-            args.hf_token,
-            message=f"Round state: stage={next_stage_k} round={next_round_n} mode={next_mode}",
+        _upload_transition_state(args=args, decision=post_decision)
+        assert post_decision.state is not None
+        print(
+            f"[coordinator] round_state.json updated: "
+            f"stage={post_decision.state['stage_k']} "
+            f"round={post_decision.state['round_n']} "
+            f"mode={post_decision.state['mode']}"
         )
-        print(f"[coordinator] round_state.json updated: stage={next_stage_k} round={next_round_n} mode={next_mode}")
 
         # ── Trigger next workers ──────────────────────────────────────────────
-        all_workers_to_trigger = next_active_workers + [
-            w for w in next_attendance_workers if w not in next_active_workers
-        ]
+        all_workers_to_trigger = _transition_dispatch_workers(post_decision)
         if args.skip_trigger:
             print("[coordinator] --skip_trigger set. Skipping worker trigger.")
         elif not all_workers_to_trigger:
             print("[coordinator] No workers to trigger (stage complete or waiting with no dispatch needed).")
         else:
-            print(f"[coordinator] Triggering training: {next_active_workers}  attendance: {next_attendance_workers}")
-            dispatch_results = trigger_kaggle_workers(
-                kaggle_creds,
-                active_workers=all_workers_to_trigger,
-                notebook_path=Path(args.kaggle_notebook_path),
-                coordinator_args=args,
+            print(
+                f"[coordinator] Triggering training: {post_decision.dispatch_active_workers}  "
+                f"attendance: {post_decision.dispatch_attendance_workers}"
             )
-            corrected_state = _reconcile_post_dispatch_state(
-                state=new_state,
-                planned_active_workers=next_active_workers,
-                planned_attendance_workers=next_attendance_workers,
-                dispatch_results=dispatch_results,
+            _dispatch_transition(
+                args=args,
+                kaggle_creds=kaggle_creds,
+                decision=post_decision,
             )
-            if corrected_state is not None:
-                hub_upload_json(
-                    args.repo_id,
-                    ROUND_STATE_PATH,
-                    corrected_state,
-                    args.hf_token,
-                    message=(
-                        f"Dispatch reconcile: stage={next_stage_k} round={next_round_n} "
-                        f"mode={corrected_state['mode']}"
-                    ),
-                )
 
         if coordinator_wandb_run is not None:
             import wandb

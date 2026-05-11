@@ -1,7 +1,8 @@
-"""DGAC halt gate and Coconut latent-forward utilities."""
+"""DGAC halt gate, policy losses, and Coconut training contract."""
 
 from __future__ import annotations
 
+import argparse
 import re as _re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -9,16 +10,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ouroboros.model import (
-    _amp_dtype,
-    _autocast_ctx,
-    _extract_last_hidden_state,
-    _get_backbone,
-    _get_embed_tokens,
-    _get_lm_head,
+from ouroboros.latent import (
+    build_question_context as _build_question_context,
+    collect_latent_hidden_sequences as _collect_latent_hidden_sequences,
+    compute_ce_mean_by_row as _compute_ce_mean_by_row,
+    compute_ce_sum_and_count as _compute_ce_sum_and_count,
+    forward_latent_batch,
+    prepare_latent_runtime,
+    run_latent_passes,
 )
 
 _LAST_NUM = _re.compile(r"[\d,]+(?:\.\d+)?")
+
 
 class HaltGate(nn.Module):
     """
@@ -150,17 +153,6 @@ def build_halt_supervision_labels(
     return labels, mask
 
 
-def _compute_ce_mean_by_row(logits: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    shift_logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
-    shift_labels = labels[:, 1:].contiguous().view(-1)
-    losses = F.cross_entropy(shift_logits, shift_labels, reduction="none", ignore_index=-100)
-    losses = losses.view(labels.size(0), -1)
-    valid = labels[:, 1:] != -100
-    counts = valid.sum(dim=1)
-    ce_by_row = losses.sum(dim=1) / counts.clamp_min(1).to(dtype=losses.dtype)
-    return ce_by_row.to(dtype=torch.float32), counts
-
-
 def _compute_supervised_halt_loss(
     *,
     hidden_sequences: List[List[torch.Tensor]],
@@ -200,42 +192,6 @@ def _compute_supervised_halt_loss(
     }
 
 
-def _compute_ce_sum_and_count(logits: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, int]:
-    shift_logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
-    shift_labels = labels[:, 1:].contiguous().view(-1)
-    valid = shift_labels != -100
-    n_valid = int(valid.sum().item())
-    if n_valid == 0:
-        return logits.new_zeros((), dtype=torch.float32), 0
-    ce_sum = F.cross_entropy(shift_logits[valid], shift_labels[valid], reduction="sum")
-    return ce_sum, n_valid
-
-
-def _build_question_context(
-    all_embeds: torch.Tensor,
-    q_lens: torch.Tensor,
-    pad_embed: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    batch_size = int(all_embeds.size(0))
-    if q_lens.numel() == 0:
-        empty_ctx = all_embeds.new_empty((batch_size, 0, all_embeds.size(-1)))
-        empty_mask = torch.zeros((batch_size, 0), dtype=torch.bool, device=all_embeds.device)
-        return empty_ctx, empty_mask
-
-    max_q_len = int(q_lens.max().item())
-    if max_q_len <= 0:
-        empty_ctx = all_embeds.new_empty((batch_size, 0, all_embeds.size(-1)))
-        empty_mask = torch.zeros((batch_size, 0), dtype=torch.bool, device=all_embeds.device)
-        return empty_ctx, empty_mask
-
-    ctx = all_embeds[:, :max_q_len, :].clone()
-    positions = torch.arange(max_q_len, device=all_embeds.device).unsqueeze(0)
-    ctx_mask = positions < q_lens.unsqueeze(1)
-    pad_value = pad_embed.to(device=all_embeds.device, dtype=ctx.dtype).view(1, 1, -1)
-    ctx = torch.where(ctx_mask.unsqueeze(-1), ctx, pad_value)
-    return ctx, ctx_mask
-
-
 def _run_latent_passes(
     model,
     ctx: torch.Tensor,
@@ -246,107 +202,16 @@ def _run_latent_passes(
     device: torch.device,
     amp_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor, Any]:
-    backbone = _get_backbone(model)
-
-    if isinstance(n_latent, int):
-        target_steps = torch.full((ctx.size(0),), int(n_latent), device=device, dtype=torch.long)
-        scalar_input = True
-    elif isinstance(n_latent, torch.Tensor):
-        target_steps = n_latent.to(device=device, dtype=torch.long).view(-1)
-        scalar_input = False
-    else:
-        target_steps = torch.tensor(list(n_latent), device=device, dtype=torch.long)
-        scalar_input = False
-
-    batch_size = int(ctx.size(0))
-    actual_k = torch.zeros(batch_size, dtype=torch.long, device=device)
-    prev_hidden = ctx.new_zeros((batch_size, ctx.size(-1)))
-    halted = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-    max_steps = int(target_steps.max().item()) if target_steps.numel() > 0 else 0
-    for latent_step in range(max_steps):
-        active_indices = ((target_steps > latent_step) & (~halted)).nonzero(as_tuple=False).flatten()
-        if active_indices.numel() == 0:
-            break
-
-        prefix_lens = ctx_mask[active_indices].sum(dim=1).to(dtype=torch.long)
-        max_prefix_len = int(prefix_lens.max().item())
-        prefix_embeds = ctx[active_indices, :max_prefix_len, :].clone()
-        prefix_positions = torch.arange(max_prefix_len, device=device).unsqueeze(0)
-        prefix_mask = prefix_positions < prefix_lens.unsqueeze(1)
-        if max_prefix_len > 0:
-            prefix_embeds = torch.where(
-                prefix_mask.unsqueeze(-1),
-                prefix_embeds,
-                prefix_embeds.new_zeros((1, 1, prefix_embeds.size(-1))),
-            )
-
-        with _autocast_ctx(device, amp_dtype):
-            outputs = backbone(
-                inputs_embeds=prefix_embeds,
-                attention_mask=prefix_mask,
-                use_cache=False,
-            )
-        hidden = _extract_last_hidden_state(outputs, f"latent pass step={latent_step}")
-        last_positions = prefix_lens - 1
-        h_step = hidden[torch.arange(active_indices.numel(), device=device), last_positions, :]
-
-        append_mask = torch.ones(active_indices.numel(), dtype=torch.bool, device=device)
-        if halt_gate is not None:
-            has_prev = actual_k[active_indices] > 0
-            if bool(has_prev.any().item()):
-                halt_probs = halt_gate(
-                    h_step[has_prev].to(dtype=torch.float32),
-                    prev_hidden[active_indices[has_prev]].to(dtype=torch.float32),
-                )
-                halt_now = halt_probs > args.halt_threshold
-                if bool(halt_now.any().item()):
-                    blocked_local = has_prev.nonzero(as_tuple=False).flatten()[halt_now]
-                    append_mask[blocked_local] = False
-                    halted[active_indices[blocked_local]] = True
-
-        next_col = ctx.new_zeros((batch_size, 1, ctx.size(-1)))
-        next_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=device)
-        if bool(append_mask.any().item()):
-            append_indices = active_indices[append_mask]
-            append_hidden = h_step[append_mask].to(dtype=ctx.dtype)
-            next_col[append_indices, 0, :] = append_hidden
-            next_mask[append_indices, 0] = True
-            actual_k[append_indices] += 1
-            prev_hidden[append_indices] = append_hidden
-
-        ctx = torch.cat([ctx, next_col], dim=1)
-        ctx_mask = torch.cat([ctx_mask, next_mask], dim=1)
-
-    if ctx_mask.numel() > 0 and ctx_mask.size(1) > 0:
-        active_cols = ctx_mask.any(dim=0)
-        if bool(active_cols.any().item()):
-            last_active_col = int(active_cols.nonzero(as_tuple=False).max().item()) + 1
-            ctx = ctx[:, :last_active_col, :]
-            ctx_mask = ctx_mask[:, :last_active_col]
-        else:
-            ctx = ctx[:, :0, :]
-            ctx_mask = ctx_mask[:, :0]
-
-    return_k: Any = int(actual_k[0].item()) if scalar_input and batch_size == 1 else actual_k
-    return ctx, ctx_mask, return_k
-
-
-def _collect_latent_hidden_sequences(
-    latent_ctx: torch.Tensor,
-    max_q_len: int,
-    actual_n_latents: torch.Tensor,
-) -> List[List[torch.Tensor]]:
-    hidden_sequences: List[List[torch.Tensor]] = [[] for _ in range(int(latent_ctx.size(0)))]
-    max_steps = int(actual_n_latents.max().item()) if actual_n_latents.numel() > 0 else 0
-    for latent_step in range(max_steps):
-        active_indices = (actual_n_latents > latent_step).nonzero(as_tuple=False).flatten()
-        if active_indices.numel() == 0:
-            break
-        step_hidden = latent_ctx[active_indices, max_q_len + latent_step, :]
-        for local_idx, sample_idx in enumerate(active_indices.tolist()):
-            hidden_sequences[sample_idx].append(step_hidden[local_idx : local_idx + 1])
-    return hidden_sequences
+    """Compatibility wrapper for callers that still use the old DGAC path."""
+    runtime = prepare_latent_runtime(model, device, amp_dtype)
+    return run_latent_passes(
+        runtime=runtime,
+        ctx=ctx,
+        ctx_mask=ctx_mask,
+        n_latent=n_latent,
+        halt_gate=halt_gate,
+        args=args,
+    )
 
 
 def _compute_batched_halt_metrics(
@@ -409,6 +274,39 @@ def _compute_batched_halt_metrics(
     }
 
 
+def _attach_halt_metrics(
+    *,
+    result: Dict[str, Any],
+    halt_gate: Optional[HaltGate],
+    device: torch.device,
+    args: argparse.Namespace,
+    step_in_phase: int,
+) -> Dict[str, Any]:
+    result.setdefault("ponder", None)
+    result.setdefault("diversity", None)
+    result.setdefault("halt_step_mean", None)
+    result.setdefault("lambda1", 0.0)
+    if halt_gate is None:
+        return result
+
+    hidden_sequences = result.get("hidden_sequences")
+    actual_n_latents = result.get("actual_n_latents")
+    if hidden_sequences is None or actual_n_latents is None:
+        return result
+
+    halt_metrics = _compute_batched_halt_metrics(
+        hidden_sequences=hidden_sequences,
+        actual_n_latents=actual_n_latents,
+        halt_gate=halt_gate,
+        device=device,
+        args=args,
+        step_in_phase=step_in_phase,
+    )
+    if halt_metrics is not None:
+        result.update(halt_metrics)
+    return result
+
+
 def _forward_batched_latent(
     model,
     input_ids: torch.Tensor,
@@ -423,86 +321,29 @@ def _forward_batched_latent(
     step_in_phase: int,
     amp_dtype: torch.dtype,
 ) -> Dict[str, Any]:
-    backbone = _get_backbone(model)
-    embed_fn = _get_embed_tokens(model)
-    lm_head_fn = _get_lm_head(model)
-
-    with _autocast_ctx(device, amp_dtype):
-        all_embeds = embed_fn(input_ids)
-        pad_embed = embed_fn(pad_id.view(1)).squeeze(0)
-
-    q_ctx, q_ctx_mask = _build_question_context(all_embeds, q_lens, pad_embed)
-    latent_ctx, _, actual_k = _run_latent_passes(
-        model=model,
-        ctx=q_ctx,
-        ctx_mask=q_ctx_mask,
-        n_latent=n_latents,
-        halt_gate=None,
-        args=args,
-        device=device,
-        amp_dtype=amp_dtype,
-    )
-    actual_n_latents = actual_k if isinstance(actual_k, torch.Tensor) else torch.full_like(n_latents, int(actual_k))
-
-    patched = all_embeds.clone()
-    max_q_len = int(q_ctx.size(1))
-    max_n_latent = int(actual_n_latents.max().item()) if actual_n_latents.numel() > 0 else 0
-    for latent_step in range(max_n_latent):
-        active_indices = (actual_n_latents > latent_step).nonzero(as_tuple=False).flatten()
-        if active_indices.numel() == 0:
-            break
-        inject_pos = q_lens[active_indices] + latent_step
-        valid_inject = inject_pos < patched.size(1)
-        if not bool(torch.all(valid_inject).item()):
-            active_indices = active_indices[valid_inject]
-            inject_pos = inject_pos[valid_inject]
-            if active_indices.numel() == 0:
-                continue
-        h_step = latent_ctx[active_indices, max_q_len + latent_step, :]
-        patched_next = patched.clone()
-        patched_next[active_indices, inject_pos, :] = h_step.to(dtype=patched_next.dtype)
-        patched = patched_next
-
-    with _autocast_ctx(device, amp_dtype):
-        outputs = backbone(inputs_embeds=patched, attention_mask=attention_mask, use_cache=False)
-        hidden = _extract_last_hidden_state(outputs, "coconut batched full forward")
-        logits = lm_head_fn(hidden).float()
-
-    ce_sum, n_valid = _compute_ce_sum_and_count(logits, labels)
-    ce_by_row, valid_by_row = _compute_ce_mean_by_row(logits, labels)
-    ce_value = float(ce_sum.item() / max(n_valid, 1))
-    result: Dict[str, Any] = {
-        "ce_sum": ce_sum,
-        "n_valid": n_valid,
-        "ce": ce_value,
-        "ce_by_row": ce_by_row,
-        "valid_by_row": valid_by_row,
-        "actual_n_latents": actual_n_latents,
-        "hidden_sequences": None,
-        "ponder": None,
-        "diversity": None,
-        "halt_step_mean": None,
-        "lambda1": 0.0,
+    """Compatibility wrapper for the former DGAC-owned latent batch path."""
+    runtime = prepare_latent_runtime(model, device, amp_dtype)
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+        "q_lens": q_lens,
+        "n_latents": n_latents,
+        "pad_id": pad_id,
     }
-
-    if halt_gate is None:
-        return result
-
-    hidden_sequences = _collect_latent_hidden_sequences(latent_ctx, max_q_len, actual_n_latents)
-    result["hidden_sequences"] = hidden_sequences
-    halt_metrics = _compute_batched_halt_metrics(
-        hidden_sequences=hidden_sequences,
-        actual_n_latents=actual_n_latents,
+    result = forward_latent_batch(
+        runtime=runtime,
+        batch=batch,
+        args=args,
+        include_hidden_sequences=halt_gate is not None,
+    )
+    return _attach_halt_metrics(
+        result=result,
         halt_gate=halt_gate,
         device=device,
         args=args,
         step_in_phase=step_in_phase,
     )
-    if halt_metrics is None:
-        return result
-
-    result.update(halt_metrics)
-    return result
 
 
 def coconut_forward(
@@ -514,27 +355,19 @@ def coconut_forward(
     args: argparse.Namespace,
     step_in_phase: int,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    input_ids = batch["input_ids"].to(device)
-    attention_mask = batch["attention_mask"].to(device)
-    labels = batch["labels"].to(device)
-    q_lens = batch["q_lens"].to(device)
-    n_latents = batch["n_latents"].to(device)
-    pad_id = batch["pad_id"].to(device)
-    amp_dtype = _amp_dtype(device)
-
-    result = _forward_batched_latent(
-        model=model,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        labels=labels,
-        q_lens=q_lens,
-        n_latents=n_latents,
-        pad_id=pad_id,
-        device=device,
+    runtime = prepare_latent_runtime(model, device)
+    result = forward_latent_batch(
+        runtime=runtime,
+        batch=batch,
+        args=args,
+        include_hidden_sequences=halt_gate is not None,
+    )
+    result = _attach_halt_metrics(
+        result=result,
         halt_gate=halt_gate,
+        device=device,
         args=args,
         step_in_phase=step_in_phase,
-        amp_dtype=amp_dtype,
     )
 
     if result["n_valid"] == 0:
@@ -550,6 +383,7 @@ def coconut_forward(
         hidden_sequences = result.get("hidden_sequences")
         actual_n_latents = result.get("actual_n_latents")
         if halt_supervision_weight > 0.0 and hidden_sequences is not None and actual_n_latents is not None:
+            n_latents = batch["n_latents"].to(device)
             probe_depths = build_dgac_halt_probe_depths(
                 stage_k=stage_k,
                 probe_steps=getattr(args, "dgac_halt_probe_steps", None),
@@ -563,19 +397,12 @@ def coconut_forward(
                         torch.full_like(n_latents, int(probe_depth)),
                         n_latents,
                     )
-                    probe_result = _forward_batched_latent(
-                        model=model,
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels,
-                        q_lens=q_lens,
-                        n_latents=probe_n_latents,
-                        pad_id=pad_id,
-                        device=device,
-                        halt_gate=None,
+                    probe_result = forward_latent_batch(
+                        runtime=runtime,
+                        batch=batch,
                         args=args,
-                        step_in_phase=step_in_phase,
-                        amp_dtype=amp_dtype,
+                        n_latents=probe_n_latents,
+                        include_hidden_sequences=False,
                     )
                     ce_by_probe_depth[int(probe_depth)] = probe_result["ce_by_row"].detach()
             target_depths = construct_dgac_halt_targets(

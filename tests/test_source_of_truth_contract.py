@@ -15,10 +15,16 @@ def test_training_entrypoint_has_graduated_to_compatibility_adapter():
 
     assert "def main(" in adapter_source
     assert "from ouroboros.train import run_cli" in adapter_source
+    stage_runner_source = (REPO_ROOT / "ouroboros" / "training" / "stage_runner.py").read_text(encoding="utf-8")
+    evaluation_source = (REPO_ROOT / "ouroboros" / "training" / "evaluation.py").read_text(encoding="utf-8")
+
     assert "def evaluate_stage(" not in adapter_source
     assert "def run_generation_callback(" not in adapter_source
-    assert "def run_training_stages(" in modular_source
+    assert "def run_training_stages(" not in modular_source
     assert "def run_cli(" in modular_source
+    assert "def run_training_stages(" in stage_runner_source
+    assert "def evaluate_stage(" in evaluation_source
+    assert "def run_generation_callback(" in evaluation_source
 
 
 def test_coordinator_entrypoint_has_graduated_to_compatibility_adapter():
