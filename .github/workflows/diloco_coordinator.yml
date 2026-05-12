@@ -28,7 +28,7 @@ on:
         required: false
         default: ''
       kaggle_run_mode:
-        description: 'Kaggle launch mode. Use "diloco" for normal coordinator dispatch, "dgac-anchor-eval" for current anchor eval-only, "dgac-canary" for bounded DGAC objective canary, "dgac-train" for sequential DGAC fallback, or "dgac-diloco" for parallel DGAC worker rounds.'
+        description: 'Kaggle launch mode. Use "diloco" for normal coordinator dispatch, "dgac-anchor-eval" for current anchor eval-only, "dgac-canary" for bounded DGAC objective canary, "dgac-train" for sequential DGAC fallback, or "dgac-diloco" for DGAC dedicated worker rounds.'
         required: false
         default: 'dgac-diloco'
       attendance_join_grace_minutes:

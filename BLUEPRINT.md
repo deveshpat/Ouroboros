@@ -47,7 +47,7 @@ Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle
 
 ## DGAC Launch Command (Phase 3.4 — available if another pass is needed)
 
-**Recommended path: parallel DGAC DiLoCo.** Cancel/stop any older single-worker `dgac-train` Kaggle run before using this, otherwise it will burn quota while the parallel workers train from the same anchor. This path initializes `round_state` for DGAC, resets the Stage-10 DGAC sample counter to 0 while preserving the pre-DGAC totals under `pre_dgac_total_samples_seen`, dispatches all selected workers, runs one local DGAC epoch per worker shard without redundant worker pre-val/gen, and aggregates both LoRA adapter weights and `halt_gate.pt` into `diloco_state/anchor`.
+**Recommended path: DGAC dedicated rounds.** Cancel/stop any older single-worker `dgac-train` Kaggle run before using this, otherwise it will burn quota while the parallel workers train from the same anchor. This path initializes `round_state` for DGAC, resets the Stage-10 DGAC sample counter to 0 while preserving the pre-DGAC totals under `pre_dgac_total_samples_seen`, dispatches all selected workers, runs one local DGAC epoch per worker shard without redundant worker pre-val/gen, and aggregates both LoRA adapter weights and `halt_gate.pt` into `diloco_state/anchor`.
 
 Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-diloco`, `force_worker_ids=A,B,C` (or empty to use every credentialed worker), `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. Worker signals resume the normal coordinator loop until DGAC reaches 36,906/36,906 Stage-10 samples and writes `mode=dgac-complete`. Do not launch another `dgac-diloco` pass unless the post-DGAC eval says HaltGate needs more training.
 
@@ -69,7 +69,7 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --diloco_outer_lr "$OUROBOROS_DILOCO_OUTER_LR" \
   --diloco_state_repo WeirdRunner/Ouroboros \
   --diloco_signal_repo deveshpat/Ouroboros \
-  --push_to_hub --output_dir runs/dgac_diloco
+  --push_to_hub --output_dir runs/dgac_dedicated
 ```
 
 **Fallback path: sequential single-worker DGAC.** Use only when you intentionally want one worker to train DGAC without mutating DiLoCo `round_state`.

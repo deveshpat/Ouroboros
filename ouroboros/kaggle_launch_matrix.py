@@ -237,12 +237,12 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
     DGAC_DILOCO_RUN_MODE: KaggleLaunchModeSpec(
         mode=DGAC_DILOCO_RUN_MODE,
         contract=get_kaggle_launch_contract(DGAC_DILOCO_RUN_MODE),
-        env_defaults=_readonly({**_COMMON_DEFAULTS, "OUROBOROS_DGAC_DILOCO_OUTPUT_DIR": "runs/dgac_diloco"}),
+        env_defaults=_readonly({**_COMMON_DEFAULTS, "OUROBOROS_DGAC_DILOCO_OUTPUT_DIR": "runs/dgac_dedicated"}),
         command_builder=_build_dgac_diloco,
         notebook_shell_template=_DGAC_DILOCO_SHELL,
         output_env_key="OUROBOROS_DGAC_DILOCO_OUTPUT_DIR",
         requires_worker_id=True,
-        workflow_label="parallel DGAC worker rounds",
+        workflow_label="DGAC dedicated worker rounds",
     ),
     CPU_SMOKE_MODE: KaggleLaunchModeSpec(
         mode=CPU_SMOKE_MODE,

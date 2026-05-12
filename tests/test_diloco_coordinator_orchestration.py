@@ -209,6 +209,55 @@ def test_initial_dgac_diloco_state_preserves_previous_totals_and_resets_stage_co
     assert state["triggered_workers"] == ["A", "B", "C"]
     assert state["seed"] == 123
 
+
+def test_initial_dgac_diloco_state_uses_successive_dedicated_rounds_after_cancelled_run():
+    next_round = coordinator._next_dgac_dedicated_round_n(
+        {
+            "stage_k": 10,
+            "round_n": 0,
+            "dgac_round_n": 0,
+            "mode": "dgac-diloco",
+            "dgac_diloco": True,
+            "total_samples_seen": {"10": 100},
+        }
+    )
+    state = coordinator._initial_dgac_diloco_state(
+        previous_state={
+            "stage_k": 10,
+            "round_n": 0,
+            "dgac_round_n": 0,
+            "mode": "dgac-diloco",
+            "dgac_diloco": True,
+            "total_samples_seen": {"10": 100},
+            "completed_stages": [10],
+        },
+        worker_ids=["A", "C"],
+        projected_shards={"A": 3, "C": 3},
+        seed=123,
+        dgac_round_n=next_round,
+    )
+
+    assert next_round == 1
+    assert state["round_n"] == 1
+    assert state["dgac_round_n"] == 1
+    assert state["dgac_round_label"] == "DGAC dedicated round 001"
+    assert state["total_samples_seen"] == {"10": 0}
+    assert state["triggered_workers"] == ["A", "C"]
+
+
+def test_initial_dgac_diloco_state_starts_first_dedicated_round_from_terminal_gate():
+    next_round = coordinator._next_dgac_dedicated_round_n(
+        {
+            "stage_k": 10,
+            "round_n": 0,
+            "mode": "terminal",
+            "dgac_manual_gate": True,
+            "total_samples_seen": {"10": 36906},
+        }
+    )
+
+    assert next_round == 0
+
 def test_packaged_coordinator_cpu_smoke_validation_defaults_to_worker_a_and_polls_remote_status(monkeypatch):
     monkeypatch.setattr(
         coordinator,

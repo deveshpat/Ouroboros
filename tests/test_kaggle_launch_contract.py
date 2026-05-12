@@ -84,7 +84,7 @@ def test_build_diloco_training_command_can_launch_dgac_diloco_worker():
     command = build_diloco_training_command(
         worker_id="c",
         epochs_per_stage=1,
-        output_dir="runs/dgac_diloco",
+        output_dir="runs/dgac_dedicated",
         use_halt_gate=True,
         resume_from_diloco_anchor=True,
         max_grad_norm=0.3,
@@ -96,7 +96,7 @@ def test_build_diloco_training_command_can_launch_dgac_diloco_worker():
     assert command[command.index("--diloco_worker_id") + 1] == "C"
     assert command[command.index("--epochs_per_stage") + 1] == "1"
     assert command[command.index("--max_grad_norm") + 1] == "0.3"
-    assert command[command.index("--output_dir") + 1] == "runs/dgac_diloco"
+    assert command[command.index("--output_dir") + 1] == "runs/dgac_dedicated"
 
 
 def test_build_diloco_training_command_rejects_multi_epoch_dgac_diloco_worker():
@@ -104,7 +104,7 @@ def test_build_diloco_training_command_rejects_multi_epoch_dgac_diloco_worker():
         build_diloco_training_command(
             worker_id="A",
             epochs_per_stage=3,
-            output_dir="runs/dgac_diloco",
+            output_dir="runs/dgac_dedicated",
             use_halt_gate=True,
             resume_from_diloco_anchor=True,
         )

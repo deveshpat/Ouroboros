@@ -204,9 +204,13 @@ def run_training_stages(
         if is_main:
             print()
             print("=" * 64)
-            label = "(CoT warmup)" if stage_k == 0 else f"{stage_k} latent pass(es)"
-            extra = "  + DGAC" if args.use_halt_gate else ""
-            print(f"  Stage {stage_k}/{curriculum_max_stage}  {label}{extra}")
+            if args.use_halt_gate and getattr(args, "dgac_round_label", None):
+                label = str(args.dgac_round_label)
+                print(f"  {label}  ({stage_k} latent pass(es))")
+            else:
+                label = "(CoT warmup)" if stage_k == 0 else f"{stage_k} latent pass(es)"
+                extra = "  + DGAC" if args.use_halt_gate else ""
+                print(f"  Stage {stage_k}/{curriculum_max_stage}  {label}{extra}")
             print(f"  Epochs: {n_epochs}  Steps/epoch: {steps_per_epoch}  Total: {total_stage_steps}")
             if stage_start_epoch > 0 or stage_start_step_in_epoch >= 0:
                 print(

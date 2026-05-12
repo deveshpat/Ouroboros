@@ -401,6 +401,9 @@ def test_coordinator_post_aggregation_planner_handles_terminal_and_absent_transi
     assert dgac.kind == "dgac_diloco_complete"
     assert dgac.state["mode"] == "dgac-complete"
     assert dgac.state["dgac_diloco_complete"] is True
+    assert dgac.state["round_n"] == 4
+    assert dgac.state["dgac_round_n"] == 4
+    assert dgac.state["next_dgac_round_n"] == 5
 
     absent = plan_post_aggregation_transition(
         state={"stage_k": 0, "round_n": 0, "mode": "diloco", "seed": 42},

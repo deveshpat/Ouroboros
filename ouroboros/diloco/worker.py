@@ -31,6 +31,45 @@ from ouroboros.model import (
 _DILOCO_SHARD_STEP_FALLBACK = 385
 
 
+def _diloco_wandb_identity(
+    args: argparse.Namespace,
+    *,
+    stage_k: int,
+    round_n: int,
+    is_dgac_diloco: bool,
+    extra_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build W&B identity/config for normal DiLoCo or DGAC dedicated rounds."""
+    worker_id = str(args.diloco_worker_id)
+    worker_key = worker_id.lower()
+    config: Dict[str, Any] = {
+        **_wandb_config(args),
+        "stage_k": int(stage_k),
+        "round_n": int(round_n),
+        "worker_id": worker_id,
+    }
+    if is_dgac_diloco:
+        config.update(
+            {
+                "mode": "dgac-dedicated-round",
+                "dgac_round_n": int(round_n),
+                "dgac_round_label": f"DGAC dedicated round {int(round_n):03d}",
+            }
+        )
+        run_id = f"dgac-{worker_key}-r{int(round_n):04d}"
+        group_id = f"dgac-dedicated-r{int(round_n):04d}"
+        name = f"DGAC Worker {worker_id} | Dedicated Round {int(round_n):03d}"
+    else:
+        config["mode"] = "diloco"
+        run_id = f"diloco-{worker_key}-s{int(stage_k)}-r{int(round_n)}"
+        group_id = f"diloco-{worker_key}-s{int(stage_k)}"
+        name = f"Worker {worker_id} | Stage {int(stage_k)} | Round {int(round_n)}"
+
+    if extra_config:
+        config.update(extra_config)
+    return {"id": run_id, "group": group_id, "name": name, "config": config}
+
+
 def _partition_contiguous_range(n_items: int, n_parts: int, part_idx: int) -> Tuple[int, int]:
     if n_items <= 0:
         return 0, 0
@@ -578,44 +617,55 @@ def run_diloco_worker(
         shard_step_estimate = _DILOCO_SHARD_STEP_FALLBACK
     round_step_span = shard_step_estimate + 1
     global_step_offset = round_n * round_step_span
+    is_dgac_diloco = lifecycle_plan.kind == WorkerLifecycleKind.DGAC_DILOCO_WORKER
+
+    if is_dgac_diloco:
+        args.dgac_round_n = int(round_n)
+        args.dgac_round_label = f"DGAC dedicated round {int(round_n):03d}"
+        output_dir = output_dir / f"round_{int(round_n):04d}"
 
     # ── W&B init (DiLoCo path only) ──────────────────────────────────────────
-    # Each worker gets one persistent run per stage, resumed across rounds.
-    # Run ID is stable: diloco-{worker}-s{stage_k}  (e.g. "diloco-a-s2")
+    # Normal DiLoCo keeps stage/round names. DGAC uses dedicated-round names so
+    # manual relaunches never collide with prior W&B run ids such as r0.
     diloco_wandb_run = None
     if _is_main_process() and args.wandb_mode != "disabled":
         try:
             import wandb as _wandb
-            run_id    = f"diloco-{args.diloco_worker_id.lower()}-s{stage_k}-r{round_n}"
-            group_id  = f"diloco-{args.diloco_worker_id.lower()}-s{stage_k}"
-            diloco_wandb_run = _wandb.init(
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                id=run_id,
-                group=group_id,
-                name=f"Worker {args.diloco_worker_id} | Stage {stage_k} | Round {round_n}",
-                # No resume= needed: each round is a guaranteed-fresh run
-                config={
-                    **_wandb_config(args),
-                    "stage_k": stage_k,
-                    "round_n": round_n,
-                    "worker_id": args.diloco_worker_id,
-                    "mode": "dgac-diloco" if args.use_halt_gate else "diloco",
+            identity = _diloco_wandb_identity(
+                args,
+                stage_k=stage_k,
+                round_n=round_n,
+                is_dgac_diloco=is_dgac_diloco,
+                extra_config={
                     "shard_step_estimate": shard_step_estimate,
                     "wandb_round_step_span": round_step_span,
                     "remaining_stage_samples": remaining_stage_samples,
                     "planned_shard_samples": len(train_shard),
                 },
+            )
+            diloco_wandb_run = _wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                id=identity["id"],
+                group=identity["group"],
+                name=identity["name"],
+                # No resume= needed: each round is a guaranteed-fresh run
+                config=identity["config"],
                 mode=args.wandb_mode,
             )
-            _wandb.log(
-                {"diloco/round": round_n, "diloco/stage": stage_k},
-                step=global_step_offset,
-            )
+            if is_dgac_diloco:
+                _wandb.log(
+                    {"dgac/round": round_n, "diloco/stage": stage_k},
+                    step=global_step_offset,
+                )
+            else:
+                _wandb.log(
+                    {"diloco/round": round_n, "diloco/stage": stage_k},
+                    step=global_step_offset,
+                )
         except Exception as _we:
             print(f"  [diloco] W&B init failed: {_we}")
 
-    is_dgac_diloco = lifecycle_plan.kind == WorkerLifecycleKind.DGAC_DILOCO_WORKER
     should_run_pre_val = bool(
         (not lifecycle_plan.skip_pre_validation)
         and (

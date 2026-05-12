@@ -117,7 +117,7 @@ def test_workflow_dispatch_exposes_dgac_anchor_eval_and_train_gates():
     assert "--eval_only" in notebook
     assert "runs/stage3_dgac" in notebook
     assert "DGAC_DILOCO_RUN_MODE" in notebook
-    assert "runs/dgac_diloco" in notebook
+    assert "runs/dgac_dedicated" in notebook
 
 
 def test_completed_cpu_smoke_prd_and_plan_are_promoted_to_wiki_and_retired():
@@ -167,5 +167,5 @@ def test_stage_10_terminal_gate_is_reflected_in_source_of_truth_docs():
     assert "post-DGAC `dgac-anchor-eval`" in status
     assert "Stage 10 terminal aggregation → DGAC manual gate" in session_log
     assert "Stage 10 terminal anchor eval-only → DGAC cleared" in session_log
-    assert "DGAC DiLoCo COMPLETE" in terminal_log
+    assert "DGAC dedicated round COMPLETE" in terminal_log
     assert "Loaded halt gate from diloco_state/anchor/halt_gate.pt" in terminal_log

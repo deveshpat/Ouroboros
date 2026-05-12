@@ -89,6 +89,35 @@ def _args(worker_id: str = "A", **overrides) -> argparse.Namespace:
     return argparse.Namespace(**values)
 
 
+def test_dgac_dedicated_round_wandb_identity_avoids_stage_round_collision():
+    identity = worker_module._diloco_wandb_identity(
+        _args(worker_id="A", use_halt_gate=True, resume_from_diloco_anchor=True),
+        stage_k=10,
+        round_n=1,
+        is_dgac_diloco=True,
+    )
+
+    assert identity["id"] == "dgac-a-r0001"
+    assert identity["group"] == "dgac-dedicated-r0001"
+    assert identity["name"] == "DGAC Worker A | Dedicated Round 001"
+    assert identity["config"]["mode"] == "dgac-dedicated-round"
+    assert identity["config"]["dgac_round_n"] == 1
+
+
+def test_normal_diloco_wandb_identity_keeps_stage_round_shape():
+    identity = worker_module._diloco_wandb_identity(
+        _args(worker_id="B"),
+        stage_k=7,
+        round_n=3,
+        is_dgac_diloco=False,
+    )
+
+    assert identity["id"] == "diloco-b-s7-r3"
+    assert identity["group"] == "diloco-b-s7"
+    assert identity["name"] == "Worker B | Stage 7 | Round 3"
+    assert identity["config"]["mode"] == "diloco"
+
+
 def test_diloco_shard_determinism_and_partition_contract():
     samples = [{"id": i} for i in range(10)]
     shards = {

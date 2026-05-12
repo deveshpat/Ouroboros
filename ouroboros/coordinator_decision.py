@@ -504,10 +504,14 @@ def plan_post_aggregation_transition(
         completed = sorted(set(completed + [stage_k]))
         if stage_k >= terminal_stage:
             if current_mode == "dgac-diloco" or bool(state.get("dgac_diloco")):
+                dgac_round_n = int(state.get("dgac_round_n", round_n))
                 terminal_state = {
                     **dict(state),
                     "stage_k": terminal_stage,
-                    "round_n": 0,
+                    "round_n": dgac_round_n,
+                    "dgac_round_n": dgac_round_n,
+                    "dgac_round_label": f"DGAC dedicated round {dgac_round_n:03d}",
+                    "next_dgac_round_n": dgac_round_n + 1,
                     "mode": dgac_complete_mode,
                     "triggered_workers": [],
                     "attendance_workers": [],
@@ -515,7 +519,7 @@ def plan_post_aggregation_transition(
                     "anchor_path": anchor_path,
                     "total_samples_seen": totals,
                     "completed_stages": completed,
-                    "dgac_manual_gate": False,
+                    "dgac_manual_gate": True,
                     "dgac_diloco": True,
                     "dgac_diloco_complete": True,
                     "last_updated": now,

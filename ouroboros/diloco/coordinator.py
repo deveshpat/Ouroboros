@@ -623,11 +623,15 @@ def _initial_dgac_diloco_state(
     worker_ids: List[str],
     projected_shards: Dict[str, int],
     seed: int,
+    dgac_round_n: int = 0,
 ) -> Dict[str, Any]:
     previous_state = dict(previous_state or {})
+    dedicated_round = max(int(dgac_round_n), 0)
     return {
         "stage_k": DILOCO_TERMINAL_STAGE,
-        "round_n": 0,
+        "round_n": dedicated_round,
+        "dgac_round_n": dedicated_round,
+        "dgac_round_label": f"DGAC dedicated round {dedicated_round:03d}",
         "mode": DGAC_DILOCO_RUN_MODE,
         "triggered_workers": worker_ids,
         "attendance_workers": [],
@@ -647,39 +651,78 @@ def _initial_dgac_diloco_state(
     }
 
 
+def _next_dgac_dedicated_round_n(previous_state: Optional[Dict[str, Any]]) -> int:
+    """Return the next external DGAC dedicated round number.
+
+    Normal DiLoCo terminal state is the pre-DGAC gate, so its first dedicated
+    round is 000. Once any DGAC worker/complete state exists, a manual relaunch
+    must advance the number to avoid reusing W&B ids such as dgac-a-r000.
+    """
+    state = dict(previous_state or {})
+    if not state:
+        return 0
+
+    is_dgac_state = (
+        state.get("mode") in {DGAC_DILOCO_RUN_MODE, DGAC_COMPLETE_MODE}
+        or bool(state.get("dgac_diloco"))
+        or bool(state.get("dgac_diloco_complete"))
+        or "dgac_round_n" in state
+        or "next_dgac_round_n" in state
+    )
+    if not is_dgac_state:
+        return 0
+
+    if state.get("next_dgac_round_n") is not None:
+        return max(int(state["next_dgac_round_n"]), 0)
+
+    candidates: List[int] = []
+    for key in ("dgac_round_n", "round_n"):
+        value = state.get(key)
+        if value is None:
+            continue
+        try:
+            candidates.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return max(candidates or [-1]) + 1
+
+
 def run_kaggle_dgac_diloco(args: argparse.Namespace) -> None:
     worker_ids = _kaggle_dgac_diloco_worker_ids(args)
     kaggle_creds = _build_kaggle_creds(args)
     seed = int(getattr(args, "seed", 42))
+    previous_state = None if args.dry_run else hub_download_json(args.repo_id, ROUND_STATE_PATH, args.hf_token)
+    dgac_round_n = _next_dgac_dedicated_round_n(previous_state)
     projected_shards = _compute_projected_shards(
         total_samples=args.total_train_samples,
         stage_k=DILOCO_TERMINAL_STAGE,
-        round_n=0,
+        round_n=dgac_round_n,
         seed=seed,
         total_samples_seen=0,
     )
     print(
-        "[kaggle-dgac-diloco] Initializing Phase 3.4 DGAC as a DiLoCo round "
-        f"workers={worker_ids} repo={args.repo_id}"
+        "[kaggle-dgac-diloco] Initializing DGAC dedicated round "
+        f"{dgac_round_n:03d} workers={worker_ids} repo={args.repo_id}"
     )
     if args.dry_run:
         print("[kaggle-dgac-diloco] DRY RUN — no round_state mutation or Kaggle dispatch.")
+        print(f"  dgac_round_n={dgac_round_n}")
         print(f"  projected_shards={projected_shards}")
         return
 
-    previous_state = hub_download_json(args.repo_id, ROUND_STATE_PATH, args.hf_token)
     new_state = _initial_dgac_diloco_state(
         previous_state=previous_state,
         worker_ids=worker_ids,
         projected_shards=projected_shards,
         seed=seed,
+        dgac_round_n=dgac_round_n,
     )
     hub_upload_json(
         args.repo_id,
         ROUND_STATE_PATH,
         new_state,
         args.hf_token,
-        message=f"DGAC DiLoCo start: workers={worker_ids}",
+        message=f"DGAC dedicated round {dgac_round_n:03d} start: workers={worker_ids}",
     )
 
     dispatch_results = trigger_kaggle_workers(
@@ -700,16 +743,19 @@ def run_kaggle_dgac_diloco(args: argparse.Namespace) -> None:
             ROUND_STATE_PATH,
             reconcile_plan.corrected_state,
             args.hf_token,
-            message=f"DGAC DiLoCo dispatch reconcile: mode={reconcile_plan.corrected_state['mode']}",
+            message=(
+                f"DGAC dedicated round {dgac_round_n:03d} dispatch reconcile: "
+                f"mode={reconcile_plan.corrected_state['mode']}"
+            ),
         )
     if any(dispatch_results.get(worker_id) != "success" for worker_id in worker_ids):
         raise RuntimeError(
-            "DGAC DiLoCo dispatch failed: "
+            f"DGAC dedicated round {dgac_round_n:03d} dispatch failed: "
             f"{dispatch_results}"
         )
     print(
-        "[kaggle-dgac-diloco] Dispatch accepted. Worker signals will resume the "
-        "normal coordinator aggregation loop and aggregate adapter + HaltGate anchors."
+        f"[kaggle-dgac-diloco] DGAC dedicated round {dgac_round_n:03d} dispatch accepted. "
+        "Worker signals will resume aggregation for adapter + HaltGate anchors."
     )
 
 
@@ -846,7 +892,13 @@ def main() -> None:
 
     if current_mode == DGAC_COMPLETE_MODE or bool(state.get("dgac_diloco_complete")):
         print(f"[coordinator] stage={stage_k} round={round_n} mode={current_mode}")
-        print("[coordinator] DGAC DiLoCo is complete. Review W&B/Hub final anchor before downstream packaging.")
+        next_round = state.get("next_dgac_round_n")
+        suffix = f" Next manual DGAC dedicated round: {int(next_round):03d}." if next_round is not None else ""
+        print(
+            "[coordinator] DGAC dedicated round is complete. "
+            "Review W&B/Hub final anchor before downstream packaging."
+            f"{suffix}"
+        )
         return
 
     if current_mode == "terminal" or bool(state.get("dgac_manual_gate")):
@@ -1208,7 +1260,7 @@ def main() -> None:
 
         if post_decision.kind == "dgac_diloco_complete":
             print(
-                f"[coordinator] DGAC DiLoCo COMPLETE "
+                f"[coordinator] DGAC dedicated round COMPLETE "
                 f"({final_stage_samples}/{args.total_train_samples} samples)."
             )
             _upload_transition_state(args=args, decision=post_decision)
@@ -1217,7 +1269,7 @@ def main() -> None:
                 wandb.log({"coordinator/dgac_diloco_complete": 1}, step=round_n)
                 wandb.finish()
                 coordinator_wandb_run = None
-            print("[coordinator] Done (DGAC DiLoCo complete).")
+            print("[coordinator] Done (DGAC dedicated round complete).")
             return
 
         if post_decision.kind == "terminal_manual_gate":

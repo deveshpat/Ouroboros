@@ -80,7 +80,7 @@ def test_launch_matrix_builds_same_commands_as_compatibility_builders():
         "OUROBOROS_DGAC_ANCHOR_EVAL_OUTPUT_DIR": "runs/dgac_anchor_eval",
         "OUROBOROS_DGAC_OUTPUT_DIR": "runs/stage3_dgac",
         "OUROBOROS_DGAC_CANARY_OUTPUT_DIR": "runs/stage3_dgac_canary",
-        "OUROBOROS_DGAC_DILOCO_OUTPUT_DIR": "runs/dgac_diloco",
+        "OUROBOROS_DGAC_DILOCO_OUTPUT_DIR": "runs/dgac_dedicated",
         "OUROBOROS_WANDB_PROJECT": "ouroboros-stage3-jamba",
     }
 
@@ -96,7 +96,7 @@ def test_launch_matrix_builds_same_commands_as_compatibility_builders():
         diloco_state_repo="WeirdRunner/Ouroboros",
         diloco_signal_repo="deveshpat/Ouroboros",
         diloco_outer_lr=0.7,
-        output_dir="runs/dgac_diloco",
+        output_dir="runs/dgac_dedicated",
         epochs_per_stage=1,
         use_halt_gate=True,
         resume_from_diloco_anchor=True,

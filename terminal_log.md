@@ -14,7 +14,7 @@ Coordinator evidence:
 DiLoCo anchor: stage 10 round 1 (3 workers, 1386 samples, mode=diloco)
 [coordinator] Stage 10 progress:
 36906/36906 samples seen
-[coordinator] DGAC DiLoCo COMPLETE (36906/36906 samples).
+[coordinator] DGAC dedicated round COMPLETE (36906/36906 samples).
 [coordinator] Done (DGAC DiLoCo complete).
 ```
 
