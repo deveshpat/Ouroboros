@@ -59,6 +59,12 @@ def _diloco_wandb_identity(
         run_id = f"dgac-{worker_key}-r{int(round_n):04d}"
         group_id = f"dgac-dedicated-r{int(round_n):04d}"
         name = f"DGAC Worker {worker_id} | Dedicated Round {int(round_n):03d}"
+        mac_claim_id = str(os.environ.get("OUROBOROS_MAC_DGAC_CLAIM_ID", "")).strip()
+        if mac_claim_id:
+            claim_suffix = mac_claim_id.replace("/", "-")[-12:]
+            run_id = f"{run_id}-{claim_suffix}"
+            name = f"{name} | Mac {claim_suffix[-6:]}"
+            config["mac_dgac_claim_id"] = mac_claim_id
     else:
         config["mode"] = "diloco"
         run_id = f"diloco-{worker_key}-s{int(stage_k)}-r{int(round_n)}"
