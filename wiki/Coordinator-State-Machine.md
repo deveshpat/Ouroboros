@@ -8,10 +8,14 @@
 | Trigger | Path |
 |---|---|
 | `push` to `signals/*.json` | Normal round completion signal |
-| `schedule` (every 30 min) | Watchdog: timeout demotion, waiting mode re-dispatch |
 | `workflow_dispatch` | Manual: `force_worker_ids`, `skip_trigger`, `dry_run`, `workflow_validate=cpu-smoke` |
 
 Concurrency: `group: diloco-coordinate`, `cancel-in-progress: false` — runs serialize, never race.
+
+The scheduled watchdog is intentionally disabled while strict local Mac DGAC
+fallback is available. Signal pushes and manual dispatch remain available, but
+GitHub Actions must not wake itself on a timer and race a Mac fallback that has
+claimed the Hub round.
 
 ---
 
@@ -103,6 +107,34 @@ Stage 10 is terminal for DiLoCo. When stage 10 completes, the coordinator:
 
 DGAC is launched manually after quality review. Cron must never auto-dispatch a
 stage-11 DiLoCo round.
+
+---
+
+## Strict Mac DGAC Fallback
+
+The local Mac path is `python -m ouroboros.mac_dgac_fallback`. It is allowed to
+mutate Hub state only after all of these pass:
+
+- live `round_state.json` still matches the expected DGAC waiting round
+  (`stage_k=10`, `round_n=3`, `mode=waiting`, `total_samples_seen[10]=23481`,
+  projected A/B/C shards of 4,475 each);
+- Apple Silicon MPS is available and CUDA is unavailable;
+- `mamba-ssm-macos` imports and its probe passes;
+- a Jamba FP16/MPS forward/backward probe passes;
+- `diloco_state/anchor` contains the adapter and `halt_gate.pt`;
+- `--use_4bit` is not requested.
+
+After preflight, the runner writes
+`diloco_state/locks/mac_dgac_fallback.json` with a short-lived claim id, converts
+the waiting round back to `mode="dgac-diloco"` with `triggered_workers=["A","B","C"]`,
+runs workers sequentially on the Mac with no GitHub signal token, then runs the
+local coordinator with `--skip_trigger --mac_claim_id <claim>`.
+
+Any GitHub Actions coordinator run that sees an active foreign Mac claim exits
+before reading or mutating `round_state.json`, so manual dispatch and signal
+doorbells cannot create a competing Kaggle session. A local coordinator process
+with the matching `--mac_claim_id` may aggregate the worker artifacts and still
+skips the next trigger.
 
 ---
 

@@ -85,6 +85,8 @@ def _amp_dtype(device: torch.device) -> torch.dtype:
         if cc >= (8, 0):  # Ampere+ (A100, H100, RTX 3090+): native BF16 tensor cores
             return torch.bfloat16
         return torch.float16  # T4 (sm75), V100 (sm70): FP16 tensor cores; BF16 is FP32 fallback
+    if device.type == "mps":
+        return torch.float16
     return torch.float32
 
 
@@ -393,10 +395,16 @@ def load_model_and_tokenizer(
         load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
 
     _mamba_fast_path = device.type == "cuda"
-    if not _mamba_fast_path:
+    _mac_mps_mamba_requested = device.type == "mps" and bool(getattr(args, "mac_mps_mamba_kernels", False))
+    if device.type == "mps":
         load_kwargs["use_mamba_kernels"] = False
-    elif is_main:
+    elif not _mamba_fast_path:
+        load_kwargs["use_mamba_kernels"] = False
+
+    if _mamba_fast_path and device.type == "cuda" and is_main:
         print("  mamba CUDA kernels: fast path ACTIVE (verified at bootstrap)")
+    if _mac_mps_mamba_requested and is_main:
+        print("  mamba MPS package: verified by strict Mac preflight; Transformers Jamba fast kernels disabled on MPS")
 
     if args.use_4bit:
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -406,19 +414,19 @@ def load_model_and_tokenizer(
             bnb_4bit_use_double_quant=True,
         )
     else:
-        load_kwargs["torch_dtype"] = amp_dtype if device.type == "cuda" else torch.float32
+        load_kwargs["torch_dtype"] = amp_dtype
 
     if is_main:
         print(f"Loading model: {args.model_id}")
         print(f"  device={device} amp_dtype={str(amp_dtype).replace('torch.', '')}")
 
-    if _mamba_fast_path:
+    if device.type == "cuda" and _mamba_fast_path:
         _patch_transformers_jamba_fast_path_globals()
 
     model = _safe_from_pretrained(args.model_id, load_kwargs)
     model.config.use_cache = False
 
-    if _mamba_fast_path:
+    if device.type == "cuda" and _mamba_fast_path:
         _patch_transformers_jamba_fast_path_globals()
         _probe_jamba_runtime_fast_path(model, device, amp_dtype)
 

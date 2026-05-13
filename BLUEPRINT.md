@@ -28,6 +28,17 @@ Based on Meta's Coconut (arXiv:2412.06769) + DGAC (Diversity-Gated Adaptive Coco
 
 Use this for both pre-DGAC terminal-anchor review and post-DGAC aggregated-anchor review. It loads `diloco_state/anchor`, restores `halt_gate.pt` when the anchor contains it, evaluates at Stage 10, optionally runs the existing generation callback, and exits without optimizer steps or checkpoint writes.
 
+For local runs, copy `.env.example` to `.env.local`, fill the secret values,
+then load it before running coordinator, canary, or Mac fallback commands:
+
+```bash
+set -a; source .env.local; set +a
+```
+
+When `WANDB_API_KEY`/`WANDB_KEY` is set and `wandb` is installed, local fallback
+workers run with `--wandb_mode online` so DGAC/DiLoCo train metrics appear live
+under `OUROBOROS_WANDB_PROJECT`.
+
 ```bash
 torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --use_halt_gate --resume_from_diloco_anchor --eval_only \
@@ -91,6 +102,30 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
 
 Workflow fallback: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-train`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. This pushes one GPU Kaggle notebook, loads the terminal DiLoCo anchor, writes local checkpoints under `runs/stage3_dgac`, pushes Hub checkpoints under `runs/stage3_dgac`, and does not mutate DiLoCo `round_state`.
 
+**Strict local Mac fallback (only after preflight).** Use this only when Kaggle
+quota/dispatch is intentionally paused and the live Hub state still matches the
+expected DGAC waiting round. The command checks MPS, confirms CUDA is absent,
+probes `mamba-ssm-macos`, proves a Jamba FP16/MPS forward/backward pass,
+confirms `diloco_state/anchor` plus `halt_gate.pt`, refuses `--use_4bit`, writes a
+short-lived Hub claim, runs A/B/C locally in sequence, then aggregates with
+`--skip_trigger` under the matching claim.
+
+```bash
+python -m ouroboros.mac_dgac_fallback \
+  --repo_id WeirdRunner/Ouroboros \
+  --workers A,B,C \
+  --expected_stage_k 10 \
+  --expected_round_n 3 \
+  --expected_mode waiting \
+  --expected_total_samples_seen 23481 \
+  --output_root runs/mac_dgac_fallback
+```
+
+While `diloco_state/locks/mac_dgac_fallback.json` has an active foreign claim,
+the GitHub Actions coordinator exits before dispatching or aggregating. Manual
+`workflow_dispatch` and signal pushes remain present, but the scheduled watchdog
+cron is disabled so GitHub cannot race the local fallback on a timer.
+
 ---
 
 ## Wiki — Load Pages Relevant to Today's Task
@@ -119,6 +154,7 @@ Workflow fallback: GitHub Actions → `coordinate` → **Run workflow** with `ka
 | `jamba_coconut_finetune.py` | Thin worker-training compatibility adapter |
 | `diloco_coordinator.py` | Thin coordinator compatibility adapter |
 | `ouroboros/` | Packaged training, worker, coordinator, dispatch, state, and aggregation behavior |
+| `ouroboros/mac_dgac_fallback.py` | Strict local Apple Silicon DGAC fallback preflight, claim lock, sequential worker commands, and local aggregation command |
 | `.github/workflows/diloco_coordinator.yml` | CI trigger + dependencies |
 | `kaggle-utils.ipynb` | Kaggle notebook runtime adapter; preserves `!torchrun` shell magic |
 | `signals/.gitkeep` | Keeps the runtime signal directory present; generated `signals/*.json` files are ignored; signal JSON pushes still trigger the coordinator |

@@ -140,6 +140,11 @@ def test_workflow_dispatch_exposes_only_valid_matrix_modes():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     public_modes = tuple(spec.mode for spec in known_launch_specs())
 
+    assert "workflow_dispatch:" in workflow
+    assert "push:" in workflow
+    assert "signals/*.json" in workflow
+    assert "schedule:" not in workflow
+    assert "cron:" not in workflow
     for mode in public_modes:
         assert mode in workflow
     assert CPU_SMOKE_MODE in workflow.split("workflow_validate", 1)[1].split("kaggle_run_mode", 1)[0]

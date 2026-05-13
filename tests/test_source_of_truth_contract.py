@@ -86,6 +86,8 @@ def test_runtime_signal_mechanism_is_retained_as_coordinator_doorbell():
     worker_source = (REPO_ROOT / "ouroboros" / "diloco" / "worker.py").read_text(encoding="utf-8")
 
     assert "signals/*.json" in workflow
+    assert "schedule:" not in workflow
+    assert "cron:" not in workflow
     assert "def diloco_push_signal" in worker_source
     assert "signals/worker_{worker_id}_stage_{stage_k}_round_{round_n}.json" in worker_source
 

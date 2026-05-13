@@ -43,6 +43,16 @@ from ouroboros.training.evaluation import run_eval_only
 from ouroboros.training.stage_runner import run_training_stages
 from ouroboros.training_plan import plan_training_session
 
+
+def _select_training_device(local_rank: int) -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda", local_rank)
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def run_training_session(args: argparse.Namespace, *, script_start: float) -> None:
     session_plan = plan_training_session(args)
     if getattr(args, "resume_from_diloco_anchor", False) and not args.use_halt_gate:
@@ -112,7 +122,7 @@ def run_training_session(args: argparse.Namespace, *, script_start: float) -> No
         else:
             torch.distributed.init_process_group(**init_kwargs)
 
-    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+    device = _select_training_device(local_rank)
 
     if distributed and args.batch_size % world_size != 0:
         raise ValueError(

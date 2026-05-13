@@ -68,6 +68,12 @@ from ouroboros.diloco.state import (
     _ordered_unique_worker_ids,
     _partition_ready_workers,
 )
+from ouroboros.mac_dgac_fallback import (
+    MAC_DGAC_CLAIM_PATH,
+    is_active_mac_claim,
+    mac_claim_matches,
+)
+from ouroboros.runtime_env import resolve_wandb_key
 from ouroboros.workflow_validation import CPU_SMOKE_MODE, workflow_validation_remote_paths
 
 
@@ -240,6 +246,15 @@ def parse_args() -> argparse.Namespace:
             "Anchor eval and dgac-train skip DiLoCo round_state mutations; dgac-diloco intentionally uses them."
         ),
     )
+    parser.add_argument(
+        "--mac_claim_id",
+        default=os.environ.get("OUROBOROS_MAC_DGAC_CLAIM_ID"),
+        help=(
+            "Allow this local coordinator process to aggregate while the matching "
+            "strict Mac DGAC fallback claim is active. GitHub Actions should leave "
+            "this empty so a valid Mac claim blocks dispatch/aggregation races."
+        ),
+    )
 
     # Per-worker Kaggle credentials (each account can only trigger its own notebook)
     parser.add_argument(
@@ -260,7 +275,7 @@ def parse_args() -> argparse.Namespace:
     # W&B
     parser.add_argument(
         "--wandb_key",
-        default=None,
+        default=resolve_wandb_key(),
         help="W&B API key. If omitted, coordinator skips W&B logging.",
     )
     parser.add_argument("--wandb_project", default="ouroboros-stage3-jamba")
@@ -507,6 +522,27 @@ def _build_kaggle_creds(args: argparse.Namespace) -> Dict[str, Tuple[Optional[st
         "B": (args.kaggle_username_b, args.kaggle_key_b),
         "C": (args.kaggle_username_c, args.kaggle_key_c),
     }
+
+
+def _active_foreign_mac_claim(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    claim = hub_download_json(args.repo_id, MAC_DGAC_CLAIM_PATH, args.hf_token)
+    if not is_active_mac_claim(claim, now=time.time()):
+        return None
+    if mac_claim_matches(claim, getattr(args, "mac_claim_id", None)):
+        return None
+    return claim
+
+
+def _refuse_if_foreign_mac_claim_active(args: argparse.Namespace) -> bool:
+    claim = _active_foreign_mac_claim(args)
+    if claim is None:
+        return False
+    print(
+        "[coordinator] Active strict Mac DGAC fallback claim detected; "
+        "refusing GitHub/Kaggle coordinator work to avoid conflicting sessions. "
+        f"claim_id={claim.get('claim_id')} expires_at={claim.get('expires_at')}"
+    )
+    return True
 
 
 def _workflow_validation_worker_ids(args: argparse.Namespace) -> List[str]:
@@ -862,6 +898,9 @@ def main() -> None:
 
     if _workflow_validation_mode_from_args(args):
         run_workflow_validation(args)
+        return
+
+    if _refuse_if_foreign_mac_claim_active(args):
         return
 
     kaggle_run_mode = getattr(args, "kaggle_run_mode", DILOCO_RUN_MODE)

@@ -62,6 +62,7 @@ def bootstrap_free_help_text() -> str:
         "  --diloco_worker_id {A,B,C}\n"
         "  --resume_from RESUME_FROM\n"
         "  --resume_from_diloco_anchor\n"
+        "  --mac_mps_mamba_kernels\n"
         "  --eval_only\n"
         "  --dgac_diagnostics\n"
         "  --dgac_halt_supervision_weight DGAC_HALT_SUPERVISION_WEIGHT\n"
@@ -240,6 +241,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "Load diloco_state/anchor from --diloco_state_repo as the base LoRA "
             "weights for Phase 3.4 DGAC training. Requires --use_halt_gate."
+        ),
+    )
+    parser.add_argument(
+        "--mac_mps_mamba_kernels",
+        action="store_true",
+        help=(
+            "Strict local Mac fallback only: request mamba-ssm-macos MPS kernels "
+            "after preflight has proven Jamba forward/backward parity."
         ),
     )
     parser.add_argument("--output_dir", default="runs/stage3")
