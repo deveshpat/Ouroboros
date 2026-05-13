@@ -182,6 +182,7 @@ def test_local_aggregation_command_uses_skip_trigger_and_matching_claim():
     assert "--mac_claim_id" in command
     assert command[command.index("--mac_claim_id") + 1] == "mac-claim-123"
     assert command[command.index("--wandb_project") + 1] == "project"
+    assert "--hf_token" not in command
     assert "--wandb_key" not in command
     assert "--kaggle_run_mode" not in command
 

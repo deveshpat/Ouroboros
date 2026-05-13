@@ -335,8 +335,6 @@ def build_local_dgac_aggregation_command(
     command = [
         python_executable,
         script,
-        "--hf_token",
-        os.environ.get("HF_TOKEN", ""),
         "--repo_id",
         repo_id,
         "--outer_lr",

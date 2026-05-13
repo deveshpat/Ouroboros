@@ -73,7 +73,7 @@ from ouroboros.mac_dgac_fallback import (
     is_active_mac_claim,
     mac_claim_matches,
 )
-from ouroboros.runtime_env import resolve_wandb_key
+from ouroboros.runtime_env import resolve_hf_token, resolve_wandb_key
 from ouroboros.workflow_validation import CPU_SMOKE_MODE, workflow_validation_remote_paths
 
 
@@ -157,7 +157,7 @@ def _retry_io(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CPU-only DiLoCo coordinator")
-    parser.add_argument("--hf_token", required=True)
+    parser.add_argument("--hf_token", default=resolve_hf_token())
     parser.add_argument("--repo_id", default="WeirdRunner/Ouroboros")
     parser.add_argument(
         "--min_shard_samples",
@@ -895,6 +895,8 @@ def run_workflow_validation(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    if not args.hf_token:
+        raise SystemExit("HF token required. Set HF_TOKEN or pass --hf_token.")
 
     if _workflow_validation_mode_from_args(args):
         run_workflow_validation(args)
