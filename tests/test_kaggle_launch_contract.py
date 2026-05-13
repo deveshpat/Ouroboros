@@ -41,6 +41,7 @@ def test_build_diloco_training_command_preserves_notebook_launch_contract():
     assert command[:4] == ["torchrun", "--standalone", "--nproc_per_node=2", "jamba_coconut_finetune.py"]
     assert "--data_dir" in command and "data/coconut_v1" in command
     assert "--use_4bit" in command
+    assert "--latent_cache" in command
     assert "--stage_0_epochs" in command and "1" in command
     assert "--epochs_per_stage" in command and "1" in command
     assert "--max_stage" in command and "10" in command
@@ -68,6 +69,7 @@ def test_build_diloco_training_command_allows_safe_overrides():
         grad_accum=2,
         output_dir="runs/smoke",
         wandb_mode="offline",
+        latent_cache=False,
     )
 
     assert "--nproc_per_node=1" in command
@@ -76,6 +78,7 @@ def test_build_diloco_training_command_allows_safe_overrides():
     assert command[command.index("--grad_accum") + 1] == "2"
     assert command[command.index("--output_dir") + 1] == "runs/smoke"
     assert command[command.index("--wandb_mode") + 1] == "offline"
+    assert "--latent_cache" not in command
 
 
 
@@ -93,6 +96,7 @@ def test_build_diloco_training_command_can_launch_dgac_diloco_worker():
     assert "--diloco_mode" in command
     assert "--use_halt_gate" in command
     assert "--resume_from_diloco_anchor" in command
+    assert "--latent_cache" in command
     assert command[command.index("--diloco_worker_id") + 1] == "C"
     assert command[command.index("--epochs_per_stage") + 1] == "1"
     assert command[command.index("--max_grad_norm") + 1] == "0.3"
@@ -158,6 +162,7 @@ def test_build_dgac_training_command_loads_anchor_trains_halt_gate_and_pushes_ch
     assert "--diloco_state_repo" in command and "WeirdRunner/Ouroboros" in command
     assert "--data_dir" in command and "data/coconut_v1" in command
     assert "--use_4bit" in command
+    assert "--latent_cache" in command
     assert "--epochs_per_stage" in command and command[command.index("--epochs_per_stage") + 1] == "3"
     assert "--max_stage" in command and command[command.index("--max_stage") + 1] == "10"
     assert "--max_grad_norm" in command and command[command.index("--max_grad_norm") + 1] == "0.3"
@@ -176,6 +181,7 @@ def test_build_dgac_training_command_allows_safe_overrides():
         hf_stage_subdir="runs/custom-dgac",
         push_to_hub=False,
         wandb_mode="offline",
+        latent_cache=False,
     )
 
     assert "--nproc_per_node=1" in command
@@ -185,6 +191,7 @@ def test_build_dgac_training_command_allows_safe_overrides():
     assert command[command.index("--hf_stage_subdir") + 1] == "runs/custom-dgac"
     assert "--push_to_hub" not in command
     assert command[command.index("--wandb_mode") + 1] == "offline"
+    assert "--latent_cache" not in command
 
 
 
@@ -194,6 +201,7 @@ def test_build_dgac_canary_command_is_bounded_and_does_not_push_checkpoints():
     assert command[:4] == ["torchrun", "--standalone", "--nproc_per_node=2", "jamba_coconut_finetune.py"]
     assert "--use_halt_gate" in command
     assert "--resume_from_diloco_anchor" in command
+    assert "--latent_cache" in command
     assert "--eval_only" not in command
     assert "--diloco_mode" not in command
     assert command[command.index("--epochs_per_stage") + 1] == "1"
@@ -230,6 +238,7 @@ def test_build_dgac_anchor_eval_command_allows_safe_overrides():
         diloco_state_repo="state/repo",
         output_dir="runs/eval",
         wandb_mode="offline",
+        latent_cache=False,
     )
 
     assert "--nproc_per_node=1" in command
@@ -237,6 +246,7 @@ def test_build_dgac_anchor_eval_command_allows_safe_overrides():
     assert command[command.index("--diloco_state_repo") + 1] == "state/repo"
     assert command[command.index("--output_dir") + 1] == "runs/eval"
     assert command[command.index("--wandb_mode") + 1] == "offline"
+    assert "--latent_cache" not in command
 
 def test_format_shell_command_quotes_arguments_for_notebook_logging():
     command = ["python", "jamba_coconut_finetune.py", "--output_dir", "runs/with spaces"]

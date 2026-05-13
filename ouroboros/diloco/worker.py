@@ -19,6 +19,7 @@ import torch
 from ouroboros.bootstrap import _resolve_github_token_common
 from ouroboros.diloco.shared import RoundState, ordered_unique_workers, retry_io
 from ouroboros.worker_lifecycle import WorkerLifecycleKind, classify_worker_lifecycle
+from ouroboros.wandb_runtime import wandb_init_kwargs
 from ouroboros.model import (
     _is_main_process,
     _world_size,
@@ -701,6 +702,7 @@ def run_diloco_worker(
                 # No resume= needed: each round is a guaranteed-fresh run
                 config=identity["config"],
                 mode=args.wandb_mode,
+                **wandb_init_kwargs(_wandb),
             )
             if is_dgac_diloco:
                 _wandb.log(

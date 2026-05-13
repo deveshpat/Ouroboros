@@ -63,12 +63,15 @@ def bootstrap_free_help_text() -> str:
         "  --resume_from RESUME_FROM\n"
         "  --resume_from_diloco_anchor\n"
         "  --mac_mps_mamba_kernels\n"
+        "  --latent_cache\n"
+        "  --mac_mps_latent_cache\n"
         "  --eval_only\n"
         "  --dgac_diagnostics\n"
         "  --dgac_halt_supervision_weight DGAC_HALT_SUPERVISION_WEIGHT\n"
         "  --dgac_halt_ce_tolerance DGAC_HALT_CE_TOLERANCE\n"
         "  --dgac_halt_probe_steps DGAC_HALT_PROBE_STEPS\n"
         "  --output_dir OUTPUT_DIR\n"
+        "  --profile_training_timing\n"
         "  --val_batch_size VAL_BATCH_SIZE\n"
         "  --gen_every_stage, --no-gen_every_stage\n"
         "  --gen_max_tokens GEN_MAX_TOKENS\n"
@@ -251,6 +254,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "after preflight has proven Jamba forward/backward parity."
         ),
     )
+    parser.add_argument(
+        "--latent_cache",
+        action="store_true",
+        help=(
+            "Cache fixed-depth Coconut latent prefixes so accelerator runs avoid "
+            "recomputing the full prefix at every latent step."
+        ),
+    )
+    parser.add_argument(
+        "--mac_mps_latent_cache",
+        dest="latent_cache",
+        action="store_true",
+        help=(
+            "Compatibility alias for --latent_cache used by strict local Mac fallback commands."
+        ),
+    )
     parser.add_argument("--output_dir", default="runs/stage3")
     parser.add_argument(
         "--eval_only",
@@ -272,6 +291,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     # Monitoring
     parser.add_argument("--log_every", type=int, default=20)
+    parser.add_argument(
+        "--profile_training_timing",
+        action="store_true",
+        help="Log per-step training timing breakdowns for canary/profiling runs.",
+    )
     parser.add_argument(
         "--val_batch_size",
         type=int,

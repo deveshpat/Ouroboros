@@ -93,6 +93,13 @@ def _amp_dtype(device: torch.device) -> torch.dtype:
 def _autocast_ctx(device: torch.device, dtype: torch.dtype):
     if device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=dtype)
+    if device.type == "mps":
+        try:
+            is_available = torch.amp.autocast_mode.is_autocast_available("mps")
+        except Exception:
+            is_available = False
+        if is_available:
+            return torch.autocast(device_type="mps", dtype=dtype)
     return contextlib.nullcontext()
 
 
@@ -403,8 +410,12 @@ def load_model_and_tokenizer(
 
     if _mamba_fast_path and device.type == "cuda" and is_main:
         print("  mamba CUDA kernels: fast path ACTIVE (verified at bootstrap)")
-    if _mac_mps_mamba_requested and is_main:
-        print("  mamba MPS package: verified by strict Mac preflight; Transformers Jamba fast kernels disabled on MPS")
+    if _mac_mps_mamba_requested:
+        from ouroboros.mac_jamba_fastpath import install_mac_jamba_mps_fastpath
+
+        mac_scan_active = install_mac_jamba_mps_fastpath(verbose=is_main)
+        if is_main and not mac_scan_active:
+            print("  Mac Jamba MPS selective-scan patch: unavailable; using Transformers slow path")
 
     if args.use_4bit:
         load_kwargs["quantization_config"] = BitsAndBytesConfig(

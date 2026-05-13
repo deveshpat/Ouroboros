@@ -36,6 +36,18 @@ from ouroboros.training.evaluation import evaluate_stage, run_generation_callbac
 
 _SCRIPT_START = time.perf_counter()
 
+
+def _sync_profile_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        return
+    if device.type == "mps":
+        mps = getattr(torch, "mps", None)
+        synchronize = getattr(mps, "synchronize", None)
+        if synchronize is not None:
+            synchronize()
+
+
 def _stage_grad_clip_norm(args: argparse.Namespace, stage_k: int) -> float:
     clip_norm = float(args.max_grad_norm)
     if stage_k >= 2:
@@ -164,6 +176,7 @@ def run_training_stages(
     if max_train_steps is not None and max_train_steps <= 0:
         raise ValueError("--max_train_steps must be positive when provided")
     train_steps_this_run = 0
+    profile_timing = bool(getattr(args, "profile_training_timing", False))
 
     for stage_k in stages:
         if args.use_halt_gate:
@@ -264,6 +277,11 @@ def run_training_stages(
                     break
 
                 step_metrics_accum: Dict[str, float] = defaultdict(float)
+                step_timing_accum: Dict[str, float] = defaultdict(float)
+                step_started = 0.0
+                if profile_timing:
+                    _sync_profile_device(device)
+                    step_started = time.perf_counter()
                 micro_count = 0
                 did_backward = False
                 step_samples_seen = _optimizer_step_sample_count(
@@ -281,6 +299,16 @@ def run_training_stages(
                         for offset in range(local_bs)
                     ]
                     batch_raw = [train_samples[idx] for idx in batch_indices]
+                    phase_started = 0.0
+                    if profile_timing:
+                        _sync_profile_device(device)
+                        micro_started = phase_started = time.perf_counter()
+                    else:
+                        micro_started = 0.0
+                    micro_forward_seconds = 0.0
+                    micro_backward_seconds = 0.0
+                    micro_seq_len = 0
+                    micro_valid_tokens = 0
                     built = [
                         build_sample_at_stage(
                             tokenizer, sample, stage_k, lat_token_id, args.max_seq_len,
@@ -289,8 +317,17 @@ def run_training_stages(
                     ]
                     built = [s for s in built if s is not None]
                     if not built:
+                        if profile_timing:
+                            _sync_profile_device(device)
+                            step_timing_accum["batch_build"] += time.perf_counter() - phase_started
                         continue
                     batch = collate_stage_k(built, pad_id)
+                    if profile_timing:
+                        micro_seq_len = int(batch["input_ids"].size(1))
+                        micro_valid_tokens = int((batch["labels"][:, 1:] != -100).sum().item())
+                        _sync_profile_device(device)
+                        step_timing_accum["batch_build"] += time.perf_counter() - phase_started
+                        phase_started = time.perf_counter()
                     loss, metrics = coconut_forward(
                         model=model,
                         batch=batch,
@@ -300,7 +337,25 @@ def run_training_stages(
                         args=args,
                         step_in_phase=step_in_phase,
                     )
+                    if profile_timing:
+                        _sync_profile_device(device)
+                        micro_forward_seconds = time.perf_counter() - phase_started
+                        step_timing_accum["forward"] += micro_forward_seconds
+                        phase_started = time.perf_counter()
                     (loss / args.grad_accum).backward()
+                    if profile_timing:
+                        _sync_profile_device(device)
+                        micro_backward_seconds = time.perf_counter() - phase_started
+                        step_timing_accum["backward"] += micro_backward_seconds
+                        if is_main and args.grad_accum > 1:
+                            micro_total_seconds = time.perf_counter() - micro_started
+                            tqdm.write(
+                                f"    micro={micro + 1:02d}/{args.grad_accum} "
+                                f"len={micro_seq_len} valid={micro_valid_tokens} "
+                                f"t={micro_total_seconds:.2f}s "
+                                f"fwd={micro_forward_seconds:.2f}s "
+                                f"bwd={micro_backward_seconds:.2f}s"
+                            )
                     did_backward = True
                     micro_count += 1
                     for k, v in metrics.items():
@@ -315,6 +370,10 @@ def run_training_stages(
                         pbar.set_postfix(skip="1")
                     continue
 
+                optimizer_started = 0.0
+                if profile_timing:
+                    _sync_profile_device(device)
+                    optimizer_started = time.perf_counter()
                 if distributed:
                     all_reduce_gradients(trainable_params, world_size)
 
@@ -327,6 +386,11 @@ def run_training_stages(
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                if profile_timing:
+                    _sync_profile_device(device)
+                    step_timing_accum["optimizer"] += time.perf_counter() - optimizer_started
+                    step_timing_accum["train_step"] = time.perf_counter() - step_started
+                    step_timing_accum["micro_count"] = float(micro_count)
                 global_step += 1
                 train_steps_this_run += 1
                 if args.use_halt_gate:
@@ -334,6 +398,16 @@ def run_training_stages(
 
                 mean_metrics = {k: v / max(micro_count, 1) for k, v in step_metrics_accum.items()}
                 mean_ce = mean_metrics.get("ce", 0.0)
+                timing_metrics: Dict[str, float] = {}
+                if profile_timing:
+                    timing_metrics = {
+                        "timing/batch_build_seconds": float(step_timing_accum.get("batch_build", 0.0)),
+                        "timing/forward_seconds": float(step_timing_accum.get("forward", 0.0)),
+                        "timing/backward_seconds": float(step_timing_accum.get("backward", 0.0)),
+                        "timing/optimizer_seconds": float(step_timing_accum.get("optimizer", 0.0)),
+                        "timing/train_step_seconds": float(step_timing_accum.get("train_step", 0.0)),
+                        "timing/micro_count": float(step_timing_accum.get("micro_count", 0.0)),
+                    }
 
                 if pbar is not None:
                     pbar.update(1)
@@ -346,10 +420,18 @@ def run_training_stages(
                         "train/lr": scheduler.get_last_lr()[0],
                         "train/stage": stage_k,
                         **{f"train/{k}": v for k, v in mean_metrics.items()},
+                        **timing_metrics,
                     }
+                    timing_text = ""
+                    if timing_metrics:
+                        timing_text = (
+                            f" t={timing_metrics['timing/train_step_seconds']:.2f}s"
+                            f" fwd={timing_metrics['timing/forward_seconds']:.2f}s"
+                            f" bwd={timing_metrics['timing/backward_seconds']:.2f}s"
+                        )
                     tqdm.write(
                         f"  step={global_step:6d} s={stage_k} ep={epoch} "
-                        f"ce={mean_ce:.4f} gn={grad_norm:.4f}"
+                        f"ce={mean_ce:.4f} gn={grad_norm:.4f}{timing_text}"
                     )
                     if wandb_run is not None:
                         import wandb

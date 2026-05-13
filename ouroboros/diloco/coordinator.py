@@ -74,6 +74,7 @@ from ouroboros.mac_dgac_fallback import (
     mac_claim_matches,
 )
 from ouroboros.runtime_env import resolve_hf_token, resolve_wandb_key
+from ouroboros.wandb_runtime import wandb_init_kwargs
 from ouroboros.workflow_validation import CPU_SMOKE_MODE, workflow_validation_remote_paths
 
 
@@ -1069,6 +1070,7 @@ def main() -> None:
                         "total_train": args.total_train_samples,
                     },
                     mode="online",
+                    **wandb_init_kwargs(wandb),
                 )
             except Exception as _we:
                 print(f"[coordinator] W&B init failed: {_we}")
