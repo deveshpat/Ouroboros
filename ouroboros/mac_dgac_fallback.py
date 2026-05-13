@@ -616,6 +616,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     env = _worker_env(os.environ, claim_id=claim["claim_id"])
+
+    def _record_failed_run(error: str, exit_code: int) -> int:
+        failed_claim = build_mac_failed_claim(claim=claim, error=error)
+        failure_state = build_mac_failure_round_state(
+            state=state or {},
+            claim_id=claim["claim_id"],
+            error=error,
+        )
+        hub_upload_json(
+            args.repo_id,
+            MAC_DGAC_CLAIM_PATH,
+            failed_claim,
+            hf_token,
+            "Mac DGAC fallback claim failed",
+        )
+        hub_upload_json(
+            args.repo_id,
+            ROUND_STATE_PATH,
+            failure_state,
+            hf_token,
+            f"Mac DGAC fallback failed: restore waiting round {expected.round_n}",
+        )
+        return int(exit_code or 1)
+
     try:
         for worker_id in worker_ids:
             command = build_local_dgac_worker_command(
@@ -640,27 +664,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         command_text = " ".join(str(part) for part in (exc.cmd or []))
         error = f"subprocess exited {exc.returncode}: {command_text}".strip()
         print(f"[mac-dgac] FATAL: {error}")
-        failed_claim = build_mac_failed_claim(claim=claim, error=error)
-        failure_state = build_mac_failure_round_state(
-            state=state or {},
-            claim_id=claim["claim_id"],
-            error=error,
-        )
-        hub_upload_json(
-            args.repo_id,
-            MAC_DGAC_CLAIM_PATH,
-            failed_claim,
-            hf_token,
-            "Mac DGAC fallback claim failed",
-        )
-        hub_upload_json(
-            args.repo_id,
-            ROUND_STATE_PATH,
-            failure_state,
-            hf_token,
-            f"Mac DGAC fallback failed: restore waiting round {expected.round_n}",
-        )
-        return int(exc.returncode or 1)
+        return _record_failed_run(error, int(exc.returncode or 1))
+    except KeyboardInterrupt:
+        error = "interrupted by user"
+        print(f"[mac-dgac] FATAL: {error}")
+        return _record_failed_run(error, 130)
 
     completed_claim = {**claim, "status": "complete", "updated_at": time.time()}
     hub_upload_json(

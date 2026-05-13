@@ -42,6 +42,7 @@ signals/*.json
 
 # Training/runtime artifacts
 checkpoints/
+data/
 outputs/
 runs/
 logs/

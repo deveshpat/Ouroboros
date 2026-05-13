@@ -279,6 +279,7 @@ def run_training_session(args: argparse.Namespace, *, script_start: float) -> No
                 "diloco_state/anchor",
                 device,
                 halt_gate=halt_gate,
+                required=True,
             )
             if is_main:
                 print(

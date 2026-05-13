@@ -218,6 +218,29 @@ def diloco_upload_worker_state(
         Path(tmp_path).unlink(missing_ok=True)
 
 
+def _set_peft_model_state_dict_compat(model, weights: Dict[str, torch.Tensor]) -> Any:
+    """
+    Load a saved PEFT adapter state dict while avoiding the Transformers-v5
+    conversion path for adapters that are already in PEFT save_pretrained shape.
+
+    PEFT 0.19 can otherwise route Jamba adapter keys through a Transformers
+    WeightConverter path whose signature is version-sensitive. The DiLoCo
+    anchor is already a PEFT adapter checkpoint, so the direct PEFT insertion
+    path is the correct load behavior here.
+    """
+    from peft import set_peft_model_state_dict
+    import peft.utils.save_and_load as peft_save_and_load
+
+    old_transformers_v5 = getattr(peft_save_and_load, "is_transformers_ge_v5", None)
+    if old_transformers_v5 is True:
+        peft_save_and_load.is_transformers_ge_v5 = False
+    try:
+        return set_peft_model_state_dict(model, weights)
+    finally:
+        if old_transformers_v5 is not None:
+            peft_save_and_load.is_transformers_ge_v5 = old_transformers_v5
+
+
 def diloco_download_anchor(
     model,
     hf_token: str,
@@ -225,6 +248,7 @@ def diloco_download_anchor(
     anchor_path: str,
     device: torch.device,
     halt_gate=None,
+    required: bool = False,
 ) -> None:
     """
     Download anchor adapter weights from Hub and load them into the model in-place.
@@ -235,7 +259,6 @@ def diloco_download_anchor(
     try:
         def _download() -> None:
             from huggingface_hub import hf_hub_download
-            from peft import set_peft_model_state_dict
             from safetensors.torch import load_file
 
             dl_path = hf_hub_download(
@@ -244,7 +267,7 @@ def diloco_download_anchor(
                 token=hf_token,
             )
             weights = load_file(dl_path, device=str(device))
-            set_peft_model_state_dict(model, weights)
+            _set_peft_model_state_dict_compat(model, weights)
 
         retry_io(f"  [diloco] Download anchor {anchor_path}", _download, verbose=_is_main_process())
         if _is_main_process():
@@ -264,15 +287,19 @@ def diloco_download_anchor(
             gate_loaded = retry_io(
                 f"  [diloco] Download halt gate {anchor_path}",
                 _download_halt_gate,
-                swallow=True,
+                swallow=not required,
                 default=False,
                 verbose=_is_main_process(),
             )
             if gate_loaded is not False and _is_main_process():
                 print(f"  [diloco] Loaded halt gate from {anchor_path}/halt_gate.pt")
+            elif required:
+                raise FileNotFoundError(f"Required DGAC halt gate missing at {anchor_path}/halt_gate.pt")
             elif _is_main_process():
                 print("  [diloco] No halt gate anchor found; using zero-init HaltGate.")
     except Exception as exc:
+        if required:
+            raise RuntimeError(f"Required DiLoCo anchor load failed at {anchor_path}: {exc}") from exc
         if _is_main_process():
             print(f"  [diloco] No anchor found at {anchor_path} ({exc}); using current weights.")
 
@@ -483,7 +510,15 @@ def run_diloco_worker(
                 f"  [diloco] Worker {args.diloco_worker_id} in attendance mode — "
                 f"signaling presence (no training this round)."
             )
-            diloco_download_anchor(model, hf_token, args.diloco_state_repo, anchor_path, device, halt_gate=halt_gate)
+            diloco_download_anchor(
+                model,
+                hf_token,
+                args.diloco_state_repo,
+                anchor_path,
+                device,
+                halt_gate=halt_gate,
+                required=bool(getattr(args, "resume_from_diloco_anchor", False)),
+            )
 
             _attend_dir = (
                 output_dir / "diloco_worker_upload"
@@ -531,7 +566,15 @@ def run_diloco_worker(
         print(f"  [diloco] Worker {args.diloco_worker_id} | stage={stage_k} round={round_n}")
         if args.push_to_hub:
             print("  [diloco] Regular stage checkpoint Hub sync is disabled in DiLoCo mode; worker uploads go to diloco_state/ only.")
-        diloco_download_anchor(model, hf_token, args.diloco_state_repo, anchor_path, device, halt_gate=halt_gate)
+        diloco_download_anchor(
+            model,
+            hf_token,
+            args.diloco_state_repo,
+            anchor_path,
+            device,
+            halt_gate=halt_gate,
+            required=bool(getattr(args, "resume_from_diloco_anchor", False)),
+        )
     barrier()
 
     if _world_size() > 1:

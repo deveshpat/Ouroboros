@@ -97,8 +97,8 @@ def test_dgac_anchor_eval_only_loads_anchor_evaluates_and_skips_training(monkeyp
     monkeypatch.setattr(session_module, "load_model_and_tokenizer", fake_load_model_and_tokenizer)
     monkeypatch.setattr(session_module, "_resolve_hf_token", lambda token: "hf_fake")
     monkeypatch.setattr(session_module, "_wandb_credentials_available", lambda: False)
-    def fake_diloco_download_anchor(model, hf_token, repo, subdir, device, *, halt_gate=None):
-        calls.append(("anchor", hf_token, repo, subdir, halt_gate is not None))
+    def fake_diloco_download_anchor(model, hf_token, repo, subdir, device, *, halt_gate=None, required=False):
+        calls.append(("anchor", hf_token, repo, subdir, halt_gate is not None, required))
 
     monkeypatch.setattr(
         worker_module,
@@ -133,7 +133,7 @@ def test_dgac_anchor_eval_only_loads_anchor_evaluates_and_skips_training(monkeyp
     train_module.run_cli(args, script_start=time.perf_counter())
 
     assert calls == [
-        ("anchor", "hf_fake", "fake/state", "diloco_state/anchor", True),
+        ("anchor", "hf_fake", "fake/state", "diloco_state/anchor", True, True),
         ("evaluate", 10, True),
         ("generation", 10, True),
     ]
@@ -176,8 +176,8 @@ def test_dgac_anchor_eval_only_runs_halt_gate_diagnostics_when_requested(monkeyp
     monkeypatch.setattr(
         worker_module,
         "diloco_download_anchor",
-        lambda model, hf_token, repo, subdir, device, *, halt_gate=None: calls.append(
-            ("anchor", halt_gate is not None)
+        lambda model, hf_token, repo, subdir, device, *, halt_gate=None, required=False: calls.append(
+            ("anchor", halt_gate is not None, required)
         ),
     )
     monkeypatch.setattr(
@@ -221,7 +221,7 @@ def test_dgac_anchor_eval_only_runs_halt_gate_diagnostics_when_requested(monkeyp
     train_module.run_cli(args, script_start=time.perf_counter())
 
     assert calls == [
-        ("anchor", True),
+        ("anchor", True, True),
         ("evaluate", True),
         ("generation", True),
         ("diagnostics", True, 10, 0.42),

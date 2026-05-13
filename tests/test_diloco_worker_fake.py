@@ -184,6 +184,25 @@ def test_anchor_download_fallback_leaves_model_weights_intact(monkeypatch):
     assert torch.equal(model.lm_head.weight.detach(), before)
 
 
+def test_required_anchor_download_raises_instead_of_training_from_fresh_weights(monkeypatch):
+    model = FakeCausalLM()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("missing anchor")
+
+    monkeypatch.setitem(__import__("sys").modules, "huggingface_hub", type("HF", (), {"hf_hub_download": boom}))
+
+    with pytest.raises(RuntimeError, match="Required DiLoCo anchor load failed"):
+        worker_module.diloco_download_anchor(
+            model,
+            "hf",
+            "repo",
+            "anchor",
+            torch.device("cpu"),
+            required=True,
+        )
+
+
 def test_attendance_only_worker_uploads_zero_sample_status_without_training(monkeypatch, tmp_path):
     calls: dict[str, list] = {"download": [], "upload": [], "signal": []}
     monkeypatch.setattr(worker_module, "barrier", lambda: None)
