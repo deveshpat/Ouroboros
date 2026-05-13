@@ -258,6 +258,72 @@ def test_initial_dgac_diloco_state_starts_first_dedicated_round_from_terminal_ga
 
     assert next_round == 0
 
+
+
+def test_packaged_coordinator_auto_dispatches_anchor_eval_after_dgac_completion(monkeypatch):
+    monkeypatch.setattr(
+        coordinator,
+        "parse_args",
+        lambda: _args(
+            kaggle_run_mode="diloco",
+            skip_trigger=False,
+            total_train_samples=9,
+        ),
+    )
+    state = {
+        "stage_k": 10,
+        "round_n": 3,
+        "dgac_round_n": 3,
+        "mode": "dgac-diloco",
+        "triggered_workers": ["B"],
+        "attendance_workers": [],
+        "triggered_at": 900.0,
+        "anchor_path": "diloco_state/anchor",
+        "total_samples_seen": {"10": 8},
+        "completed_stages": [10],
+        "dgac_diloco": True,
+        "seed": 42,
+    }
+    triggered = []
+    uploads = []
+    saved = []
+
+    monkeypatch.setattr(coordinator.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(coordinator, "hub_download_json", lambda *args, **kwargs: state)
+    monkeypatch.setattr(
+        coordinator,
+        "collect_ready_workers",
+        lambda *args, **kwargs: [
+            {
+                "worker_id": "B",
+                "stage_k": 10,
+                "round_n": 3,
+                "status": "done",
+                "samples_seen": 1,
+                "weights_path": "workers/B",
+                "halt_gate_path": "workers/B/halt_gate.pt",
+            }
+        ],
+    )
+    monkeypatch.setattr(coordinator, "load_adapter_weights_cpu", lambda repo_id, weights_path, token: {"w": weights_path})
+    monkeypatch.setattr(coordinator, "load_torch_state_cpu", lambda repo_id, path, token: {"gate": path})
+    monkeypatch.setattr(coordinator, "hub_download_text", lambda *args, **kwargs: "{}")
+    monkeypatch.setattr(coordinator, "save_and_upload_anchor", lambda *args, **kwargs: saved.append((args, kwargs)))
+    monkeypatch.setattr(coordinator, "hub_upload_json", lambda *args, **kwargs: uploads.append((args, kwargs)))
+
+    def fake_trigger(kaggle_creds, *, active_workers, notebook_path, coordinator_args):
+        triggered.append((active_workers, notebook_path, coordinator_args.kaggle_run_mode))
+        return {worker_id: "success" for worker_id in active_workers}
+
+    monkeypatch.setattr(coordinator, "trigger_kaggle_workers", fake_trigger)
+
+    coordinator.main()
+
+    assert saved
+    assert uploads[-1][0][2]["mode"] == "dgac-complete"
+    assert uploads[-1][0][2]["dgac_diloco_complete"] is True
+    assert triggered == [(["A"], Path("kaggle-utils.ipynb"), "dgac-anchor-eval")]
+
 def test_packaged_coordinator_cpu_smoke_validation_defaults_to_worker_a_and_polls_remote_status(monkeypatch):
     monkeypatch.setattr(
         coordinator,

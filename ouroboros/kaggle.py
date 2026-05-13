@@ -94,6 +94,8 @@ def build_diloco_training_command(
     use_halt_gate: bool = False,
     resume_from_diloco_anchor: bool = False,
     max_grad_norm: float | None = None,
+    diloco_run_val: bool = False,
+    gen_every_stage: bool | None = None,
 ) -> list[str]:
     """Build the tested Kaggle Dual-GPU DiLoCo training command.
 
@@ -159,6 +161,10 @@ def build_diloco_training_command(
     )
     if max_grad_norm is not None:
         command.extend(["--max_grad_norm", str(float(max_grad_norm))])
+    if diloco_run_val:
+        command.append("--diloco_run_val")
+    if gen_every_stage is not None:
+        command.append("--gen_every_stage" if gen_every_stage else "--no-gen_every_stage")
     if push_to_hub:
         command.append("--push_to_hub")
     command.extend(["--output_dir", output_dir])

@@ -666,15 +666,29 @@ def run_diloco_worker(
         except Exception as _we:
             print(f"  [diloco] W&B init failed: {_we}")
 
+    active_workers_for_pre_val = triggered_workers or [args.diloco_worker_id]
+    pre_val_leader = active_workers_for_pre_val[0] if active_workers_for_pre_val else args.diloco_worker_id
+    forced_pre_val = bool(args.diloco_run_val and args.diloco_worker_id == pre_val_leader)
+    default_stage_pre_val = bool(
+        round_n == 0
+        and is_new_stage
+        and args.diloco_worker_id == pre_val_leader
+    )
     should_run_pre_val = bool(
         (not lifecycle_plan.skip_pre_validation)
-        and (
-            args.diloco_run_val
-            or (round_n == 0 and is_new_stage and args.diloco_worker_id == "A")
-        )
+        and (forced_pre_val or default_stage_pre_val)
     )
     if is_dgac_diloco and _is_main_process():
-        print("  [dgac-diloco] Skipping worker pre-val; anchor eval already covers val/gen.")
+        if should_run_pre_val:
+            print(
+                "  [dgac-diloco] Running leader pre-val before DGAC shard training "
+                f"(worker={args.diloco_worker_id}, round={round_n})."
+            )
+        else:
+            print(
+                "  [dgac-diloco] Skipping duplicate worker pre-val "
+                f"(leader={pre_val_leader}, worker={args.diloco_worker_id})."
+            )
     if should_run_pre_val and val_samples:
         from ouroboros.training.evaluation import evaluate_stage
         val_ce, val_acc = evaluate_stage(
@@ -711,7 +725,7 @@ def run_diloco_worker(
     args.epochs_per_stage = 1
     if stage_k == 0:
         args.stage_0_epochs = 1
-    args.gen_every_stage = False
+    args.gen_every_stage = bool(original_gen_every_stage) if is_dgac_diloco else False
 
     try:
         from ouroboros.training.stage_runner import run_training_stages
@@ -739,7 +753,7 @@ def run_diloco_worker(
             global_step=global_step_offset,
             step_in_phase=0,
             load_best_between_stages=False,
-            run_generation_at_stage_end=False,
+            run_generation_at_stage_end=bool(args.gen_every_stage) if is_dgac_diloco else False,
             run_epoch_end_val=False,
         )
     finally:

@@ -70,10 +70,10 @@ def plan_training_session(args: Any) -> TrainingSessionPlan:
         return TrainingSessionPlan(
             kind=TrainingPlanKind.DGAC_DILOCO_WORKER if is_dgac else TrainingPlanKind.DILOCO_WORKER,
             should_train=True,
-            should_validate=False,
-            should_generate=False,
+            should_validate=bool(getattr(args, "diloco_run_val", False)),
+            should_generate=gen_every_stage if is_dgac else False,
             delegates_to_diloco=True,
-            skip_worker_pre_validation=is_dgac,
+            skip_worker_pre_validation=False,
             reason="worker execution delegated to DiLoCo runtime",
         )
 

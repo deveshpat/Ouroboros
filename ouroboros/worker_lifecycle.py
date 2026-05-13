@@ -114,7 +114,7 @@ def classify_worker_lifecycle(
         should_upload_status=True,
         should_push_signal=True,
         contributes_to_aggregation=True,
-        skip_pre_validation=is_dgac,
+        skip_pre_validation=False,
         shard_samples=int(shard_samples),
         reason="DGAC DiLoCo active shard" if is_dgac else "normal DiLoCo active shard",
     )

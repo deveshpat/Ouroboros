@@ -357,12 +357,12 @@ def test_dgac_diloco_worker_forces_one_local_epoch_and_uploads_halt_gate(monkeyp
     assert calls["signal"]
 
 
-def test_dgac_diloco_worker_skips_pre_val_even_for_worker_a_first_round(monkeypatch, tmp_path):
+def test_dgac_diloco_worker_runs_leader_pre_val_and_enables_generation_when_requested(monkeypatch, tmp_path):
     calls: dict[str, list] = {"download": [], "upload": [], "signal": [], "train": [], "eval": []}
     monkeypatch.setattr(worker_module, "barrier", lambda: None)
     monkeypatch.setattr(worker_module, "diloco_read_round_state", lambda hf_token, repo_id: {
         "stage_k": 10,
-        "round_n": 0,
+        "round_n": 3,
         "mode": "dgac-diloco",
         "anchor_path": "diloco_state/anchor",
         "triggered_workers": ["A", "B", "C"],
@@ -379,7 +379,7 @@ def test_dgac_diloco_worker_skips_pre_val_even_for_worker_a_first_round(monkeypa
     from ouroboros.training import evaluation as evaluation_module
     from ouroboros.training import stage_runner as stage_runner_module
 
-    monkeypatch.setattr(evaluation_module, "evaluate_stage", lambda **kwargs: calls["eval"].append(kwargs))
+    monkeypatch.setattr(evaluation_module, "evaluate_stage", lambda **kwargs: (calls["eval"].append(kwargs) or (0.5, 0.25)))
 
     def fake_run_training_stages(**kwargs):
         calls["train"].append(kwargs)
@@ -399,13 +399,89 @@ def test_dgac_diloco_worker_skips_pre_val_even_for_worker_a_first_round(monkeypa
         halt_gate=FakeHaltGate(),
         train_samples=[
             {"question": f"Q{i}", "steps": ["s"], "answer_full": "a", "answer_norm": "a"}
-            for i in range(6)
+            for i in range(12)
         ],
         val_samples=[{"question": "V", "steps": ["s"], "answer_full": "a", "answer_norm": "a"}],
         curriculum_max_stage=10,
         lat_token_id=6,
         pad_id=0,
-        args=_args(worker_id="A", use_halt_gate=True, resume_from_diloco_anchor=True, epochs_per_stage=1),
+        args=_args(
+            worker_id="A",
+            use_halt_gate=True,
+            resume_from_diloco_anchor=True,
+            epochs_per_stage=1,
+            diloco_run_val=True,
+            gen_every_stage=True,
+        ),
+        device=torch.device("cpu"),
+        output_dir=tmp_path,
+        session_start=time.perf_counter(),
+        wandb_run=None,
+        hf_token="hf_fake",
+    )
+
+    assert calls["eval"]
+    assert calls["train"]
+    assert calls["train"][0]["run_generation_at_stage_end"] is True
+    assert calls["train"][0]["run_epoch_end_val"] is False
+
+
+def test_dgac_diloco_worker_skips_duplicate_pre_val_for_non_leader(monkeypatch, tmp_path):
+    calls: dict[str, list] = {"download": [], "upload": [], "signal": [], "train": [], "eval": []}
+    monkeypatch.setattr(worker_module, "barrier", lambda: None)
+    monkeypatch.setattr(worker_module, "diloco_read_round_state", lambda hf_token, repo_id: {
+        "stage_k": 10,
+        "round_n": 3,
+        "mode": "dgac-diloco",
+        "anchor_path": "diloco_state/anchor",
+        "triggered_workers": ["A", "B", "C"],
+        "attendance_workers": [],
+        "total_samples_seen": {"10": 0},
+        "dgac_diloco": True,
+        "seed": 42,
+    })
+    monkeypatch.setattr(worker_module, "diloco_download_anchor", lambda *args, **kwargs: calls["download"].append((args, kwargs)))
+    monkeypatch.setattr(worker_module, "diloco_upload_worker_state", lambda **kwargs: calls["upload"].append(kwargs))
+    monkeypatch.setattr(worker_module, "_resolve_github_token_common", lambda: "gh_fake")
+    monkeypatch.setattr(worker_module, "diloco_push_signal", lambda *args: calls["signal"].append(args))
+
+    from ouroboros.training import evaluation as evaluation_module
+    from ouroboros.training import stage_runner as stage_runner_module
+
+    monkeypatch.setattr(evaluation_module, "evaluate_stage", lambda **kwargs: (calls["eval"].append(kwargs) or (0.5, 0.25)))
+
+    def fake_run_training_stages(**kwargs):
+        calls["train"].append(kwargs)
+        return {
+            "samples_seen": len(kwargs["train_samples"]),
+            "global_step": 1,
+            "timeout_triggered": False,
+            "val_budget_triggered": False,
+            "stages": [10],
+        }
+
+    monkeypatch.setattr(stage_runner_module, "run_training_stages", fake_run_training_stages)
+
+    worker_module.run_diloco_worker(
+        model=FakeCausalLM(),
+        tokenizer=FakeTokenizer(),
+        halt_gate=FakeHaltGate(),
+        train_samples=[
+            {"question": f"Q{i}", "steps": ["s"], "answer_full": "a", "answer_norm": "a"}
+            for i in range(12)
+        ],
+        val_samples=[{"question": "V", "steps": ["s"], "answer_full": "a", "answer_norm": "a"}],
+        curriculum_max_stage=10,
+        lat_token_id=6,
+        pad_id=0,
+        args=_args(
+            worker_id="B",
+            use_halt_gate=True,
+            resume_from_diloco_anchor=True,
+            epochs_per_stage=1,
+            diloco_run_val=True,
+            gen_every_stage=True,
+        ),
         device=torch.device("cpu"),
         output_dir=tmp_path,
         session_start=time.perf_counter(),

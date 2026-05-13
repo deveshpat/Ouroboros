@@ -586,6 +586,19 @@ def run_kaggle_anchor_eval(args: argparse.Namespace) -> None:
     )
 
 
+def _dispatch_post_dgac_completion_anchor_eval(args: argparse.Namespace) -> None:
+    """Launch one eval-only notebook after DGAC DiLoCo reaches its sample target."""
+    if args.skip_trigger:
+        print("[kaggle-eval] --skip_trigger set. Skipping automatic DGAC anchor eval.")
+        return
+    original_mode = getattr(args, "kaggle_run_mode", DILOCO_RUN_MODE)
+    try:
+        args.kaggle_run_mode = DGAC_ANCHOR_EVAL_RUN_MODE
+        run_kaggle_anchor_eval(args)
+    finally:
+        args.kaggle_run_mode = original_mode
+
+
 def run_kaggle_dgac_train(args: argparse.Namespace) -> None:
     worker_ids = _kaggle_dgac_worker_ids(args)
     kaggle_creds = _build_kaggle_creds(args)
@@ -1269,7 +1282,8 @@ def main() -> None:
                 wandb.log({"coordinator/dgac_diloco_complete": 1}, step=round_n)
                 wandb.finish()
                 coordinator_wandb_run = None
-            print("[coordinator] Done (DGAC dedicated round complete).")
+            _dispatch_post_dgac_completion_anchor_eval(args)
+            print("[coordinator] Done (DGAC dedicated round complete; anchor eval dispatched).")
             return
 
         if post_decision.kind == "terminal_manual_gate":

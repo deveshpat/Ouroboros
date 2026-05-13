@@ -55,6 +55,7 @@ def test_training_session_planner_classifies_branches_without_heavy_imports():
         max_train_steps=None,
         workflow_validate=None,
         gen_every_stage=True,
+        diloco_run_val=False,
     )
 
     assert plan_training_session(base).kind == TrainingPlanKind.STANDARD_TRAIN
@@ -79,7 +80,7 @@ def test_training_session_planner_classifies_branches_without_heavy_imports():
     worker_plan = plan_training_session(worker_args)
     assert worker_plan.kind == TrainingPlanKind.DGAC_DILOCO_WORKER
     assert worker_plan.delegates_to_diloco is True
-    assert worker_plan.skip_worker_pre_validation is True
+    assert worker_plan.skip_worker_pre_validation is False
 
     bad_args = argparse.Namespace(**{**vars(base), "diloco_mode": True, "use_halt_gate": True})
     try:
@@ -119,7 +120,7 @@ def test_worker_lifecycle_classifier_expresses_training_attendance_and_passthrou
         resume_from_diloco_anchor=True,
     )
     assert dgac.kind == WorkerLifecycleKind.DGAC_DILOCO_WORKER
-    assert dgac.skip_pre_validation is True
+    assert dgac.skip_pre_validation is False
 
     skipped = classify_worker_lifecycle(worker_id="C", round_state=state, shard_samples=3)
     assert skipped.kind == WorkerLifecycleKind.NOOP

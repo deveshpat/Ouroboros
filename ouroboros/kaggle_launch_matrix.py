@@ -96,6 +96,8 @@ def _build_dgac_diloco(env: Mapping[str, str], *, worker_id: str | None = None) 
         use_halt_gate=True,
         resume_from_diloco_anchor=True,
         max_grad_norm=0.3,
+        diloco_run_val=True,
+        gen_every_stage=True,
     )
 
 
@@ -158,7 +160,8 @@ _DGAC_DILOCO_SHELL = (
     '--data_dir data/coconut_v1 --use_4bit --use_halt_gate --resume_from_diloco_anchor '
     '--stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 --max_grad_norm 0.3 '
     '--batch_size 4 --grad_accum 8 --val_batch_size 2 --val_skip_buffer_minutes 60 '
-    '--session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 --diloco_mode '
+    '--session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 --diloco_run_val '
+    '--gen_every_stage --diloco_mode '
     '--diloco_worker_id "$DILOCO_WORKER_ID" --diloco_outer_lr "$OUROBOROS_DILOCO_OUTER_LR" '
     '--diloco_state_repo "$OUROBOROS_DILOCO_STATE_REPO" '
     '--diloco_signal_repo "$OUROBOROS_DILOCO_SIGNAL_REPO" --push_to_hub '

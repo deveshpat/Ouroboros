@@ -101,6 +101,8 @@ def test_launch_matrix_builds_same_commands_as_compatibility_builders():
         use_halt_gate=True,
         resume_from_diloco_anchor=True,
         max_grad_norm=0.3,
+        diloco_run_val=True,
+        gen_every_stage=True,
     )
     assert build_launch_command(DGAC_CANARY_RUN_MODE, env) == build_dgac_canary_command(
         diloco_state_repo="WeirdRunner/Ouroboros",
