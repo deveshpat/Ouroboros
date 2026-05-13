@@ -11,6 +11,8 @@ from ouroboros.mac_dgac_fallback import (
     MAC_DGAC_CLAIM_PATH,
     ExpectedRoundState,
     MacRuntimeProbe,
+    build_mac_failed_claim,
+    build_mac_failure_round_state,
     build_local_dgac_aggregation_command,
     build_local_dgac_worker_command,
     build_mac_controlled_round_state,
@@ -145,6 +147,31 @@ def test_mac_controlled_round_state_reactivates_waiting_workers_without_changing
     assert state["projected_shards"] == {"A": 4475, "B": 4475, "C": 4475}
     assert state["mac_dgac_claim_id"] == "mac-claim-123"
     assert state["triggered_at"] == 2000.0
+
+
+def test_mac_failure_state_preserves_waiting_round_and_marks_failed_claim():
+    original = _round_state()
+
+    failed_claim = build_mac_failed_claim(
+        claim={"claim_id": "mac-claim-123", "status": "running"},
+        error="worker A failed",
+        now=3000.0,
+    )
+    failure_state = build_mac_failure_round_state(
+        state=original,
+        claim_id="mac-claim-123",
+        error="worker A failed",
+        now=3000.0,
+    )
+
+    assert failed_claim["status"] == "failed"
+    assert failed_claim["failure"] == "worker A failed"
+    assert failure_state["mode"] == "waiting"
+    assert failure_state["attendance_workers"] == ["A", "B", "C"]
+    assert failure_state["triggered_workers"] == []
+    assert failure_state["total_samples_seen"] == {"10": 23481}
+    assert failure_state["mac_dgac_claim_id"] == "mac-claim-123"
+    assert failure_state["mac_dgac_failure"] == "worker A failed"
 
 
 def test_local_worker_command_is_sequential_mps_safe_and_never_uses_4bit_or_github_signal():

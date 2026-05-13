@@ -256,6 +256,38 @@ def build_mac_controlled_round_state(
     }
 
 
+def build_mac_failed_claim(
+    *,
+    claim: Mapping[str, Any],
+    error: str,
+    now: Optional[float] = None,
+) -> dict[str, Any]:
+    current = time.time() if now is None else float(now)
+    return {
+        **dict(claim),
+        "status": "failed",
+        "updated_at": current,
+        "failure": str(error),
+    }
+
+
+def build_mac_failure_round_state(
+    *,
+    state: Mapping[str, Any],
+    claim_id: str,
+    error: str,
+    now: Optional[float] = None,
+) -> dict[str, Any]:
+    current = time.time() if now is None else float(now)
+    return {
+        **dict(state),
+        "mac_dgac_claim_id": claim_id,
+        "mac_dgac_failed_at": current,
+        "mac_dgac_failure": str(error),
+        "last_updated": current,
+    }
+
+
 def build_local_dgac_worker_command(
     *,
     worker_id: str,
@@ -584,28 +616,60 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     env = _worker_env(os.environ, claim_id=claim["claim_id"])
-    for worker_id in worker_ids:
-        command = build_local_dgac_worker_command(
-            worker_id=worker_id,
-            repo_id=args.repo_id,
-            output_root=args.output_root,
-            outer_lr=args.outer_lr,
-        )
-        print("[mac-dgac] running worker:", " ".join(command))
-        subprocess.run(command, check=True, env=env)
+    try:
+        for worker_id in worker_ids:
+            command = build_local_dgac_worker_command(
+                worker_id=worker_id,
+                repo_id=args.repo_id,
+                output_root=args.output_root,
+                outer_lr=args.outer_lr,
+            )
+            print("[mac-dgac] running worker:", " ".join(command))
+            subprocess.run(command, check=True, env=env)
 
-    aggregation = build_local_dgac_aggregation_command(
-        repo_id=args.repo_id,
-        claim_id=claim["claim_id"],
-        total_train_samples=args.total_train_samples,
-        outer_lr=args.outer_lr,
-        min_shard_samples=args.min_shard_samples,
-    )
-    print("[mac-dgac] running local aggregation:", " ".join(aggregation))
-    subprocess.run(aggregation, check=True, env=env)
+        aggregation = build_local_dgac_aggregation_command(
+            repo_id=args.repo_id,
+            claim_id=claim["claim_id"],
+            total_train_samples=args.total_train_samples,
+            outer_lr=args.outer_lr,
+            min_shard_samples=args.min_shard_samples,
+        )
+        print("[mac-dgac] running local aggregation:", " ".join(aggregation))
+        subprocess.run(aggregation, check=True, env=env)
+    except subprocess.CalledProcessError as exc:
+        command_text = " ".join(str(part) for part in (exc.cmd or []))
+        error = f"subprocess exited {exc.returncode}: {command_text}".strip()
+        print(f"[mac-dgac] FATAL: {error}")
+        failed_claim = build_mac_failed_claim(claim=claim, error=error)
+        failure_state = build_mac_failure_round_state(
+            state=state or {},
+            claim_id=claim["claim_id"],
+            error=error,
+        )
+        hub_upload_json(
+            args.repo_id,
+            MAC_DGAC_CLAIM_PATH,
+            failed_claim,
+            hf_token,
+            "Mac DGAC fallback claim failed",
+        )
+        hub_upload_json(
+            args.repo_id,
+            ROUND_STATE_PATH,
+            failure_state,
+            hf_token,
+            f"Mac DGAC fallback failed: restore waiting round {expected.round_n}",
+        )
+        return int(exc.returncode or 1)
 
     completed_claim = {**claim, "status": "complete", "updated_at": time.time()}
-    hub_upload_json(args.repo_id, MAC_DGAC_CLAIM_PATH, completed_claim, hf_token, "Mac DGAC fallback claim complete")
+    hub_upload_json(
+        args.repo_id,
+        MAC_DGAC_CLAIM_PATH,
+        completed_claim,
+        hf_token,
+        "Mac DGAC fallback claim complete",
+    )
     return 0
 
 

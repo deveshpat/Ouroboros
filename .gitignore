@@ -44,6 +44,7 @@ signals/*.json
 checkpoints/
 outputs/
 runs/
+logs/
 wandb/
 mlruns/
 *.safetensors

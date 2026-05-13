@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ouroboros.runtime_env import (
     WANDB_KEY_ALIASES,
@@ -168,6 +168,31 @@ def _wandb_credentials_available() -> bool:
 
 def _bootstrap_resolve_token() -> Optional[str]:
     return _resolve_hf_token_common()
+
+
+def _bootstrap_strict_mac_mps_requested(
+    *,
+    torch_module: Optional[Any] = None,
+    argv: Optional[Sequence[str]] = None,
+) -> bool:
+    """Return true for the local Apple Silicon fallback path that cannot use CUDA wheels."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--mac_mps_mamba_kernels" not in args:
+        return False
+    if sys.platform != "darwin":
+        return False
+
+    try:
+        _torch = torch_module
+        if _torch is None:
+            import torch as _torch  # type: ignore[no-redef]
+        mps_backend = getattr(getattr(_torch, "backends", None), "mps", None)
+        cuda_backend = getattr(_torch, "cuda", None)
+        mps_available = bool(mps_backend is not None and mps_backend.is_available())
+        cuda_available = bool(cuda_backend is not None and cuda_backend.is_available())
+    except Exception:
+        return False
+    return mps_available and not cuda_available
 
 
 def _load_mamba_fast_path_symbols() -> Dict[str, Any]:
@@ -384,6 +409,13 @@ def _bootstrap_shared_install_phases() -> None:
     )
     if _r1.returncode != 0:
         print("[bootstrap] WARNING: Phase 1 pip returned non-zero — check output above.")
+
+    if _bootstrap_strict_mac_mps_requested(torch_module=_torch):
+        print(
+            "[bootstrap] Strict Mac MPS fallback: skipping CUDA-only "
+            "causal-conv1d/mamba_ssm wheel bootstrap."
+        )
+        return
 
     print("[bootstrap] Phase 2: arch-aware Hub wheel install...")
     _hf_token = _bootstrap_resolve_token()
@@ -620,6 +652,13 @@ def _bootstrap_process_local_finalize() -> None:
         pass
     except Exception as _shim_err:
         _always(f"WARNING: transformers shim failed: {_shim_err}")
+
+    if _bootstrap_strict_mac_mps_requested(torch_module=_torch):
+        _info(
+            "Strict Mac MPS fallback: skipping CUDA kernel export shim and "
+            "CUDA-op verification; Transformers Jamba fast kernels stay disabled on MPS."
+        )
+        return
 
     try:
         _patched_exports = _patch_kernel_top_level_exports()
