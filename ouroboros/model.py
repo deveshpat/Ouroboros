@@ -67,6 +67,35 @@ def _maybe_empty_cuda_cache() -> None:
         torch.cuda.empty_cache()
 
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _should_auto_disable_gradient_checkpointing(args: argparse.Namespace, total_vram_gb: float) -> bool:
+    """Disable GC only when the configured latent workload is small enough."""
+    if total_vram_gb < 40.0:
+        return False
+    if _env_truthy("OUROBOROS_FORCE_GRAD_CHECKPOINT"):
+        return False
+
+    batch_size = _coerce_positive_int(getattr(args, "batch_size", None), 1)
+    max_seq_len = _coerce_positive_int(getattr(args, "max_seq_len", None), 1024)
+    max_stage = _coerce_positive_int(getattr(args, "max_stage", None), 1)
+    latent_token_pressure = batch_size * max_seq_len * max(max_stage, 1)
+    high_depth_dgac = bool(getattr(args, "use_halt_gate", False)) and max_stage >= 6
+    if high_depth_dgac or latent_token_pressure >= 32768:
+        return False
+    return True
+
+
 def _amp_dtype(device: torch.device) -> torch.dtype:
     """
     Select autocast dtype based on hardware capability.
@@ -456,13 +485,18 @@ def load_model_and_tokenizer(
     # compute on A100 (80GB) where the full model fits in VRAM without recomputation.
     if args.grad_checkpoint and device.type == "cuda":
         total_vram_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
-        if total_vram_gb >= 40.0:
+        if _should_auto_disable_gradient_checkpointing(args, total_vram_gb):
             args.grad_checkpoint = False
             if is_main:
                 print(
                     f"  [perf] {total_vram_gb:.0f}GB VRAM detected: "
                     "disabling gradient checkpointing (not needed, saves ~20-40%)."
                 )
+        elif is_main and total_vram_gb >= 40.0:
+            print(
+                f"  [perf] {total_vram_gb:.0f}GB VRAM detected, but keeping "
+                "gradient checkpointing for this high-depth latent workload."
+            )
 
     if args.use_4bit:
         from peft import prepare_model_for_kbit_training

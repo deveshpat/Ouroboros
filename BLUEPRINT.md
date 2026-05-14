@@ -42,6 +42,10 @@ under `OUROBOROS_WANDB_PROJECT`.
 Accelerator-neutral speedups should stay enabled on CUDA/Kaggle paths: the
 Kaggle launch builders and notebook command templates include `--latent_cache`,
 and CE now projects only supervised next-token positions through the LM head.
+CUDA bootstrap also caches arch-specific `causal_conv1d`, `mamba_ssm`, and
+`flash_attn` wheels on Hugging Face; `flash_attn` is enabled only on sm80+
+(A100/H100-class GPUs) and verified with a real CUDA forward/backward probe
+before model load.
 Mac-only speedups (`--mac_mps_mamba_kernels`, reduced `--max_seq_len`, and
 `--dgac_halt_probe_steps stage_k`) stay on the strict local fallback path because
 CUDA already uses the native Mamba kernels and the full DGAC probe schedule
