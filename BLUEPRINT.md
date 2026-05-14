@@ -39,11 +39,23 @@ When `WANDB_API_KEY`/`WANDB_KEY` is set and `wandb` is installed, local fallback
 workers run with `--wandb_mode online` so DGAC/DiLoCo train metrics appear live
 under `OUROBOROS_WANDB_PROJECT`.
 
+Accelerator-neutral speedups should stay enabled on CUDA/Kaggle paths: the
+Kaggle launch builders and notebook command templates include `--latent_cache`,
+and CE now projects only supervised next-token positions through the LM head.
+CUDA bootstrap also caches arch-specific `causal_conv1d`, `mamba_ssm`, and
+`flash_attn` wheels on Hugging Face; `flash_attn` is enabled only on sm80+
+(A100/H100-class GPUs) and verified with a real CUDA forward/backward probe
+before model load.
+Mac-only speedups (`--mac_mps_mamba_kernels`, reduced `--max_seq_len`, and
+`--dgac_halt_probe_steps stage_k`) stay on the strict local fallback path because
+CUDA already uses the native Mamba kernels and the full DGAC probe schedule
+preserves the GPU training target selection.
+
 ```bash
 torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --use_halt_gate --resume_from_diloco_anchor --eval_only \
   --diloco_state_repo WeirdRunner/Ouroboros --hf_token "$HF_TOKEN" \
-  --data_dir data/coconut_v1 --use_4bit \
+  --data_dir data/coconut_v1 --use_4bit --latent_cache \
   --max_stage 10 --max_grad_norm 0.3 \
   --batch_size 4 --grad_accum 8 --val_batch_size 2 \
   --val_skip_buffer_minutes 60 \
@@ -68,7 +80,7 @@ Equivalent worker command shape:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
-  --data_dir data/coconut_v1 --use_4bit \
+  --data_dir data/coconut_v1 --use_4bit --latent_cache \
   --use_halt_gate --resume_from_diloco_anchor \
   --stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 --max_grad_norm 0.3 \
   --dgac_halt_supervision_weight 0.1 --dgac_halt_ce_tolerance 0.02 \
@@ -89,7 +101,7 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
 torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
   --use_halt_gate --resume_from_diloco_anchor \
   --diloco_state_repo WeirdRunner/Ouroboros --hf_token "$HF_TOKEN" \
-  --data_dir data/coconut_v1 --use_4bit \
+  --data_dir data/coconut_v1 --use_4bit --latent_cache \
   --epochs_per_stage 3 --max_stage 10 --max_grad_norm 0.3 \
   --dgac_halt_supervision_weight 0.1 --dgac_halt_ce_tolerance 0.02 \
   --dgac_halt_probe_steps 1,2,4,stage_k \
@@ -107,13 +119,14 @@ quota/dispatch is intentionally paused and the live Hub state still matches the
 expected DGAC waiting round. The command checks MPS, confirms CUDA is absent,
 probes `mamba-ssm-macos`, proves a Jamba FP16/MPS forward/backward pass,
 confirms `diloco_state/anchor` plus `halt_gate.pt`, refuses `--use_4bit`, writes a
-short-lived Hub claim, runs A/B/C locally in sequence, then aggregates with
+short-lived Hub claim, runs one local Mac worker, then aggregates with
 `--skip_trigger` under the matching claim.
 
 ```bash
 python -m ouroboros.mac_dgac_fallback \
   --repo_id WeirdRunner/Ouroboros \
-  --workers A,B,C \
+  --workers A \
+  --local_grad_accum 8 \
   --expected_stage_k 10 \
   --expected_round_n 3 \
   --expected_mode waiting \

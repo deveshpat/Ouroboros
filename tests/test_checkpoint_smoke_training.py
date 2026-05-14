@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -52,6 +54,7 @@ def _training_args(**overrides) -> argparse.Namespace:
         min_lr_ratio=0.1,
         warmup_steps=0,
         weight_decay=0.0,
+        max_train_steps=None,
         max_grad_norm=1.0,
         seed=123,
         session_timeout_hours=100.0,
@@ -59,6 +62,7 @@ def _training_args(**overrides) -> argparse.Namespace:
         val_skip_buffer_minutes=0.0,
         log_every=1,
         val_batch_size=1,
+        profile_training_timing=False,
         gen_every_stage=True,
         gen_max_tokens=2,
         halt_threshold=0.9,
@@ -194,3 +198,59 @@ def test_one_stage_fake_smoke_training_run_exercises_public_loop_and_checkpointi
     assert (tmp_path / "stage_0" / "best" / "training_state.pt").exists()
     assert model.model.grad_enabled_observations
     assert set(model.model.device_type_observations) == {"cpu"}
+
+
+def test_profile_training_timing_logs_step_breakdown_to_wandb(monkeypatch, tmp_path):
+    logged = []
+    monkeypatch.setitem(
+        sys.modules,
+        "wandb",
+        SimpleNamespace(log=lambda payload, step=None: logged.append((payload, step))),
+    )
+
+    tokenizer = FakeTokenizer()
+    model = FakeCausalLM()
+    args = _training_args(
+        max_train_steps=1,
+        profile_training_timing=True,
+        gen_every_stage=False,
+    )
+    train_samples = [
+        {"question": "What is 1+1?", "steps": ["Add."], "answer_full": "2", "answer_norm": "2"},
+    ]
+
+    result = run_training_stages(
+        model=model,
+        tokenizer=tokenizer,
+        halt_gate=None,
+        train_samples=train_samples,
+        val_samples=[],
+        lat_token_id=6,
+        pad_id=tokenizer.pad_token_id,
+        args=args,
+        device=torch.device("cpu"),
+        output_dir=tmp_path,
+        session_start=time.perf_counter(),
+        wandb_run=object(),
+        stages=[0],
+        curriculum_max_stage=0,
+        load_best_between_stages=False,
+        run_generation_at_stage_end=False,
+        run_epoch_end_val=False,
+    )
+
+    assert result["max_train_steps_triggered"] is True
+    assert logged
+    payload, step = logged[0]
+    assert step == 1
+    for key in (
+        "timing/batch_build_seconds",
+        "timing/forward_seconds",
+        "timing/backward_seconds",
+        "timing/optimizer_seconds",
+        "timing/train_step_seconds",
+        "timing/micro_count",
+    ):
+        assert key in payload
+        assert payload[key] >= 0.0
+    assert payload["timing/micro_count"] == 1.0

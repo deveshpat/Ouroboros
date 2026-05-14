@@ -9,6 +9,7 @@ computing CE, and decoding from latent context. DGAC policy stays in
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -87,6 +88,37 @@ def compute_ce_sum_and_count(logits: torch.Tensor, labels: torch.Tensor) -> Tupl
     return ce_sum, n_valid
 
 
+def compute_ce_from_hidden(
+    *,
+    runtime: LatentRuntime,
+    hidden: torch.Tensor,
+    labels: torch.Tensor,
+) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]:
+    """Compute CE by projecting only supervised next-token positions."""
+    shift_hidden = hidden[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    valid = shift_labels != -100
+    valid_by_row = valid.sum(dim=1)
+    n_valid = int(valid_by_row.sum().item())
+    if n_valid == 0:
+        zeros = hidden.new_zeros((labels.size(0),), dtype=torch.float32)
+        return hidden.new_zeros((), dtype=torch.float32), 0, zeros, valid_by_row
+
+    selected_hidden = shift_hidden[valid]
+    selected_labels = shift_labels[valid]
+    with runtime.autocast():
+        selected_logits = runtime.lm_head(selected_hidden).float()
+    losses = F.cross_entropy(selected_logits, selected_labels, reduction="none")
+    ce_sum = losses.sum()
+
+    row_ids = torch.arange(labels.size(0), device=labels.device).unsqueeze(1).expand_as(valid)
+    selected_rows = row_ids[valid]
+    row_sums = losses.new_zeros((labels.size(0),), dtype=losses.dtype)
+    row_sums.index_add_(0, selected_rows, losses)
+    ce_by_row = row_sums / valid_by_row.clamp_min(1).to(dtype=losses.dtype)
+    return ce_sum, n_valid, ce_by_row.to(dtype=torch.float32), valid_by_row
+
+
 def build_question_context(
     all_embeds: torch.Tensor,
     q_lens: torch.Tensor,
@@ -132,6 +164,23 @@ def run_latent_passes(
     else:
         target_steps = torch.tensor(list(n_latent), device=device, dtype=torch.long)
         scalar_input = False
+
+    if (
+        (
+            bool(getattr(args, "latent_cache", False))
+            or bool(getattr(args, "mac_mps_latent_cache", False))
+        )
+        and halt_gate is None
+    ):
+        cached_result = _try_run_latent_passes_with_cache(
+            runtime=runtime,
+            ctx=ctx,
+            ctx_mask=ctx_mask,
+            target_steps=target_steps,
+            scalar_input=scalar_input,
+        )
+        if cached_result is not None:
+            return cached_result
 
     batch_size = int(ctx.size(0))
     actual_k = torch.zeros(batch_size, dtype=torch.long, device=device)
@@ -202,6 +251,114 @@ def run_latent_passes(
         else:
             ctx = ctx[:, :0, :]
             ctx_mask = ctx_mask[:, :0]
+
+    return_k: Any = int(actual_k[0].item()) if scalar_input and batch_size == 1 else actual_k
+    return ctx, ctx_mask, return_k
+
+
+def _clone_cache_for_autograd(cache: Any) -> Any:
+    """Clone cache tensors so cache updates do not mutate saved autograd values."""
+    cloned = copy.copy(cache)
+    if not hasattr(cache, "__dict__"):
+        return cloned
+    cloned.__dict__ = {}
+    for key, value in cache.__dict__.items():
+        if isinstance(value, torch.Tensor):
+            cloned.__dict__[key] = value.clone()
+        elif isinstance(value, list):
+            cloned.__dict__[key] = [
+                _clone_cache_for_autograd(item)
+                if hasattr(item, "__dict__")
+                else (item.clone() if isinstance(item, torch.Tensor) else item)
+                for item in value
+            ]
+        else:
+            cloned.__dict__[key] = value
+    return cloned
+
+
+def _gradient_checkpointing_is_enabled(model: Any) -> bool:
+    enabled = getattr(model, "is_gradient_checkpointing", False)
+    return bool(enabled() if callable(enabled) else enabled)
+
+
+def _set_gradient_checkpointing(model: Any, enabled: bool) -> None:
+    method_name = "gradient_checkpointing_enable" if enabled else "gradient_checkpointing_disable"
+    method = getattr(model, method_name, None)
+    if callable(method):
+        method()
+    if enabled:
+        input_grad_method = getattr(model, "enable_input_require_grads", None)
+        if callable(input_grad_method):
+            input_grad_method()
+
+
+def _try_run_latent_passes_with_cache(
+    *,
+    runtime: LatentRuntime,
+    ctx: torch.Tensor,
+    ctx_mask: torch.Tensor,
+    target_steps: torch.Tensor,
+    scalar_input: bool,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, Any]]:
+    """Cache-backed fixed-depth latent pass for accelerator fallback runs."""
+    batch_size = int(ctx.size(0))
+    max_steps = int(target_steps.max().item()) if target_steps.numel() > 0 else 0
+    if batch_size < 1 or max_steps <= 0:
+        actual_k = torch.zeros(batch_size, dtype=torch.long, device=runtime.device)
+        return_k: Any = int(actual_k[0].item()) if scalar_input and batch_size == 1 else actual_k
+        return ctx, ctx_mask, return_k
+
+    checkpointing_was_enabled = _gradient_checkpointing_is_enabled(runtime.model)
+    if checkpointing_was_enabled:
+        _set_gradient_checkpointing(runtime.model, False)
+
+    actual_k = torch.zeros(batch_size, dtype=torch.long, device=runtime.device)
+    cache = None
+    try:
+        initial_embeds = torch.where(
+            ctx_mask.unsqueeze(-1),
+            ctx,
+            ctx.new_zeros((1, 1, ctx.size(-1))),
+        )
+        with runtime.autocast():
+            outputs = runtime.backbone(inputs_embeds=initial_embeds, attention_mask=ctx_mask, use_cache=True)
+        cache = getattr(outputs, "past_key_values", None)
+        if cache is None:
+            return None
+        hidden = _extract_last_hidden_state(outputs, "cached latent pass step=0")
+        prefix_lens = ctx_mask.sum(dim=1).to(dtype=torch.long).clamp_min(1)
+        h_step = hidden[torch.arange(batch_size, device=runtime.device), prefix_lens - 1, :]
+
+        for latent_step in range(max_steps):
+            active_mask = target_steps > latent_step
+            if not bool(active_mask.any().item()):
+                break
+            next_col = ctx.new_zeros((batch_size, 1, ctx.size(-1)))
+            next_col[active_mask, 0, :] = h_step[active_mask].to(dtype=ctx.dtype)
+            next_mask = active_mask.view(batch_size, 1)
+            ctx = torch.cat([ctx, next_col], dim=1)
+            ctx_mask = torch.cat([ctx_mask, next_mask], dim=1)
+            actual_k[active_mask] += 1
+
+            if latent_step + 1 >= max_steps or not bool((target_steps > latent_step + 1).any().item()):
+                break
+
+            step_cache = _clone_cache_for_autograd(cache)
+            with runtime.autocast():
+                outputs = runtime.backbone(
+                    inputs_embeds=next_col,
+                    attention_mask=ctx_mask,
+                    past_key_values=step_cache,
+                    use_cache=True,
+                )
+            cache = getattr(outputs, "past_key_values", None)
+            if cache is None:
+                return None
+            h_step = _extract_last_hidden_state(outputs, f"cached latent pass step={latent_step + 1}")[:, -1, :]
+    finally:
+        if checkpointing_was_enabled:
+            _set_gradient_checkpointing(runtime.model, True)
 
     return_k: Any = int(actual_k[0].item()) if scalar_input and batch_size == 1 else actual_k
     return ctx, ctx_mask, return_k
@@ -278,10 +435,12 @@ def forward_latent_batch(
     with runtime.autocast():
         outputs = runtime.backbone(inputs_embeds=patched, attention_mask=attention_mask, use_cache=False)
         hidden = _extract_last_hidden_state(outputs, "coconut batched full forward")
-        logits = runtime.lm_head(hidden).float()
 
-    ce_sum, n_valid = compute_ce_sum_and_count(logits, labels)
-    ce_by_row, valid_by_row = compute_ce_mean_by_row(logits, labels)
+    ce_sum, n_valid, ce_by_row, valid_by_row = compute_ce_from_hidden(
+        runtime=runtime,
+        hidden=hidden,
+        labels=labels,
+    )
     ce_value = float(ce_sum.item() / max(n_valid, 1))
     hidden_sequences = (
         collect_latent_hidden_sequences(latent_ctx, max_q_len, actual_n_latents)

@@ -146,7 +146,7 @@ _COMMON_DEFAULTS = {
 
 _DILOCO_SHELL = (
     'torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py '
-    '--data_dir data/coconut_v1 --use_4bit --stage_0_epochs 1 --epochs_per_stage 1 '
+    '--data_dir data/coconut_v1 --use_4bit --latent_cache --stage_0_epochs 1 --epochs_per_stage 1 '
     '--max_stage 10 --batch_size 4 --grad_accum 8 --val_batch_size 2 '
     '--val_skip_buffer_minutes 60 --session_timeout_hours 12.0 '
     '--graceful_exit_buffer_minutes 20 --diloco_mode --diloco_worker_id "$DILOCO_WORKER_ID" '
@@ -158,7 +158,7 @@ _DILOCO_SHELL = (
 _DGAC_DILOCO_SHELL = (
     'torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py '
     '--data_dir data/coconut_v1 --use_4bit --use_halt_gate --resume_from_diloco_anchor '
-    '--stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 --max_grad_norm 0.3 '
+    '--latent_cache --stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 --max_grad_norm 0.3 '
     '--batch_size 4 --grad_accum 8 --val_batch_size 2 --val_skip_buffer_minutes 60 '
     '--session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 --diloco_run_val '
     '--gen_every_stage --diloco_mode '
@@ -170,7 +170,7 @@ _DGAC_DILOCO_SHELL = (
 _DGAC_CANARY_SHELL = (
     'torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py '
     '--use_halt_gate --resume_from_diloco_anchor --diloco_state_repo "$OUROBOROS_DILOCO_STATE_REPO" '
-    '--data_dir data/coconut_v1 --use_4bit --epochs_per_stage 1 --max_stage 10 '
+    '--data_dir data/coconut_v1 --use_4bit --latent_cache --epochs_per_stage 1 --max_stage 10 '
     '--max_grad_norm 0.3 --batch_size 4 --grad_accum 8 --val_batch_size 2 '
     '--val_skip_buffer_minutes 720 --session_timeout_hours 12.0 '
     '--graceful_exit_buffer_minutes 20 --max_samples 512 --max_train_steps 20 '
@@ -180,7 +180,7 @@ _DGAC_CANARY_SHELL = (
 _DGAC_TRAIN_SHELL = (
     'torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py '
     '--use_halt_gate --resume_from_diloco_anchor --diloco_state_repo "$OUROBOROS_DILOCO_STATE_REPO" '
-    '--data_dir data/coconut_v1 --use_4bit --epochs_per_stage 3 --max_stage 10 '
+    '--data_dir data/coconut_v1 --use_4bit --latent_cache --epochs_per_stage 3 --max_stage 10 '
     '--max_grad_norm 0.3 --batch_size 4 --grad_accum 8 --val_batch_size 2 '
     '--val_skip_buffer_minutes 60 --session_timeout_hours 12.0 '
     '--graceful_exit_buffer_minutes 20 --push_to_hub --output_dir "$OUROBOROS_DGAC_OUTPUT_DIR" '
@@ -190,7 +190,7 @@ _DGAC_ANCHOR_EVAL_SHELL = (
     'torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py '
     '--use_halt_gate --resume_from_diloco_anchor --eval_only '
     '--diloco_state_repo "$OUROBOROS_DILOCO_STATE_REPO" --data_dir data/coconut_v1 '
-    '--use_4bit --max_stage 10 --max_grad_norm 0.3 --batch_size 4 --grad_accum 8 '
+    '--use_4bit --latent_cache --max_stage 10 --max_grad_norm 0.3 --batch_size 4 --grad_accum 8 '
     '--val_batch_size 2 --val_skip_buffer_minutes 60 --session_timeout_hours 12.0 '
     '--graceful_exit_buffer_minutes 20 --output_dir "$OUROBOROS_DGAC_ANCHOR_EVAL_OUTPUT_DIR" '
     '--wandb_project "$OUROBOROS_WANDB_PROJECT"'

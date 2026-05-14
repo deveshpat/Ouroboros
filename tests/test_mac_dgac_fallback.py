@@ -8,18 +8,23 @@ import torch
 
 from ouroboros.diloco import coordinator
 from ouroboros.mac_dgac_fallback import (
+    CANARY_LATEST_DIRNAME,
+    DEFAULT_MAC_DGAC_WORKERS,
     MAC_DGAC_CLAIM_PATH,
     ExpectedRoundState,
     MacRuntimeProbe,
     build_mac_failed_claim,
     build_mac_failure_round_state,
     build_local_dgac_aggregation_command,
+    build_local_dgac_canary_command,
     build_local_dgac_worker_command,
     build_mac_controlled_round_state,
     evaluate_mac_preflight,
     is_active_mac_claim,
+    promote_canary_output,
+    prune_canary_outputs,
 )
-from ouroboros.model import _amp_dtype
+from ouroboros.model import _amp_dtype, _autocast_ctx
 
 
 def _round_state(**overrides):
@@ -56,6 +61,10 @@ def _passing_probe(**overrides):
     }
     probe.update(overrides)
     return MacRuntimeProbe(**probe)
+
+
+def test_default_mac_worker_set_is_single_local_worker():
+    assert DEFAULT_MAC_DGAC_WORKERS == ("A",)
 
 
 def _args(**overrides):
@@ -106,6 +115,33 @@ def test_mac_preflight_allows_canonical_writes_only_after_strict_runtime_and_no_
 
 def test_mac_training_dtype_is_fp16_on_mps_to_avoid_strict_fallback_oom():
     assert _amp_dtype(torch.device("mps")) == torch.float16
+
+
+def test_mac_training_autocast_uses_mps_when_available(monkeypatch):
+    calls = []
+
+    class DummyContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(
+        torch.amp.autocast_mode,
+        "is_autocast_available",
+        lambda device_type: device_type == "mps",
+    )
+    monkeypatch.setattr(
+        torch,
+        "autocast",
+        lambda *, device_type, dtype: calls.append((device_type, dtype)) or DummyContext(),
+    )
+
+    with _autocast_ctx(torch.device("mps"), torch.float16):
+        pass
+
+    assert calls == [("mps", torch.float16)]
 
 
 def test_mac_preflight_refuses_when_live_round_state_drifted():
@@ -188,11 +224,74 @@ def test_local_worker_command_is_sequential_mps_safe_and_never_uses_4bit_or_gith
     assert "--use_4bit" not in command
     assert "--use_halt_gate" in command
     assert "--resume_from_diloco_anchor" in command
+    assert "--mac_mps_mamba_kernels" in command
+    assert "--latent_cache" not in command
     assert command[command.index("--diloco_worker_id") + 1] == "B"
     assert command[command.index("--diloco_signal_repo") + 1] == ""
     assert command[command.index("--output_dir") + 1] == "runs/mac_dgac_fallback/worker_B"
     assert command[command.index("--wandb_mode") + 1] == "online"
     assert command[command.index("--wandb_project") + 1] == "project"
+    assert command[command.index("--max_seq_len") + 1] == "384"
+    assert command[command.index("--grad_accum") + 1] == "8"
+    assert command[command.index("--dgac_halt_probe_steps") + 1] == "stage_k"
+    assert "--profile_training_timing" in command
+    assert command[command.index("--log_every") + 1] == "1"
+
+
+def test_local_canary_command_profiles_without_diloco_upload_or_aggregation():
+    command = build_local_dgac_canary_command(
+        repo_id="WeirdRunner/Ouroboros",
+        output_root="runs/mac_dgac_fallback",
+        grad_accum=2,
+        max_train_steps=1,
+        max_samples=12,
+        wandb_project="project",
+    )
+
+    assert command[:2] == [sys.executable, "jamba_coconut_finetune.py"]
+    assert "--diloco_mode" not in command
+    assert "--push_to_hub" not in command
+    assert "--resume_from_diloco_anchor" in command
+    assert "--profile_training_timing" in command
+    assert "--mac_mps_mamba_kernels" in command
+    assert "--latent_cache" not in command
+    assert "--no-grad_checkpoint" not in command
+    assert "--no-gen_every_stage" in command
+    assert command[command.index("--diloco_state_repo") + 1] == "WeirdRunner/Ouroboros"
+    assert command[command.index("--grad_accum") + 1] == "2"
+    assert command[command.index("--max_train_steps") + 1] == "1"
+    assert command[command.index("--max_samples") + 1] == "12"
+    assert command[command.index("--max_seq_len") + 1] == "384"
+    assert command[command.index("--dgac_halt_probe_steps") + 1] == "stage_k"
+    assert command[command.index("--log_every") + 1] == "1"
+    assert command[command.index("--output_dir") + 1] == f"runs/mac_dgac_fallback/{CANARY_LATEST_DIRNAME}"
+    assert command[command.index("--wandb_project") + 1] == "project"
+
+    no_checkpoint_command = build_local_dgac_canary_command(
+        repo_id="WeirdRunner/Ouroboros",
+        disable_grad_checkpoint=True,
+    )
+    assert "--no-grad_checkpoint" in no_checkpoint_command
+
+
+def test_canary_output_promotion_keeps_only_latest_weights(tmp_path):
+    output_root = tmp_path / "mac_dgac_fallback"
+    output_root.mkdir()
+    old_canary = output_root / "canary_old"
+    old_canary.mkdir()
+    (old_canary / "weights.bin").write_text("old", encoding="utf-8")
+    current_latest = output_root / CANARY_LATEST_DIRNAME
+    current_latest.mkdir()
+    (current_latest / "weights.bin").write_text("previous", encoding="utf-8")
+    active = output_root / "canary_active_abc"
+    active.mkdir()
+    (active / "weights.bin").write_text("new", encoding="utf-8")
+
+    promote_canary_output(active, current_latest)
+    prune_canary_outputs(output_root, keep_latest=True)
+
+    assert sorted(path.name for path in output_root.iterdir()) == [CANARY_LATEST_DIRNAME]
+    assert (current_latest / "weights.bin").read_text(encoding="utf-8") == "new"
 
 
 def test_local_aggregation_command_uses_skip_trigger_and_matching_claim():
@@ -208,6 +307,7 @@ def test_local_aggregation_command_uses_skip_trigger_and_matching_claim():
     assert "--skip_trigger" in command
     assert "--mac_claim_id" in command
     assert command[command.index("--mac_claim_id") + 1] == "mac-claim-123"
+    assert command[command.index("--force_worker_ids") + 1] == "A"
     assert command[command.index("--wandb_project") + 1] == "project"
     assert "--hf_token" not in command
     assert "--wandb_key" not in command

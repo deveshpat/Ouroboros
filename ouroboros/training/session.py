@@ -42,6 +42,7 @@ from ouroboros.training.checkpointing import (
 from ouroboros.training.evaluation import run_eval_only
 from ouroboros.training.stage_runner import run_training_stages
 from ouroboros.training_plan import plan_training_session
+from ouroboros.wandb_runtime import wandb_init_kwargs
 
 
 def _select_training_device(local_rank: int) -> torch.device:
@@ -204,6 +205,7 @@ def run_training_session(args: argparse.Namespace, *, script_start: float) -> No
                 name=args.wandb_run_name,
                 mode=args.wandb_mode,
                 config=_wandb_config(args),
+                **wandb_init_kwargs(wandb),
             )
         except ImportError:
             print("[warn] wandb not installed")

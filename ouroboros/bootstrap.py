@@ -27,10 +27,12 @@ def _normalize_text(value: Optional[Any], *, uppercase: bool = False) -> Optiona
     return normalize_text(value, uppercase=uppercase)
 
 
-_HUB_WHEEL_BASES = [
+_MAMBA_HUB_WHEEL_BASES = [
     "causal_conv1d-1.6.1-cp312-cp312-linux_x86_64",
     "mamba_ssm-1.2.2-cp312-cp312-linux_x86_64",
 ]
+_FLASH_ATTN_HUB_WHEEL_BASE = "flash_attn-2.8.3-cp312-cp312-linux_x86_64"
+_HUB_WHEEL_BASES = [*_MAMBA_HUB_WHEEL_BASES, _FLASH_ATTN_HUB_WHEEL_BASE]
 
 
 _HUB_REPO_ID = "WeirdRunner/Ouroboros"
@@ -40,6 +42,98 @@ _KNOWN_ARCH_SUFFIXES = [
     "sm60", "sm70", "sm72", "sm75", "sm80", "sm86", "sm87", "sm89",
     "sm90", "sm100", "sm120", "smunknown",
 ]
+
+
+def _bootstrap_flash_attention_supported(cuda_capability: Tuple[int, int]) -> bool:
+    """FlashAttention 2 is for Ampere/Ada/Hopper; keep T4 on eager attention."""
+    return tuple(cuda_capability) >= (8, 0)
+
+
+def _bootstrap_wheel_bases_for_cuda_arch(cuda_capability: Tuple[int, int]) -> List[str]:
+    bases = list(_MAMBA_HUB_WHEEL_BASES)
+    if _bootstrap_flash_attention_supported(cuda_capability):
+        bases.append(_FLASH_ATTN_HUB_WHEEL_BASE)
+    return bases
+
+
+def _bootstrap_pip_spec_for_wheel_base(wheel_base: str) -> Tuple[str, str]:
+    parts = wheel_base.split("-")
+    pkg_name = parts[0]
+    pkg_ver = parts[1]
+    if pkg_name == "mamba_ssm":
+        return pkg_name, f"git+https://github.com/state-spaces/mamba.git@v{pkg_ver}"
+    return pkg_name, f"{pkg_name.replace('_', '-')}=={pkg_ver}"
+
+
+def _patch_triton_math_log1p() -> List[str]:
+    """
+    Restore the Triton math.log1p symbol expected by mamba-ssm 1.2.2.
+
+    Triton 3.2 removed/relocated ``tl.math.log1p`` while the Mamba kernels still
+    reference it during JIT compilation. A small alias to ``tl.log(1 + x)`` keeps
+    the verified fast path alive without changing model math.
+    """
+    try:
+        import triton as _triton
+        import triton.language as _tl
+    except Exception:
+        return []
+    _math = getattr(_tl, "math", None)
+    if _math is None or getattr(_math, "log1p", None) is not None:
+        return []
+
+    def _log1p(x):
+        return _tl.log(1.0 + x)
+
+    _jit = getattr(_triton, "jit", None)
+    if callable(_jit):
+        _log1p = _jit(_log1p)
+
+    setattr(_math, "log1p", _log1p)
+    return ["triton.language.math.log1p"]
+
+
+_MAMBA_TRITON_LOG1P_REPLACEMENTS = {
+    "tl.math.log1p(tl.exp(dt))": "tl.log(1.0 + tl.exp(dt))",
+}
+
+
+def _patch_mamba_triton_log1p_source() -> List[str]:
+    """
+    Patch mamba-ssm 1.2.2 Triton source for Triton 3.x log1p compatibility.
+
+    The runtime monkeypatch above must be a JIT function, but source-level repair is
+    stronger: it keeps mamba's own kernels and the Jamba fast path on the same code
+    path before Triton parses the kernel AST.
+    """
+    import importlib.util as _ilu
+
+    try:
+        spec = _ilu.find_spec("mamba_ssm")
+    except Exception:
+        return []
+    search_locations = list(getattr(spec, "submodule_search_locations", None) or [])
+    if not search_locations:
+        return []
+
+    patched: List[str] = []
+    for package_root in search_locations:
+        triton_dir = Path(package_root) / "ops" / "triton"
+        if not triton_dir.exists():
+            continue
+        for source_path in triton_dir.glob("*.py"):
+            try:
+                source = source_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            updated = source
+            for old, new in _MAMBA_TRITON_LOG1P_REPLACEMENTS.items():
+                updated = updated.replace(old, new)
+            if updated == source:
+                continue
+            source_path.write_text(updated, encoding="utf-8")
+            patched.append(str(source_path))
+    return patched
 
 
 def _maybe_get_kaggle_secret(label: str) -> Optional[str]:
@@ -200,6 +294,8 @@ def _load_mamba_fast_path_symbols() -> Dict[str, Any]:
     import importlib as _il
     import warnings as _warnings
 
+    _patch_mamba_triton_log1p_source()
+    _patch_triton_math_log1p()
     _il.invalidate_caches()
 
     with _warnings.catch_warnings():
@@ -274,6 +370,7 @@ def _bootstrap_verify_fast_path() -> bool:
     import torch as _torch
     import triton.language as _tl
 
+    _patch_triton_math_log1p()
     _syms = _load_mamba_fast_path_symbols()
     selective_scan_fn = _syms["selective_scan_fn"]
     selective_state_update = _syms["selective_state_update"]
@@ -325,6 +422,29 @@ def _bootstrap_verify_fast_path() -> bool:
         f"Unexpected selective_state_update shape: {_step_out.shape}"
     )
 
+    _torch.cuda.synchronize()
+    return True
+
+
+def _bootstrap_verify_flash_attention() -> bool:
+    """Run a tiny real FlashAttention 2 forward/backward op on the active CUDA device."""
+    import torch as _torch
+    from flash_attn import flash_attn_func  # type: ignore
+
+    if not _torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable")
+    _cc = _torch.cuda.get_device_capability()
+    if not _bootstrap_flash_attention_supported(_cc):
+        raise RuntimeError(f"FlashAttention 2 is unsupported on sm{_cc[0]}{_cc[1]}")
+
+    _dtype = _torch.bfloat16 if _cc >= (8, 0) else _torch.float16
+    _q = _torch.randn(2, 64, 4, 64, device="cuda", dtype=_dtype, requires_grad=True)
+    _k = _torch.randn_like(_q, requires_grad=True)
+    _v = _torch.randn_like(_q, requires_grad=True)
+    _out = flash_attn_func(_q, _k, _v, dropout_p=0.0, causal=True)
+    assert _out.shape == _q.shape, f"Unexpected flash_attn_func shape: {_out.shape}"
+    _out.float().sum().backward()
+    assert _q.grad is not None, "flash_attn_func backward did not produce q.grad"
     _torch.cuda.synchronize()
     return True
 
@@ -403,6 +523,7 @@ def _bootstrap_shared_install_phases() -> None:
          "bitsandbytes>=0.46.1",
          "accelerate",
          "huggingface_hub",
+         "ninja",
          "einops",
          "safetensors"],
         check=False,
@@ -442,7 +563,14 @@ def _bootstrap_shared_install_phases() -> None:
     elif _kaggle_wheel_dir.exists():
         print(f"[bootstrap]   Kaggle dataset wheel cache present but skipped on {_arch_suffix} (sm75-only cache)")
 
-    for _base in _HUB_WHEEL_BASES:
+    _wheel_bases = _bootstrap_wheel_bases_for_cuda_arch(_cc)
+    if _FLASH_ATTN_HUB_WHEEL_BASE not in _wheel_bases:
+        print(
+            f"[bootstrap]   flash-attn skipped on {_arch_suffix}: "
+            "FlashAttention 2 requires sm80+."
+        )
+
+    for _base in _wheel_bases:
         _hub_filename   = f"{_base}-{_arch_suffix}.whl"
         _local_filename = f"{_base}.whl"
         _local_path     = _wheel_dir / _local_filename
@@ -473,17 +601,18 @@ def _bootstrap_shared_install_phases() -> None:
                       f"({type(_dl_err).__name__}). Compiling from source...")
 
         if not _downloaded:
-            _parts    = _base.split("-")
-            _pkg_name = _parts[0]
-            _pkg_ver  = _parts[1]
-            if _pkg_name == "mamba_ssm":
-                _pip_spec = f"git+https://github.com/state-spaces/mamba.git@v{_pkg_ver}"
-            else:
-                _pip_spec = f"{_pkg_name.replace('_', '-')}=={_pkg_ver}"
+            _pkg_name, _pip_spec = _bootstrap_pip_spec_for_wheel_base(_base)
 
             _env_vars = os.environ.copy()
-            _env_vars["MAX_JOBS"] = "4"
+            _env_vars["MAX_JOBS"] = os.environ.get("OUROBOROS_CUDA_BUILD_MAX_JOBS", "4")
             _env_vars["TORCH_CUDA_ARCH_LIST"] = _arch_list
+            if _pkg_name == "flash_attn":
+                _env_vars.setdefault("FLASH_ATTENTION_FORCE_BUILD", "TRUE")
+                _env_vars.setdefault("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE")
+                _env_vars.setdefault(
+                    "NVCC_THREADS",
+                    os.environ.get("OUROBOROS_FLASH_ATTN_NVCC_THREADS", "4"),
+                )
 
             print(f"[bootstrap]   Building {_pip_spec} "
                   f"(TORCH_CUDA_ARCH_LIST={_arch_list}) ...")
@@ -661,6 +790,19 @@ def _bootstrap_process_local_finalize() -> None:
         return
 
     try:
+        _mamba_source_patches = _patch_mamba_triton_log1p_source()
+        if _mamba_source_patches:
+            _info(
+                "Mamba Triton source shim: "
+                + ", ".join(Path(path).name for path in _mamba_source_patches)
+                + " ✓"
+            )
+        else:
+            _info("Mamba Triton source shim: already aligned")
+    except Exception as _mamba_source_patch_err:
+        _always(f"WARNING: Mamba Triton source shim failed: {_mamba_source_patch_err}")
+
+    try:
         _patched_exports = _patch_kernel_top_level_exports()
         if _patched_exports:
             _info("Kernel export shim: " + ", ".join(_patched_exports) + " ✓")
@@ -668,6 +810,10 @@ def _bootstrap_process_local_finalize() -> None:
             _info("Kernel export shim: already aligned")
     except Exception as _kernel_patch_err:
         _always(f"WARNING: kernel export shim failed: {_kernel_patch_err}")
+
+    _triton_math_patches = _patch_triton_math_log1p()
+    if _triton_math_patches:
+        _info("Triton math shim: " + ", ".join(_triton_math_patches) + " ✓")
 
     _info("Phase 3: verifying mamba fast path (symbol + CUDA op)...")
 
@@ -693,6 +839,31 @@ def _bootstrap_process_local_finalize() -> None:
         _always(f"FATAL: Mamba fast path verification FAILED: {_ve}")
         _always("         Exiting now (no slow-path fallback — 500s/step is unusable).")
         sys.exit(1)
+
+    try:
+        _flash_device = _torch.cuda.current_device() if _torch.cuda.is_available() else None
+        _flash_cc = (
+            _torch.cuda.get_device_capability(_flash_device)
+            if _flash_device is not None
+            else (0, 0)
+        )
+    except Exception:
+        _flash_cc = (0, 0)
+
+    if _bootstrap_flash_attention_supported(_flash_cc):
+        _info("Phase 4: verifying flash-attn (symbol + CUDA forward/backward)...")
+        try:
+            _bootstrap_verify_flash_attention()
+            _info("flash-attn: ACTIVE ✓ — transformers can use flash_attention_2.")
+        except Exception as _flash_err:
+            _always(f"FATAL: flash-attn verification FAILED: {_flash_err}")
+            _always("         Exiting now; rerun after fixing flash-attn build/cache.")
+            sys.exit(1)
+    else:
+        _info(
+            f"flash-attn: skipped on sm{_flash_cc[0]}{_flash_cc[1]} "
+            "(requires sm80+); attention loader will use eager fallback."
+        )
 
 
 def _bootstrap_run_local_finalize_padded() -> None:

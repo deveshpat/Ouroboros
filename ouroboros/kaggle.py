@@ -93,6 +93,7 @@ def build_diloco_training_command(
     wandb_mode: str | None = None,
     use_halt_gate: bool = False,
     resume_from_diloco_anchor: bool = False,
+    latent_cache: bool = True,
     max_grad_norm: float | None = None,
     diloco_run_val: bool = False,
     gen_every_stage: bool | None = None,
@@ -128,6 +129,8 @@ def build_diloco_training_command(
         command.append("--use_halt_gate")
     if resume_from_diloco_anchor:
         command.append("--resume_from_diloco_anchor")
+    if latent_cache:
+        command.append("--latent_cache")
     command.extend(
         [
             "--stage_0_epochs",
@@ -200,6 +203,7 @@ def build_dgac_training_command(
     wandb_project: str | None = "ouroboros-stage3-jamba",
     wandb_entity: str | None = None,
     wandb_mode: str | None = None,
+    latent_cache: bool = True,
 ) -> list[str]:
     """Build the tested Kaggle command for Phase 3.4 DGAC training."""
     command = [
@@ -216,6 +220,8 @@ def build_dgac_training_command(
     ]
     if use_4bit:
         command.append("--use_4bit")
+    if latent_cache:
+        command.append("--latent_cache")
     command.extend(
         [
             "--epochs_per_stage",
@@ -283,6 +289,7 @@ def build_dgac_canary_command(
     wandb_project: str | None = "ouroboros-stage3-jamba",
     wandb_entity: str | None = None,
     wandb_mode: str | None = None,
+    latent_cache: bool = True,
 ) -> list[str]:
     """Build a bounded DGAC canary command that exits before full-epoch training."""
     return build_dgac_training_command(
@@ -310,6 +317,7 @@ def build_dgac_canary_command(
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
         wandb_mode=wandb_mode,
+        latent_cache=latent_cache,
     )
 
 def build_dgac_anchor_eval_command(
@@ -331,6 +339,7 @@ def build_dgac_anchor_eval_command(
     wandb_project: str | None = "ouroboros-stage3-jamba",
     wandb_entity: str | None = None,
     wandb_mode: str | None = None,
+    latent_cache: bool = True,
 ) -> list[str]:
     """Build the tested Kaggle command for current DGAC/DiLoCo anchor eval-only."""
     command = [
@@ -349,6 +358,8 @@ def build_dgac_anchor_eval_command(
     ]
     if use_4bit:
         command.append("--use_4bit")
+    if latent_cache:
+        command.append("--latent_cache")
     command.extend(
         [
             "--max_stage",
