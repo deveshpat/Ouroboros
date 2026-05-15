@@ -5,28 +5,29 @@
 
 ---
 
-## Last Run — DGAC DiLoCo Complete; post-DGAC eval loader bug found (2026-05-10)
+## Last Run — Azure H100 corrected DGAC epoch-0 checkpoint (2026-05-15)
 
-Coordinator evidence:
-
-```text
-[coordinator] New anchor uploaded:
-DiLoCo anchor: stage 10 round 1 (3 workers, 1386 samples, mode=diloco)
-[coordinator] Stage 10 progress:
-36906/36906 samples seen
-[coordinator] DGAC dedicated round COMPLETE (36906/36906 samples).
-[coordinator] Done (DGAC DiLoCo complete).
-```
-
-Eval-loader bug evidence from the attempted `dgac-anchor-eval` path:
+Run: `Azure H100 SCUS DGAC full budgeted` in W&B.
 
 ```text
+Loaded 36906 train / 1940 val from data/coconut_v1
+[GPU] NVIDIA H100 NVL  cc=sm90  VRAM=100GB  amp_dtype=bfloat16
+flash-attn available: using flash_attention_2
+mamba CUDA kernels: fast path ACTIVE (verified at bootstrap)
+[perf] 100GB VRAM detected, but keeping gradient checkpointing for this high-depth latent workload.
+DGAC HaltGate: d_model=2560  params=5121
+
+[DGAC] Loading DiLoCo anchor from WeirdRunner/Ouroboros/diloco_state/anchor as base weights for Phase 3.4 DGAC training.
 [diloco] Loaded anchor weights from diloco_state/anchor
-[DGAC] Anchor loaded. HaltGate at zero-init. gate_stage will default to curriculum_max_stage. Optimizer starts fresh.
-```
-
-Result: do not use that eval for post-DGAC HaltGate quality. Patch `--resume_from_diloco_anchor` so it passes the live `HaltGate` into `diloco_download_anchor`; rerun `kaggle_run_mode=dgac-anchor-eval` and require:
-
-```text
 [diloco] Loaded halt gate from diloco_state/anchor/halt_gate.pt
+[DGAC] Anchor load complete. If the anchor contains halt_gate.pt, HaltGate was restored; otherwise it remains zero-init. Optimizer starts fresh unless this is eval-only.
+
+Stage 10/10  10 latent pass(es)  + DGAC
+Epochs: 3  Steps/epoch: 1154  Total: 3462
+step=  1150 s=10 ep=0 ce=0.3538 gn=0.3338
+[timeout] Skipping val/gen at epoch 0 - 299min remaining (< 720min val budget).
+[ckpt] saved -> runs/azure_h100_dgac/stage_10/checkpoint-0001154  acc=None  ce=None
+[hub] uploaded runs/azure_h100_dgac/stage_10/checkpoint-0001154 -> WeirdRunner/Ouroboros
 ```
+
+Result: corrected HaltGate load path is live and the H100 run produced an epoch-0 DGAC checkpoint with `training_state.pt`, adapter weights, and `halt_gate.pt`. This is checkpoint evidence only, not a quality pass, because val/gen were skipped. Evaluate `runs/azure_h100_dgac/stage_10/checkpoint-0001154` or resume from it explicitly before making benchmark/packaging decisions.

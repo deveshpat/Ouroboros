@@ -17,6 +17,8 @@
 | `wandb==0.25.0` `resume="allow"` on finished run → ephemeral run | Per-round run IDs + `group=` for stage-level grouping |
 | W&B dashboard unreadable with many overlapping runs | Unique `id` per round + `group` by stage |
 | `--use_halt_gate` starts from random LoRA weights in DiLoCo path | `--resume_from_diloco_anchor` loads `diloco_state/anchor/` before DGAC training |
+| `--resume_from_diloco_anchor` used when evaluating/resuming a numbered DGAC checkpoint | It bypasses checkpoint discovery and reloads `diloco_state/anchor`; use normal checkpoint resume (`--resume_from` locally or `--hf_stage_subdir` Hub scan) for `runs/azure_h100_dgac/stage_10/checkpoint-0001154` |
+| H100 run reaches epoch end but does not produce val/gen | Large `--val_skip_buffer_minutes` can intentionally skip val/gen near timeout; treat checkpoint as training evidence only until a separate eval runs |
 | Completed PRDs/plans linger in `prds/` or `plans/` and compete with docs | Promote durable decisions into `wiki/`, then delete obsolete planning artifacts |
 | Runtime `signals/*.json` appears in source control | Ignore generated signal JSONs and keep only `signals/.gitkeep` tracked; do not remove the workflow signal trigger until a replacement exists |
 | Root scripts become safer but then risk regrowing into monoliths | Keep adapter guardrail tests that assert root entrypoints delegate into package modules |

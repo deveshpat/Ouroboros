@@ -5,6 +5,18 @@
 
 ---
 
+## Session 30 — Azure H100 corrected DGAC epoch-0 checkpoint (2026-05-15) 🟡
+
+**Evidence:** W&B run `Azure H100 SCUS DGAC full budgeted` finished after loading 36,906 train / 1,940 val samples on `NVIDIA H100 NVL` (`sm90`, 100GB, BF16). Bootstrap verified `flash_attention_2` and the Mamba CUDA fast path. The run loaded `diloco_state/anchor` and restored `diloco_state/anchor/halt_gate.pt`, then completed Stage 10 epoch 0 with logged CE/grad-norm samples through step 1150.
+
+**Checkpoint:** Saved and uploaded `runs/azure_h100_dgac/stage_10/checkpoint-0001154` with `training_state.pt`, adapter weights, and `halt_gate.pt`.
+
+**Caveat:** This is not a final quality pass. Epoch-end val/gen were skipped because only 299 min remained and the Azure script used `--val_skip_buffer_minutes 720`; checkpoint metadata has `acc=None` and `ce=None`.
+
+**Decision:** Evaluate the H100 checkpoint or resume from it explicitly via normal checkpoint resume. Do not use `--resume_from_diloco_anchor` for checkpoint evaluation/resume, because that flag intentionally reloads `diloco_state/anchor` and starts fresh from the anchor.
+
+---
+
 ## Session 29 — DGAC HaltGate objective corrected (2026-05-10) ✅
 
 **Problem:** DGAC diagnostics could show `k_actual=1` across visible samples even when the base anchor quality was usable. The old training objective let HaltGate behavior be driven by ponder/diversity pressure instead of a correctness-aware stop target.

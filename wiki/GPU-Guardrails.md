@@ -57,10 +57,10 @@ if args.diloco_mode and device.type == "cuda":
 | T4 | sm75 | 16 GB | ✅ Target |
 | V100 | sm70 | 16/32 GB | ⚠️ No cached wheels |
 | P100 | sm60 | 16 GB | ❌ Rejected by guard |
-| A100 | sm80 | 40/80 GB | ✅ GC auto-disabled |
-| H100 | sm90 | 80 GB | ✅ GC auto-disabled |
+| A100 | sm80 | 40/80 GB | ✅ Target; GC may auto-disable for smaller latent workloads |
+| H100 | sm90 | 80/100 GB | ✅ Target; high-depth DGAC can keep GC enabled |
 
-Gradient checkpointing auto-disabled when `total_vram_gb >= 40.0` (saves 20–40% compute).
+Gradient checkpointing is no longer a pure VRAM threshold. `_should_auto_disable_gradient_checkpointing()` may disable it at `total_vram_gb >= 40.0` for smaller latent workloads, but keeps it enabled when latent-token pressure is high or `--use_halt_gate` runs deep DGAC (`max_stage >= 6`). `OUROBOROS_FORCE_GRAD_CHECKPOINT=1` also prevents auto-disable. Latest Azure H100 evidence printed `100GB VRAM detected, but keeping gradient checkpointing for this high-depth latent workload.`
 
 ---
 
@@ -69,3 +69,8 @@ Gradient checkpointing auto-disabled when `total_vram_gb >= 40.0` (saves 20–40
 - No P100 assignment observed since Session 21 fix deployment.
 - Guard tested implicitly: `triggered_at=0` recovery path verified (Session 19).
 - If P100 appears again: check Kaggle quota remaining for the affected account.
+
+
+## Azure H100 DGAC Note
+
+The Azure H100 path is not part of the Kaggle P100/T4 dispatch guardrail, but it still uses the same bootstrap contract: BF16 on sm90, `flash_attention_2`, and verified Mamba CUDA kernels before model load. The 2026-05-15 run saved `runs/azure_h100_dgac/stage_10/checkpoint-0001154` after restoring the DiLoCo anchor and `halt_gate.pt`. Treat this checkpoint as training evidence only until a separate val/gen quality gate runs.

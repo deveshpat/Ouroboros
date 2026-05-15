@@ -10,7 +10,8 @@ WeirdRunner/Ouroboros (HF Hub)
 ├── diloco_state/
 │   ├── anchor/
 │   │   ├── adapter_model.safetensors   ← aggregated anchor after each coordinator run
-│   │   └── adapter_config.json
+│   │   ├── adapter_config.json
+│   │   └── halt_gate.pt                ← present after DGAC/HaltGate aggregation or checkpoint promotion
 │   ├── round_state.json                ← coordinator state machine
 │   └── workers/{A,B,C}/
 │       ├── status.json                 ← {worker_id, stage_k, round_n, samples_seen, status, weights_path}
@@ -45,25 +46,28 @@ Called by coordinator (aggregation) and worker (round start).
 ```python
 hf_hub_download(repo_id, filename=f"{anchor_path}/adapter_model.safetensors", token)
 set_peft_model_state_dict(model, load_file(local_path, device=str(device)))
+# when halt_gate is passed and halt_gate.pt exists:
+halt_gate.load_state_dict(torch.load(...))
 ```
 
-Falls back silently if no anchor exists (first round uses random LoRA init).
+Falls back silently if no anchor exists (first round uses random LoRA init). When `required=True`, missing anchor weights fail the run; when a `halt_gate` object is provided, `halt_gate.pt` is restored if present.
 
 ---
 
 ## DGAC Resume from DiLoCo (`--resume_from_diloco_anchor`)
 
-For Phase 3.4 (DGAC) only. Loads DiLoCo stage-K aggregate instead of a sequential checkpoint.
+For Phase 3.4 (DGAC) anchor-start runs only. Loads the current DiLoCo stage-K aggregate from `diloco_state/anchor/` instead of a sequential checkpoint.
 
 ```
 --use_halt_gate --resume_from_diloco_anchor
-  → diloco_download_anchor(model, "diloco_state/anchor/")
-  → HaltGate at zero-init
-  → Optimizer starts fresh
+  → diloco_download_anchor(model, "diloco_state/anchor/", halt_gate=halt_gate)
+  → restore adapter weights and `halt_gate.pt` when present
+  → Optimizer starts fresh unless this is eval-only
   → run_training_stages([curriculum_max_stage], ...)
 ```
 
-Bypasses `find_latest_resume_checkpoint()` entirely.
+Bypasses `find_latest_resume_checkpoint()` entirely. That is intentional for anchor-start DGAC, but it means this flag must **not** be used when evaluating or continuing a numbered checkpoint such as `runs/azure_h100_dgac/stage_10/checkpoint-0001154`. For numbered checkpoint evaluation/resume, use `--use_halt_gate` with the normal checkpoint resume path (`--resume_from` for a local checkpoint, or `--hf_stage_subdir` so Hub resume can discover the latest checkpoint) and omit `--resume_from_diloco_anchor`.
+
 Requires `--hf_token` and `--diloco_state_repo WeirdRunner/Ouroboros`.
 
 ---
@@ -78,6 +82,22 @@ After each training round:
 Attendance workers (samples_seen=0) still upload status.json — coordinator uses it to confirm presence.
 
 ---
+
+## Azure H100 DGAC Checkpoint Stream
+
+The 2026-05-15 Azure H100 corrected DGAC run uploaded:
+
+```
+WeirdRunner/Ouroboros/
+└── runs/azure_h100_dgac/
+    └── stage_10/
+        └── checkpoint-0001154/
+            ├── training_state.pt
+            ├── adapter_model/adapter_model.safetensors
+            └── halt_gate.pt
+```
+
+This checkpoint came from `--use_halt_gate --resume_from_diloco_anchor`, so it started from `diloco_state/anchor` and restored the anchor `halt_gate.pt`. The checkpoint itself should be evaluated/resumed through the normal checkpoint path, not through `--resume_from_diloco_anchor`.
 
 ## Checkpoint Resume Logic (sequential path)
 

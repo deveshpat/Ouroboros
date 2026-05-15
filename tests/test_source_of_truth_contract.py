@@ -169,5 +169,6 @@ def test_stage_10_terminal_gate_is_reflected_in_source_of_truth_docs():
     assert "post-DGAC `dgac-anchor-eval`" in status
     assert "Stage 10 terminal aggregation → DGAC manual gate" in session_log
     assert "Stage 10 terminal anchor eval-only → DGAC cleared" in session_log
-    assert "DGAC dedicated round COMPLETE" in terminal_log
+    assert "Azure H100 corrected DGAC epoch-0 checkpoint" in terminal_log
     assert "Loaded halt gate from diloco_state/anchor/halt_gate.pt" in terminal_log
+    assert "runs/azure_h100_dgac/stage_10/checkpoint-0001154" in terminal_log

@@ -1,6 +1,6 @@
 # Project Status — Coconut-Ouroboros
 > **This page is the body. `BLUEPRINT.md` is the index. Load this page after BLUEPRINT.md.**
-> Last updated: 2026-05-10
+> Last updated: 2026-05-15
 
 ---
 
@@ -20,8 +20,8 @@
 | 9 — 9 latent passes | ✅ COMPLETE | Stage 9 visible in W&B as complete before stage 10 dispatch |
 | 10 — 10 latent passes | ✅ COMPLETE | Terminal DiLoCo and DGAC DiLoCo both reached 36,906/36,906 samples; latest anchor is the aggregated post-DGAC anchor |
 
-**Compute mode:** DiLoCo dynamic workers with attendance/waiting-mode fallback.
-**Current gate:** DGAC DiLoCo is complete, but the halt objective has been corrected after diagnostics showed early-halting risk. Run a short DGAC canary with correctness-aware HaltGate supervision, then rerun `dgac-anchor-eval`; coordinator cron must not dispatch stage 11.
+**Compute mode:** DiLoCo dynamic workers with attendance/waiting-mode fallback; Azure H100 is available for budget-bounded sequential DGAC checkpoints when Kaggle quota is the bottleneck.
+**Current gate:** Correctness-aware DGAC has a completed Azure H100 epoch-0 checkpoint at `runs/azure_h100_dgac/stage_10/checkpoint-0001154` with restored `halt_gate.pt`. It is **not** a final quality gate yet: val/gen were skipped because only 299 min remained under the 720 min validation buffer. Next action is to evaluate this checkpoint or explicitly resume the remaining DGAC epochs; coordinator cron must not dispatch stage 11.
 
 
 ---
@@ -48,11 +48,11 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 
 ## Immediate Next Steps
 
-1. **Run a short DGAC canary with the corrected halt objective** — use the normal DGAC path, but inspect early metrics before spending a full epoch. Require `train/dgac_halt_loss`, `train/dgac_ponder`, `train/dgac_diversity`, and `train/dgac_halt_step_mean` to log separately.
-2. **Rerun `dgac-anchor-eval` after the canary or corrected pass** — use GitHub Actions → `coordinate` with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`; trust it only if logs include `Loaded halt gate from diloco_state/anchor/halt_gate.pt`.
-3. **Review DGAC research signal** — inspect HaltGate behavior / halt-step distribution and compare post-DGAC `val_ce`, `val_acc`, and generations against the terminal anchor baseline. `pct_at_1≈1.0` is acceptable only if forced-`k1` CE is near forced-full CE.
-4. **Decide next branch** — if val/gen/halt distribution is good, move to benchmark + packaging PRD; if mixed, run another corrected DGAC DiLoCo pass from the aggregated anchor; if bad, rollback or inspect DGAC loss/instrumentation.
-5. **Deferred research note** — JEPA-style latent prediction and multimodal input/output architecture are documented for later; do not implement before DGAC and baseline evaluations are stable.
+1. **Quality-check the Azure H100 corrected DGAC checkpoint** — evaluate `runs/azure_h100_dgac/stage_10/checkpoint-0001154` before calling the run complete. Do not use `--resume_from_diloco_anchor` for this checkpoint eval; that flag reloads `diloco_state/anchor` instead of the H100 checkpoint.
+2. **Resume remaining H100 DGAC epochs only if needed** — continue from `checkpoint-0001154` with `--use_halt_gate` + the normal checkpoint resume path, `--hf_stage_subdir runs/azure_h100_dgac`, and no `--resume_from_diloco_anchor`. Lower `--val_skip_buffer_minutes` if validation/generation must run before timeout.
+3. **Rerun/compare anchor eval after promotion or another corrected pass** — use GitHub Actions → `coordinate` with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`; trust the anchor path only if logs include `Loaded halt gate from diloco_state/anchor/halt_gate.pt`.
+4. **Review DGAC research signal** — inspect HaltGate behavior / halt-step distribution and compare post-DGAC `val_ce`, `val_acc`, and generations against the terminal anchor baseline. `pct_at_1≈1.0` is acceptable only if forced-`k1` CE is near forced-full CE.
+5. **Decide next branch** — if val/gen/halt distribution is good, move to benchmark + packaging PRD; if mixed, run another corrected DGAC pass from the best checkpoint/anchor; if bad, rollback or inspect DGAC loss/instrumentation.
 
 ---
 
@@ -72,6 +72,7 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 | Deep-module CPU regression suite | ✅ PASS | Latest chunked local CPU validation across all 24 test files: `36 passed`, `84 passed`, `38 passed` → `158 passed` total |
 | Training/runtime/launch/latent deep-module regression suite | ✅ PASS | Current post-RFC chunked coverage: all 24 test files, `158 passed` total. Single `pytest -q` can still time out locally before final summary, so chunked validation remains the reported local gate. |
 | Kaggle launch + DGAC canary preflight slice | ✅ PASS | Targeted launch/notebook/deep-module/source-of-truth/DGAC halt-supervision gate passed locally: `57 passed`; `dgac-canary --dry_run` exits before Hub/Kaggle mutation. |
+| Azure H100 corrected DGAC epoch 0 | ✅ CHECKPOINTED | Run `Azure H100 SCUS DGAC full budgeted` loaded `diloco_state/anchor` plus `halt_gate.pt`, verified H100 BF16/flash-attn/Mamba fast path, completed epoch 0 at stage 10, saved `runs/azure_h100_dgac/stage_10/checkpoint-0001154`, and uploaded `training_state.pt`, adapter weights, and `halt_gate.pt`; val/gen skipped due to the 720 min validation buffer. |
 
 ## Hub State
 
@@ -83,6 +84,8 @@ WeirdRunner/Ouroboros/
     workflow_validation/25377312407-1/   ✓ live CPU-smoke status/report verified by coordinator #272
     workers/A/round_0000_stage_10/       ✓ 10,912 samples
     workers/{A,B,C}/round_0002_stage_10/ ✓ final terminal aggregation inputs: 8,665 + 8,665 + 8,664 samples
+  runs/azure_h100_dgac/
+    stage_10/checkpoint-0001154/          ✓ corrected DGAC epoch-0 checkpoint: training_state.pt + adapter + halt_gate.pt
 ```
 
 ---
@@ -94,7 +97,7 @@ WeirdRunner/Ouroboros/
 | Stage 2 DiLoCo: aggregated model vs sequential baseline? | 🟡 Pre-val acc rising monotonically — promising |
 | Stage 3 rounds 2–3: Worker A signals absent | 🟡 Solo/attendance handled correctly by coordinator |
 | TRC GPU quota conversion | 🟡 Email sent — awaiting |
-| DGAC halt_step distribution at K≥2 | 🟡 Ready to measure — rerun post-DGAC `dgac-anchor-eval` after HaltGate-load patch |
+| DGAC halt_step distribution at K≥2 | 🟡 Ready to measure — evaluate the Azure H100 checkpoint or rerun post-DGAC `dgac-anchor-eval` after anchor promotion |
 | Worker quota for DiLoCo stage 10 | ✅ No longer blocking — final A/B/C round aggregated on 2026-05-09 |
 | Stage 10 terminal anchor quality gate | ✅ Passed — `val_ce=0.4863`, `val_acc=0.0889`, coherent generation, `Mean UWR=0.733` |
 | CPU-smoke end-to-end workflow gate before DGAC? | 🟢 Passed live — GitHub Actions `coordinate #272`, validation run `25377312407-1`, Worker A, Hub status/report verified |
@@ -123,7 +126,7 @@ WeirdRunner/Ouroboros/
 | `--batch_size` | 4 (2 per GPU on Dual T4) |
 | amp_dtype T4 (sm75) | FP16 |
 | amp_dtype A100+ (sm80+) | BF16 |
-| Gradient checkpointing | Auto-disabled at VRAM≥40GB |
+| Gradient checkpointing | Auto-disabled at VRAM≥40GB only for small latent workloads; high-depth DGAC can keep it enabled even on 100GB H100 |
 | Multi-account strategy | DiLoCo dynamic parallel |
 | Notebook launch cells | `!torchrun` magic commands only; shell tokens are tested against `ouroboros.kaggle_launch_matrix` |
 | Worker auto-detection | `DILOCO_WORKER_ID` Kaggle secret per account (`A`/`B`/`C`) |
