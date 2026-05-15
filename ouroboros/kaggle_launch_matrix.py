@@ -188,7 +188,7 @@ _DGAC_TRAIN_SHELL = (
 )
 _DGAC_ANCHOR_EVAL_SHELL = (
     'torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py '
-    '--use_halt_gate --resume_from_diloco_anchor --eval_only '
+    '--use_halt_gate --resume_from_diloco_anchor --eval_only --dgac_diagnostics '
     '--diloco_state_repo "$OUROBOROS_DILOCO_STATE_REPO" --data_dir data/coconut_v1 '
     '--use_4bit --latent_cache --max_stage 10 --max_grad_norm 0.3 --batch_size 4 --grad_accum 8 '
     '--val_batch_size 2 --val_skip_buffer_minutes 60 --session_timeout_hours 12.0 '

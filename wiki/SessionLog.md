@@ -5,6 +5,16 @@
 
 ---
 
+## Session 31 — Azure H100 DGAC checkpoint promoted to canonical anchor (2026-05-15) 🟡
+
+**Evidence:** Promotion metadata recorded `promoted_at=2026-05-15T11:24:25+00:00`, `repo_id=WeirdRunner/Ouroboros`, `source_revision=374a9a32d81242224465b786d62aaef7564639e6`, and `source_checkpoint=runs/azure_h100_dgac/stage_10/checkpoint-0001154`.
+
+**Promotion:** Copied the checkpoint adapter weights/config and `halt_gate.pt` into `diloco_state/anchor`, set `terminal_stage=10`, recorded `total_train_samples=36906`, and marked `mark_dgac_complete=true`.
+
+**Decision:** Treat `diloco_state/anchor` as the active DGAC-complete model. The next quality gate is `dgac-anchor-eval` on the canonical anchor; direct Azure checkpoint eval is now optional forensic comparison or a resume source if another H100 continuation is needed.
+
+---
+
 ## Session 30 — Azure H100 corrected DGAC epoch-0 checkpoint (2026-05-15) 🟡
 
 **Evidence:** W&B run `Azure H100 SCUS DGAC full budgeted` finished after loading 36,906 train / 1,940 val samples on `NVIDIA H100 NVL` (`sm90`, 100GB, BF16). Bootstrap verified `flash_attention_2` and the Mamba CUDA fast path. The run loaded `diloco_state/anchor` and restored `diloco_state/anchor/halt_gate.pt`, then completed Stage 10 epoch 0 with logged CE/grad-norm samples through step 1150.

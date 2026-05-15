@@ -18,15 +18,15 @@ Based on Meta's Coconut (arXiv:2412.06769) + DGAC (Diversity-Gated Adaptive Coco
 |---|---|
 | Stages 0–9 | ✅ COMPLETE |
 | Stage 10 | ✅ COMPLETE — terminal DiLoCo anchor uploaded (2026-05-09) |
-| DGAC | ✅ COMPLETE / 🟡 QUALITY PENDING — corrected Azure H100 epoch-0 checkpoint uploaded; quality eval still pending |
+| DGAC | ✅ COMPLETE / 🟡 QUALITY PENDING — corrected Azure H100 checkpoint promoted to canonical DiLoCo anchor; post-promotion eval/gen pending |
 
-**Compute:** DiLoCo dynamic workers with attendance/waiting fallback. The 2026-05-09 coordinator run aggregated Workers A/B/C for stage 10 round 2, reached 36,906/36,906 stage samples, uploaded the terminal DiLoCo anchor, and stopped at the DGAC manual gate with no stage-11 dispatch. The pre-DGAC anchor eval-only run loaded `diloco_state/anchor` and reported `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, and `Mean UWR=0.733`. The 2026-05-10 DGAC DiLoCo coordinator run then completed 36,906/36,906 samples and uploaded a new aggregated anchor. The 2026-05-15 Azure H100 corrected DGAC run restored the anchor `halt_gate.pt`, completed epoch 0, and uploaded `runs/azure_h100_dgac/stage_10/checkpoint-0001154`; val/gen did not run because the 720 min validation buffer tripped with 299 min remaining. Evaluate that checkpoint, or resume from it explicitly, before deciding whether another DGAC pass is needed.
+**Compute:** DiLoCo dynamic workers with attendance/waiting fallback. The 2026-05-09 coordinator run aggregated Workers A/B/C for stage 10 round 2, reached 36,906/36,906 stage samples, uploaded the terminal DiLoCo anchor, and stopped at the DGAC manual gate with no stage-11 dispatch. The pre-DGAC anchor eval-only run loaded `diloco_state/anchor` and reported `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, and `Mean UWR=0.733`. The 2026-05-10 DGAC DiLoCo coordinator run then completed 36,906/36,906 samples and uploaded a new aggregated anchor. The 2026-05-15 Azure H100 corrected DGAC run restored the anchor `halt_gate.pt`, completed epoch 0, and uploaded `runs/azure_h100_dgac/stage_10/checkpoint-0001154`; val/gen did not run because the 720 min validation buffer tripped with 299 min remaining. That checkpoint was then promoted at `2026-05-15T11:24:25+00:00` to the canonical Hub anchor `diloco_state/anchor` from source revision `374a9a32d81242224465b786d62aaef7564639e6`, with `mark_dgac_complete=true` and `total_train_samples=36906`. The active quality gate is now post-promotion anchor eval/gen, not raw checkpoint review.
 
 ---
 
 ## Current Anchor Quality Review Command
 
-Use this for both pre-DGAC terminal-anchor review and post-DGAC aggregated-anchor review. It loads `diloco_state/anchor`, restores `halt_gate.pt` when the anchor contains it, evaluates at Stage 10, optionally runs the existing generation callback, and exits without optimizer steps or checkpoint writes.
+Use this for the canonical post-promotion DGAC quality review. It loads `diloco_state/anchor`, restores `halt_gate.pt` when the anchor contains it, evaluates at Stage 10, runs the existing generation callback by default, runs DGAC diagnostics when requested, and exits without optimizer steps or checkpoint writes.
 
 For local runs, copy `.env.example` to `.env.local`, fill the secret values,
 then load it before running coordinator, canary, or Mac fallback commands:
@@ -66,13 +66,13 @@ torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
 
 Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. This pushes one GPU Kaggle notebook in eval-only mode; it does not mutate `round_state` and loads the latest adapter + `halt_gate.pt` from `diloco_state/anchor` on Hub when present.
 
-**Latest completed eval result:** Stage 10 terminal anchor PASS — `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, `Mean UWR=0.733`. `k_actual=10` for all samples was expected before DGAC because HaltGate started at zero-init. After DGAC aggregation, rerun this same command and require `diloco` logs to show `Loaded halt gate from diloco_state/anchor/halt_gate.pt` before trusting halt-step distribution.
+**Latest completed eval result:** Stage 10 terminal pre-DGAC anchor PASS — `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, `Mean UWR=0.733`. `k_actual=10` for all samples was expected before DGAC because HaltGate started zero-init. After the Azure checkpoint promotion, rerun this same command against the canonical anchor and require `diloco` logs to show `Loaded halt gate from diloco_state/anchor/halt_gate.pt` before trusting halt-step distribution.
 
-## Azure H100 Corrected DGAC Checkpoint Review (latest active gate)
+## Azure H100 Corrected DGAC Checkpoint Promotion Evidence
 
-Latest evidence: `Azure H100 SCUS DGAC full budgeted` loaded `diloco_state/anchor`, restored `diloco_state/anchor/halt_gate.pt`, verified H100 BF16 + flash-attn + Mamba CUDA fast path, ran stage 10 epoch 0, then saved and uploaded `runs/azure_h100_dgac/stage_10/checkpoint-0001154` with `training_state.pt`, adapter weights, and `halt_gate.pt`. Validation/generation were skipped because the run had 299 min remaining and `--val_skip_buffer_minutes 720`.
+Latest evidence: `Azure H100 SCUS DGAC full budgeted` loaded `diloco_state/anchor`, restored `diloco_state/anchor/halt_gate.pt`, verified H100 BF16 + flash-attn + Mamba CUDA fast path, ran stage 10 epoch 0, then saved and uploaded `runs/azure_h100_dgac/stage_10/checkpoint-0001154` with `training_state.pt`, adapter weights, and `halt_gate.pt`. Validation/generation were skipped because the run had 299 min remaining and `--val_skip_buffer_minutes 720`. Promotion metadata shows that checkpoint was copied into `diloco_state/anchor` as adapter weights plus `halt_gate.pt`, with `mark_dgac_complete=true`; therefore the normal `dgac-anchor-eval` path is now the active quality gate.
 
-Use the normal checkpoint resume path for this artifact. Do **not** pass `--resume_from_diloco_anchor` when evaluating or resuming `checkpoint-0001154`, because that flag intentionally reloads `diloco_state/anchor` and starts a fresh optimizer from the anchor.
+Use the normal checkpoint resume path only for forensic comparison or additional H100 continuation. Do **not** pass `--resume_from_diloco_anchor` when evaluating or resuming `checkpoint-0001154`, because that flag intentionally reloads `diloco_state/anchor`. For the current promoted model, prefer the anchor eval command above or the GitHub Actions `dgac-anchor-eval` workflow path.
 
 ```bash
 torchrun --standalone --nproc_per_node=1 jamba_coconut_finetune.py \
@@ -85,7 +85,7 @@ torchrun --standalone --nproc_per_node=1 jamba_coconut_finetune.py \
   --wandb_project "ouroboros-stage3-jamba"
 ```
 
-If the H100 run should continue training instead of only evaluating, resume the same checkpoint stream with `--use_halt_gate`, `--hf_stage_subdir runs/azure_h100_dgac`, `--output_dir runs/azure_h100_dgac`, and no `--resume_from_diloco_anchor`. Lower the validation buffer from 720 min if an epoch-end val/gen checkpoint is required before timeout.
+If the H100 stream should continue training beyond the promoted anchor, resume the same checkpoint stream with `--use_halt_gate`, `--hf_stage_subdir runs/azure_h100_dgac`, `--output_dir runs/azure_h100_dgac`, and no `--resume_from_diloco_anchor`. Lower the validation buffer from 720 min if an epoch-end val/gen checkpoint is required before timeout, then promote again only after reviewing eval/gen evidence.
 
 ## DGAC Launch Command (Phase 3.4 — available if another pass is needed)
 
