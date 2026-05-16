@@ -18,7 +18,6 @@ class TrainingPlanKind(str, Enum):
     DGAC_CANARY = "dgac-canary"
     DILOCO_WORKER = "diloco-worker"
     DGAC_DILOCO_WORKER = "dgac-diloco-worker"
-    CPU_SMOKE = "cpu-smoke"
 
 
 @dataclass(frozen=True)
@@ -30,7 +29,6 @@ class TrainingSessionPlan:
     should_resume_checkpoint: bool = False
     resume_source: Optional[str] = None
     delegates_to_diloco: bool = False
-    cpu_smoke_safe: bool = False
     skip_worker_pre_validation: bool = False
     reason: str = ""
 
@@ -41,16 +39,6 @@ def _truthy_attr(args: Any, name: str, default: bool = False) -> bool:
 
 def plan_training_session(args: Any) -> TrainingSessionPlan:
     """Classify the requested run before heavy model/dataset execution."""
-    workflow_validate = normalize_text(getattr(args, "workflow_validate", None))
-    if workflow_validate == "cpu-smoke":
-        return TrainingSessionPlan(
-            kind=TrainingPlanKind.CPU_SMOKE,
-            should_train=False,
-            should_validate=True,
-            should_generate=False,
-            cpu_smoke_safe=True,
-            reason="workflow CPU-smoke validation branch",
-        )
 
     diloco_mode = _truthy_attr(args, "diloco_mode")
     use_halt_gate = _truthy_attr(args, "use_halt_gate")

@@ -48,7 +48,20 @@ _EXPORTS = {
     "build_optimizer_and_scheduler": ("stage_runner", "build_optimizer_and_scheduler"),
 }
 
-__all__ = tuple(_EXPORTS)
+_PUBLIC_EXPORTS = (
+    "run_cli",
+    "plan_training_session",
+    "TrainingSessionPlan",
+    "TrainingPlanKind",
+    "HaltGate",
+    "run_dgac_diagnostics",
+    "run_eval_only",
+    "run_training_stages",
+    "save_checkpoint",
+    "load_checkpoint",
+)
+
+__all__ = _PUBLIC_EXPORTS
 
 
 def __getattr__(name: str) -> Any:

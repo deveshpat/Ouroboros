@@ -1,7 +1,7 @@
 """Data contract for Kaggle launch modes.
 
-The coordinator, notebook, and workflow validation use this module as the single
-stdlib-only source of truth for mode policies. Command builders remain in
+Coordinator and notebook adapters use this module as the stdlib-only source
+of truth for launch-mode policies. Command builders remain in
 ``ouroboros.coordinator.kaggle_commands`` so this contract stays importable in bootstrap contexts.
 """
 
@@ -20,7 +20,6 @@ DGAC_TRAIN_RUN_MODE = "dgac-train"
 DGAC_CANARY_RUN_MODE = "dgac-canary"
 DGAC_DILOCO_RUN_MODE = "dgac-diloco"
 BENCHMARK_RUN_MODE = "benchmark"
-CPU_SMOKE_MODE = "cpu-smoke"
 
 
 @dataclass(frozen=True)
@@ -36,7 +35,6 @@ class KaggleLaunchContract:
     notebook_path: str
     allowed_from_github_actions: bool
     allowed_manually: bool
-    cpu_smoke_safe: bool = False
 
 
 _COMMON_ENV = (
@@ -152,31 +150,11 @@ _CONTRACTS: dict[str, KaggleLaunchContract] = {
         allowed_from_github_actions=True,
         allowed_manually=True,
     ),
-    CPU_SMOKE_MODE: KaggleLaunchContract(
-        mode=CPU_SMOKE_MODE,
-        requires_gpu=False,
-        worker_mode=True,
-        trains=False,
-        validates=True,
-        mutates_round_state=False,
-        env_keys=_COMMON_ENV + _WORKER_ENV + (
-            "OUROBOROS_WORKFLOW_VALIDATE",
-            "OUROBOROS_WORKFLOW_VALIDATION_RUN_ID",
-            "OUROBOROS_WORKFLOW_VALIDATION_PUBLISH",
-            "OUROBOROS_WORKFLOW_VALIDATION_STATE_REPO",
-        ),
-        required_cli_args=("-m", "ouroboros.eval.smoke_worker"),
-        notebook_path="kaggle-utils.ipynb",
-        allowed_from_github_actions=True,
-        allowed_manually=True,
-        cpu_smoke_safe=True,
-    ),
 }
 
 
-def known_kaggle_launch_modes(*, include_cpu_smoke: bool = False) -> tuple[str, ...]:
-    modes = tuple(mode for mode in _CONTRACTS if include_cpu_smoke or mode != CPU_SMOKE_MODE)
-    return modes
+def known_kaggle_launch_modes() -> tuple[str, ...]:
+    return tuple(_CONTRACTS)
 
 
 def get_kaggle_launch_contract(mode: str) -> KaggleLaunchContract:
@@ -187,7 +165,7 @@ def get_kaggle_launch_contract(mode: str) -> KaggleLaunchContract:
     if normalized not in _CONTRACTS:
         raise ValueError(
             f"Invalid Kaggle launch mode {normalized!r}. Expected one of: "
-            f"{', '.join(known_kaggle_launch_modes(include_cpu_smoke=True))}."
+            f"{', '.join(known_kaggle_launch_modes())}."
         )
     return _CONTRACTS[normalized]
 

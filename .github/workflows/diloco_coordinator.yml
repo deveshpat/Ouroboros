@@ -20,10 +20,6 @@ on:
         description: 'Print round plan without aggregating or triggering.'
         required: false
         default: 'false'
-      workflow_validate:
-        description: 'Optional read-only workflow validation mode. Supported: "" or "cpu-smoke". Defaults to Worker A when force_worker_ids is empty.'
-        required: false
-        default: ''
       kaggle_run_mode:
         description: 'Kaggle launch mode. Use benchmark for lm-evaluation-harness progress checks.'
         required: false
@@ -113,8 +109,6 @@ jobs:
           KAGGLE_KEY_B: ${{ secrets.KAGGLE_KEY_B }}
           KAGGLE_USERNAME_C: ${{ secrets.KAGGLE_USERNAME_C }}
           KAGGLE_KEY_C: ${{ secrets.KAGGLE_KEY_C }}
-          OUROBOROS_WORKFLOW_VALIDATE: ${{ github.event.inputs.workflow_validate || '' }}
-          OUROBOROS_WORKFLOW_VALIDATION_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           OUROBOROS_KAGGLE_RUN_MODE: ${{ github.event.inputs.kaggle_run_mode || 'diloco' }}
           OUROBOROS_DGAC_DIAGNOSTICS_ONLY: ${{ github.event.inputs.dgac_anchor_eval_resume_mode == 'diagnostics-only' && '1' || '' }}
           OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE: ${{ github.event.inputs.dgac_diagnostics_forced_kmax_ce || '' }}
@@ -140,8 +134,6 @@ jobs:
             --kaggle_key_c      "$KAGGLE_KEY_C" \
             --total_train_samples 36906 \
             --min_shard_samples  32 \
-            --workflow_validate "$OUROBOROS_WORKFLOW_VALIDATE" \
-            --workflow_validation_run_id "$OUROBOROS_WORKFLOW_VALIDATION_RUN_ID" \
             --kaggle_run_mode "$OUROBOROS_KAGGLE_RUN_MODE" \
             ${{ github.event.inputs.force_worker_ids && format('--force_worker_ids "{0}"', github.event.inputs.force_worker_ids) || '' }} \
             ${{ github.event.inputs.skip_trigger == 'true' && '--skip_trigger' || '' }} \

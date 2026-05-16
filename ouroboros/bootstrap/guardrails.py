@@ -1,7 +1,7 @@
 """Executable guardrail registry for recurring Ouroboros hard lessons.
 
-This module is intentionally stdlib-only so it can be imported by CPU smoke,
-Kaggle preflight, and local log triage without torch/CUDA/bootstrap side effects.
+This module is intentionally stdlib-only so it can be imported by Kaggle
+preflight and local log triage without torch/CUDA/bootstrap side effects.
 Docs are not the source of enforcement by themselves: every row in
 ``wiki/Lessons-Learned.md`` must have a matching registry entry here, and tests
 ratchet that contract so new lessons cannot be added as passive prose only.
@@ -87,7 +87,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         kind="dependency-preflight",
         guardrail="Requirements and workflow tests pin kaggle>=1.8.4 before accelerator push flags are used.",
         refs=("tests/requirements.sh", ".github/workflows/diloco_coordinator.yml", "tests/test_kaggle_launch_matrix.py"),
-        remediation="Upgrade Kaggle CLI to >=1.8.4 or remove the flag only in CPU smoke mode.",
+        remediation="Upgrade Kaggle CLI to >=1.8.4 before using accelerator push flags.",
         signature_patterns=(r"--accelerator", r"unrecognized argument"),
     ),
     HardLessonGuardrail(
@@ -158,7 +158,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom="H100 run reaches epoch end but does not produce val/gen",
         kind="workflow-contract",
         guardrail="Session/status docs mark skipped val/gen checkpoints as training evidence until separate eval passes.",
-        refs=("wiki/STATUS.md", "wiki/SessionLog.md", "tests/test_dgac_anchor_cli_contract.py"),
+        refs=("wiki/STATUS.md", "wiki/Lessons-Learned.md", "tests/test_dgac_anchor_cli_contract.py"),
         remediation="Do not treat an H100 checkpoint as quality-gated if val/gen were skipped by timeout buffer.",
         signature_patterns=(r"H100", r"val/gen|validation|generation", r"skipped|buffer"),
     ),

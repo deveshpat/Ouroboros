@@ -13,7 +13,7 @@ import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ouroboros.coordinator.kaggle_contract import CPU_SMOKE_MODE, DILOCO_RUN_MODE
+from ouroboros.coordinator.kaggle_contract import DILOCO_RUN_MODE
 from ouroboros.coordinator.kaggle_launch_matrix import requires_kaggle_gpu
 from ouroboros.utils.runtime_env import (
     normalize_text,
@@ -200,42 +200,6 @@ def _build_worker_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[
         _first_nonempty_text(os.environ.get("OUROBOROS_DILOCO_OUTPUT_DIR"), "runs/diloco"),
     )
 
-    workflow_validate = _first_nonempty_text(
-        getattr(args, "workflow_validate", None),
-        os.environ.get("OUROBOROS_WORKFLOW_VALIDATE"),
-    )
-    if workflow_validate:
-        runtime_env["OUROBOROS_WORKFLOW_VALIDATE"] = workflow_validate
-        # Remote publication is what turns the Kaggle CPU smoke from a local
-        # notebook branch into an end-to-end GitHub Actions -> Kaggle -> Hub
-        # validation that the coordinator can observe.
-        runtime_env["OUROBOROS_WORKFLOW_VALIDATION_PUBLISH"] = "1"
-        validation_run_id = _first_nonempty_text(
-            getattr(args, "workflow_validation_run_id", None),
-            os.environ.get("OUROBOROS_WORKFLOW_VALIDATION_RUN_ID"),
-        )
-        if validation_run_id is None:
-            github_run_id = _first_nonempty_text(os.environ.get("GITHUB_RUN_ID"))
-            github_attempt = _first_nonempty_text(os.environ.get("GITHUB_RUN_ATTEMPT"))
-            validation_run_id = (
-                f"{github_run_id}-{github_attempt}"
-                if github_run_id and github_attempt
-                else github_run_id
-            )
-        _set_env_if_present(
-            runtime_env,
-            "OUROBOROS_WORKFLOW_VALIDATION_RUN_ID",
-            validation_run_id,
-        )
-        _set_env_if_present(
-            runtime_env,
-            "OUROBOROS_WORKFLOW_VALIDATION_STATE_REPO",
-            _first_nonempty_text(
-                os.environ.get("OUROBOROS_WORKFLOW_VALIDATION_STATE_REPO"),
-                os.environ.get("OUROBOROS_DILOCO_STATE_REPO"),
-                getattr(args, "repo_id", None),
-            ),
-        )
 
     return runtime_env
 
@@ -383,7 +347,7 @@ def _trigger_single_worker(
     notebook_path: Path,
     *,
     injected_env: Optional[Dict[str, str]] = None,
-    validation_mode: Optional[str] = None,
+    launch_mode: Optional[str] = None,
 ) -> bool:
     """
     Trigger a Kaggle kernel by pushing the repo-tracked notebook with generated
@@ -429,8 +393,8 @@ def _trigger_single_worker(
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
-            validation_mode_normalized = _normalize_optional_text(validation_mode)
-            gpu_enabled = requires_kaggle_gpu(validation_mode_normalized or DILOCO_RUN_MODE)
+            launch_mode_normalized = _normalize_optional_text(launch_mode)
+            gpu_enabled = requires_kaggle_gpu(launch_mode_normalized or DILOCO_RUN_MODE)
             _stage_local_kaggle_kernel(
                 notebook_path,
                 slug,
@@ -442,8 +406,6 @@ def _trigger_single_worker(
 
             # --accelerator requires kaggle>=1.8.4 (added in PR #907).
             # "NvidiaTeslaT4" is the official accelerator ID per kaggle-cli docs.
-            # CPU-smoke validation intentionally omits both the CLI accelerator
-            # and the metadata accelerator so it cannot consume GPU quota.
             push_args = ["kernels", "push", "-p", str(tmp_path)]
             if gpu_enabled:
                 push_args.extend(["--accelerator", "NvidiaTeslaT4"])
@@ -501,7 +463,7 @@ def trigger_kaggle_workers(
             if coordinator_args is not None
             else None
         )
-        validation_mode = _normalize_optional_text((injected_env or {}).get("OUROBOROS_WORKFLOW_VALIDATE"))
+        launch_mode = _normalize_optional_text((injected_env or {}).get("OUROBOROS_KAGGLE_RUN_MODE"))
         results[worker_id] = (
             "success"
             if _trigger_single_worker(
@@ -511,7 +473,7 @@ def trigger_kaggle_workers(
                 slug,
                 notebook_path=notebook_path,
                 injected_env=injected_env,
-                validation_mode=validation_mode,
+                launch_mode=launch_mode,
             )
             else "failed"
         )

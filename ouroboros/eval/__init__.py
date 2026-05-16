@@ -1,4 +1,4 @@
-"""Eval public interface: benchmark, lm-eval, diagnostics, and smoke quality gates."""
+"""Eval public interface: benchmark, lm-eval, diagnostics, smoke gates."""
 
 from __future__ import annotations
 
@@ -10,9 +10,8 @@ _EXPORTS = {
     "run_lm_eval": ("benchmark_harness", "run_lm_eval"),
     "main": ("benchmark_harness", "main"),
     "build_sharded_lm_eval_benchmark_commands": ("benchmark_multi_gpu", "build_sharded_lm_eval_benchmark_commands"),
-    "run_cpu_smoke_validation": ("smoke", "run_cpu_smoke_validation"),
-    "build_cpu_smoke_validation_command": ("smoke", "build_cpu_smoke_validation_command"),
-    "workflow_validation_mode": ("smoke", "workflow_validation_mode"),
+    "run_eval_smoke": ("smoke", "run_eval_smoke"),
+    "EvalSmokeReport": ("smoke", "EvalSmokeReport"),
 }
 
 __all__ = tuple(_EXPORTS)

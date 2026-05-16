@@ -1,30 +1,30 @@
-# Project Ouroboros — Minimal Runtime Blueprint
+# Ouroboros -> Minimal Runtime
 
-Ouroboros is now described through seven public package roots. Load this file first, then inspect the owning package for implementation details.
+Read first -> inspect owning package -> avoid root-wrapper thinking.
 
-## Public runtime map
+## Public map
 
-| Package | Owns | Normal operator surface |
+| Package | Owns | Surface |
 |---|---|---|
-| Bootstrap | runtime readiness, dependency bootstrap, device/dtype checks, CUDA/MPS/CPU guardrails, hard-lesson failure triage | `python -m ouroboros.coconut --help` stays bootstrap-safe; runtime setup is called once before training |
-| Coconut | stage curriculum, latent execution, DGAC/HaltGate, training loop, checkpoints, resume, Coconut dataset shaping | `python -m ouroboros.coconut ...` |
-| Models | HF CausalLM-compatible model/tokenizer loading, adapters, LoRA/PEFT, quantization, memory policy, model-family quirks | imported through `ouroboros.models` |
-| Inference | prompt resolution, latent-pass inference, decode, generation result contract | `python -m ouroboros.inference ...` |
-| Eval | anchor eval/generation checks, lm-eval, benchmark sharding, diagnostics, smoke quality gates | `python -m ouroboros.eval ...` |
-| Coordinator | DiLoCo/solo/DDP orchestration, workers, dispatch, aggregation, promotion, repair, Kaggle launch decisions | `python -m ouroboros.coordinator ...` |
-| Utils | provider-neutral env, Hub IO, W&B, Kaggle/Azure/Mac utility glue, command formatting helpers | imported through `ouroboros.utils` or explicit utility submodules |
+| Bootstrap | runtime -> device/dtype -> guardrails -> known-failure triage | imported before heavy runtime |
+| Coconut | curriculum -> latent passes -> DGAC/HaltGate -> train/checkpoint/resume | `python -m ouroboros.coconut ...` |
+| Models | HF CausalLM -> tokenizer -> adapter -> LoRA/PEFT -> quant/memory policy | `ouroboros.models` |
+| Inference | prompt -> latent decode -> generated output | `python -m ouroboros.inference ...` |
+| Eval | anchor eval -> gen checks -> diagnostics -> lm-eval/benchmark -> smoke | `python -m ouroboros.eval ...` |
+| Coordinator | DiLoCo/solo/DDP -> dispatch -> aggregate -> promote/repair | `python -m ouroboros.coordinator ...` |
+| Utils | env/provider -> Hub/W&B/Kaggle/Azure/Mac helpers | `ouroboros.utils` |
 
-## Package ownership rules
+## Ownership rule
 
-1. Runtime readiness, device, dtype, CUDA/MPS/CPU, guardrail → Bootstrap.
-2. Stage, latent execution, DGAC, HaltGate, train loop, checkpoint → Coconut.
-3. HF model/tokenizer/adapter/quantization/memory behavior → Models.
-4. Prompt-to-generation path → Inference.
-5. Anchor eval/gen, diagnostics, smoke, lm-eval, benchmark → Eval.
-6. DiLoCo, solo, worker, DDP, launch, aggregation, promotion, repair → Coordinator.
-7. Provider/env/Hub/W&B/Kaggle/Azure/Mac helper with no orchestration decision → Utils.
+runtime? -> Bootstrap
+stage/latent/DGAC/train/checkpoint? -> Coconut
+model/tokenizer/adapter/quant/memory? -> Models
+prompt/generate/decode? -> Inference
+eval/gen/diagnostics/lm-eval/benchmark? -> Eval
+worker/DDP/dispatch/aggregate/promote/repair? -> Coordinator
+provider/env/Hub/W&B helper only? -> Utils
 
-## Current command surfaces
+## Commands
 
 ```bash
 python -m ouroboros.coconut --help
@@ -34,23 +34,23 @@ python -m ouroboros.eval --help
 python -m ouroboros.inference --help
 ```
 
-Root workflow scripts were removed. Public imports should use package roots unless a submodule is explicitly part of a package's documented internal implementation.
+Root scripts -> retired.
+Package roots -> public surface.
+Submodules -> internal unless doc says seam.
 
-## Validation gates
-
-Run dependency-light checks locally first:
+## Validation
 
 ```bash
-python -m compileall -q ouroboros tests
-python -m pytest tests/test_minimal_runtime_public_architecture.py -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m compileall -q ouroboros tests
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
-When optional ML dependencies are available, run the full package contract suite. Tests should protect public behavior and hard lessons, not historical file locations.
+Tests -> behavior + hard lessons.
+No tests -> old extraction shape.
 
-## Current operational status
+## State
 
-The canonical project state remains the promoted DGAC anchor under `WeirdRunner/Ouroboros/diloco_state/anchor`. Coordinator still owns dispatch/aggregation/promotion. Eval owns quality gates before further promotion or benchmark claims.
-
-## Hard-lesson policy
-
-Hard lessons must survive as executable guardrails, smoke checks, known-error classifiers, or behavior tests. They should not exist only as passive historical prose.
+Canonical anchor -> `WeirdRunner/Ouroboros/diloco_state/anchor`.
+Coordinator -> dispatch/aggregate/promote.
+Eval -> quality gates before claims.
+Hard lesson -> executable guardrail/test/classifier, not prose only.

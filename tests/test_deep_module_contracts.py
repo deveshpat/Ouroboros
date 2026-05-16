@@ -5,7 +5,6 @@ import argparse
 
 def test_kaggle_launch_contracts_cover_runtime_modes_and_policies():
     from ouroboros.coordinator.kaggle_contract import (
-        CPU_SMOKE_MODE,
         DGAC_CANARY_RUN_MODE,
         DGAC_DILOCO_RUN_MODE,
         DILOCO_RUN_MODE,
@@ -14,8 +13,8 @@ def test_kaggle_launch_contracts_cover_runtime_modes_and_policies():
         resolve_kaggle_launch_contract,
     )
 
-    modes = set(known_kaggle_launch_modes(include_cpu_smoke=True))
-    assert {"diloco", "dgac-anchor-eval", "dgac-train", "dgac-canary", "dgac-diloco", "cpu-smoke"} <= modes
+    modes = set(known_kaggle_launch_modes())
+    assert {"diloco", "dgac-anchor-eval", "dgac-train", "dgac-canary", "dgac-diloco", "benchmark"} <= modes
 
     diloco = get_kaggle_launch_contract(DILOCO_RUN_MODE)
     assert diloco.requires_gpu is True
@@ -34,11 +33,6 @@ def test_kaggle_launch_contracts_cover_runtime_modes_and_policies():
     assert dgac_diloco.worker_mode is True
     assert dgac_diloco.mutates_round_state is True
 
-    cpu = get_kaggle_launch_contract(CPU_SMOKE_MODE)
-    assert cpu.requires_gpu is False
-    assert cpu.cpu_smoke_safe is True
-    assert cpu.trains is False
-    assert cpu.validates is True
 
     assert resolve_kaggle_launch_contract({"OUROBOROS_KAGGLE_RUN_MODE": "DGAC-CANARY"}) == canary
 
@@ -53,7 +47,6 @@ def test_training_session_planner_classifies_branches_without_heavy_imports():
         resume_from_diloco_anchor=False,
         use_halt_gate=False,
         max_train_steps=None,
-        workflow_validate=None,
         gen_every_stage=True,
         diloco_run_val=False,
     )

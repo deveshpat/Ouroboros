@@ -25,7 +25,6 @@ from ouroboros.coordinator.kaggle_commands import (
 )
 from ouroboros.coordinator.kaggle_contract import (
     BENCHMARK_RUN_MODE,
-    CPU_SMOKE_MODE,
     DGAC_ANCHOR_EVAL_RUN_MODE,
     DGAC_CANARY_RUN_MODE,
     DGAC_DILOCO_RUN_MODE,
@@ -177,11 +176,6 @@ def _build_benchmark(env: Mapping[str, str], *, worker_id: str | None = None) ->
     )
 
 
-def _build_cpu_smoke(env: Mapping[str, str], *, worker_id: str | None = None) -> list[str]:
-    del env, worker_id
-    return ["python", "-m", "ouroboros.eval.smoke_worker"]
-
-
 _COMMON_DEFAULTS = {
     "OUROBOROS_DILOCO_STATE_REPO": "WeirdRunner/Ouroboros",
     "OUROBOROS_DILOCO_SIGNAL_REPO": "deveshpat/Ouroboros",
@@ -265,21 +259,12 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
         requires_worker_id=False,
         workflow_label="lm-evaluation-harness benchmark",
     ),
-    CPU_SMOKE_MODE: KaggleLaunchModeSpec(
-        mode=CPU_SMOKE_MODE,
-        contract=get_kaggle_launch_contract(CPU_SMOKE_MODE),
-        env_defaults=_readonly({"OUROBOROS_WORKFLOW_VALIDATE": CPU_SMOKE_MODE}),
-        command_builder=_build_cpu_smoke,
-        output_env_key=None,
-        requires_worker_id=True,
-        workflow_label="read-only CPU workflow validation",
-    ),
 }
 
 
-def known_launch_specs(*, include_cpu_smoke: bool = False) -> tuple[KaggleLaunchModeSpec, ...]:
+def known_launch_specs() -> tuple[KaggleLaunchModeSpec, ...]:
     """Return launch specs for public Kaggle launch modes."""
-    return tuple(_SPECS[mode] for mode in known_kaggle_launch_modes(include_cpu_smoke=include_cpu_smoke))
+    return tuple(_SPECS[mode] for mode in known_kaggle_launch_modes())
 
 
 def get_launch_spec(mode: str) -> KaggleLaunchModeSpec:

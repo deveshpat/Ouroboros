@@ -89,10 +89,6 @@ def _args(**overrides):
         wandb_project="project",
         wandb_entity=None,
         total_train_samples=36906,
-        workflow_validate=None,
-        workflow_validation_run_id=None,
-        workflow_validation_timeout_s=900.0,
-        workflow_validation_poll_s=10.0,
         kaggle_run_mode="dgac-diloco",
         mac_claim_id=None,
     )

@@ -75,7 +75,6 @@ from ouroboros.coordinator.mac_dgac_fallback import (
 )
 from ouroboros.utils.runtime_env import resolve_hf_token, resolve_wandb_key
 from ouroboros.utils.wandb_runtime import wandb_init_kwargs
-from ouroboros.eval.smoke import CPU_SMOKE_MODE, workflow_validation_remote_paths
 
 
 T = TypeVar("T")
@@ -192,31 +191,6 @@ def parse_args() -> argparse.Namespace:
              "Useful for quota-exhausted scenarios.",
     )
     parser.add_argument("--outer_lr", type=float, default=0.7)
-    parser.add_argument(
-        "--workflow_validate",
-        default=None,
-        help=(
-            "Optional workflow validation mode. Use 'cpu-smoke' to run a read-only "
-            "GitHub Actions -> Kaggle -> Hub validation instead of mutating round_state."
-        ),
-    )
-    parser.add_argument(
-        "--workflow_validation_run_id",
-        default=None,
-        help="Stable id for remote workflow validation artifacts. Defaults to GitHub run id when available.",
-    )
-    parser.add_argument(
-        "--workflow_validation_timeout_s",
-        type=float,
-        default=900.0,
-        help="Seconds to wait for remote CPU-smoke status artifacts after Kaggle dispatch.",
-    )
-    parser.add_argument(
-        "--workflow_validation_poll_s",
-        type=float,
-        default=10.0,
-        help="Seconds between remote CPU-smoke status checks.",
-    )
     parser.add_argument(
         "--worker_timeout_hours",
         type=float,
@@ -513,30 +487,6 @@ def _dispatch_transition(
 
 
 
-def _workflow_validation_mode_from_args(args: argparse.Namespace) -> Optional[str]:
-    mode = _first_nonempty_text(
-        getattr(args, "workflow_validate", None),
-        os.environ.get("OUROBOROS_WORKFLOW_VALIDATE"),
-    )
-    return mode.lower() if mode else None
-
-
-def _workflow_validation_run_id_from_args(args: argparse.Namespace) -> str:
-    explicit = _first_nonempty_text(
-        getattr(args, "workflow_validation_run_id", None),
-        os.environ.get("OUROBOROS_WORKFLOW_VALIDATION_RUN_ID"),
-    )
-    if explicit:
-        return explicit
-    github_run = _first_nonempty_text(os.environ.get("GITHUB_RUN_ID"))
-    github_attempt = _first_nonempty_text(os.environ.get("GITHUB_RUN_ATTEMPT"))
-    if github_run and github_attempt:
-        return f"{github_run}-{github_attempt}"
-    if github_run:
-        return github_run
-    return f"local-{int(time.time())}"
-
-
 def _build_kaggle_creds(args: argparse.Namespace) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
     return {
         "A": (args.kaggle_username_a, args.kaggle_key_a),
@@ -564,19 +514,6 @@ def _refuse_if_foreign_mac_claim_active(args: argparse.Namespace) -> bool:
         f"claim_id={claim.get('claim_id')} expires_at={claim.get('expires_at')}"
     )
     return True
-
-
-def _workflow_validation_worker_ids(args: argparse.Namespace) -> List[str]:
-    if args.force_worker_ids:
-        requested = _ordered_unique_worker_ids(
-            [w.strip().upper() for w in str(args.force_worker_ids).split(",") if w.strip()]
-        )
-        if requested:
-            return requested
-    # CPU smoke should be a one-click validation path. Defaulting to Worker A keeps
-    # it deterministic and avoids accidentally pushing three notebooks when the
-    # operator only wanted to prove the end-to-end plumbing.
-    return ["A"]
 
 
 def _kaggle_eval_worker_ids(args: argparse.Namespace) -> List[str]:
@@ -869,99 +806,11 @@ def run_kaggle_dgac_diloco(args: argparse.Namespace) -> None:
     )
 
 
-def _is_matching_cpu_smoke_status(status: Optional[Dict], *, worker_id: str, run_id: str) -> bool:
-    if not isinstance(status, dict):
-        return False
-    return (
-        str(status.get("worker_id", "")).upper() == worker_id
-        and str(status.get("validation_mode", "")).lower() == CPU_SMOKE_MODE
-        and str(status.get("validation_run_id", "")) == run_id
-        and status.get("status") == "done"
-    )
-
-
-def _poll_cpu_smoke_validation_status(
-    *,
-    repo_id: str,
-    token: str,
-    worker_ids: List[str],
-    run_id: str,
-    timeout_s: float,
-    poll_s: float,
-) -> Dict[str, Dict]:
-    deadline = time.time() + max(float(timeout_s), 0.0)
-    poll_s = max(float(poll_s), 0.1)
-    latest: Dict[str, Optional[Dict]] = {}
-    while True:
-        ready: Dict[str, Dict] = {}
-        for worker_id in worker_ids:
-            status_path, _ = workflow_validation_remote_paths(run_id=run_id, worker_id=worker_id)
-            status = hub_download_json(repo_id, status_path, token)
-            latest[worker_id] = status
-            if _is_matching_cpu_smoke_status(status, worker_id=worker_id, run_id=run_id):
-                ready[worker_id] = status
-            else:
-                print(f"[workflow-validate] Waiting for Worker {worker_id} status at {status_path}: {status}")
-        if len(ready) == len(worker_ids):
-            return ready
-        if time.time() >= deadline:
-            raise TimeoutError(
-                "Timed out waiting for CPU-smoke validation status artifacts: "
-                f"run_id={run_id} latest={latest}"
-            )
-        time.sleep(poll_s)
-
-
-def run_workflow_validation(args: argparse.Namespace) -> None:
-    mode = _workflow_validation_mode_from_args(args)
-    if mode != CPU_SMOKE_MODE:
-        raise ValueError(f"Unsupported workflow validation mode: {mode!r}")
-
-    worker_ids = _workflow_validation_worker_ids(args)
-    run_id = _workflow_validation_run_id_from_args(args)
-    kaggle_creds = _build_kaggle_creds(args)
-    print(
-        "[workflow-validate] Starting CPU-smoke validation "
-        f"run_id={run_id} workers={worker_ids} repo={args.repo_id}"
-    )
-    if args.dry_run:
-        print("[workflow-validate] DRY RUN — no Kaggle dispatch or polling.")
-        return
-
-    dispatch_results = trigger_kaggle_workers(
-        kaggle_creds,
-        active_workers=worker_ids,
-        notebook_path=Path(args.kaggle_notebook_path),
-        coordinator_args=args,
-    )
-    if any(dispatch_results.get(worker_id) != "success" for worker_id in worker_ids):
-        raise RuntimeError(
-            "CPU-smoke validation dispatch failed; refusing to pass end-to-end gate: "
-            f"{dispatch_results}"
-        )
-
-    ready = _poll_cpu_smoke_validation_status(
-        repo_id=args.repo_id,
-        token=args.hf_token,
-        worker_ids=worker_ids,
-        run_id=run_id,
-        timeout_s=args.workflow_validation_timeout_s,
-        poll_s=args.workflow_validation_poll_s,
-    )
-    print(
-        "[workflow-validate] CPU-smoke validation verified via remote Hub artifacts: "
-        f"{sorted(ready)}"
-    )
-
-
 def main() -> None:
     args = parse_args()
     if not args.hf_token:
         raise SystemExit("HF token required. Set HF_TOKEN or pass --hf_token.")
 
-    if _workflow_validation_mode_from_args(args):
-        run_workflow_validation(args)
-        return
 
     if _refuse_if_foreign_mac_claim_active(args):
         return
