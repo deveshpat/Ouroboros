@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from ouroboros.diloco import aggregation
+from ouroboros.coordinator import aggregation
 
 
 def _monolith_weighted_average(anchor_weights, worker_weights, worker_samples, outer_lr):

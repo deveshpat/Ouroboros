@@ -38,14 +38,14 @@ Install:
              There is NO fallback to slow path — a broken kernel wastes 500s/step.
 
 Run (smoke test, Kaggle):
-  !python jamba_coconut_finetune.py \
+  !python -m ouroboros.coconut \
     --data_dir data/coconut_v1 --use_4bit \
     --epochs_per_stage 1 --max_stage 2 --max_samples 200 \
     --max_seq_len 1024 --max_grad_norm 0.3 \
     --session_timeout_hours 1.5 --wandb_mode disabled --output_dir runs/smoke
 
 Run (Phase 3.1 through 3.K, Kaggle Dual GPU):
-  !torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
+  !torchrun --standalone --nproc_per_node=2 -m ouroboros.coconut \
     --data_dir data/coconut_v1 --use_4bit \
     --epochs_per_stage 3 --max_stage 10 --batch_size 2 --grad_accum 8 \
     --max_grad_norm 0.3 \
@@ -54,7 +54,7 @@ Run (Phase 3.1 through 3.K, Kaggle Dual GPU):
     --output_dir runs/stage3_curriculum
 
 Run (Phase 3.4, DGAC gate, from Stage K best checkpoint):
-  !python jamba_coconut_finetune.py \
+  !python -m ouroboros.coconut \
     --data_dir data/coconut_v1 --use_4bit \
     --use_halt_gate --resume_from runs/stage3_curriculum/stage_10/best \
     --epochs_per_stage 3 --output_dir runs/stage3_dgac
@@ -867,7 +867,7 @@ def _bootstrap() -> None:
 def _print_bootstrap_free_help_and_exit() -> None:
     """Render the stable CLI help surface without bootstrap or ML imports."""
     print(
-        "usage: jamba_coconut_finetune.py [-h] [--model_id MODEL_ID] "
+        "usage: -m ouroboros.coconut [-h] [--model_id MODEL_ID] "
         "[--max_seq_len MAX_SEQ_LEN] [--use_4bit] [--data_dir DATA_DIR] "
         "[--max_stage MAX_STAGE] [--epochs_per_stage EPOCHS_PER_STAGE] "
         "[--batch_size BATCH_SIZE] [--grad_accum GRAD_ACCUM] "
@@ -4599,7 +4599,7 @@ def main() -> None:
                     best_k_dir = output_dir / f"stage_{curriculum_max_stage}" / "best"
                     print(
                         "  Phase 3.4 (DGAC):\n"
-                        f"    python jamba_coconut_finetune.py --use_halt_gate "
+                        f"    python -m ouroboros.coconut --use_halt_gate "
                         f"--resume_from {best_k_dir} "
                         f"--output_dir {args.output_dir}_dgac [...]"
                     )

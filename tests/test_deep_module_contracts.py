@@ -4,7 +4,7 @@ import argparse
 
 
 def test_kaggle_launch_contracts_cover_runtime_modes_and_policies():
-    from ouroboros.kaggle_contract import (
+    from ouroboros.coordinator.kaggle_contract import (
         CPU_SMOKE_MODE,
         DGAC_CANARY_RUN_MODE,
         DGAC_DILOCO_RUN_MODE,
@@ -44,7 +44,7 @@ def test_kaggle_launch_contracts_cover_runtime_modes_and_policies():
 
 
 def test_training_session_planner_classifies_branches_without_heavy_imports():
-    from ouroboros.training_plan import TrainingPlanKind, plan_training_session
+    from ouroboros.coconut.training_plan import TrainingPlanKind, plan_training_session
 
     base = argparse.Namespace(
         diloco_mode=False,
@@ -92,7 +92,7 @@ def test_training_session_planner_classifies_branches_without_heavy_imports():
 
 
 def test_worker_lifecycle_classifier_expresses_training_attendance_and_passthrough():
-    from ouroboros.worker_lifecycle import WorkerLifecycleKind, classify_worker_lifecycle
+    from ouroboros.coordinator.worker_lifecycle import WorkerLifecycleKind, classify_worker_lifecycle
 
     state = {"triggered_workers": ["A"], "attendance_workers": ["B"], "stage_k": 1, "round_n": 2}
 
@@ -135,8 +135,8 @@ def test_worker_lifecycle_classifier_expresses_training_attendance_and_passthrou
 
 
 def test_coordinator_decision_module_plans_force_repair_and_dispatch_reconcile():
-    from ouroboros.coordinator_decision import plan_force_repair, plan_round_start
-    from ouroboros.diloco.state import _reconcile_post_dispatch_state
+    from ouroboros.coordinator.decision import plan_force_repair, plan_round_start
+    from ouroboros.coordinator.state import _reconcile_post_dispatch_state
 
     state = {
         "stage_k": 2,
@@ -191,7 +191,7 @@ def test_coordinator_decision_module_plans_force_repair_and_dispatch_reconcile()
 
 
 def test_coordinator_transition_planner_handles_waiting_mode_actions():
-    from ouroboros.coordinator_decision import plan_round_start, plan_waiting_mode_transition
+    from ouroboros.coordinator.decision import plan_round_start, plan_waiting_mode_transition
 
     state = {
         "stage_k": 10,
@@ -266,7 +266,7 @@ def test_coordinator_transition_planner_handles_waiting_mode_actions():
 
 
 def test_coordinator_transition_planner_handles_missing_worker_repair_and_unconfirmed_dispatch():
-    from ouroboros.coordinator_decision import plan_missing_worker_transition
+    from ouroboros.coordinator.decision import plan_missing_worker_transition
 
     state = {
         "stage_k": 10,
@@ -334,7 +334,7 @@ def test_coordinator_transition_planner_handles_missing_worker_repair_and_unconf
 
 
 def test_coordinator_post_aggregation_planner_handles_terminal_and_absent_transitions():
-    from ouroboros.coordinator_decision import plan_post_aggregation_transition
+    from ouroboros.coordinator.decision import plan_post_aggregation_transition
 
     base_state = {
         "stage_k": 10,
@@ -437,7 +437,7 @@ def test_coordinator_post_aggregation_planner_handles_terminal_and_absent_transi
 
 
 def test_dispatch_reconciliation_is_owned_by_decision_layer():
-    from ouroboros.coordinator_decision import plan_dispatch_reconciliation
+    from ouroboros.coordinator.decision import plan_dispatch_reconciliation
 
     plan = plan_dispatch_reconciliation(
         state={"mode": "diloco", "triggered_workers": ["A", "B"], "attendance_workers": []},

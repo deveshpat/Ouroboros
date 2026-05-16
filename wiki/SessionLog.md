@@ -92,19 +92,19 @@
 
 **Fix:** added `wiki/Architecture-Extraction.md` and `wiki/Engineering-Workflow.md`, updated `BLUEPRINT.md`/`STATUS.md`, and retired completed training/coordinator PRD/plan files.
 
-**Guardrail:** `tests/test_source_of_truth_contract.py` now checks that completed extraction decisions live in wiki docs and that obsolete plan files are absent.
+**Guardrail:** `tests/test_minimal_runtime_public_architecture.py` now checks that current architecture docs describe seven package roots and that obsolete root scripts stay retired.
 
 ---
 
 ## Session 23 — coordinator zero-drift extraction and adapter thinning (2026-05-04) ✅
 
-**Goal:** extract `diloco_coordinator.py` without changing CLI, Hub state, Kaggle dispatch, aggregation math, or recovery behavior.
+**Goal:** extract coordinator behavior without changing CLI, Hub state, Kaggle dispatch, aggregation math, or recovery behavior.
 
-**Result:** root `diloco_coordinator.py` became a thin compatibility adapter. Coordinator behavior now lives in:
-- `ouroboros.diloco.aggregation`
-- `ouroboros.diloco.state`
-- `ouroboros.diloco.dispatch`
-- `ouroboros.diloco.coordinator`
+**Result:** `python -m ouroboros.coordinator` became the package-owned Coordinator entrypoint. Coordinator behavior lives in:
+- `ouroboros.coordinator.aggregation`
+- `ouroboros.coordinator.state`
+- `ouroboros.coordinator.dispatch`
+- `ouroboros.coordinator.coordinator`
 
 **Tests added:** aggregation, state, dispatch, orchestration, adapter, and source-of-truth guardrails.
 
@@ -114,11 +114,11 @@
 
 ## Session 22 — training monolith extraction and Kaggle launch seam (2026-05-04) ✅
 
-**Goal:** extract the training monolith while preserving runtime behavior, then thin `jamba_coconut_finetune.py` into a compatibility adapter.
+**Goal:** extract the training monolith while preserving runtime behavior, then move the operator surface to `python -m ouroboros.coconut`.
 
-**Result:** reusable behavior moved under `ouroboros/*`; the root training script now owns process startup and delegates to `ouroboros.train.run_cli`.
+**Result:** reusable behavior moved under `ouroboros/*`; `python -m ouroboros.coconut` now owns process startup and delegates to `ouroboros.coconut.run_cli`.
 
-**Kaggle contract:** `kaggle-utils.ipynb` remains a thin adapter and preserves the IPython shell-magic launch seam (`!{shell_command}`) instead of using Python `subprocess.run`; command argv comes from `ouroboros.kaggle_launch_matrix`.
+**Kaggle contract:** `kaggle-utils.ipynb` remains a thin adapter and preserves the IPython shell-magic launch seam (`!{shell_command}`) instead of using Python `subprocess.run`; command argv comes from `ouroboros.coordinator.kaggle_launch_matrix`.
 
 **Artifact hygiene:** generated `signals/*.json` files are runtime artifacts and should not be tracked; `signals/.gitkeep` keeps the directory present.
 
@@ -132,8 +132,8 @@
 
 **Fix (3 files):**
 - `.github/workflows/diloco_coordinator.yml`: `kaggle>=1.8.4`
-- `diloco_coordinator.py`: `"NvidiaTeslaT4"` in JSON + `--accelerator NvidiaTeslaT4` in push_args
-- `jamba_coconut_finetune.py`: `cc < (7,5)` guard → `_diloco_reset_triggered_at()` + signal + exit
+- `-m ouroboros.coordinator`: `"NvidiaTeslaT4"` in JSON + `--accelerator NvidiaTeslaT4` in push_args
+- `-m ouroboros.coconut`: `cc < (7,5)` guard → `_diloco_reset_triggered_at()` + signal + exit
 
 **Status:** No P100 assignment observed since deployment.
 

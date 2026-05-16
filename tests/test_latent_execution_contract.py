@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
 import torch
 from torch import nn
-from transformers import JambaConfig, JambaForCausalLM
 
-from ouroboros.data import build_sample_at_stage, collate_stage_k
-from ouroboros.latent import (
+from ouroboros.coconut import build_sample_at_stage, collate_stage_k
+from ouroboros.coconut import (
     compute_ce_from_hidden,
     compute_ce_mean_by_row,
     compute_ce_sum_and_count,
@@ -77,6 +77,9 @@ def test_run_latent_passes_allows_halt_gate_to_reduce_actual_depth():
 
 
 def test_cached_latent_pass_matches_jamba_prefix_recompute_and_restores_checkpointing():
+    transformers = pytest.importorskip("transformers")
+    JambaConfig = transformers.JambaConfig
+    JambaForCausalLM = transformers.JambaForCausalLM
     config = JambaConfig(
         vocab_size=64,
         hidden_size=32,

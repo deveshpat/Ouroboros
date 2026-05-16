@@ -21,9 +21,9 @@ Add a CPU-safe validation seam that exercises Kaggle workflow plumbing without i
 
 ## Implementation Decisions
 
-- `ouroboros.kaggle_runtime` owns testable repo/ref/commit checkout helpers for the Kaggle runtime contract.
-- `ouroboros.workflow_validation` owns the CPU-smoke validation branch and emits a coordinator-compatible local status JSON plus a report JSON. When `OUROBOROS_WORKFLOW_VALIDATION_PUBLISH=1`, it also publishes both artifacts to Hub.
-- `ouroboros.workflow_validation_worker` is a tiny stdlib-only fake worker command used as a command-construction contract; it does not import training dependencies.
+- `ouroboros.utils.kaggle_runtime` owns testable repo/ref/commit checkout helpers for the Kaggle runtime contract.
+- `ouroboros.eval.smoke` owns the CPU-smoke validation branch and emits a coordinator-compatible local status JSON plus a report JSON. When `OUROBOROS_WORKFLOW_VALIDATION_PUBLISH=1`, it also publishes both artifacts to Hub.
+- `ouroboros.eval.smoke_worker` is a tiny stdlib-only fake worker command used as a command-construction contract; it does not import training dependencies.
 - `OUROBOROS_WORKFLOW_VALIDATE=cpu-smoke` is the validation switch.
 - Remote validation artifacts live under `diloco_state/workflow_validation/<run_id>/worker_<id>_status.json` and `diloco_state/workflow_validation/<run_id>/worker_<id>_report.json`.
 - Coordinator validation mode runs before reading `round_state.json`, defaults to Worker A when `force_worker_ids` is empty, and polls those remote artifacts before passing the GitHub Actions job.
@@ -95,9 +95,9 @@ Regression chunks used during implementation:
 
 ```bash
 python -m pytest tests/test_bootstrap_cli_contract.py tests/test_checkpoint_smoke_training.py
-python -m pytest tests/test_data_coconut_fake.py tests/test_dgac_anchor_cli_contract.py tests/test_diloco_coordinator_adapter.py tests/test_diloco_coordinator_aggregation.py
+python -m pytest tests/test_data_coconut_fake.py tests/test_dgac_anchor_cli_contract.py tests/test_diloco_coordinator_aggregation.py
 python -m pytest tests/test_diloco_coordinator_dispatch.py tests/test_diloco_coordinator_orchestration.py tests/test_diloco_coordinator_state.py tests/test_diloco_worker_fake.py
-python -m pytest tests/test_kaggle_cpu_api_workflow_validation.py tests/test_kaggle_launch_contract.py tests/test_kaggle_notebook_contract.py tests/test_kaggle_runtime_contract.py tests/test_source_of_truth_contract.py tests/test_training_entrypoint_adapter.py tests/test_validation_no_drift.py
+python -m pytest tests/test_kaggle_cpu_api_workflow_validation.py tests/test_kaggle_launch_contract.py tests/test_kaggle_notebook_contract.py tests/test_kaggle_runtime_contract.py tests/test_validation_no_drift.py
 ```
 
 ## Out of Scope

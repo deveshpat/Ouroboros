@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ouroboros.diloco import coordinator
-from ouroboros.mac_dgac_fallback import MAC_DGAC_CLAIM_PATH
+from ouroboros.coordinator import coordinator
+from ouroboros.coordinator.mac_dgac_fallback import MAC_DGAC_CLAIM_PATH
 
 
 def _args(**overrides):
@@ -160,6 +160,7 @@ def test_packaged_coordinator_dgac_train_uses_one_forced_worker_only(monkeypatch
         return {worker_id: "success" for worker_id in active_workers}
 
     monkeypatch.setattr(coordinator, "trigger_kaggle_workers", fake_trigger)
+    monkeypatch.setattr(coordinator, "hub_download_json", lambda *args, **kwargs: None)
 
     coordinator.main()
 
@@ -183,6 +184,7 @@ def test_packaged_coordinator_dgac_anchor_eval_respects_force_worker_ids(monkeyp
         return {worker_id: "success" for worker_id in active_workers}
 
     monkeypatch.setattr(coordinator, "trigger_kaggle_workers", fake_trigger)
+    monkeypatch.setattr(coordinator, "hub_download_json", lambda *args, **kwargs: None)
 
     coordinator.main()
 

@@ -4,7 +4,7 @@ import sys
 
 import torch
 
-from ouroboros.benchmark_harness import (
+from ouroboros.eval.benchmark_harness import (
     _filter_vocab_mismatched_weights,
     build_lm_eval_argv,
     build_model_args,
@@ -81,7 +81,7 @@ def test_build_lm_eval_argv_is_reproducible_and_keeps_limit_optional():
         limit="100",
     )
 
-    assert command[:3] == [sys.executable, "-m", "ouroboros.lm_eval_bootstrap"]
+    assert command[:3] == [sys.executable, "-m", "ouroboros.eval.lm_eval_bootstrap"]
     assert command[command.index("--model") + 1] == "hf"
     assert command[command.index("--tasks") + 1] == "arc_easy,hellaswag"
     assert command[command.index("--output_path") + 1] == "runs/bench"

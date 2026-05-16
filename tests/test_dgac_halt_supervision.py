@@ -4,15 +4,15 @@ import argparse
 
 import torch
 
-from ouroboros.data import build_sample_at_stage, collate_stage_k
-from ouroboros.dgac import (
+from ouroboros.coconut import build_sample_at_stage, collate_stage_k
+from ouroboros.coconut import (
     HaltGate,
     build_dgac_halt_probe_depths,
     build_halt_supervision_labels,
     coconut_forward,
     construct_dgac_halt_targets,
 )
-from ouroboros.cli import parse_args
+from ouroboros.coconut.cli import parse_args
 from tests.fakes.eval_fakes import FakeCausalLM, FakeTokenizer
 
 

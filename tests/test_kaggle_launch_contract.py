@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from ouroboros.kaggle import (
+from ouroboros.coordinator.kaggle_commands import (
     BENCHMARK_RUN_MODE,
     DGAC_ANCHOR_EVAL_RUN_MODE,
     DGAC_CANARY_RUN_MODE,
@@ -40,7 +40,7 @@ def test_resolve_diloco_worker_id_rejects_missing_or_invalid_values():
 def test_build_diloco_training_command_preserves_notebook_launch_contract():
     command = build_diloco_training_command(worker_id="b")
 
-    assert command[:4] == ["torchrun", "--standalone", "--nproc_per_node=2", "jamba_coconut_finetune.py"]
+    assert command[:5] == ["torchrun", "--standalone", "--nproc_per_node=2", "-m", "ouroboros.coconut"]
     assert "--data_dir" in command and "data/coconut_v1" in command
     assert "--use_4bit" in command
     assert "--latent_cache" in command
@@ -157,7 +157,7 @@ def test_resolve_kaggle_run_mode_defaults_to_diloco_and_accepts_dgac_modes():
 def test_build_dgac_training_command_loads_anchor_trains_halt_gate_and_pushes_checkpoints():
     command = build_dgac_training_command()
 
-    assert command[:4] == ["torchrun", "--standalone", "--nproc_per_node=2", "jamba_coconut_finetune.py"]
+    assert command[:5] == ["torchrun", "--standalone", "--nproc_per_node=2", "-m", "ouroboros.coconut"]
     assert "--use_halt_gate" in command
     assert "--resume_from_diloco_anchor" in command
     assert "--eval_only" not in command
@@ -201,7 +201,7 @@ def test_build_dgac_training_command_allows_safe_overrides():
 def test_build_dgac_canary_command_is_bounded_and_does_not_push_checkpoints():
     command = build_dgac_canary_command()
 
-    assert command[:4] == ["torchrun", "--standalone", "--nproc_per_node=2", "jamba_coconut_finetune.py"]
+    assert command[:5] == ["torchrun", "--standalone", "--nproc_per_node=2", "-m", "ouroboros.coconut"]
     assert "--use_halt_gate" in command
     assert "--resume_from_diloco_anchor" in command
     assert "--latent_cache" in command
@@ -219,7 +219,7 @@ def test_build_dgac_canary_command_is_bounded_and_does_not_push_checkpoints():
 def test_build_dgac_anchor_eval_command_loads_anchor_and_skips_training():
     command = build_dgac_anchor_eval_command()
 
-    assert command[:4] == ["torchrun", "--standalone", "--nproc_per_node=2", "jamba_coconut_finetune.py"]
+    assert command[:5] == ["torchrun", "--standalone", "--nproc_per_node=2", "-m", "ouroboros.coconut"]
     assert "--use_halt_gate" in command
     assert "--resume_from_diloco_anchor" in command
     assert "--eval_only" in command
@@ -263,7 +263,7 @@ def test_build_dgac_anchor_eval_command_allows_safe_overrides():
 def test_build_lm_eval_benchmark_command_loads_anchor_adapter_with_harness():
     command = build_lm_eval_benchmark_command()
 
-    assert command[:3] == ["python", "-m", "ouroboros.benchmark_harness"]
+    assert command[:3] == ["python", "-m", "ouroboros.eval.benchmark_harness"]
     assert command[command.index("--tasks") + 1] == "arc_easy,hellaswag,winogrande"
     assert command[command.index("--output_dir") + 1] == "runs/lm_eval_benchmark"
     assert command[command.index("--base_model") + 1] == "ai21labs/AI21-Jamba-Reasoning-3B"
@@ -306,8 +306,8 @@ def test_build_lm_eval_benchmark_command_allows_safe_overrides():
 
 
 def test_format_shell_command_quotes_arguments_for_notebook_logging():
-    command = ["python", "jamba_coconut_finetune.py", "--output_dir", "runs/with spaces"]
-    assert format_shell_command(command) == "python jamba_coconut_finetune.py --output_dir 'runs/with spaces'"
+    command = ["python", "-m", "ouroboros.coconut", "--output_dir", "runs/with spaces"]
+    assert format_shell_command(command) == "python -m ouroboros.coconut --output_dir 'runs/with spaces'"
 
 
 def test_kaggle_secret_presence_reports_booleans_without_values(monkeypatch):

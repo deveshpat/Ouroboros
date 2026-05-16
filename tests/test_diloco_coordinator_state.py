@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ouroboros.diloco import state
+from ouroboros.coordinator import state
 
 
 def test_worker_ordering_mode_selection_and_projected_shards_match_coordinator_contract():

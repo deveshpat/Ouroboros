@@ -7,7 +7,7 @@ import os
 import zlib
 from pathlib import Path
 
-from ouroboros.diloco import dispatch
+from ouroboros.coordinator import dispatch
 
 
 def _decode_payload(payload: str) -> dict[str, str]:

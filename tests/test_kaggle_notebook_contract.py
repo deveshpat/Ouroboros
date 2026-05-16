@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ouroboros.kaggle_contract import (
+from ouroboros.coordinator.kaggle_contract import (
     BENCHMARK_RUN_MODE,
     DGAC_ANCHOR_EVAL_RUN_MODE,
     DGAC_CANARY_RUN_MODE,
@@ -11,7 +11,7 @@ from ouroboros.kaggle_contract import (
     DGAC_TRAIN_RUN_MODE,
     DILOCO_RUN_MODE,
 )
-from ouroboros.kaggle_launch_matrix import build_launch_command
+from ouroboros.coordinator.kaggle_launch_matrix import build_launch_command
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = REPO_ROOT / "kaggle-utils.ipynb"
@@ -25,12 +25,12 @@ def _notebook_source() -> str:
 def test_kaggle_notebook_keeps_shell_magic_not_python_subprocess():
     source = _notebook_source()
 
-    assert "from ouroboros.kaggle import" in source
+    assert "from ouroboros.coordinator.kaggle_commands import" in source
     assert "resolve_diloco_worker_id" in source
     assert "resolve_kaggle_run_mode" in source
     assert "!{shell_command}" in source
     assert "subprocess.run(command, check=True)" not in source
-    assert "import subprocess" not in source.split("from ouroboros.kaggle import", 1)[-1]
+    assert "import subprocess" not in source.split("from ouroboros.coordinator.kaggle_commands import", 1)[-1]
 
 
 def test_kaggle_notebook_describes_itself_as_thin_adapter():
@@ -45,7 +45,7 @@ def test_kaggle_notebook_delegates_all_gpu_launch_argv_to_matrix():
 
     assert "build_launch_command(run_mode, os.environ, worker_id=worker_id)" in source
     assert "format_shell_command(command)" in source
-    assert "The command argv comes from ouroboros.kaggle_launch_matrix" in source
+    assert "The command argv comes from ouroboros.coordinator.kaggle_launch_matrix" in source
     assert "!torchrun --standalone" not in source
 
     forbidden_parallel_builders = (
@@ -100,7 +100,7 @@ def test_matrix_supports_expected_kaggle_gpu_modes_without_notebook_branches():
     assert "--push_to_hub" in commands[DGAC_TRAIN_RUN_MODE]
     assert "--eval_only" in commands[DGAC_ANCHOR_EVAL_RUN_MODE]
     assert "--dgac_diagnostics" in commands[DGAC_ANCHOR_EVAL_RUN_MODE]
-    assert commands[BENCHMARK_RUN_MODE][:3] == ["python", "-m", "ouroboros.benchmark_multi_gpu"]
+    assert commands[BENCHMARK_RUN_MODE][:3] == ["python", "-m", "ouroboros.eval.benchmark_multi_gpu"]
     assert "--devices" not in commands[BENCHMARK_RUN_MODE]
     assert "--tasks" in commands[BENCHMARK_RUN_MODE]
     assert "--publish_to_hub" in commands[BENCHMARK_RUN_MODE]

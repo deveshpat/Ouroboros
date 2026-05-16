@@ -5,7 +5,7 @@ import argparse
 import torch
 from torch import nn
 
-from ouroboros.train import run_dgac_diagnostics
+from ouroboros.coconut import run_dgac_diagnostics
 from tests.fakes.eval_fakes import FakeCausalLM, FakeTokenizer
 
 

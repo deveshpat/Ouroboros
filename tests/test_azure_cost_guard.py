@@ -1,6 +1,6 @@
 import pytest
 
-from ouroboros.azure_cost_guard import (
+from ouroboros.utils.azure_cost_guard import (
     AzureRetailPrice,
     build_retail_price_filter,
     estimate_cost,

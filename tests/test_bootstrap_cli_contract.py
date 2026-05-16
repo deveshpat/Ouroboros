@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TRAINING_MONOLITH = REPO_ROOT / "jamba_coconut_finetune.py"
-CLI_MODULE = REPO_ROOT / "ouroboros" / "cli.py"
+COCONUT_MAIN = REPO_ROOT / "ouroboros" / "coconut" / "__main__.py"
+CLI_MODULE = REPO_ROOT / "ouroboros" / "coconut" / "cli.py"
 
 
 def test_cli_module_import_is_bootstrap_safe_and_does_not_import_torch():
@@ -17,7 +17,7 @@ def test_cli_module_import_is_bootstrap_safe_and_does_not_import_torch():
         [
             sys.executable,
             "-c",
-            "import sys; import ouroboros.cli; raise SystemExit('torch' in sys.modules)",
+            "import sys; import ouroboros.coconut.cli; raise SystemExit('torch' in sys.modules)",
         ],
         cwd=str(REPO_ROOT),
         env=env,
@@ -31,8 +31,8 @@ def test_cli_module_import_is_bootstrap_safe_and_does_not_import_torch():
 
 
 def test_critical_env_vars_are_set_before_train_imports():
-    source = TRAINING_MONOLITH.read_text(encoding="utf-8")
-    train_import = source.index("from ouroboros.train import run_cli")
+    source = COCONUT_MAIN.read_text(encoding="utf-8")
+    train_import = source.index("from ouroboros.coconut import run_cli")
     for env_name in (
         "PYTORCH_CUDA_ALLOC_CONF",
         "TORCH_NCCL_ASYNC_ERROR_HANDLING",
@@ -45,21 +45,21 @@ def test_critical_env_vars_are_set_before_train_imports():
 
 
 def test_bootstrap_call_stays_before_train_import_for_real_execution():
-    source = TRAINING_MONOLITH.read_text(encoding="utf-8")
+    source = COCONUT_MAIN.read_text(encoding="utf-8")
     help_guard = source.index('if any(arg in {"-h", "--help"}')
     bootstrap_call = source.index("    ensure_environment()")
-    train_import = source.index("from ouroboros.train import run_cli")
+    train_import = source.index("from ouroboros.coconut import run_cli")
     cli_help_call = source.index("print_bootstrap_free_help_and_exit", 0)
-    assert cli_help_call < help_guard < bootstrap_call < train_import
+    assert help_guard < cli_help_call < bootstrap_call < train_import
     assert '{"-h", "--help"}' in source[help_guard:train_import]
-    assert "from ouroboros.cli import print_bootstrap_free_help_and_exit" in source[:train_import]
+    assert "from ouroboros.coconut.cli import print_bootstrap_free_help_and_exit" in source[:train_import]
 
 
 def test_cli_help_exits_without_bootstrap_or_cuda_side_effects():
     env = os.environ.copy()
     env.setdefault("PYTHONPATH", str(REPO_ROOT))
     completed = subprocess.run(
-        [sys.executable, str(TRAINING_MONOLITH), "--help"],
+        [sys.executable, "-m", "ouroboros.coconut", "--help"],
         cwd=str(REPO_ROOT),
         env=env,
         text=True,
@@ -98,7 +98,7 @@ def test_cli_defaults_and_worker_normalization_match_source_contract():
     ):
         assert contract in source
 
-    monolith_source = TRAINING_MONOLITH.read_text(encoding="utf-8")
-    assert "from ouroboros.cli import parse_args" in monolith_source
-    assert "args = parse_args(argv)" in monolith_source
-    assert "from ouroboros.train import run_cli" in monolith_source
+    main_source = COCONUT_MAIN.read_text(encoding="utf-8")
+    assert "from ouroboros.coconut.cli import parse_args" in main_source
+    assert "parse_args(argv)" in main_source
+    assert "from ouroboros.coconut import run_cli" in main_source

@@ -5,16 +5,16 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TRAINING_MONOLITH = REPO_ROOT / "jamba_coconut_finetune.py"
-MODULAR_TRAIN = REPO_ROOT / "ouroboros" / "train.py"
-SESSION_MODULE = REPO_ROOT / "ouroboros" / "training" / "session.py"
+COCONUT_MAIN = REPO_ROOT / "ouroboros" / "coconut" / "__main__.py"
+COCONUT_RUNNER = REPO_ROOT / "ouroboros" / "coconut" / "runner.py"
+SESSION_MODULE = REPO_ROOT / "ouroboros" / "coconut" / "session.py"
 BLUEPRINT = REPO_ROOT / "BLUEPRINT.md"
-CLI_MODULE = REPO_ROOT / "ouroboros" / "cli.py"
+CLI_MODULE = REPO_ROOT / "ouroboros" / "coconut" / "cli.py"
 
 
 def test_dgac_anchor_flag_is_exposed_by_bootstrap_free_help():
     completed = subprocess.run(
-        [sys.executable, str(TRAINING_MONOLITH), "--help"],
+        [sys.executable, "-m", "ouroboros.coconut", "--help"],
         cwd=str(REPO_ROOT),
         text=True,
         stdout=subprocess.PIPE,
@@ -29,18 +29,18 @@ def test_dgac_anchor_flag_is_exposed_by_bootstrap_free_help():
 
 def test_dgac_anchor_launch_contract_matches_root_modular_and_cli_entrypoints():
     blueprint_source = BLUEPRINT.read_text(encoding="utf-8")
-    monolith_source = TRAINING_MONOLITH.read_text(encoding="utf-8")
-    modular_source = MODULAR_TRAIN.read_text(encoding="utf-8")
+    main_source = COCONUT_MAIN.read_text(encoding="utf-8")
+    runner_source = COCONUT_RUNNER.read_text(encoding="utf-8")
     session_source = SESSION_MODULE.read_text(encoding="utf-8")
     cli_source = CLI_MODULE.read_text(encoding="utf-8")
 
     assert "--use_halt_gate --resume_from_diloco_anchor" in blueprint_source
     assert '"--resume_from_diloco_anchor",' in cli_source
 
-    assert "from ouroboros.train import run_cli" in monolith_source
-    assert "from ouroboros.cli import parse_args" in monolith_source
+    assert "from ouroboros.coconut import run_cli" in main_source
+    assert "from ouroboros.coconut.cli import parse_args" in main_source
 
-    assert "run_training_session" in modular_source
+    assert "run_training_session" in runner_source
     assert "--resume_from_diloco_anchor" in session_source
     assert "diloco_download_anchor" in session_source
     assert "Loading DiLoCo anchor" in session_source
@@ -49,7 +49,7 @@ def test_dgac_anchor_launch_contract_matches_root_modular_and_cli_entrypoints():
 
 
 def test_eval_only_flag_is_exposed_by_bootstrap_free_help_and_cli_parser():
-    from ouroboros.cli import bootstrap_free_help_text, parse_args
+    from ouroboros.coconut.cli import bootstrap_free_help_text, parse_args
 
     help_text = bootstrap_free_help_text()
     assert "--eval_only" in help_text
@@ -76,11 +76,11 @@ def test_eval_only_flag_is_exposed_by_bootstrap_free_help_and_cli_parser():
 def test_dgac_anchor_eval_only_loads_anchor_evaluates_and_skips_training(monkeypatch, tmp_path, capsys):
     import time
 
-    from ouroboros.cli import parse_args
-    from ouroboros import train as train_module
-    from ouroboros.diloco import worker as worker_module
-    from ouroboros.training import evaluation as evaluation_module
-    from ouroboros.training import session as session_module
+    from ouroboros.coconut.cli import parse_args
+    from ouroboros import coconut as train_module
+    from ouroboros.coordinator import worker as worker_module
+    from ouroboros.coconut import evaluation as evaluation_module
+    from ouroboros.coconut import session as session_module
     from tests.fakes.eval_fakes import FakeCausalLM, FakeTokenizer
 
     calls = []
@@ -151,11 +151,11 @@ def test_dgac_anchor_eval_only_loads_anchor_evaluates_and_skips_training(monkeyp
 def test_dgac_anchor_eval_only_runs_halt_gate_diagnostics_when_requested(monkeypatch, tmp_path):
     import time
 
-    from ouroboros.cli import parse_args
-    from ouroboros import train as train_module
-    from ouroboros.diloco import worker as worker_module
-    from ouroboros.training import evaluation as evaluation_module
-    from ouroboros.training import session as session_module
+    from ouroboros.coconut.cli import parse_args
+    from ouroboros import coconut as train_module
+    from ouroboros.coordinator import worker as worker_module
+    from ouroboros.coconut import evaluation as evaluation_module
+    from ouroboros.coconut import session as session_module
     from tests.fakes.eval_fakes import FakeCausalLM, FakeTokenizer
 
     calls = []
@@ -237,11 +237,11 @@ def test_dgac_anchor_eval_only_runs_halt_gate_diagnostics_when_requested(monkeyp
 def test_dgac_anchor_eval_only_can_skip_known_validation_and_run_diagnostics_only(monkeypatch, tmp_path):
     import time
 
-    from ouroboros.cli import parse_args
-    from ouroboros import train as train_module
-    from ouroboros.diloco import worker as worker_module
-    from ouroboros.training import evaluation as evaluation_module
-    from ouroboros.training import session as session_module
+    from ouroboros.coconut.cli import parse_args
+    from ouroboros import coconut as train_module
+    from ouroboros.coordinator import worker as worker_module
+    from ouroboros.coconut import evaluation as evaluation_module
+    from ouroboros.coconut import session as session_module
     from tests.fakes.eval_fakes import FakeCausalLM, FakeTokenizer
 
     calls = []

@@ -4,7 +4,7 @@ import base64
 import subprocess
 from pathlib import Path
 
-from ouroboros.kaggle_runtime import (
+from ouroboros.utils.kaggle_runtime import (
     build_authenticated_git_env,
     copy_runtime_files,
     fetch_and_checkout,
@@ -35,7 +35,7 @@ def test_resolve_kaggle_repo_spec_uses_runtime_env_over_defaults(tmp_path):
     assert spec.repo_commit == "abc123"
     assert spec.repo_dir == tmp_path / "repo"
     assert spec.target_dir == tmp_path / "working"
-    assert spec.files_to_copy == ("jamba_coconut_finetune.py", "ouroboros/")
+    assert spec.files_to_copy == ("ouroboros/",)
 
 
 def test_build_authenticated_git_env_adds_github_header_without_mutating_source_env():
@@ -105,13 +105,11 @@ def test_copy_runtime_files_replaces_package_without_pycache(tmp_path):
     (repo / "ouroboros" / "__pycache__").mkdir(parents=True)
     (repo / "ouroboros" / "__init__.py").write_text("# package\n", encoding="utf-8")
     (repo / "ouroboros" / "__pycache__" / "stale.pyc").write_text("stale", encoding="utf-8")
-    (repo / "jamba_coconut_finetune.py").write_text("print('adapter')\n", encoding="utf-8")
     (target / "ouroboros").mkdir(parents=True)
     (target / "ouroboros" / "old.py").write_text("old\n", encoding="utf-8")
 
     copy_runtime_files(repo, target)
 
-    assert (target / "jamba_coconut_finetune.py").read_text(encoding="utf-8") == "print('adapter')\n"
     assert (target / "ouroboros" / "__init__.py").exists()
     assert not (target / "ouroboros" / "old.py").exists()
     assert not (target / "ouroboros" / "__pycache__").exists()

@@ -6,8 +6,8 @@ from pathlib import Path
 
 import torch
 
-from ouroboros.diloco import coordinator
-from ouroboros.mac_dgac_fallback import (
+from ouroboros.coordinator import coordinator
+from ouroboros.coordinator.mac_dgac_fallback import (
     CANARY_LATEST_DIRNAME,
     DEFAULT_MAC_DGAC_WORKERS,
     MAC_DGAC_CLAIM_PATH,
@@ -24,7 +24,7 @@ from ouroboros.mac_dgac_fallback import (
     promote_canary_output,
     prune_canary_outputs,
 )
-from ouroboros.model import _amp_dtype, _autocast_ctx
+from ouroboros.models import _amp_dtype, _autocast_ctx
 
 
 def _round_state(**overrides):
@@ -219,7 +219,7 @@ def test_local_worker_command_is_sequential_mps_safe_and_never_uses_4bit_or_gith
         wandb_project="project",
     )
 
-    assert command[:2] == [sys.executable, "jamba_coconut_finetune.py"]
+    assert command[:3] == [sys.executable, "-m", "ouroboros.coconut"]
     assert "torchrun" not in command
     assert "--use_4bit" not in command
     assert "--use_halt_gate" in command
@@ -248,7 +248,7 @@ def test_local_canary_command_profiles_without_diloco_upload_or_aggregation():
         wandb_project="project",
     )
 
-    assert command[:2] == [sys.executable, "jamba_coconut_finetune.py"]
+    assert command[:3] == [sys.executable, "-m", "ouroboros.coconut"]
     assert "--diloco_mode" not in command
     assert "--push_to_hub" not in command
     assert "--resume_from_diloco_anchor" in command
@@ -303,7 +303,7 @@ def test_local_aggregation_command_uses_skip_trigger_and_matching_claim():
         wandb_project="project",
     )
 
-    assert command[:2] == [sys.executable, "diloco_coordinator.py"]
+    assert command[:3] == [sys.executable, "-m", "ouroboros.coordinator"]
     assert "--skip_trigger" in command
     assert "--mac_claim_id" in command
     assert command[command.index("--mac_claim_id") + 1] == "mac-claim-123"

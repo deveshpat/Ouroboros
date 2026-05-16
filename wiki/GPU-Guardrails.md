@@ -21,7 +21,7 @@ Compile time: ~30 min on P100. Kaggle cancels kernel around the same time. Zero 
 |---|---|---|
 | JSON metadata field | `_build_kaggle_kernel_metadata()` | `"accelerator": "NvidiaTeslaT4"` (capital N) |
 | CLI flag | `_trigger_single_worker()` push_args | `--accelerator NvidiaTeslaT4` |
-| Runtime fast-fail | `main()` in `jamba_coconut_finetune.py` | `cc < (7,5)` → exit |
+| Runtime fast-fail | `main()` in `-m ouroboros.coconut` | `cc < (7,5)` → exit |
 
 **Requires `kaggle>=1.8.4`.** The `--accelerator` CLI flag was added in v1.8.4 (PR #907).
 Prior pin `kaggle==1.6.17` silently discarded the field. Verified working since Session 21.

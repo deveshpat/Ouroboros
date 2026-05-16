@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from ouroboros.benchmark_multi_gpu import (
+from ouroboros.eval.benchmark_multi_gpu import (
     build_sharded_lm_eval_benchmark_commands,
     resolve_benchmark_devices,
     shard_tasks,
@@ -49,8 +49,8 @@ def test_shard_tasks_rejects_empty_tasks_or_devices():
 
 
 def test_resolve_benchmark_devices_auto_detects_cuda_visible_devices(monkeypatch):
-    monkeypatch.setattr("ouroboros.benchmark_multi_gpu._torch_cuda_device_count", lambda: 0)
-    monkeypatch.setattr("ouroboros.benchmark_multi_gpu._nvidia_smi_device_count", lambda: 0)
+    monkeypatch.setattr("ouroboros.eval.benchmark_multi_gpu._torch_cuda_device_count", lambda: 0)
+    monkeypatch.setattr("ouroboros.eval.benchmark_multi_gpu._nvidia_smi_device_count", lambda: 0)
 
     assert resolve_benchmark_devices("auto", env={"CUDA_VISIBLE_DEVICES": "0,1"}) == [
         "cuda:0",

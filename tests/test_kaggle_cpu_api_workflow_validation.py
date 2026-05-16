@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ouroboros.workflow_validation import (
+from ouroboros.eval.smoke import (
     CPU_SMOKE_MODE,
     build_cpu_smoke_validation_command,
     is_cpu_smoke_validation_enabled,
@@ -30,7 +30,7 @@ def test_workflow_validation_module_import_is_bootstrap_safe_and_does_not_import
         [
             sys.executable,
             "-c",
-            "import sys; import ouroboros.workflow_validation; raise SystemExit('torch' in sys.modules)",
+            "import sys; import ouroboros.eval.smoke; raise SystemExit('torch' in sys.modules)",
         ],
         cwd=REPO_ROOT,
         env=env,
@@ -78,7 +78,7 @@ def test_cpu_smoke_validation_writes_status_and_report_without_gpu_or_hub(tmp_pa
     assert report.push_to_hub_requested is False
     assert "--use_4bit" not in report.command
     assert "--push_to_hub" not in report.command
-    assert report.command[:3] == [sys.executable, "-m", "ouroboros.workflow_validation_worker"]
+    assert report.command[:3] == [sys.executable, "-m", "ouroboros.eval.smoke_worker"]
 
     status = json.loads(Path(report.status_path).read_text(encoding="utf-8"))
     assert status == {
@@ -103,7 +103,7 @@ def test_cpu_smoke_validation_writes_status_and_report_without_gpu_or_hub(tmp_pa
     assert any("CPU smoke validation complete" in line for line in lines)
 
 
-def test_cpu_smoke_validation_worker_command_is_executable_without_training_dependencies(tmp_path):
+def test_cpu_smoke_validation_worker_command_is_executable_without_training_dependencies(tmp_path, monkeypatch):
     status_path = tmp_path / "worker_status.json"
     command = build_cpu_smoke_validation_command(
         worker_id="A",
@@ -111,21 +111,14 @@ def test_cpu_smoke_validation_worker_command_is_executable_without_training_depe
         round_n=2,
         status_path=status_path,
     )
-    env = os.environ.copy()
-    env.setdefault("PYTHONPATH", str(REPO_ROOT))
 
-    completed = subprocess.run(
-        command,
-        cwd=REPO_ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=15,
-        check=False,
-    )
+    assert command[:3] == [sys.executable, "-m", "ouroboros.eval.smoke_worker"]
 
-    assert completed.returncode == 0, completed.stderr[:1000]
+    from ouroboros.eval import smoke_worker
+
+    monkeypatch.setattr(sys, "argv", ["smoke_worker", *command[3:]])
+    smoke_worker.main()
+
     status = json.loads(status_path.read_text(encoding="utf-8"))
     assert status["worker_id"] == "A"
     assert status["stage_k"] == 3

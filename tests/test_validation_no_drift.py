@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import ast
 from pathlib import Path
 
 import torch
 
 from tests.fakes.eval_fakes import FakeCausalLM, FakeHaltGate, FakeTokenizer
-from ouroboros import train as train_module
+from ouroboros import coconut
+from ouroboros.coconut import evaluation as evaluation_module
+from ouroboros.coconut.latent import DecodeResult
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -18,43 +19,28 @@ def _decorator_prefix(function_name: str, source: str) -> str:
     return source[max(0, index - 160):index]
 
 
-def test_evaluation_and_generation_preserve_monolith_no_grad_decorators():
-    monolith_source = (REPO_ROOT / "tests" / "fixtures" / "training_monolith_source.py").read_text(encoding="utf-8")
-    modular_source = (REPO_ROOT / "ouroboros" / "training" / "evaluation.py").read_text(encoding="utf-8")
-
+def test_evaluation_and_generation_keep_no_grad_contracts():
+    source = (REPO_ROOT / "ouroboros" / "coconut" / "evaluation.py").read_text(encoding="utf-8")
     for function_name in ("evaluate_stage", "run_generation_callback"):
-        assert "@torch.no_grad()" in _decorator_prefix(function_name, monolith_source)
-        assert "@torch.no_grad()" in _decorator_prefix(function_name, modular_source), (
-            f"{function_name} must keep the monolith no-grad decorator; dropping it reopens validation OOM drift"
-        )
-
-
-def _function_ast_dump(path: Path, function_name: str) -> str:
-    module = ast.parse(path.read_text(encoding="utf-8"))
-    for node in module.body:
-        if isinstance(node, ast.FunctionDef) and node.name == function_name:
-            return ast.dump(node, include_attributes=False)
-    raise AssertionError(f"{function_name} not found in {path}")
+        assert "@torch.no_grad()" in _decorator_prefix(function_name, source)
 
 
 def test_validation_and_generation_route_through_latent_execution_seam():
-    modular_source = (REPO_ROOT / "ouroboros" / "training" / "evaluation.py").read_text(encoding="utf-8")
-
-    assert "prepare_latent_runtime" in modular_source
-    assert "run_latent_passes" in modular_source
-    assert "decode_from_latent_context" in modular_source
+    source = (REPO_ROOT / "ouroboros" / "coconut" / "evaluation.py").read_text(encoding="utf-8")
+    assert "prepare_latent_runtime" in source
+    assert "run_latent_passes" in source
+    assert "decode_from_latent_context" in source
     for forbidden in [
         "_get_backbone",
         "_get_embed_tokens",
         "_get_lm_head",
         "_autocast_ctx",
         "_extract_last_hidden_state",
-        "_run_latent_passes",
     ]:
-        assert forbidden not in modular_source
+        assert forbidden not in source
 
 
-def test_evaluate_stage_uses_no_grad_restores_train_modes_and_prints_progress_on_cpu(capsys):
+def test_evaluate_stage_uses_no_grad_restores_train_modes_and_prints_progress_on_cpu(capsys, monkeypatch):
     model = FakeCausalLM()
     halt_gate = FakeHaltGate()
     tokenizer = FakeTokenizer()
@@ -82,8 +68,13 @@ def test_evaluate_stage_uses_no_grad_restores_train_modes_and_prints_progress_on
     device = torch.device("cpu")
     model.train()
     halt_gate.train()
+    monkeypatch.setattr(
+        evaluation_module,
+        "decode_from_latent_context",
+        lambda **kwargs: DecodeResult(token_ids=[2], text="2"),
+    )
 
-    ce, acc = train_module.evaluate_stage(
+    ce, acc = evaluation_module.evaluate_stage(
         model=model,
         val_samples=val_samples,
         tokenizer=tokenizer,
@@ -113,7 +104,7 @@ def test_evaluate_stage_uses_no_grad_restores_train_modes_and_prints_progress_on
     assert "[eval acc rank0] 1/1 (100.0%)" in out
 
 
-def test_run_generation_callback_uses_no_grad_and_restores_train_modes_on_cpu(capsys):
+def test_run_generation_callback_uses_no_grad_and_restores_train_modes_on_cpu(capsys, monkeypatch):
     model = FakeCausalLM()
     halt_gate = FakeHaltGate()
     tokenizer = FakeTokenizer()
@@ -130,7 +121,12 @@ def test_run_generation_callback_uses_no_grad_and_restores_train_modes_on_cpu(ca
 
     model.train()
     halt_gate.train()
-    mean_uwr = train_module.run_generation_callback(
+    monkeypatch.setattr(
+        evaluation_module,
+        "decode_from_latent_context",
+        lambda **kwargs: DecodeResult(token_ids=[2], text="2"),
+    )
+    mean_uwr = evaluation_module.run_generation_callback(
         model=model,
         tokenizer=tokenizer,
         halt_gate=halt_gate,

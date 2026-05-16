@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ouroboros.wandb_runtime import _wandb_init_timeout_seconds, wandb_init_kwargs
+from ouroboros.utils.wandb_runtime import _wandb_init_timeout_seconds, wandb_init_kwargs
 
 
 class _FakeWandb:

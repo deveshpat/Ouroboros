@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from ouroboros.model import _should_auto_disable_gradient_checkpointing
+from ouroboros.models import _should_auto_disable_gradient_checkpointing
 
 
 def test_high_vram_small_workload_auto_disables_gradient_checkpointing(monkeypatch):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ouroboros.hard_lesson_guardrails import (
+from ouroboros.bootstrap.guardrails import (
     HARD_LESSON_GUARDRAILS,
     classify_failure_log,
     duplicate_guardrail_symptoms,

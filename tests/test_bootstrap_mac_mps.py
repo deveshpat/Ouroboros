@@ -6,7 +6,7 @@ from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
 
-import ouroboros.bootstrap as bootstrap
+from ouroboros.bootstrap import runtime as bootstrap
 
 
 def _fake_torch(*, mps_available: bool, cuda_available: bool):

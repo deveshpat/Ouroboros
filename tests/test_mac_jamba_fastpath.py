@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from ouroboros.mac_jamba_fastpath import install_mac_jamba_mps_fastpath
+from ouroboros.bootstrap.mac_jamba_fastpath import install_mac_jamba_mps_fastpath
 
 
 def _tiny_jamba_config():

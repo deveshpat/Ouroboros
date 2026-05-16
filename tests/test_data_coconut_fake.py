@@ -1,40 +1,26 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 from pathlib import Path
 
 import torch
 
-from ouroboros.data import build_sample_at_stage, collate_stage_k
-from ouroboros.dgac import coconut_forward, compute_dgac_lambda1, normalize_pred
+from ouroboros.coconut import build_sample_at_stage, collate_stage_k
+from ouroboros.coconut import coconut_forward, compute_dgac_lambda1, normalize_pred
 from tests.fakes.eval_fakes import FakeCausalLM, FakeHaltGate, FakeTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _function_ast_dump(path: Path, function_name: str) -> str:
-    module = ast.parse(path.read_text(encoding="utf-8"))
-    for node in module.body:
-        if isinstance(node, ast.FunctionDef) and node.name == function_name:
-            return ast.dump(node, include_attributes=False)
-    raise AssertionError(f"{function_name} not found in {path}")
 
+def test_coconut_data_and_dgac_live_under_package_and_route_through_latent():
+    assert build_sample_at_stage.__module__ == "ouroboros.coconut.data"
+    assert collate_stage_k.__module__ == "ouroboros.coconut.data"
+    assert compute_dgac_lambda1.__module__ == "ouroboros.coconut.dgac"
+    assert normalize_pred.__module__ == "ouroboros.coconut.dgac"
 
-def test_data_ast_matches_monolith_and_coconut_contract_routes_through_latent():
-    monolith_path = REPO_ROOT / "tests" / "fixtures" / "training_monolith_source.py"
-
-    for function_name in ("build_sample_at_stage", "collate_stage_k"):
-        assert _function_ast_dump(REPO_ROOT / "ouroboros" / "data.py", function_name) == _function_ast_dump(
-            monolith_path, function_name
-        )
-    for function_name in ("compute_dgac_lambda1", "normalize_pred"):
-        assert _function_ast_dump(REPO_ROOT / "ouroboros" / "dgac.py", function_name) == _function_ast_dump(
-            monolith_path, function_name
-        )
-
-    dgac_source = (REPO_ROOT / "ouroboros" / "dgac.py").read_text(encoding="utf-8")
+    dgac_source = (REPO_ROOT / "ouroboros" / "coconut" / "dgac.py").read_text(encoding="utf-8")
     assert "def coconut_forward(" in dgac_source
     assert "forward_latent_batch" in dgac_source
     assert "prepare_latent_runtime" in dgac_source

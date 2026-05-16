@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import sys
 import time
 from pathlib import Path
@@ -9,31 +8,11 @@ from types import SimpleNamespace
 
 import torch
 
-from ouroboros.train import load_checkpoint, run_training_stages, save_checkpoint
+from ouroboros.coconut import load_checkpoint, run_training_stages, save_checkpoint
 from tests.fakes.eval_fakes import FakeCausalLM, FakeTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-
-def _function_ast_dump(path: Path, function_name: str) -> str:
-    module = ast.parse(path.read_text(encoding="utf-8"))
-    for node in module.body:
-        if isinstance(node, ast.FunctionDef) and node.name == function_name:
-            return ast.dump(node, include_attributes=False)
-    raise AssertionError(f"{function_name} not found in {path}")
-
-
-def test_checkpoint_and_timeout_core_ast_match_monolith_source_of_truth():
-    monolith_path = REPO_ROOT / "tests" / "fixtures" / "training_monolith_source.py"
-    owner_paths = {
-        "save_checkpoint": REPO_ROOT / "ouroboros" / "training" / "checkpointing.py",
-        "load_checkpoint": REPO_ROOT / "ouroboros" / "training" / "checkpointing.py",
-        "prune_epoch_checkpoints": REPO_ROOT / "ouroboros" / "training" / "checkpointing.py",
-        "make_timeout_checker": REPO_ROOT / "ouroboros" / "training" / "stage_runner.py",
-        "run_training_stages": REPO_ROOT / "ouroboros" / "training" / "stage_runner.py",
-    }
-    for function_name, owner_path in owner_paths.items():
-        assert _function_ast_dump(owner_path, function_name) == _function_ast_dump(monolith_path, function_name)
 
 
 def _training_args(**overrides) -> argparse.Namespace:

@@ -124,7 +124,7 @@ jobs:
           OUROBOROS_BENCHMARK_MODEL_ARGS: ${{ github.event.inputs.benchmark_model_args }}
           OUROBOROS_BENCHMARK_PUBLISH_TO_HUB: '1'
         run: |
-          python diloco_coordinator.py \
+          python -m ouroboros.coordinator \
             --hf_token          "$HF_TOKEN" \
             --repo_id           "WeirdRunner/Ouroboros" \
             --outer_lr          0.7 \

@@ -112,7 +112,7 @@ stage-11 DiLoCo round.
 
 ## Strict Mac DGAC Fallback
 
-The local Mac path is `python -m ouroboros.mac_dgac_fallback`. It is allowed to
+The local Mac path is `python -m ouroboros.coordinator.mac_dgac_fallback`. It is allowed to
 mutate Hub state only after all of these pass:
 
 - live `round_state.json` still matches the expected DGAC waiting round

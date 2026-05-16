@@ -30,13 +30,13 @@
 
 | Track | Status | Notes |
 |---|---|---|
-| Training monolith extraction | ✅ COMPLETE | `jamba_coconut_finetune.py` is a thin compatibility adapter; `ouroboros.train` is now a compatibility façade over `ouroboros.training.checkpointing`, `evaluation`, `stage_runner`, and `session`. |
-| Kaggle launch seam | ✅ COMPLETE | `ouroboros.kaggle_launch_matrix` owns launch-mode behavior; notebook remains a thin shell-magic adapter and no longer duplicates `torchrun` argv. |
+| Training monolith extraction | ✅ COMPLETE | `python -m ouroboros.coconut` is the package-owned training entrypoint; Coconut owns CLI, stage, DGAC, latent, checkpoint, evaluation hooks, and session seams. |
+| Kaggle launch seam | ✅ COMPLETE | `ouroboros.coordinator.kaggle_launch_matrix` owns launch-mode behavior; notebook remains a thin shell-magic adapter and no longer duplicates `torchrun` argv. |
 | Runtime signal tracking cleanup | ✅ COMPLETE | Generated `signals/*.json` files are ignored; only `signals/.gitkeep` belongs in source control; the signal mechanism remains active as the coordinator doorbell. |
-| Coordinator zero-drift extraction | ✅ COMPLETE | `diloco_coordinator.py` is a thin adapter; aggregation, state, dispatch, and orchestration live under `ouroboros.diloco.*`. |
+| Coordinator zero-drift extraction | ✅ COMPLETE | `python -m ouroboros.coordinator` is the package-owned orchestration entrypoint; aggregation, state, dispatch, worker, launch, promotion, and repair seams live under `ouroboros.coordinator.*`. |
 | Planning artifact retirement | ✅ COMPLETE | Completed PRDs/plans have been promoted into wiki documentation and removed from `prds/` and `plans/`. |
-| Kaggle CPU/API workflow validation | ✅ COMPLETE | CPU-smoke validation mode, repo/runtime seams, CPU metadata dispatch, fake coordinator loop tests, manual API validation docs, and remote Hub artifact verification are in place. |
-| Deep-module runtime reliability | ✅ COMPLETE | Added pure seams for coordinator decisions, Kaggle launch contracts/matrix, training session plans, worker lifecycle classification, runtime env aliases, Kaggle runtime, and latent execution; latest chunked local CPU regression coverage passed `158` tests. |
+| Kaggle CPU/API workflow validation | ✅ COMPLETE | Eval-owned CPU smoke mode, repo/runtime seams, CPU metadata dispatch, fake coordinator loop tests, manual API validation docs, and remote Hub artifact verification are in place. |
+| Seven-package runtime reliability | ✅ COMPLETE | Added pure seams for coordinator decisions, Kaggle launch contracts/matrix, training session plans, worker lifecycle classification, runtime env aliases, Kaggle runtime, and latent execution; latest chunked local CPU regression coverage passed `158` tests. |
 | DGAC readiness CPU-smoke gate | ✅ PASSED LIVE | GitHub Actions `coordinate #272` ran `workflow_validate=cpu-smoke`, defaulted to Worker A, pushed Kaggle kernel version 39, Kaggle exited before `torchrun`, published Hub artifacts, and coordinator verified validation run `25377312407-1`. |
 | JEPA-style latent prediction / multimodal Ouroboros | 🧊 DEFERRED | Direction documented in [Future-JEPA-Multimodal-Latent](Future-JEPA-Multimodal-Latent.md). No code changes until DGAC, evaluation, benchmarking, and core correctness gates are stable. |
 
@@ -69,7 +69,7 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 | Remote Hub validation artifact | ✅ PASS | `diloco_state/workflow_validation/25377312407-1/worker_A_status.json` and `worker_A_report.json` published |
 | Coordinator artifact verification | ✅ PASS | Coordinator printed `CPU-smoke validation verified via remote Hub artifacts: ['A']` |
 | GPU/training-state safety | ✅ PASS | Report shows `gpu_requested=false`, `torchrun_requested=false`, `published=true`; status path stayed under `local_validation/...` |
-| Deep-module CPU regression suite | ✅ PASS | Latest chunked local CPU validation across all 24 test files: `36 passed`, `84 passed`, `38 passed` → `158 passed` total |
+| Seven-package runtime regression suite | ✅ PASS | Latest chunked local CPU validation across all 24 test files: `36 passed`, `84 passed`, `38 passed` → `158 passed` total |
 | Training/runtime/launch/latent deep-module regression suite | ✅ PASS | Current post-RFC chunked coverage: all 24 test files, `158 passed` total. Single `pytest -q` can still time out locally before final summary, so chunked validation remains the reported local gate. |
 | Kaggle launch + DGAC canary preflight slice | ✅ PASS | Targeted launch/notebook/deep-module/source-of-truth/DGAC halt-supervision gate passed locally: `57 passed`; `dgac-canary --dry_run` exits before Hub/Kaggle mutation. |
 | Azure H100 corrected DGAC epoch 0 | ✅ CHECKPOINTED | Run `Azure H100 SCUS DGAC full budgeted` loaded `diloco_state/anchor` plus `halt_gate.pt`, verified H100 BF16/flash-attn/Mamba fast path, completed epoch 0 at stage 10, saved `runs/azure_h100_dgac/stage_10/checkpoint-0001154`, and uploaded `training_state.pt`, adapter weights, and `halt_gate.pt`; val/gen skipped due to the 720 min validation buffer. |
@@ -129,7 +129,7 @@ WeirdRunner/Ouroboros/
 | amp_dtype A100+ (sm80+) | BF16 |
 | Gradient checkpointing | Auto-disabled at VRAM≥40GB only for small latent workloads; high-depth DGAC can keep it enabled even on 100GB H100 |
 | Multi-account strategy | DiLoCo dynamic parallel |
-| Notebook launch cells | single `!{shell_command}` magic command; argv is built by `ouroboros.kaggle_launch_matrix` |
+| Notebook launch cells | single `!{shell_command}` magic command; argv is built by `ouroboros.coordinator.kaggle_launch_matrix` |
 | Worker auto-detection | `DILOCO_WORKER_ID` Kaggle secret per account (`A`/`B`/`C`) |
 | Kaggle trigger mechanism | Local `kernels push` — staged checked-in notebook + generated metadata. No pull needed. ✅ |
 | Kaggle push success detection | Strict parser: requires `successfully pushed`; quota/error output is failed dispatch even with exit code 0. ✅ |

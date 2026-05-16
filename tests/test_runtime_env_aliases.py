@@ -6,7 +6,7 @@ import sys
 
 def test_runtime_env_aliases_are_stdlib_safe_and_normalize_workers():
     before = set(sys.modules)
-    runtime_env = importlib.import_module("ouroboros.runtime_env")
+    runtime_env = importlib.import_module("ouroboros.utils.runtime_env")
 
     assert runtime_env.normalize_worker_id(" b ") == "B"
     assert runtime_env.normalize_worker_id("x") is None
@@ -16,7 +16,7 @@ def test_runtime_env_aliases_are_stdlib_safe_and_normalize_workers():
 
 
 def test_runtime_env_token_and_credential_aliases_fail_safe():
-    from ouroboros.runtime_env import (
+    from ouroboros.utils.runtime_env import (
         env_bool,
         env_int,
         resolve_env_alias,

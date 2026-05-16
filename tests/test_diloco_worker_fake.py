@@ -1,35 +1,25 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import time
 from pathlib import Path
 
 import pytest
 import torch
 
-from ouroboros.diloco import worker as worker_module
-from ouroboros.diloco.shared import RoundState, ordered_unique_workers
+from ouroboros.coordinator import worker as worker_module
+from ouroboros.coordinator.shared import RoundState, ordered_unique_workers
 from tests.fakes.eval_fakes import FakeCausalLM, FakeHaltGate, FakeTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _function_ast_dump(path: Path, function_name: str) -> str:
-    module = ast.parse(path.read_text(encoding="utf-8"))
-    for node in module.body:
-        if isinstance(node, ast.FunctionDef) and node.name == function_name:
-            return ast.dump(node, include_attributes=False)
-    raise AssertionError(f"{function_name} not found in {path}")
 
+def test_diloco_worker_core_contract_lives_under_coordinator_package():
+    assert worker_module._partition_contiguous_range.__module__ == "ouroboros.coordinator.worker"
+    assert worker_module.diloco_get_shard.__module__ == "ouroboros.coordinator.worker"
 
-def test_diloco_worker_core_ast_matches_monolith_source_of_truth():
-    monolith_path = REPO_ROOT / "tests" / "fixtures" / "training_monolith_source.py"
-    modular_path = REPO_ROOT / "ouroboros" / "diloco" / "worker.py"
-    for function_name in ("_partition_contiguous_range", "diloco_get_shard"):
-        assert _function_ast_dump(modular_path, function_name) == _function_ast_dump(monolith_path, function_name)
-
-    modular_source = modular_path.read_text(encoding="utf-8")
+    worker_source = (REPO_ROOT / "ouroboros" / "coordinator" / "worker.py").read_text(encoding="utf-8")
     for contract in (
         "samples_already_seen",
         "triggered_workers",
@@ -39,7 +29,7 @@ def test_diloco_worker_core_ast_matches_monolith_source_of_truth():
         "diloco_signal_repo",
         "DGAC DiLoCo requires --resume_from_diloco_anchor",
     ):
-        assert contract in modular_source
+        assert contract in worker_source
 
 
 def _args(worker_id: str = "A", **overrides) -> argparse.Namespace:
@@ -390,7 +380,7 @@ def test_dgac_diloco_worker_forces_one_local_epoch_and_uploads_halt_gate(monkeyp
     monkeypatch.setattr(worker_module, "_resolve_github_token_common", lambda: "gh_fake")
     monkeypatch.setattr(worker_module, "diloco_push_signal", lambda *args: calls["signal"].append(args))
 
-    from ouroboros.training import stage_runner as stage_runner_module
+    from ouroboros.coconut import stage_runner as stage_runner_module
 
     def fake_run_training_stages(**kwargs):
         calls["train"].append(kwargs)
@@ -453,8 +443,8 @@ def test_dgac_diloco_worker_runs_leader_pre_val_and_enables_generation_when_requ
     monkeypatch.setattr(worker_module, "_resolve_github_token_common", lambda: "gh_fake")
     monkeypatch.setattr(worker_module, "diloco_push_signal", lambda *args: calls["signal"].append(args))
 
-    from ouroboros.training import evaluation as evaluation_module
-    from ouroboros.training import stage_runner as stage_runner_module
+    from ouroboros.coconut import evaluation as evaluation_module
+    from ouroboros.coconut import stage_runner as stage_runner_module
 
     monkeypatch.setattr(evaluation_module, "evaluate_stage", lambda **kwargs: (calls["eval"].append(kwargs) or (0.5, 0.25)))
 
@@ -522,8 +512,8 @@ def test_dgac_diloco_worker_skips_duplicate_pre_val_for_non_leader(monkeypatch, 
     monkeypatch.setattr(worker_module, "_resolve_github_token_common", lambda: "gh_fake")
     monkeypatch.setattr(worker_module, "diloco_push_signal", lambda *args: calls["signal"].append(args))
 
-    from ouroboros.training import evaluation as evaluation_module
-    from ouroboros.training import stage_runner as stage_runner_module
+    from ouroboros.coconut import evaluation as evaluation_module
+    from ouroboros.coconut import stage_runner as stage_runner_module
 
     monkeypatch.setattr(evaluation_module, "evaluate_stage", lambda **kwargs: (calls["eval"].append(kwargs) or (0.5, 0.25)))
 

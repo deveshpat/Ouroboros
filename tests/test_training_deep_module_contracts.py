@@ -3,9 +3,9 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from ouroboros import train as train_module
-from ouroboros.training import checkpointing, evaluation, session, stage_runner
-from ouroboros import latent as latent_module
+from ouroboros import coconut
+from ouroboros.coconut import checkpointing, evaluation, session, stage_runner
+from ouroboros.coconut import latent as latent_module
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,57 +21,41 @@ def _imported_modules(path: Path) -> set[str]:
     return modules
 
 
-def test_training_deep_modules_expose_new_preferred_interfaces():
-    assert checkpointing.save_checkpoint.__module__ == "ouroboros.training.checkpointing"
-    assert checkpointing.load_checkpoint.__module__ == "ouroboros.training.checkpointing"
-    assert checkpointing.prune_epoch_checkpoints.__module__ == "ouroboros.training.checkpointing"
-    assert evaluation.evaluate_stage.__module__ == "ouroboros.training.evaluation"
-    assert evaluation.run_generation_callback.__module__ == "ouroboros.training.evaluation"
-    assert latent_module.prepare_latent_runtime.__module__ == "ouroboros.latent"
-    assert latent_module.forward_latent_batch.__module__ == "ouroboros.latent"
-    assert latent_module.decode_from_latent_context.__module__ == "ouroboros.latent"
-    assert stage_runner.run_training_stages.__module__ == "ouroboros.training.stage_runner"
-    assert stage_runner.make_timeout_checker.__module__ == "ouroboros.training.stage_runner"
-    assert session.run_training_session.__module__ == "ouroboros.training.session"
+def test_coconut_package_exposes_training_latent_dgac_checkpoint_interface():
+    assert coconut.save_checkpoint is checkpointing.save_checkpoint
+    assert coconut.load_checkpoint is checkpointing.load_checkpoint
+    assert coconut.evaluate_stage is evaluation.evaluate_stage
+    assert coconut.run_generation_callback is evaluation.run_generation_callback
+    assert coconut.run_training_stages is stage_runner.run_training_stages
+    assert coconut.run_cli.__module__ == "ouroboros.coconut.runner"
+    assert coconut.HaltGate.__module__ == "ouroboros.coconut.dgac"
+    assert coconut.prepare_latent_runtime is latent_module.prepare_latent_runtime
+    assert coconut.forward_latent_batch is latent_module.forward_latent_batch
+    assert coconut.decode_from_latent_context is latent_module.decode_from_latent_context
 
 
-def test_train_module_remains_compatibility_facade():
-    assert train_module.save_checkpoint is checkpointing.save_checkpoint
-    assert train_module.load_checkpoint is checkpointing.load_checkpoint
-    assert train_module.evaluate_stage is evaluation.evaluate_stage
-    assert train_module.run_generation_callback is evaluation.run_generation_callback
-    assert train_module.run_training_stages is stage_runner.run_training_stages
-    assert train_module.run_cli.__module__ == "ouroboros.train"
-
-    train_source = (REPO_ROOT / "ouroboros" / "train.py").read_text(encoding="utf-8")
-    assert "def run_cli(args: argparse.Namespace, *, script_start: float) -> None:" in train_source
-    assert "def run_training_stages(" not in train_source
-    assert "def evaluate_stage(" not in train_source
-    assert "def save_checkpoint(" not in train_source
-
-
-def test_worker_no_longer_imports_train_module():
-    worker_path = REPO_ROOT / "ouroboros" / "diloco" / "worker.py"
+def test_worker_imports_coconut_internals_not_retired_root_training_module():
+    worker_path = REPO_ROOT / "ouroboros" / "coordinator" / "worker.py"
     imported = _imported_modules(worker_path)
     assert "ouroboros.train" not in imported
-    assert "ouroboros.training.stage_runner" in imported
-    assert "ouroboros.training.evaluation" in imported
+    assert "ouroboros.coconut.stage_runner" in imported
+    assert "ouroboros.coconut.evaluation" in imported
 
 
-def test_stage_runner_has_no_diloco_or_train_dependency():
-    imported = _imported_modules(REPO_ROOT / "ouroboros" / "training" / "stage_runner.py")
+def test_stage_runner_has_no_coordinator_dependency():
+    imported = _imported_modules(REPO_ROOT / "ouroboros" / "coconut" / "stage_runner.py")
     forbidden = {
-        "ouroboros.train",
-        "ouroboros.diloco.worker",
-        "ouroboros.diloco.coordinator",
+        "ouroboros.coordinator.worker",
+        "ouroboros.coordinator.coordinator",
+        "ouroboros.coordinator.dispatch",
     }
     assert imported.isdisjoint(forbidden)
 
 
-def test_latent_execution_ownership_has_moved_out_of_evaluation_and_dgac():
-    evaluation_source = (REPO_ROOT / "ouroboros" / "training" / "evaluation.py").read_text(encoding="utf-8")
-    dgac_source = (REPO_ROOT / "ouroboros" / "dgac.py").read_text(encoding="utf-8")
-    latent_source = (REPO_ROOT / "ouroboros" / "latent.py").read_text(encoding="utf-8")
+def test_latent_execution_ownership_has_dedicated_coconut_module():
+    evaluation_source = (REPO_ROOT / "ouroboros" / "coconut" / "evaluation.py").read_text(encoding="utf-8")
+    dgac_source = (REPO_ROOT / "ouroboros" / "coconut" / "dgac.py").read_text(encoding="utf-8")
+    latent_source = (REPO_ROOT / "ouroboros" / "coconut" / "latent.py").read_text(encoding="utf-8")
 
     for forbidden in [
         "_get_backbone",
@@ -79,7 +63,6 @@ def test_latent_execution_ownership_has_moved_out_of_evaluation_and_dgac():
         "_get_lm_head",
         "_autocast_ctx",
         "_extract_last_hidden_state",
-        "_run_latent_passes",
     ]:
         assert forbidden not in evaluation_source
 

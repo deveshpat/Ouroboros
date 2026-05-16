@@ -50,7 +50,7 @@ echo "[azure-entrypoint] region=${AZURE_REGION} sku=${AZURE_H100_SKU} planned_ho
 echo "[azure-entrypoint] diloco_state_repo=${OUROBOROS_DILOCO_STATE_REPO} wandb_project=${OUROBOROS_WANDB_PROJECT}"
 echo "[azure-entrypoint] batch=${OUROBOROS_AZURE_BATCH_SIZE} grad_accum=${OUROBOROS_AZURE_GRAD_ACCUM} max_seq_len=${OUROBOROS_AZURE_MAX_SEQ_LEN}"
 
-python -m ouroboros.azure_cost_guard \
+python -m ouroboros.utils.azure_cost_guard \
   --region "${AZURE_REGION}" \
   --sku "${AZURE_H100_SKU}" \
   --hourly_usd "${AZURE_HOURLY_USD}" \
@@ -100,14 +100,14 @@ COMMON_ARGS=(
   --data_dir data/coconut_v1
   --use_4bit
   --latent_cache
-  --epochs_per_stage 3
+  --epochs_per_stage 1
   --max_stage 10
   --max_seq_len "${OUROBOROS_AZURE_MAX_SEQ_LEN}"
   --max_grad_norm 0.3
   --batch_size "${OUROBOROS_AZURE_BATCH_SIZE}"
   --grad_accum "${OUROBOROS_AZURE_GRAD_ACCUM}"
   --val_batch_size "${OUROBOROS_AZURE_VAL_BATCH_SIZE}"
-  --val_skip_buffer_minutes 720
+  --val_skip_buffer_minutes 120
   --graceful_exit_buffer_minutes 20
   --log_every 5
   --no-gen_every_stage
@@ -121,7 +121,7 @@ if [[ -n "${OUROBOROS_WANDB_ENTITY:-}" ]]; then
 fi
 
 echo "[azure-entrypoint] Starting 5-step H100 canary..."
-python -m torch.distributed.run --standalone --nproc_per_node=1 jamba_coconut_finetune.py \
+python -m torch.distributed.run --standalone --nproc_per_node=1 -m ouroboros.coconut \
   "${COMMON_ARGS[@]}" \
   --epochs_per_stage 1 \
   --session_timeout_hours 0.75 \
@@ -135,7 +135,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=1 jamba_coconut_fi
 
 echo "[azure-entrypoint] Canary passed. Starting budgeted full run..."
 timeout --preserve-status "${AZURE_FULL_TIMEOUT}" \
-  python -m torch.distributed.run --standalone --nproc_per_node=1 jamba_coconut_finetune.py \
+  python -m torch.distributed.run --standalone --nproc_per_node=1 -m ouroboros.coconut \
     "${COMMON_ARGS[@]}" \
     --session_timeout_hours "${AZURE_SESSION_TIMEOUT_HOURS}" \
     --push_to_hub \

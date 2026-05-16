@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ouroboros.kaggle import (
+from ouroboros.coordinator.kaggle_commands import (
     build_lm_eval_benchmark_command,
     build_lm_eval_benchmark_multi_gpu_command,
     build_dgac_anchor_eval_command,
@@ -11,7 +11,7 @@ from ouroboros.kaggle import (
     build_dgac_training_command,
     build_diloco_training_command,
 )
-from ouroboros.kaggle_contract import (
+from ouroboros.coordinator.kaggle_contract import (
     BENCHMARK_RUN_MODE,
     CPU_SMOKE_MODE,
     DGAC_ANCHOR_EVAL_RUN_MODE,
@@ -22,7 +22,7 @@ from ouroboros.kaggle_contract import (
     get_kaggle_launch_contract,
     known_kaggle_launch_modes,
 )
-from ouroboros.kaggle_launch_matrix import (
+from ouroboros.coordinator.kaggle_launch_matrix import (
     apply_launch_environment_defaults,
     build_launch_command,
     get_launch_spec,
@@ -177,7 +177,7 @@ def test_benchmark_mode_builds_auto_detecting_multi_gpu_command_from_env():
         },
     )
 
-    assert command[:3] == ["python", "-m", "ouroboros.benchmark_multi_gpu"]
+    assert command[:3] == ["python", "-m", "ouroboros.eval.benchmark_multi_gpu"]
     assert "--devices" not in command
     assert _arg_value(command, "--tasks") == "mmlu,arc_challenge"
     assert _arg_value(command, "--limit") == "50"
@@ -199,7 +199,7 @@ def test_benchmark_mode_keeps_advanced_runtime_device_override_outside_workflow(
         },
     )
 
-    assert command[:3] == ["python", "-m", "ouroboros.benchmark_multi_gpu"]
+    assert command[:3] == ["python", "-m", "ouroboros.eval.benchmark_multi_gpu"]
     assert _arg_value(command, "--devices") == "cuda:0"
 
 
