@@ -77,7 +77,7 @@ def test_auto_parallelism_keeps_limited_smoke_runs_single_gpu():
     )
 
 
-def test_auto_parallelism_shards_full_multi_task_benchmarks():
+def test_auto_parallelism_keeps_full_multi_task_benchmarks_single_gpu():
     assert (
         resolve_benchmark_parallelism(
             "auto",
@@ -85,15 +85,15 @@ def test_auto_parallelism_shards_full_multi_task_benchmarks():
             tasks="arc_easy,hellaswag,winogrande",
             devices=["cuda:0", "cuda:1"],
         )
-        == "task_shard"
+        == "single"
     )
 
 
-def test_auto_benchmark_commands_use_single_gpu_for_limit_smoke():
+def test_auto_benchmark_commands_use_single_gpu_for_full_default_benchmark():
     commands = build_lm_eval_benchmark_commands(
         tasks="arc_easy,hellaswag,winogrande",
         devices="cuda:0,cuda:1",
-        limit="100",
+        limit=None,
         output_dir="runs/lm_eval_benchmark",
         publish_to_hub=False,
     )

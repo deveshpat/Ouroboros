@@ -474,7 +474,11 @@ def build_lm_eval_benchmark_multi_gpu_command(
     publish_to_hub: bool = True,
     parallelism: str | None = None,
 ) -> list[str]:
-    """Build a Kaggle command that shards lm-eval tasks across multiple GPUs."""
+    """Build the Kaggle lm-eval benchmark command.
+
+    The called launcher runs single-GPU by default; task sharding is only used
+    when the caller explicitly passes ``parallelism="task_shard"``.
+    """
     command = [
         "python",
         "-m",

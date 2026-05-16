@@ -1,9 +1,9 @@
-"""Run Ouroboros lm-eval benchmarks across multiple Kaggle GPUs.
+"""Run Ouroboros lm-eval benchmarks through a single GPU by default.
 
-This wrapper keeps each lm-evaluation-harness process single-GPU, then shards
-whole tasks across devices. That is safer for PEFT/Jamba than trying to make one
-lm-eval process data-parallel, and it lets Kaggle's T4 x2 allocation run two
-independent benchmark shards at once.
+The launcher still accepts explicit task sharding for experiments, but the
+operational default is one lm-evaluation-harness process on the first resolved
+device. This avoids duplicate Jamba/PEFT/Mamba bootstrap work and removes the
+Kaggle dual-GPU shard race from routine benchmark runs.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from ouroboros.coordinator.kaggle_commands import build_lm_eval_benchmark_comman
 from ouroboros.utils.runtime_env import normalize_benchmark_limit
 
 DEFAULT_DEVICES = "auto"
-DEFAULT_PARALLELISM = "auto"
+DEFAULT_PARALLELISM = "single"
 
 
 def _env(env: Mapping[str, str], name: str, default: str) -> str:
@@ -148,12 +148,12 @@ def resolve_benchmark_parallelism(
     tasks: str,
     devices: Sequence[str],
 ) -> str:
-    """Choose benchmark parallelism without pretending two cold starts are speedup.
+    """Choose benchmark parallelism for stable single-process operation.
 
-    ``lm-eval --limit`` runs are smoke/probe runs. For those, duplicating the
-    full Jamba + PEFT + Mamba bootstrap on two GPUs costs more than the small
-    number of examples can repay, so auto mode stays single-GPU. Full benchmarks
-    may shard whole tasks across devices unless explicitly forced otherwise.
+    Auto mode intentionally resolves to ``single``. Task sharding remains
+    available only as an explicit opt-in for experiments because each shard
+    repeats the Jamba + PEFT + Mamba bootstrap and can race on shared runtime
+    setup in Kaggle.
     """
     value = (_normalize_text(requested) or DEFAULT_PARALLELISM).lower().replace("-", "_")
     aliases = {
@@ -171,11 +171,7 @@ def resolve_benchmark_parallelism(
     mode = aliases[value]
     if mode != "auto":
         return mode
-    if normalize_benchmark_limit(limit) is not None:
-        return "single"
-    if len(_split_csv(tasks)) <= 1 or len([device for device in devices if str(device).strip()]) <= 1:
-        return "single"
-    return "task_shard"
+    return "single"
 
 
 def build_lm_eval_benchmark_commands(
@@ -278,7 +274,7 @@ def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | No
     parser.add_argument(
         "--parallelism",
         default=_env(env, "OUROBOROS_BENCHMARK_PARALLELISM", DEFAULT_PARALLELISM),
-        help="auto, single, or task_shard. Auto keeps --limit smoke runs single-GPU to avoid duplicate cold starts.",
+        help="auto, single, or task_shard. Auto resolves to single-GPU for stable Kaggle benchmark runs.",
     )
     parser.add_argument("--limit", default=normalize_benchmark_limit(env.get("OUROBOROS_BENCHMARK_LIMIT")))
     parser.add_argument("--output_dir", default=_env(env, "OUROBOROS_BENCHMARK_OUTPUT_DIR", DEFAULT_OUTPUT_DIR))

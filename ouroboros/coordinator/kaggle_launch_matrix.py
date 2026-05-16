@@ -253,7 +253,7 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
                 "OUROBOROS_BENCHMARK_DEVICE": "cuda:0",
                 "OUROBOROS_BENCHMARK_DTYPE": "float16",
                 "OUROBOROS_BENCHMARK_PUBLISH_TO_HUB": "1",
-                "OUROBOROS_BENCHMARK_PARALLELISM": "auto",
+                "OUROBOROS_BENCHMARK_PARALLELISM": "single",
             }
         ),
         command_builder=_build_benchmark,
