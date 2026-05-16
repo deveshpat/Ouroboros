@@ -33,6 +33,29 @@ GEN_PROMPTS = [
     "Solve for x: 3x + 6 = 21.",
 ]
 
+
+def _eval_progress_every(args: argparse.Namespace) -> int:
+    """Return the validation progress cadence. Zero disables progress logs."""
+    return max(int(getattr(args, "eval_progress_every", 25) or 0), 0)
+
+
+def _emit_progress(message: str) -> None:
+    """Print rank-0 progress immediately so Kaggle logs do not look stalled."""
+    if _is_main_process():
+        print(message, flush=True)
+
+
+def _maybe_emit_progress(*, label: str, processed: int, total: int, every: int) -> None:
+    if every <= 0 or total <= 0:
+        return
+    processed = min(max(int(processed), 0), int(total))
+    if processed <= 0:
+        return
+    if processed == total or processed % every == 0:
+        pct = 100.0 * processed / max(int(total), 1)
+        _emit_progress(f"  [{label}] {processed}/{total} ({pct:.1f}%)")
+
+
 @torch.no_grad()
 def evaluate_stage(
     model,
@@ -60,6 +83,11 @@ def evaluate_stage(
     batch_size = max(int(args.val_batch_size), 1)
 
     local_val_samples = val_samples[rank::world_size]
+    progress_every = _eval_progress_every(args)
+    _emit_progress(
+        f"  [eval] validation CE start: rank0_shard={len(local_val_samples)} "
+        f"global_samples={len(val_samples)} batch_size={batch_size} stage={stage_k}"
+    )
 
     ce_numer = 0.0
     ce_denom = 0
@@ -86,17 +114,27 @@ def evaluate_stage(
         valid_tokens = int((batch["labels"][:, 1:].contiguous().view(-1) != -100).sum().item())
         ce_numer += float(loss.item()) * valid_tokens
         ce_denom += valid_tokens
+        _maybe_emit_progress(
+            label="eval CE rank0",
+            processed=min(start + batch_size, len(local_val_samples)),
+            total=len(local_val_samples),
+            every=progress_every,
+        )
 
     ce_numer, ce_denom = _ddp_sum([ce_numer, ce_denom], device)
     ce_denom = int(round(ce_denom))
 
     acc_samples = val_samples[:50]
     local_acc_samples = acc_samples[rank::world_size]
+    _emit_progress(
+        f"  [eval] accuracy decode start: rank0_shard={len(local_acc_samples)} "
+        f"global_samples={len(acc_samples)}"
+    )
 
     n_correct = 0
     n_total = 0
 
-    for sample in local_acc_samples:
+    for acc_index, sample in enumerate(local_acc_samples, start=1):
         built = build_sample_at_stage(tokenizer, sample, stage_k, lat_token_id, args.max_seq_len)
         if built is None:
             continue
@@ -128,6 +166,12 @@ def evaluate_stage(
         if pred and gold and (pred == gold or pred.lower() == gold.lower()):
             n_correct += 1
         n_total += 1
+        _maybe_emit_progress(
+            label="eval acc rank0",
+            processed=acc_index,
+            total=len(local_acc_samples),
+            every=max(1, min(progress_every, 10)) if progress_every > 0 else 0,
+        )
 
     n_correct, n_total = _ddp_sum([n_correct, n_total], device)
     n_correct = int(round(n_correct))
@@ -215,6 +259,10 @@ def _evaluate_ce_for_sample_stage_pairs(
     model.eval()
     pad_id = tokenizer.pad_token_id or 0
     batch_size = max(int(args.val_batch_size), 1)
+    progress_every = _eval_progress_every(args)
+    _emit_progress(
+        f"  [DGAC diagnostic] CE start: rank0_pairs={len(sample_stage_pairs)} batch_size={batch_size}"
+    )
 
     ce_numer = 0.0
     ce_denom = 0
@@ -245,6 +293,12 @@ def _evaluate_ce_for_sample_stage_pairs(
         valid_tokens = int((batch["labels"][:, 1:].contiguous().view(-1) != -100).sum().item())
         ce_numer += float(loss.item()) * valid_tokens
         ce_denom += valid_tokens
+        _maybe_emit_progress(
+            label="DGAC diagnostic CE rank0",
+            processed=min(start + batch_size, len(sample_stage_pairs)),
+            total=len(sample_stage_pairs),
+            every=progress_every,
+        )
 
     ce_numer, ce_denom = _ddp_sum([ce_numer, ce_denom], device)
     ce_denom = int(round(ce_denom))
@@ -273,6 +327,11 @@ def _collect_local_halt_gate_stage_plan(
     world_size = _world_size()
     local_val_samples = val_samples[rank::world_size]
     batch_size = max(int(args.val_batch_size), 1)
+    progress_every = _eval_progress_every(args)
+    _emit_progress(
+        f"  [DGAC diagnostic] HaltGate plan start: rank0_shard={len(local_val_samples)} "
+        f"global_samples={len(val_samples)} batch_size={batch_size} stage={stage_k}"
+    )
     pad_id = tokenizer.pad_token_id or 0
     runtime = prepare_latent_runtime(model, device)
 
@@ -318,6 +377,12 @@ def _collect_local_halt_gate_stage_plan(
             clipped = max(0, min(int(stage_k), int(actual)))
             local_pairs.append((sample, clipped))
             local_ks.append(clipped)
+        _maybe_emit_progress(
+            label="DGAC HaltGate plan rank0",
+            processed=min(start + batch_size, len(local_val_samples)),
+            total=len(local_val_samples),
+            every=progress_every,
+        )
 
     model.train()
     halt_gate.train()
@@ -486,6 +551,7 @@ def run_eval_only(
     run_generation: bool = True,
 ) -> Dict[str, float]:
     """Run a validation/generation preflight and exit without optimizer steps."""
+    _emit_progress(f"\n  [eval-only] starting validation stage={stage_k} samples={len(val_samples)}")
     val_ce, val_acc = evaluate_stage(
         model=model,
         val_samples=val_samples,

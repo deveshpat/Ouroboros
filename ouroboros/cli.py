@@ -73,6 +73,7 @@ def bootstrap_free_help_text() -> str:
         "  --output_dir OUTPUT_DIR\n"
         "  --profile_training_timing\n"
         "  --val_batch_size VAL_BATCH_SIZE\n"
+        "  --eval_progress_every EVAL_PROGRESS_EVERY\n"
         "  --gen_every_stage, --no-gen_every_stage\n"
         "  --gen_max_tokens GEN_MAX_TOKENS\n"
         "  --wandb_mode {online,offline,disabled}\n"
@@ -301,6 +302,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=1,
         help="Batch size for val forward passes. Keep at 1 to avoid OOM.",
+    )
+    parser.add_argument(
+        "--eval_progress_every",
+        type=int,
+        default=25,
+        help=(
+            "Print rank-0 validation/diagnostic progress every N local samples; "
+            "set 0 to disable progress logs."
+        ),
     )
     _add_bool_arg(parser, "--gen_every_stage", True, "Run generation callback at stage end.")
     parser.add_argument("--gen_max_tokens", type=int, default=200)

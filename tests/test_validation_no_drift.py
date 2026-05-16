@@ -54,7 +54,7 @@ def test_validation_and_generation_route_through_latent_execution_seam():
         assert forbidden not in modular_source
 
 
-def test_evaluate_stage_uses_no_grad_and_restores_train_modes_on_cpu():
+def test_evaluate_stage_uses_no_grad_restores_train_modes_and_prints_progress_on_cpu(capsys):
     model = FakeCausalLM()
     halt_gate = FakeHaltGate()
     tokenizer = FakeTokenizer()
@@ -68,6 +68,7 @@ def test_evaluate_stage_uses_no_grad_and_restores_train_modes_on_cpu():
         dgac_lambda_ponder_max=0.0,
         dgac_tau=0.95,
         dgac_lambda_diversity=0.0,
+        eval_progress_every=1,
     )
     val_samples = [
         {
@@ -105,6 +106,11 @@ def test_evaluate_stage_uses_no_grad_and_restores_train_modes_on_cpu():
     assert model.model.device_type_observations
     assert set(model.model.device_type_observations) == {"cpu"}
     assert model.model.grad_enabled_observations == [False] * len(model.model.grad_enabled_observations)
+    out = capsys.readouterr().out
+    assert "[eval] validation CE start" in out
+    assert "[eval CE rank0] 1/1 (100.0%)" in out
+    assert "[eval] accuracy decode start" in out
+    assert "[eval acc rank0] 1/1 (100.0%)" in out
 
 
 def test_run_generation_callback_uses_no_grad_and_restores_train_modes_on_cpu(capsys):
