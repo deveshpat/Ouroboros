@@ -55,7 +55,7 @@ def test_completed_extraction_plans_are_promoted_to_wiki_and_retired():
     workflow_text = workflow_record.read_text(encoding="utf-8")
 
     assert "Completed Track: Training Monolith Extraction" in architecture_text
-    assert "Kaggle launch remains an IPython `!torchrun` shell-magic command" in architecture_text
+    assert "Kaggle launch remains IPython shell magic (`!{shell_command}`)" in architecture_text
     assert "Completed Track: Coordinator Zero-Drift Extraction" in architecture_text
     assert "`plans/zero-drift-monolith-extraction.md`" in architecture_text
     assert "`plans/diloco-coordinator-zero-drift-extraction-plan.md`" in architecture_text
@@ -107,6 +107,8 @@ def test_workflow_dispatch_exposes_cpu_smoke_end_to_end_validation_gate():
 def test_workflow_dispatch_exposes_dgac_anchor_eval_and_train_gates():
     workflow = (REPO_ROOT / ".github" / "workflows" / "diloco_coordinator.yml").read_text(encoding="utf-8")
     notebook = (REPO_ROOT / "kaggle-utils.ipynb").read_text(encoding="utf-8")
+    launch_matrix = (REPO_ROOT / "ouroboros" / "kaggle_launch_matrix.py").read_text(encoding="utf-8")
+    kaggle_commands = (REPO_ROOT / "ouroboros" / "kaggle.py").read_text(encoding="utf-8")
 
     assert "kaggle_run_mode" in workflow
     assert "dgac-anchor-eval" in workflow
@@ -115,11 +117,13 @@ def test_workflow_dispatch_exposes_dgac_anchor_eval_and_train_gates():
     assert "OUROBOROS_KAGGLE_RUN_MODE" in workflow
     assert "--kaggle_run_mode" in workflow
     assert "OUROBOROS_KAGGLE_RUN_MODE" in notebook
-    assert "--resume_from_diloco_anchor" in notebook
-    assert "--eval_only" in notebook
-    assert "runs/stage3_dgac" in notebook
-    assert "DGAC_DILOCO_RUN_MODE" in notebook
-    assert "runs/dgac_dedicated" in notebook
+    assert "build_launch_command(run_mode, os.environ, worker_id=worker_id)" in notebook
+    assert "!{shell_command}" in notebook
+    assert "--resume_from_diloco_anchor" in kaggle_commands
+    assert "--eval_only" in kaggle_commands
+    assert "runs/stage3_dgac" in launch_matrix
+    assert "DGAC_DILOCO_RUN_MODE" in launch_matrix
+    assert "runs/dgac_dedicated" in launch_matrix
 
 
 def test_completed_cpu_smoke_prd_and_plan_are_promoted_to_wiki_and_retired():

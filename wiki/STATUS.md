@@ -31,7 +31,7 @@
 | Track | Status | Notes |
 |---|---|---|
 | Training monolith extraction | ✅ COMPLETE | `jamba_coconut_finetune.py` is a thin compatibility adapter; `ouroboros.train` is now a compatibility façade over `ouroboros.training.checkpointing`, `evaluation`, `stage_runner`, and `session`. |
-| Kaggle launch seam | ✅ COMPLETE | `ouroboros.kaggle_launch_matrix` owns launch-mode behavior; notebook remains a thin adapter and preserves literal `!torchrun` shell magic. |
+| Kaggle launch seam | ✅ COMPLETE | `ouroboros.kaggle_launch_matrix` owns launch-mode behavior; notebook remains a thin shell-magic adapter and no longer duplicates `torchrun` argv. |
 | Runtime signal tracking cleanup | ✅ COMPLETE | Generated `signals/*.json` files are ignored; only `signals/.gitkeep` belongs in source control; the signal mechanism remains active as the coordinator doorbell. |
 | Coordinator zero-drift extraction | ✅ COMPLETE | `diloco_coordinator.py` is a thin adapter; aggregation, state, dispatch, and orchestration live under `ouroboros.diloco.*`. |
 | Planning artifact retirement | ✅ COMPLETE | Completed PRDs/plans have been promoted into wiki documentation and removed from `prds/` and `plans/`. |
@@ -117,7 +117,7 @@ WeirdRunner/Ouroboros/
 | `--max_seq_len` | 1024 |
 | `--max_grad_norm` | 0.3 (k≥2 stages) |
 | `--session_timeout_hours` | 12.0 |
-| `--val_batch_size` | 2 |
+| `--val_batch_size` | 2 for training/DiLoCo; 1 for `dgac-anchor-eval` on T4 |
 | val accuracy samples | 50 |
 | `--val_skip_buffer_minutes` | 60 |
 | NCCL timeout | `timedelta(hours=4)` |
@@ -129,7 +129,7 @@ WeirdRunner/Ouroboros/
 | amp_dtype A100+ (sm80+) | BF16 |
 | Gradient checkpointing | Auto-disabled at VRAM≥40GB only for small latent workloads; high-depth DGAC can keep it enabled even on 100GB H100 |
 | Multi-account strategy | DiLoCo dynamic parallel |
-| Notebook launch cells | `!torchrun` magic commands only; shell tokens are tested against `ouroboros.kaggle_launch_matrix` |
+| Notebook launch cells | single `!{shell_command}` magic command; argv is built by `ouroboros.kaggle_launch_matrix` |
 | Worker auto-detection | `DILOCO_WORKER_ID` Kaggle secret per account (`A`/`B`/`C`) |
 | Kaggle trigger mechanism | Local `kernels push` — staged checked-in notebook + generated metadata. No pull needed. ✅ |
 | Kaggle push success detection | Strict parser: requires `successfully pushed`; quota/error output is failed dispatch even with exit code 0. ✅ |

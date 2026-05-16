@@ -118,7 +118,7 @@
 
 **Result:** reusable behavior moved under `ouroboros/*`; the root training script now owns process startup and delegates to `ouroboros.train.run_cli`.
 
-**Kaggle contract:** `kaggle-utils.ipynb` remains a thin adapter and preserves the `!torchrun` shell-magic launch seam instead of using Python `subprocess.run`.
+**Kaggle contract:** `kaggle-utils.ipynb` remains a thin adapter and preserves the IPython shell-magic launch seam (`!{shell_command}`) instead of using Python `subprocess.run`; command argv comes from `ouroboros.kaggle_launch_matrix`.
 
 **Artifact hygiene:** generated `signals/*.json` files are runtime artifacts and should not be tracked; `signals/.gitkeep` keeps the directory present.
 

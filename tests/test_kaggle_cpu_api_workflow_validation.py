@@ -177,5 +177,5 @@ def test_kaggle_notebook_validation_branch_exits_before_real_torchrun():
     assert "OUROBOROS_WORKFLOW_VALIDATE" in source
     assert "run_cpu_smoke_validation" in source
     assert "raise SystemExit(0)" in source
-    assert source.index("run_cpu_smoke_validation") < source.index("!torchrun --standalone")
-    assert source.index("raise SystemExit(0)") < source.index("!torchrun --standalone")
+    assert source.index("run_cpu_smoke_validation") < source.index("!{shell_command}")
+    assert source.index("raise SystemExit(0)") < source.index("!{shell_command}")

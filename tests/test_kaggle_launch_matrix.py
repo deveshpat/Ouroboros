@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shlex
 from pathlib import Path
 
 from ouroboros.kaggle import (
@@ -21,8 +20,8 @@ from ouroboros.kaggle_contract import (
     known_kaggle_launch_modes,
 )
 from ouroboros.kaggle_launch_matrix import (
+    apply_launch_environment_defaults,
     build_launch_command,
-    expected_notebook_shell_tokens,
     get_launch_spec,
     known_launch_specs,
     requires_kaggle_gpu,
@@ -38,16 +37,8 @@ def _notebook_source() -> str:
     return "\n".join("".join(cell.get("source", [])) for cell in notebook.get("cells", []))
 
 
-def _shell_tokens_after(marker: str, stop_marker: str | None = None) -> tuple[str, ...]:
-    source = _notebook_source()
-    branch = source.split(marker, 1)[1]
-    if stop_marker is not None:
-        branch = branch.split(stop_marker, 1)[0]
-    for line in branch.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("!torchrun "):
-            return tuple(shlex.split(stripped.removeprefix("!")))
-    raise AssertionError(f"no !torchrun command found after {marker!r}")
+def _arg_value(command: list[str], flag: str) -> str:
+    return command[command.index(flag) + 1]
 
 
 def test_launch_matrix_covers_every_declared_mode_and_contract():
@@ -123,17 +114,53 @@ def test_launch_matrix_builds_same_commands_as_compatibility_builders():
     )
 
 
-def test_notebook_literal_torchrun_commands_match_launch_matrix():
-    branch_markers = {
-        DGAC_DILOCO_RUN_MODE: ("if run_mode == DGAC_DILOCO_RUN_MODE:", "elif run_mode == DGAC_CANARY_RUN_MODE:"),
-        DGAC_CANARY_RUN_MODE: ("elif run_mode == DGAC_CANARY_RUN_MODE:", "elif run_mode == DGAC_TRAIN_RUN_MODE:"),
-        DGAC_TRAIN_RUN_MODE: ("elif run_mode == DGAC_TRAIN_RUN_MODE:", "elif run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:"),
-        DGAC_ANCHOR_EVAL_RUN_MODE: ("elif run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:", "elif run_mode == DILOCO_RUN_MODE:"),
-        DILOCO_RUN_MODE: ("elif run_mode == DILOCO_RUN_MODE:", "else:"),
-    }
+def test_dgac_anchor_eval_uses_t4_safe_eval_and_diagnostic_microbatches():
+    command = build_launch_command(DGAC_ANCHOR_EVAL_RUN_MODE, {})
 
-    for mode, (start, stop) in branch_markers.items():
-        assert _shell_tokens_after(start, stop) == expected_notebook_shell_tokens(mode)
+    assert _arg_value(command, "--val_batch_size") == "1"
+    assert _arg_value(command, "--dgac_diagnostics_batch_size") == "1"
+    assert "--eval_only" in command
+    assert "--dgac_diagnostics" in command
+
+
+
+
+def test_dgac_anchor_eval_can_resume_at_diagnostics_only_from_env():
+    command = build_launch_command(
+        DGAC_ANCHOR_EVAL_RUN_MODE,
+        {
+            "OUROBOROS_DGAC_DIAGNOSTICS_ONLY": "1",
+            "OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE": "0.4112",
+        },
+    )
+
+    assert "--dgac_diagnostics_only" in command
+    assert _arg_value(command, "--dgac_diagnostics_forced_kmax_ce") == "0.4112"
+    assert _arg_value(command, "--val_batch_size") == "1"
+    assert _arg_value(command, "--dgac_diagnostics_batch_size") == "1"
+
+
+def test_launch_environment_defaults_are_centralized_and_non_destructive():
+    env = {"OUROBOROS_WANDB_PROJECT": "custom-project"}
+
+    apply_launch_environment_defaults(DGAC_ANCHOR_EVAL_RUN_MODE, env)
+
+    assert env["OUROBOROS_WANDB_PROJECT"] == "custom-project"
+    assert env["OUROBOROS_DILOCO_STATE_REPO"] == "WeirdRunner/Ouroboros"
+    assert env["OUROBOROS_DGAC_ANCHOR_EVAL_OUTPUT_DIR"] == "runs/dgac_anchor_eval"
+    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+
+
+def test_notebook_executes_single_matrix_built_shell_command():
+    source = _notebook_source()
+
+    assert "build_launch_command(run_mode, os.environ, worker_id=worker_id)" in source
+    assert "apply_launch_environment_defaults(run_mode, os.environ)" in source
+    assert "!{shell_command}" in source
+    assert "!torchrun --standalone" not in source
+    assert "build_dgac_anchor_eval_command" not in source
+    assert "build_dgac_training_command" not in source
+    assert "build_diloco_training_command" not in source
 
 
 def test_workflow_dispatch_exposes_only_valid_matrix_modes():

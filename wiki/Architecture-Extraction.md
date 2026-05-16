@@ -28,7 +28,7 @@ Extract reusable training behavior from the original worker monolith into packag
 - `python jamba_coconut_finetune.py --help` stays bootstrap-free.
 - Critical NCCL/CUDA/process environment variables are set before heavyweight imports.
 - Training CLI behavior delegates through the package without changing launch flags.
-- Kaggle launch remains an IPython `!torchrun` shell-magic command, not a Python subprocess.
+- Kaggle launch remains IPython shell magic (`!{shell_command}`), not a Python subprocess, with argv built only from `ouroboros.kaggle_launch_matrix`.
 - The notebook remains a runtime adapter that resolves worker identity and launches the root training entrypoint.
 
 ### Final ownership

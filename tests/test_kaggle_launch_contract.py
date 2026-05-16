@@ -226,6 +226,9 @@ def test_build_dgac_anchor_eval_command_loads_anchor_and_skips_training():
     assert "--use_4bit" in command
     assert "--max_stage" in command and command[command.index("--max_stage") + 1] == "10"
     assert "--max_grad_norm" in command and command[command.index("--max_grad_norm") + 1] == "0.3"
+    assert "--val_batch_size" in command and command[command.index("--val_batch_size") + 1] == "1"
+    assert "--dgac_diagnostics_batch_size" in command
+    assert command[command.index("--dgac_diagnostics_batch_size") + 1] == "1"
     assert "--output_dir" in command and "runs/dgac_anchor_eval" in command
     assert "--diloco_mode" not in command
     assert "--push_to_hub" not in command
@@ -237,6 +240,9 @@ def test_build_dgac_anchor_eval_command_allows_safe_overrides():
         use_4bit=False,
         diloco_state_repo="state/repo",
         output_dir="runs/eval",
+        dgac_diagnostics_batch_size=3,
+        dgac_diagnostics_only=True,
+        dgac_diagnostics_forced_kmax_ce=0.4112,
         wandb_mode="offline",
         latent_cache=False,
     )
@@ -245,6 +251,9 @@ def test_build_dgac_anchor_eval_command_allows_safe_overrides():
     assert "--use_4bit" not in command
     assert command[command.index("--diloco_state_repo") + 1] == "state/repo"
     assert command[command.index("--output_dir") + 1] == "runs/eval"
+    assert command[command.index("--dgac_diagnostics_batch_size") + 1] == "3"
+    assert "--dgac_diagnostics_only" in command
+    assert command[command.index("--dgac_diagnostics_forced_kmax_ce") + 1] == "0.4112"
     assert command[command.index("--wandb_mode") + 1] == "offline"
     assert "--latent_cache" not in command
 

@@ -3,6 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from ouroboros.kaggle_contract import (
+    DGAC_ANCHOR_EVAL_RUN_MODE,
+    DGAC_CANARY_RUN_MODE,
+    DGAC_DILOCO_RUN_MODE,
+    DGAC_TRAIN_RUN_MODE,
+    DILOCO_RUN_MODE,
+)
+from ouroboros.kaggle_launch_matrix import build_launch_command
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = REPO_ROOT / "kaggle-utils.ipynb"
 
@@ -12,15 +21,15 @@ def _notebook_source() -> str:
     return "\n".join("".join(cell.get("source", [])) for cell in notebook.get("cells", []))
 
 
-def test_kaggle_notebook_keeps_torchrun_shell_magic_not_python_subprocess():
+def test_kaggle_notebook_keeps_shell_magic_not_python_subprocess():
     source = _notebook_source()
 
     assert "from ouroboros.kaggle import" in source
     assert "resolve_diloco_worker_id" in source
     assert "resolve_kaggle_run_mode" in source
-    assert "!torchrun --standalone" in source
+    assert "!{shell_command}" in source
     assert "subprocess.run(command, check=True)" not in source
-    assert "import subprocess" not in source.split("!torchrun --standalone", 1)[0].split("from ouroboros.kaggle import", 1)[-1]
+    assert "import subprocess" not in source.split("from ouroboros.kaggle import", 1)[-1]
 
 
 def test_kaggle_notebook_describes_itself_as_thin_adapter():
@@ -30,49 +39,55 @@ def test_kaggle_notebook_describes_itself_as_thin_adapter():
     assert "Reusable training, checkpoint, DGAC, DiLoCo worker" in source
 
 
-def test_kaggle_notebook_supports_dgac_anchor_eval_mode_without_diloco_training():
+def test_kaggle_notebook_delegates_all_gpu_launch_argv_to_matrix():
     source = _notebook_source()
 
-    assert "OUROBOROS_KAGGLE_RUN_MODE" in source
-    assert "DGAC_ANCHOR_EVAL_RUN_MODE" in source
-    assert "build_dgac_anchor_eval_command" in source
-    assert "--resume_from_diloco_anchor" in source
-    assert "--eval_only" in source
-    assert "--use_halt_gate" in source
-    assert "runs/dgac_anchor_eval" in source
-    eval_branch = source.split("elif run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:", 1)[1].split("elif run_mode == DILOCO_RUN_MODE:", 1)[0]
-    assert "--diloco_mode" not in eval_branch
-    assert "--push_to_hub" not in eval_branch
+    assert "build_launch_command(run_mode, os.environ, worker_id=worker_id)" in source
+    assert "format_shell_command(command)" in source
+    assert "The command argv comes from ouroboros.kaggle_launch_matrix" in source
+    assert "!torchrun --standalone" not in source
+
+    forbidden_parallel_builders = (
+        "build_dgac_anchor_eval_command",
+        "build_dgac_canary_command",
+        "build_dgac_training_command",
+        "build_diloco_training_command",
+    )
+    for name in forbidden_parallel_builders:
+        assert name not in source
 
 
+def test_matrix_supports_expected_kaggle_gpu_modes_without_notebook_branches():
+    env = {
+        "DILOCO_WORKER_ID": "A",
+        "OUROBOROS_DILOCO_STATE_REPO": "WeirdRunner/Ouroboros",
+        "OUROBOROS_DILOCO_SIGNAL_REPO": "deveshpat/Ouroboros",
+        "OUROBOROS_DILOCO_OUTER_LR": "0.7",
+        "OUROBOROS_DILOCO_OUTPUT_DIR": "runs/diloco",
+        "OUROBOROS_DGAC_ANCHOR_EVAL_OUTPUT_DIR": "runs/dgac_anchor_eval",
+        "OUROBOROS_DGAC_OUTPUT_DIR": "runs/stage3_dgac",
+        "OUROBOROS_DGAC_CANARY_OUTPUT_DIR": "runs/stage3_dgac_canary",
+        "OUROBOROS_DGAC_DILOCO_OUTPUT_DIR": "runs/dgac_dedicated",
+        "OUROBOROS_WANDB_PROJECT": "ouroboros-stage3-jamba",
+    }
 
-def test_kaggle_notebook_supports_bounded_dgac_canary_mode():
-    source = _notebook_source()
+    commands = {
+        mode: build_launch_command(mode, env)
+        for mode in (
+            DILOCO_RUN_MODE,
+            DGAC_DILOCO_RUN_MODE,
+            DGAC_CANARY_RUN_MODE,
+            DGAC_TRAIN_RUN_MODE,
+            DGAC_ANCHOR_EVAL_RUN_MODE,
+        )
+    }
 
-    assert "DGAC_CANARY_RUN_MODE" in source
-    assert "build_dgac_canary_command" in source
-    canary_branch = source.split("if run_mode == DGAC_CANARY_RUN_MODE:", 1)[1].split("elif run_mode == DGAC_TRAIN_RUN_MODE:", 1)[0]
-    assert "--use_halt_gate" in canary_branch
-    assert "--resume_from_diloco_anchor" in canary_branch
-    assert "--max_samples 512" in canary_branch
-    assert "--max_train_steps 20" in canary_branch
-    assert "--log_every 1" in canary_branch
-    assert "--no-gen_every_stage" in canary_branch
-    assert "--push_to_hub" not in canary_branch
-    assert "--eval_only" not in canary_branch
-    assert "--diloco_mode" not in canary_branch
-
-
-def test_kaggle_notebook_supports_dgac_training_mode_without_diloco_or_eval_only():
-    source = _notebook_source()
-
-    assert "DGAC_TRAIN_RUN_MODE" in source
-    assert "build_dgac_training_command" in source
-    assert "runs/stage3_dgac" in source
-    train_branch = source.split("if run_mode == DGAC_TRAIN_RUN_MODE:", 1)[1].split("elif run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:", 1)[0]
-    assert "--use_halt_gate" in train_branch
-    assert "--resume_from_diloco_anchor" in train_branch
-    assert "--push_to_hub" in train_branch
-    assert "--hf_stage_subdir" in train_branch
-    assert "--eval_only" not in train_branch
-    assert "--diloco_mode" not in train_branch
+    assert "--diloco_mode" in commands[DILOCO_RUN_MODE]
+    assert "--diloco_mode" in commands[DGAC_DILOCO_RUN_MODE]
+    assert "--use_halt_gate" in commands[DGAC_DILOCO_RUN_MODE]
+    assert "--max_train_steps" in commands[DGAC_CANARY_RUN_MODE]
+    assert "--push_to_hub" in commands[DGAC_TRAIN_RUN_MODE]
+    assert "--eval_only" in commands[DGAC_ANCHOR_EVAL_RUN_MODE]
+    assert "--dgac_diagnostics" in commands[DGAC_ANCHOR_EVAL_RUN_MODE]
+    assert "--diloco_mode" not in commands[DGAC_ANCHOR_EVAL_RUN_MODE]
+    assert "--push_to_hub" not in commands[DGAC_ANCHOR_EVAL_RUN_MODE]

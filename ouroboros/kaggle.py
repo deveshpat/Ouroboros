@@ -330,7 +330,10 @@ def build_dgac_anchor_eval_command(
     max_grad_norm: float = 0.3,
     batch_size: int = 4,
     grad_accum: int = 8,
-    val_batch_size: int = 2,
+    val_batch_size: int = 1,
+    dgac_diagnostics_batch_size: int | None = 1,
+    dgac_diagnostics_only: bool = False,
+    dgac_diagnostics_forced_kmax_ce: float | None = None,
     val_skip_buffer_minutes: int = 60,
     session_timeout_hours: float = 12.0,
     graceful_exit_buffer_minutes: int = 20,
@@ -382,6 +385,12 @@ def build_dgac_anchor_eval_command(
             output_dir,
         ]
     )
+    if dgac_diagnostics_only:
+        command.append("--dgac_diagnostics_only")
+    if dgac_diagnostics_batch_size is not None:
+        command.extend(["--dgac_diagnostics_batch_size", str(int(dgac_diagnostics_batch_size))])
+    if dgac_diagnostics_forced_kmax_ce is not None:
+        command.extend(["--dgac_diagnostics_forced_kmax_ce", str(float(dgac_diagnostics_forced_kmax_ce))])
     if wandb_project is not None:
         command.extend(["--wandb_project", wandb_project])
     if wandb_entity is not None:

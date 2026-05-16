@@ -39,6 +39,14 @@ def _eval_progress_every(args: argparse.Namespace) -> int:
     return max(int(getattr(args, "eval_progress_every", 25) or 0), 0)
 
 
+def _diagnostic_batch_size(args: argparse.Namespace) -> int:
+    """Return DGAC diagnostic microbatch size independent of normal validation."""
+    value = getattr(args, "dgac_diagnostics_batch_size", None)
+    if value is None:
+        value = getattr(args, "val_batch_size", 1)
+    return max(int(value), 1)
+
+
 def _emit_progress(message: str) -> None:
     """Print rank-0 progress immediately so Kaggle logs do not look stalled."""
     if _is_main_process():
@@ -258,7 +266,7 @@ def _evaluate_ce_for_sample_stage_pairs(
     _maybe_empty_cuda_cache()
     model.eval()
     pad_id = tokenizer.pad_token_id or 0
-    batch_size = max(int(args.val_batch_size), 1)
+    batch_size = _diagnostic_batch_size(args)
     progress_every = _eval_progress_every(args)
     _emit_progress(
         f"  [DGAC diagnostic] CE start: rank0_pairs={len(sample_stage_pairs)} batch_size={batch_size}"
@@ -326,7 +334,7 @@ def _collect_local_halt_gate_stage_plan(
     rank = _rank()
     world_size = _world_size()
     local_val_samples = val_samples[rank::world_size]
-    batch_size = max(int(args.val_batch_size), 1)
+    batch_size = _diagnostic_batch_size(args)
     progress_every = _eval_progress_every(args)
     _emit_progress(
         f"  [DGAC diagnostic] HaltGate plan start: rank0_shard={len(local_val_samples)} "
@@ -551,6 +559,34 @@ def run_eval_only(
     run_generation: bool = True,
 ) -> Dict[str, float]:
     """Run a validation/generation preflight and exit without optimizer steps."""
+    diagnostics_requested = bool(getattr(args, "dgac_diagnostics", False))
+    diagnostics_only = bool(getattr(args, "dgac_diagnostics_only", False))
+    if diagnostics_only:
+        if not diagnostics_requested:
+            raise ValueError("--dgac_diagnostics_only requires --dgac_diagnostics")
+        if halt_gate is None:
+            raise ValueError("--dgac_diagnostics_only requires --use_halt_gate")
+        known_kmax_ce = getattr(args, "dgac_diagnostics_forced_kmax_ce", None)
+        _emit_progress(
+            f"\n  [eval-only] DGAC diagnostics-only start: stage={stage_k} "
+            f"samples={len(val_samples)} known_forced_kmax_ce={known_kmax_ce}"
+        )
+        metrics = run_dgac_diagnostics(
+            model=model,
+            tokenizer=tokenizer,
+            halt_gate=halt_gate,
+            val_samples=val_samples,
+            lat_token_id=lat_token_id,
+            stage_k=stage_k,
+            device=device,
+            args=args,
+            step=step,
+            wandb_run=wandb_run,
+            val_ce_forced_kmax=(float(known_kmax_ce) if known_kmax_ce is not None else None),
+        )
+        barrier()
+        return metrics
+
     _emit_progress(f"\n  [eval-only] starting validation stage={stage_k} samples={len(val_samples)}")
     val_ce, val_acc = evaluate_stage(
         model=model,
@@ -588,7 +624,7 @@ def run_eval_only(
             metrics["gen_mean_uwr"] = float(mean_uwr)
 
     barrier()
-    if bool(getattr(args, "dgac_diagnostics", False)):
+    if diagnostics_requested:
         if halt_gate is None:
             raise ValueError("--dgac_diagnostics requires --use_halt_gate")
         metrics.update(

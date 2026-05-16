@@ -188,7 +188,7 @@ cron is disabled so GitHub cannot race the local fallback on a timer.
 | `ouroboros/` | Packaged training, worker, coordinator, dispatch, state, and aggregation behavior |
 | `ouroboros/mac_dgac_fallback.py` | Strict local Apple Silicon DGAC fallback preflight, claim lock, sequential worker commands, and local aggregation command |
 | `.github/workflows/diloco_coordinator.yml` | CI trigger + dependencies |
-| `kaggle-utils.ipynb` | Kaggle notebook runtime adapter; preserves `!torchrun` shell magic |
+| `kaggle-utils.ipynb` | Kaggle notebook runtime adapter; runs one matrix-built `!{shell_command}` shell magic |
 | `signals/.gitkeep` | Keeps the runtime signal directory present; generated `signals/*.json` files are ignored; signal JSON pushes still trigger the coordinator |
 | `wiki/` | Durable operational and architectural knowledge base |
 | `terminal_log.md` | Last-session verbatim output (rolling, ≤80 lines) |

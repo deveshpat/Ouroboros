@@ -67,6 +67,9 @@ def bootstrap_free_help_text() -> str:
         "  --mac_mps_latent_cache\n"
         "  --eval_only\n"
         "  --dgac_diagnostics\n"
+        "  --dgac_diagnostics_only\n"
+        "  --dgac_diagnostics_batch_size DGAC_DIAGNOSTICS_BATCH_SIZE\n"
+        "  --dgac_diagnostics_forced_kmax_ce DGAC_DIAGNOSTICS_FORCED_KMAX_CE\n"
         "  --dgac_halt_supervision_weight DGAC_HALT_SUPERVISION_WEIGHT\n"
         "  --dgac_halt_ce_tolerance DGAC_HALT_CE_TOLERANCE\n"
         "  --dgac_halt_probe_steps DGAC_HALT_PROBE_STEPS\n"
@@ -286,6 +289,34 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "During eval-only HaltGate runs, log DGAC diagnostics: k_actual "
             "histogram plus forced-k and gated validation CE comparisons."
+        ),
+    )
+    parser.add_argument(
+        "--dgac_diagnostics_only",
+        action="store_true",
+        help=(
+            "During eval-only DGAC runs, skip the normal validation/generation preflight "
+            "and run only HaltGate diagnostics. Use with "
+            "--dgac_diagnostics_forced_kmax_ce to reuse a known forced-kmax CE from a "
+            "previous successful eval."
+        ),
+    )
+    parser.add_argument(
+        "--dgac_diagnostics_batch_size",
+        type=int,
+        default=1,
+        help=(
+            "Microbatch size for DGAC diagnostic HaltGate planning and forced-k CE. "
+            "Keep at 1 on 16GB T4 because diagnostics run multiple extra full-depth forwards."
+        ),
+    )
+    parser.add_argument(
+        "--dgac_diagnostics_forced_kmax_ce",
+        type=float,
+        default=None,
+        help=(
+            "Optional known forced-kmax validation CE to reuse in --dgac_diagnostics_only "
+            "instead of recomputing the full-depth validation CE."
         ),
     )
     parser.add_argument("--keep_checkpoints_per_stage", type=int, default=2)

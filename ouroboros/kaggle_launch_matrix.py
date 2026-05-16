@@ -1,15 +1,18 @@
 """Deep Kaggle launch-mode matrix for Ouroboros.
 
 ``ouroboros.kaggle_contract`` remains the stdlib-safe policy layer. This
-module binds each launch mode to the command builders, notebook shell-magic
-expectations, output env keys, and workflow-facing labels used by adapters.
+module binds each launch mode to the command builders, output env keys,
+workflow-facing labels, and launch-time environment defaults used by adapters.
+
+The notebook must execute commands built from this matrix. It must not maintain
+parallel hard-coded ``torchrun`` argv strings, because those drift from the
+Python command builders and silently re-open runtime bugs.
 """
 
 from __future__ import annotations
 
 import os
-import shlex
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -39,7 +42,6 @@ class KaggleLaunchModeSpec:
     contract: KaggleLaunchContract
     env_defaults: Mapping[str, str]
     command_builder: Callable[..., list[str]]
-    notebook_shell_template: str
     output_env_key: str | None
     requires_worker_id: bool
     workflow_label: str
@@ -67,6 +69,20 @@ def _value(env: Mapping[str, str], key: str) -> str:
 
 def _float_value(env: Mapping[str, str], key: str) -> float:
     return float(_value(env, key))
+
+
+def _optional_float_value(env: Mapping[str, str], key: str) -> float | None:
+    value = normalize_text(env.get(key))
+    if value is None:
+        return None
+    return float(value)
+
+
+def _truthy_value(env: Mapping[str, str], key: str) -> bool:
+    value = normalize_text(env.get(key))
+    if value is None:
+        return False
+    return value.lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _resolve_worker(env: Mapping[str, str], worker_id: str | None) -> str:
@@ -129,6 +145,10 @@ def _build_dgac_anchor_eval(env: Mapping[str, str], *, worker_id: str | None = N
         diloco_state_repo=_value(env, "OUROBOROS_DILOCO_STATE_REPO"),
         output_dir=_value(env, "OUROBOROS_DGAC_ANCHOR_EVAL_OUTPUT_DIR"),
         wandb_project=_value(env, "OUROBOROS_WANDB_PROJECT"),
+        dgac_diagnostics_only=_truthy_value(env, "OUROBOROS_DGAC_DIAGNOSTICS_ONLY"),
+        dgac_diagnostics_forced_kmax_ce=_optional_float_value(
+            env, "OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE"
+        ),
     )
 
 
@@ -144,57 +164,11 @@ _COMMON_DEFAULTS = {
     "OUROBOROS_WANDB_PROJECT": "ouroboros-stage3-jamba",
 }
 
-_DILOCO_SHELL = (
-    'torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py '
-    '--data_dir data/coconut_v1 --use_4bit --latent_cache --stage_0_epochs 1 --epochs_per_stage 1 '
-    '--max_stage 10 --batch_size 4 --grad_accum 8 --val_batch_size 2 '
-    '--val_skip_buffer_minutes 60 --session_timeout_hours 12.0 '
-    '--graceful_exit_buffer_minutes 20 --diloco_mode --diloco_worker_id "$DILOCO_WORKER_ID" '
-    '--diloco_outer_lr "$OUROBOROS_DILOCO_OUTER_LR" '
-    '--diloco_state_repo "$OUROBOROS_DILOCO_STATE_REPO" '
-    '--diloco_signal_repo "$OUROBOROS_DILOCO_SIGNAL_REPO" --push_to_hub '
-    '--output_dir "$OUROBOROS_DILOCO_OUTPUT_DIR"'
-)
-_DGAC_DILOCO_SHELL = (
-    'torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py '
-    '--data_dir data/coconut_v1 --use_4bit --use_halt_gate --resume_from_diloco_anchor '
-    '--latent_cache --stage_0_epochs 1 --epochs_per_stage 1 --max_stage 10 --max_grad_norm 0.3 '
-    '--batch_size 4 --grad_accum 8 --val_batch_size 2 --val_skip_buffer_minutes 60 '
-    '--session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 --diloco_run_val '
-    '--gen_every_stage --diloco_mode '
-    '--diloco_worker_id "$DILOCO_WORKER_ID" --diloco_outer_lr "$OUROBOROS_DILOCO_OUTER_LR" '
-    '--diloco_state_repo "$OUROBOROS_DILOCO_STATE_REPO" '
-    '--diloco_signal_repo "$OUROBOROS_DILOCO_SIGNAL_REPO" --push_to_hub '
-    '--output_dir "$OUROBOROS_DGAC_DILOCO_OUTPUT_DIR"'
-)
-_DGAC_CANARY_SHELL = (
-    'torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py '
-    '--use_halt_gate --resume_from_diloco_anchor --diloco_state_repo "$OUROBOROS_DILOCO_STATE_REPO" '
-    '--data_dir data/coconut_v1 --use_4bit --latent_cache --epochs_per_stage 1 --max_stage 10 '
-    '--max_grad_norm 0.3 --batch_size 4 --grad_accum 8 --val_batch_size 2 '
-    '--val_skip_buffer_minutes 720 --session_timeout_hours 12.0 '
-    '--graceful_exit_buffer_minutes 20 --max_samples 512 --max_train_steps 20 '
-    '--log_every 1 --no-gen_every_stage --output_dir "$OUROBOROS_DGAC_CANARY_OUTPUT_DIR" '
-    '--hf_stage_subdir "$OUROBOROS_DGAC_CANARY_OUTPUT_DIR" --wandb_project "$OUROBOROS_WANDB_PROJECT"'
-)
-_DGAC_TRAIN_SHELL = (
-    'torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py '
-    '--use_halt_gate --resume_from_diloco_anchor --diloco_state_repo "$OUROBOROS_DILOCO_STATE_REPO" '
-    '--data_dir data/coconut_v1 --use_4bit --latent_cache --epochs_per_stage 3 --max_stage 10 '
-    '--max_grad_norm 0.3 --batch_size 4 --grad_accum 8 --val_batch_size 2 '
-    '--val_skip_buffer_minutes 60 --session_timeout_hours 12.0 '
-    '--graceful_exit_buffer_minutes 20 --push_to_hub --output_dir "$OUROBOROS_DGAC_OUTPUT_DIR" '
-    '--hf_stage_subdir "$OUROBOROS_DGAC_OUTPUT_DIR" --wandb_project "$OUROBOROS_WANDB_PROJECT"'
-)
-_DGAC_ANCHOR_EVAL_SHELL = (
-    'torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py '
-    '--use_halt_gate --resume_from_diloco_anchor --eval_only --dgac_diagnostics '
-    '--diloco_state_repo "$OUROBOROS_DILOCO_STATE_REPO" --data_dir data/coconut_v1 '
-    '--use_4bit --latent_cache --max_stage 10 --max_grad_norm 0.3 --batch_size 4 --grad_accum 8 '
-    '--val_batch_size 2 --val_skip_buffer_minutes 60 --session_timeout_hours 12.0 '
-    '--graceful_exit_buffer_minutes 20 --output_dir "$OUROBOROS_DGAC_ANCHOR_EVAL_OUTPUT_DIR" '
-    '--wandb_project "$OUROBOROS_WANDB_PROJECT"'
-)
+_RUNTIME_ENV_DEFAULTS = {
+    # The eval/diagnostic path runs close to the T4 memory ceiling. This allocator
+    # setting avoids avoidable fragmentation OOMs without changing model behavior.
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+}
 
 _SPECS: dict[str, KaggleLaunchModeSpec] = {
     DILOCO_RUN_MODE: KaggleLaunchModeSpec(
@@ -202,7 +176,6 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
         contract=get_kaggle_launch_contract(DILOCO_RUN_MODE),
         env_defaults=_readonly({**_COMMON_DEFAULTS, "OUROBOROS_DILOCO_OUTPUT_DIR": "runs/diloco"}),
         command_builder=_build_diloco,
-        notebook_shell_template=_DILOCO_SHELL,
         output_env_key="OUROBOROS_DILOCO_OUTPUT_DIR",
         requires_worker_id=True,
         workflow_label="normal coordinator DiLoCo dispatch",
@@ -212,7 +185,6 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
         contract=get_kaggle_launch_contract(DGAC_ANCHOR_EVAL_RUN_MODE),
         env_defaults=_readonly({**_COMMON_DEFAULTS, "OUROBOROS_DGAC_ANCHOR_EVAL_OUTPUT_DIR": "runs/dgac_anchor_eval"}),
         command_builder=_build_dgac_anchor_eval,
-        notebook_shell_template=_DGAC_ANCHOR_EVAL_SHELL,
         output_env_key="OUROBOROS_DGAC_ANCHOR_EVAL_OUTPUT_DIR",
         requires_worker_id=False,
         workflow_label="current anchor eval-only",
@@ -222,7 +194,6 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
         contract=get_kaggle_launch_contract(DGAC_TRAIN_RUN_MODE),
         env_defaults=_readonly({**_COMMON_DEFAULTS, "OUROBOROS_DGAC_OUTPUT_DIR": "runs/stage3_dgac"}),
         command_builder=_build_dgac_train,
-        notebook_shell_template=_DGAC_TRAIN_SHELL,
         output_env_key="OUROBOROS_DGAC_OUTPUT_DIR",
         requires_worker_id=False,
         workflow_label="sequential DGAC fallback",
@@ -232,7 +203,6 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
         contract=get_kaggle_launch_contract(DGAC_CANARY_RUN_MODE),
         env_defaults=_readonly({**_COMMON_DEFAULTS, "OUROBOROS_DGAC_CANARY_OUTPUT_DIR": "runs/stage3_dgac_canary"}),
         command_builder=_build_dgac_canary,
-        notebook_shell_template=_DGAC_CANARY_SHELL,
         output_env_key="OUROBOROS_DGAC_CANARY_OUTPUT_DIR",
         requires_worker_id=False,
         workflow_label="bounded DGAC objective canary",
@@ -242,7 +212,6 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
         contract=get_kaggle_launch_contract(DGAC_DILOCO_RUN_MODE),
         env_defaults=_readonly({**_COMMON_DEFAULTS, "OUROBOROS_DGAC_DILOCO_OUTPUT_DIR": "runs/dgac_dedicated"}),
         command_builder=_build_dgac_diloco,
-        notebook_shell_template=_DGAC_DILOCO_SHELL,
         output_env_key="OUROBOROS_DGAC_DILOCO_OUTPUT_DIR",
         requires_worker_id=True,
         workflow_label="DGAC dedicated worker rounds",
@@ -252,7 +221,6 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
         contract=get_kaggle_launch_contract(CPU_SMOKE_MODE),
         env_defaults=_readonly({"OUROBOROS_WORKFLOW_VALIDATE": CPU_SMOKE_MODE}),
         command_builder=_build_cpu_smoke,
-        notebook_shell_template="",
         output_env_key=None,
         requires_worker_id=True,
         workflow_label="read-only CPU workflow validation",
@@ -271,6 +239,24 @@ def get_launch_spec(mode: str) -> KaggleLaunchModeSpec:
     return _SPECS[contract.mode]
 
 
+def apply_launch_environment_defaults(
+    mode: str,
+    env: MutableMapping[str, str] | None = None,
+) -> MutableMapping[str, str]:
+    """Set launch-time env defaults in one place for notebook/GitHub adapters.
+
+    Command argv defaults still come from ``build_launch_command``. This helper is
+    for environment values that must exist before the shell magic starts, such as
+    CUDA allocator configuration and output env keys used by logs or downstream
+    tools.
+    """
+    target = os.environ if env is None else env
+    defaults = {**_RUNTIME_ENV_DEFAULTS, **get_launch_spec(mode).env_defaults}
+    for key, value in defaults.items():
+        target.setdefault(key, value)
+    return target
+
+
 def build_launch_command(
     mode: str,
     env: Mapping[str, str] | None = None,
@@ -283,14 +269,6 @@ def build_launch_command(
     return spec.command_builder(merged_env, worker_id=worker_id)
 
 
-def expected_notebook_shell_tokens(mode: str) -> tuple[str, ...]:
-    """Return the literal IPython shell-magic argv expected in kaggle-utils.ipynb."""
-    template = get_launch_spec(mode).notebook_shell_template
-    if not template:
-        return ()
-    return tuple(shlex.split(template))
-
-
 def requires_kaggle_gpu(mode: str) -> bool:
     """Return whether Kaggle metadata/CLI should request GPU for this launch mode."""
     return get_launch_spec(mode).contract.requires_gpu
@@ -298,8 +276,8 @@ def requires_kaggle_gpu(mode: str) -> bool:
 
 __all__ = [
     "KaggleLaunchModeSpec",
+    "apply_launch_environment_defaults",
     "build_launch_command",
-    "expected_notebook_shell_tokens",
     "get_launch_spec",
     "known_launch_specs",
     "requires_kaggle_gpu",

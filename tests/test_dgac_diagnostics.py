@@ -18,6 +18,8 @@ def _args() -> argparse.Namespace:
     return argparse.Namespace(
         max_seq_len=64,
         val_batch_size=2,
+        dgac_diagnostics_batch_size=1,
+        eval_progress_every=1,
         halt_threshold=0.5,
         dgac_warmup_steps=0,
         dgac_ramp_steps=1,
@@ -65,3 +67,30 @@ def test_dgac_diagnostics_reports_halt_histogram_and_ce_comparison(capsys):
     assert "val_ce_forced_k1=" in out
     assert "val_ce_gated=" in out
     assert "val_ce_forced_k3=0.1230" in out
+
+
+def test_dgac_diagnostics_uses_diagnostic_microbatch_instead_of_validation_batch(capsys):
+    tokenizer = FakeTokenizer()
+    samples = [
+        {"question": "Q one", "steps": ["s1", "s2"], "answer_full": "1", "answer_norm": "1"},
+        {"question": "Q two", "steps": ["s1", "s2"], "answer_full": "2", "answer_norm": "2"},
+    ]
+
+    run_dgac_diagnostics(
+        model=FakeCausalLM(),
+        tokenizer=tokenizer,
+        halt_gate=AlwaysHaltAfterOneGate(),
+        val_samples=samples,
+        lat_token_id=6,
+        stage_k=2,
+        device=torch.device("cpu"),
+        args=_args(),
+        step=0,
+        wandb_run=None,
+        val_ce_forced_kmax=0.123,
+    )
+
+    out = capsys.readouterr().out
+    assert "[DGAC diagnostic] HaltGate plan start:" in out
+    assert "batch_size=1" in out
+    assert "[DGAC diagnostic] CE start: rank0_pairs=2 batch_size=1" in out
