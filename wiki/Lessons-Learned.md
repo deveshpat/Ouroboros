@@ -1,5 +1,7 @@
 # Lessons Learned
 > Operational hard lessons. Load when debugging a recurring failure class.
+>
+> **Guardrail rule:** this page is not allowed to be passive memory. Every table row must have a matching executable guardrail record in `ouroboros/hard_lesson_guardrails.py`; tests fail when a new lesson is documented without a preflight, runtime guard, regression test, or known-error signature.
 
 | Symptom / Mistake | Fix Applied |
 |---|---|
@@ -29,7 +31,8 @@
 | `last_hidden_state` None | assert in all forward paths |
 | Graceful session timeout | `make_timeout_checker()` using `_SCRIPT_START` |
 | `conv1d` in LoRA | Excluded from LORA_TARGET_MODULES |
-| OOM at val | `empty_cache()` + `val_batch_size=2` |
+| OOM at val | `empty_cache()` + `val_batch_size=2`; validation/generation/DGAC diagnostics must stay inference-only |
+| DGAC diagnostics eval-only OOM in `selective_scan_fn`/bitsandbytes dequantization | `run_dgac_diagnostics()` and DGAC CE helpers run under `torch.inference_mode()`; known log signature triages directly to this guardrail |
 | Stage 1+ samples filtered by short seq_len | `--max_seq_len 1024` |
 | Exploding gradients k≥2 | `--max_grad_norm 0.3` |
 | mamba-ssm 2.x API break | Pinned to 1.2.2 |

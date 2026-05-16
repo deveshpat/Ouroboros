@@ -94,3 +94,35 @@ def test_dgac_diagnostics_uses_diagnostic_microbatch_instead_of_validation_batch
     assert "[DGAC diagnostic] HaltGate plan start:" in out
     assert "batch_size=1" in out
     assert "[DGAC diagnostic] CE start: rank0_pairs=2 batch_size=1" in out
+
+
+def test_dgac_diagnostics_runs_all_model_forwards_with_autograd_disabled_and_restores_modes():
+    tokenizer = FakeTokenizer()
+    model = FakeCausalLM()
+    halt_gate = AlwaysHaltAfterOneGate()
+    samples = [
+        {"question": "Q one", "steps": ["s1", "s2", "s3"], "answer_full": "1", "answer_norm": "1"},
+        {"question": "Q two", "steps": ["s1", "s2", "s3"], "answer_full": "2", "answer_norm": "2"},
+    ]
+
+    model.train()
+    halt_gate.train()
+    metrics = run_dgac_diagnostics(
+        model=model,
+        tokenizer=tokenizer,
+        halt_gate=halt_gate,
+        val_samples=samples,
+        lat_token_id=6,
+        stage_k=3,
+        device=torch.device("cpu"),
+        args=_args(),
+        step=0,
+        wandb_run=None,
+        val_ce_forced_kmax=0.123,
+    )
+
+    assert metrics["dgac_diag/samples"] == 2.0
+    assert model.model.grad_enabled_observations
+    assert model.model.grad_enabled_observations == [False] * len(model.model.grad_enabled_observations)
+    assert model.training is True
+    assert halt_gate.training is True

@@ -253,6 +253,7 @@ def run_generation_callback(
     return mean_uwr
 
 
+@torch.inference_mode()
 def _evaluate_ce_for_sample_stage_pairs(
     *,
     model,
@@ -437,6 +438,7 @@ def _summarize_halt_histogram(local_ks: List[int], stage_k: int, device: torch.d
     }
 
 
+@torch.inference_mode()
 def run_dgac_diagnostics(
     *,
     model,
