@@ -29,6 +29,7 @@ DEFAULT_BATCH_SIZE = "1"
 DEFAULT_DEVICE = "cuda:0"
 DEFAULT_DTYPE = "float16"
 DEFAULT_HUB_PREFIX = "benchmarks/lm_eval"
+DEFAULT_BOOTSTRAP_LM_EVAL = True
 _VOCAB_WEIGHT_SUFFIXES = ("embed_tokens.weight", "lm_head.weight")
 
 
@@ -72,6 +73,23 @@ def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | No
     parser.add_argument("--device", default=_env(env, "OUROBOROS_BENCHMARK_DEVICE", DEFAULT_DEVICE))
     parser.add_argument("--dtype", default=_env(env, "OUROBOROS_BENCHMARK_DTYPE", DEFAULT_DTYPE))
     parser.add_argument("--model_args", default=_normalize_text(env.get("OUROBOROS_BENCHMARK_MODEL_ARGS")))
+    parser.add_argument(
+        "--bootstrap_lm_eval",
+        dest="bootstrap_lm_eval",
+        action="store_true",
+        default=_env_bool(env, "OUROBOROS_BENCHMARK_BOOTSTRAP_LM_EVAL", DEFAULT_BOOTSTRAP_LM_EVAL),
+        help=(
+            "Run lm-eval through the Ouroboros bootstrap wrapper so Jamba CUDA "
+            "Mamba kernels are installed and patched inside the child process. "
+            "Enabled by default for the default Jamba benchmark path."
+        ),
+    )
+    parser.add_argument(
+        "--no_bootstrap_lm_eval",
+        dest="bootstrap_lm_eval",
+        action="store_false",
+        help="Call upstream python -m lm_eval directly without the Ouroboros bootstrap wrapper.",
+    )
     parser.add_argument("--adapter_cache_dir", default=_env(env, "OUROBOROS_BENCHMARK_ADAPTER_CACHE_DIR", "/kaggle/working/ouroboros_benchmark_adapter"))
     parser.add_argument("--hub_results_prefix", default=_env(env, "OUROBOROS_BENCHMARK_HUB_PREFIX", DEFAULT_HUB_PREFIX))
     parser.add_argument("--publish_to_hub", action="store_true", default=_truthy(env.get("OUROBOROS_BENCHMARK_PUBLISH_TO_HUB")))
@@ -260,11 +278,13 @@ def build_lm_eval_argv(
     batch_size: str,
     device: str,
     limit: str | None = None,
+    bootstrap_lm_eval: bool = True,
 ) -> list[str]:
+    module = "ouroboros.lm_eval_bootstrap" if bootstrap_lm_eval else "lm_eval"
     argv = [
         sys.executable,
         "-m",
-        "lm_eval",
+        module,
         "--model",
         "hf",
         "--model_args",
@@ -342,6 +362,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         batch_size=args.batch_size,
         device=args.device,
         limit=args.limit,
+        bootstrap_lm_eval=bool(args.bootstrap_lm_eval),
     )
     print("[benchmark] " + " ".join(command))
     subprocess.run(command, check=True)

@@ -39,6 +39,7 @@ def test_benchmark_harness_parses_env_defaults_without_importing_lm_eval():
     assert args.batch_size == "auto"
     assert args.dtype == "bfloat16"
     assert args.model_args == "pretrained=merged/model"
+    assert args.bootstrap_lm_eval is True
     assert args.publish_to_hub is True
 
 
@@ -64,6 +65,12 @@ def test_build_model_args_respects_raw_override():
     )
 
 
+def test_benchmark_harness_can_disable_lm_eval_bootstrap():
+    args = parse_args(["--no_bootstrap_lm_eval"], env={})
+
+    assert args.bootstrap_lm_eval is False
+
+
 def test_build_lm_eval_argv_is_reproducible_and_keeps_limit_optional():
     command = build_lm_eval_argv(
         tasks="arc_easy,hellaswag",
@@ -74,7 +81,7 @@ def test_build_lm_eval_argv_is_reproducible_and_keeps_limit_optional():
         limit="100",
     )
 
-    assert command[:3] == [sys.executable, "-m", "lm_eval"]
+    assert command[:3] == [sys.executable, "-m", "ouroboros.lm_eval_bootstrap"]
     assert command[command.index("--model") + 1] == "hf"
     assert command[command.index("--tasks") + 1] == "arc_easy,hellaswag"
     assert command[command.index("--output_path") + 1] == "runs/bench"
@@ -87,7 +94,9 @@ def test_build_lm_eval_argv_is_reproducible_and_keeps_limit_optional():
         batch_size="1",
         device="cuda:0",
         limit="",
+        bootstrap_lm_eval=False,
     )
+    assert no_limit[:3] == [sys.executable, "-m", "lm_eval"]
     assert "--limit" not in no_limit
 
 
