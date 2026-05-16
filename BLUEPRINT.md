@@ -69,6 +69,10 @@ Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle
 
 **Latest completed eval result:** Stage 10 terminal pre-DGAC anchor PASS — `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, `Mean UWR=0.733`. `k_actual=10` for all samples was expected before DGAC because HaltGate started zero-init. After the Azure checkpoint promotion, rerun this same command against the canonical anchor and require `diloco` logs to show `Loaded halt gate from diloco_state/anchor/halt_gate.pt` before trusting halt-step distribution.
 
+## External Benchmark Workflow
+
+Use GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=benchmark` to dispatch one Kaggle GPU notebook that runs EleutherAI `lm-evaluation-harness` against the current `diloco_state/anchor` adapter. Defaults are intentionally bounded (`benchmark_tasks=arc_easy,hellaswag,winogrande`, `benchmark_limit=100`) so a first progress check does not accidentally burn a full benchmark pass. Clear `benchmark_limit` for a full run, or set `benchmark_model_args` to evaluate a merged/exported model instead of the default base Jamba + PEFT anchor adapter. Results are written under `runs/lm_eval_benchmark` and uploaded to `benchmarks/lm_eval/<timestamp>` in the state repo when `HF_TOKEN` is available.
+
 ## Azure H100 Corrected DGAC Checkpoint Promotion Evidence
 
 Latest evidence: `Azure H100 SCUS DGAC full budgeted` loaded `diloco_state/anchor`, restored `diloco_state/anchor/halt_gate.pt`, verified H100 BF16 + flash-attn + Mamba CUDA fast path, ran stage 10 epoch 0, then saved and uploaded `runs/azure_h100_dgac/stage_10/checkpoint-0001154` with `training_state.pt`, adapter weights, and `halt_gate.pt`. Validation/generation were skipped because the run had 299 min remaining and `--val_skip_buffer_minutes 720`. Promotion metadata shows that checkpoint was copied into `diloco_state/anchor` as adapter weights plus `halt_gate.pt`, with `mark_dgac_complete=true`; therefore the normal `dgac-anchor-eval` path is now the active quality gate.

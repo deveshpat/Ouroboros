@@ -25,9 +25,33 @@ on:
         required: false
         default: ''
       kaggle_run_mode:
-        description: 'Kaggle launch mode. Use "diloco" for normal coordinator dispatch, "dgac-anchor-eval" for current anchor eval-only, "dgac-canary" for bounded DGAC objective canary, "dgac-train" for sequential DGAC fallback, or "dgac-diloco" for DGAC dedicated worker rounds.'
+        description: 'Kaggle launch mode. Use benchmark for lm-evaluation-harness progress checks.'
         required: false
+        type: choice
         default: 'dgac-diloco'
+        options:
+          - diloco
+          - dgac-anchor-eval
+          - dgac-canary
+          - dgac-train
+          - dgac-diloco
+          - benchmark
+      benchmark_tasks:
+        description: 'Only applies when kaggle_run_mode=benchmark. lm-eval tasks, comma-separated.'
+        required: false
+        default: 'arc_easy,hellaswag,winogrande'
+      benchmark_limit:
+        description: 'Only applies when kaggle_run_mode=benchmark. Sample limit per task. Empty = full benchmark.'
+        required: false
+        default: '100'
+      benchmark_output_dir:
+        description: 'Only applies when kaggle_run_mode=benchmark. Local output directory before Hub upload.'
+        required: false
+        default: 'runs/lm_eval_benchmark'
+      benchmark_model_args:
+        description: 'Optional raw lm-eval --model_args override. Leave empty to load base Jamba plus diloco_state/anchor adapter.'
+        required: false
+        default: ''
       dgac_anchor_eval_resume_mode:
         description: 'Only applies when kaggle_run_mode=dgac-anchor-eval. Use diagnostics-only to skip already-known base validation/generation and resume DGAC diagnostics.'
         required: false
@@ -94,6 +118,11 @@ jobs:
           OUROBOROS_KAGGLE_RUN_MODE: ${{ github.event.inputs.kaggle_run_mode || 'diloco' }}
           OUROBOROS_DGAC_DIAGNOSTICS_ONLY: ${{ github.event.inputs.dgac_anchor_eval_resume_mode == 'diagnostics-only' && '1' || '' }}
           OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE: ${{ github.event.inputs.dgac_diagnostics_forced_kmax_ce || '' }}
+          OUROBOROS_BENCHMARK_TASKS: ${{ github.event.inputs.benchmark_tasks }}
+          OUROBOROS_BENCHMARK_LIMIT: ${{ github.event.inputs.benchmark_limit }}
+          OUROBOROS_BENCHMARK_OUTPUT_DIR: ${{ github.event.inputs.benchmark_output_dir }}
+          OUROBOROS_BENCHMARK_MODEL_ARGS: ${{ github.event.inputs.benchmark_model_args }}
+          OUROBOROS_BENCHMARK_PUBLISH_TO_HUB: '1'
         run: |
           python diloco_coordinator.py \
             --hf_token          "$HF_TOKEN" \

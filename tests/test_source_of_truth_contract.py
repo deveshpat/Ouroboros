@@ -114,6 +114,8 @@ def test_workflow_dispatch_exposes_dgac_anchor_eval_and_train_gates():
     assert "dgac-anchor-eval" in workflow
     assert "dgac-train" in workflow
     assert "dgac-diloco" in workflow
+    assert "benchmark" in workflow
+    assert "benchmark_tasks" in workflow
     assert "OUROBOROS_KAGGLE_RUN_MODE" in workflow
     assert "--kaggle_run_mode" in workflow
     assert "dgac_anchor_eval_resume_mode" in workflow
@@ -121,6 +123,9 @@ def test_workflow_dispatch_exposes_dgac_anchor_eval_and_train_gates():
     assert "dgac_diagnostics_forced_kmax_ce" in workflow
     assert "OUROBOROS_DGAC_DIAGNOSTICS_ONLY" in workflow
     assert "OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE" in workflow
+    assert "OUROBOROS_BENCHMARK_TASKS" in workflow
+    assert "OUROBOROS_BENCHMARK_OUTPUT_DIR" in workflow
+    assert "OUROBOROS_BENCHMARK_PUBLISH_TO_HUB" in workflow
     assert "OUROBOROS_KAGGLE_RUN_MODE" in notebook
     assert "build_launch_command(run_mode, os.environ, worker_id=worker_id)" in notebook
     assert "!{shell_command}" in notebook
@@ -129,6 +134,9 @@ def test_workflow_dispatch_exposes_dgac_anchor_eval_and_train_gates():
     assert "runs/stage3_dgac" in launch_matrix
     assert "DGAC_DILOCO_RUN_MODE" in launch_matrix
     assert "runs/dgac_dedicated" in launch_matrix
+    assert "BENCHMARK_RUN_MODE" in launch_matrix
+    assert "runs/lm_eval_benchmark" in launch_matrix
+    assert "build_lm_eval_benchmark_command" in kaggle_commands
 
 
 def test_completed_cpu_smoke_prd_and_plan_are_promoted_to_wiki_and_retired():

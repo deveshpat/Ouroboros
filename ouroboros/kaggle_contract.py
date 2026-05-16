@@ -19,6 +19,7 @@ DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
 DGAC_TRAIN_RUN_MODE = "dgac-train"
 DGAC_CANARY_RUN_MODE = "dgac-canary"
 DGAC_DILOCO_RUN_MODE = "dgac-diloco"
+BENCHMARK_RUN_MODE = "benchmark"
 CPU_SMOKE_MODE = "cpu-smoke"
 
 
@@ -120,6 +121,33 @@ _CONTRACTS: dict[str, KaggleLaunchContract] = {
         mutates_round_state=True,
         env_keys=_COMMON_ENV + _WORKER_ENV + ("OUROBOROS_DILOCO_SIGNAL_REPO", "OUROBOROS_DILOCO_OUTER_LR"),
         required_cli_args=("--diloco_mode", "--use_halt_gate", "--resume_from_diloco_anchor"),
+        notebook_path="kaggle-utils.ipynb",
+        allowed_from_github_actions=True,
+        allowed_manually=True,
+    ),
+    BENCHMARK_RUN_MODE: KaggleLaunchContract(
+        mode=BENCHMARK_RUN_MODE,
+        requires_gpu=True,
+        worker_mode=True,
+        trains=False,
+        validates=True,
+        mutates_round_state=False,
+        env_keys=_COMMON_ENV + _WORKER_ENV + (
+            "OUROBOROS_BENCHMARK_TASKS",
+            "OUROBOROS_BENCHMARK_LIMIT",
+            "OUROBOROS_BENCHMARK_OUTPUT_DIR",
+            "OUROBOROS_BENCHMARK_BASE_MODEL",
+            "OUROBOROS_BENCHMARK_ADAPTER_REPO",
+            "OUROBOROS_BENCHMARK_ADAPTER_SUBFOLDER",
+            "OUROBOROS_BENCHMARK_BATCH_SIZE",
+            "OUROBOROS_BENCHMARK_DEVICE",
+            "OUROBOROS_BENCHMARK_DTYPE",
+            "OUROBOROS_BENCHMARK_MODEL_ARGS",
+            "OUROBOROS_BENCHMARK_PUBLISH_TO_HUB",
+            "OUROBOROS_BENCHMARK_HUB_PREFIX",
+            "OUROBOROS_BENCHMARK_SKIP_INSTALL",
+        ),
+        required_cli_args=("-m", "ouroboros.benchmark_harness"),
         notebook_path="kaggle-utils.ipynb",
         allowed_from_github_actions=True,
         allowed_manually=True,

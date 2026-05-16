@@ -90,6 +90,7 @@ DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
 DGAC_TRAIN_RUN_MODE = "dgac-train"
 DGAC_CANARY_RUN_MODE = "dgac-canary"
 DGAC_DILOCO_RUN_MODE = "dgac-diloco"
+BENCHMARK_RUN_MODE = "benchmark"
 DGAC_COMPLETE_MODE = "dgac-complete"
 
 
@@ -237,14 +238,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kaggle_run_mode",
         default=os.environ.get("OUROBOROS_KAGGLE_RUN_MODE", DILOCO_RUN_MODE),
-        choices=[DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE, DGAC_TRAIN_RUN_MODE, DGAC_CANARY_RUN_MODE, DGAC_DILOCO_RUN_MODE],
+        choices=[DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE, DGAC_TRAIN_RUN_MODE, DGAC_CANARY_RUN_MODE, DGAC_DILOCO_RUN_MODE, BENCHMARK_RUN_MODE],
         help=(
             "Kaggle notebook launch mode. Use 'dgac-anchor-eval' to push one "
             "GPU eval-only notebook for the terminal DiLoCo anchor; use "
             "'dgac-train' to launch Phase 3.4 DGAC from the terminal anchor, "
             "'dgac-canary' to launch a bounded short DGAC objective canary, "
-            "or 'dgac-diloco' to initialize DGAC as a DiLoCo worker round. "
-            "Anchor eval and dgac-train skip DiLoCo round_state mutations; dgac-diloco intentionally uses them."
+            "'dgac-diloco' to initialize DGAC as a DiLoCo worker round, "
+            "or 'benchmark' to launch the lm-evaluation-harness benchmark path. "
+            "Anchor eval, dgac-train, and benchmark skip DiLoCo round_state mutations; dgac-diloco intentionally uses them."
         ),
     )
     parser.add_argument(
@@ -588,6 +590,18 @@ def _kaggle_eval_worker_ids(args: argparse.Namespace) -> List[str]:
     return ["A"]
 
 
+def _kaggle_benchmark_worker_ids(args: argparse.Namespace) -> List[str]:
+    if args.force_worker_ids:
+        requested = _ordered_unique_worker_ids(
+            [w.strip().upper() for w in str(args.force_worker_ids).split(",") if w.strip()]
+        )
+        if requested:
+            return [requested[0]]
+    # Benchmarks are read-only but expensive. One worker gives a deterministic
+    # one-click path and avoids duplicate benchmark jobs.
+    return ["A"]
+
+
 def _kaggle_dgac_worker_ids(args: argparse.Namespace) -> List[str]:
     if args.force_worker_ids:
         requested = _ordered_unique_worker_ids(
@@ -638,6 +652,34 @@ def run_kaggle_anchor_eval(args: argparse.Namespace) -> None:
     print(
         "[kaggle-eval] Dispatch accepted by Kaggle. Monitor the Kaggle kernel "
         "and W&B eval_only/* metrics; this mode does not mutate round_state."
+    )
+
+
+def run_kaggle_benchmark(args: argparse.Namespace) -> None:
+    worker_ids = _kaggle_benchmark_worker_ids(args)
+    kaggle_creds = _build_kaggle_creds(args)
+    print(
+        "[benchmark] Dispatching lm-evaluation-harness benchmark notebook "
+        f"workers={worker_ids} repo={args.repo_id}"
+    )
+    if args.dry_run:
+        print("[benchmark] DRY RUN — no Kaggle dispatch.")
+        return
+
+    dispatch_results = trigger_kaggle_workers(
+        kaggle_creds,
+        active_workers=worker_ids,
+        notebook_path=Path(args.kaggle_notebook_path),
+        coordinator_args=args,
+    )
+    if any(dispatch_results.get(worker_id) != "success" for worker_id in worker_ids):
+        raise RuntimeError(
+            "Benchmark dispatch failed: "
+            f"{dispatch_results}"
+        )
+    print(
+        "[benchmark] Dispatch accepted by Kaggle. Monitor the Kaggle kernel; "
+        "this mode does not mutate DiLoCo round_state."
     )
 
 
@@ -927,6 +969,9 @@ def main() -> None:
     kaggle_run_mode = getattr(args, "kaggle_run_mode", DILOCO_RUN_MODE)
     if kaggle_run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:
         run_kaggle_anchor_eval(args)
+        return
+    if kaggle_run_mode == BENCHMARK_RUN_MODE:
+        run_kaggle_benchmark(args)
         return
     if kaggle_run_mode in {DGAC_TRAIN_RUN_MODE, DGAC_CANARY_RUN_MODE}:
         run_kaggle_dgac_train(args)

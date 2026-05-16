@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from ouroboros.kaggle_contract import (
+    BENCHMARK_RUN_MODE,
     DGAC_ANCHOR_EVAL_RUN_MODE,
     DGAC_CANARY_RUN_MODE,
     DGAC_DILOCO_RUN_MODE,
@@ -68,6 +69,15 @@ def test_matrix_supports_expected_kaggle_gpu_modes_without_notebook_branches():
         "OUROBOROS_DGAC_OUTPUT_DIR": "runs/stage3_dgac",
         "OUROBOROS_DGAC_CANARY_OUTPUT_DIR": "runs/stage3_dgac_canary",
         "OUROBOROS_DGAC_DILOCO_OUTPUT_DIR": "runs/dgac_dedicated",
+        "OUROBOROS_BENCHMARK_TASKS": "arc_easy",
+        "OUROBOROS_BENCHMARK_LIMIT": "10",
+        "OUROBOROS_BENCHMARK_OUTPUT_DIR": "runs/lm_eval_benchmark",
+        "OUROBOROS_BENCHMARK_BASE_MODEL": "ai21labs/AI21-Jamba-Reasoning-3B",
+        "OUROBOROS_BENCHMARK_ADAPTER_REPO": "WeirdRunner/Ouroboros",
+        "OUROBOROS_BENCHMARK_ADAPTER_SUBFOLDER": "diloco_state/anchor",
+        "OUROBOROS_BENCHMARK_BATCH_SIZE": "1",
+        "OUROBOROS_BENCHMARK_DEVICE": "cuda:0",
+        "OUROBOROS_BENCHMARK_DTYPE": "float16",
         "OUROBOROS_WANDB_PROJECT": "ouroboros-stage3-jamba",
     }
 
@@ -79,6 +89,7 @@ def test_matrix_supports_expected_kaggle_gpu_modes_without_notebook_branches():
             DGAC_CANARY_RUN_MODE,
             DGAC_TRAIN_RUN_MODE,
             DGAC_ANCHOR_EVAL_RUN_MODE,
+            BENCHMARK_RUN_MODE,
         )
     }
 
@@ -89,5 +100,8 @@ def test_matrix_supports_expected_kaggle_gpu_modes_without_notebook_branches():
     assert "--push_to_hub" in commands[DGAC_TRAIN_RUN_MODE]
     assert "--eval_only" in commands[DGAC_ANCHOR_EVAL_RUN_MODE]
     assert "--dgac_diagnostics" in commands[DGAC_ANCHOR_EVAL_RUN_MODE]
+    assert commands[BENCHMARK_RUN_MODE][:3] == ["python", "-m", "ouroboros.benchmark_harness"]
+    assert "--tasks" in commands[BENCHMARK_RUN_MODE]
+    assert "--publish_to_hub" in commands[BENCHMARK_RUN_MODE]
     assert "--diloco_mode" not in commands[DGAC_ANCHOR_EVAL_RUN_MODE]
     assert "--push_to_hub" not in commands[DGAC_ANCHOR_EVAL_RUN_MODE]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 from ouroboros.kaggle import (
+    BENCHMARK_RUN_MODE,
     DGAC_ANCHOR_EVAL_RUN_MODE,
     DGAC_CANARY_RUN_MODE,
     DGAC_DILOCO_RUN_MODE,
@@ -12,6 +13,7 @@ from ouroboros.kaggle import (
     build_dgac_canary_command,
     build_dgac_training_command,
     build_diloco_training_command,
+    build_lm_eval_benchmark_command,
     format_shell_command,
     kaggle_secret_presence,
     resolve_diloco_worker_id,
@@ -141,6 +143,7 @@ def test_resolve_kaggle_run_mode_defaults_to_diloco_and_accepts_dgac_modes():
     assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "dgac-train"}) == DGAC_TRAIN_RUN_MODE
     assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "dgac-canary"}) == DGAC_CANARY_RUN_MODE
     assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "dgac-diloco"}) == DGAC_DILOCO_RUN_MODE
+    assert resolve_kaggle_run_mode({"OUROBOROS_KAGGLE_RUN_MODE": "benchmark"}) == BENCHMARK_RUN_MODE
     assert resolve_kaggle_run_mode({"OUROBOROS_RUN_MODE": "DILOCO"}) == DILOCO_RUN_MODE
 
     try:
@@ -256,6 +259,49 @@ def test_build_dgac_anchor_eval_command_allows_safe_overrides():
     assert command[command.index("--dgac_diagnostics_forced_kmax_ce") + 1] == "0.4112"
     assert command[command.index("--wandb_mode") + 1] == "offline"
     assert "--latent_cache" not in command
+
+def test_build_lm_eval_benchmark_command_loads_anchor_adapter_with_harness():
+    command = build_lm_eval_benchmark_command()
+
+    assert command[:3] == ["python", "-m", "ouroboros.benchmark_harness"]
+    assert command[command.index("--tasks") + 1] == "arc_easy,hellaswag,winogrande"
+    assert command[command.index("--output_dir") + 1] == "runs/lm_eval_benchmark"
+    assert command[command.index("--base_model") + 1] == "ai21labs/AI21-Jamba-Reasoning-3B"
+    assert command[command.index("--adapter_repo") + 1] == "WeirdRunner/Ouroboros"
+    assert command[command.index("--adapter_subfolder") + 1] == "diloco_state/anchor"
+    assert command[command.index("--batch_size") + 1] == "1"
+    assert command[command.index("--device") + 1] == "cuda:0"
+    assert command[command.index("--dtype") + 1] == "float16"
+    assert "--publish_to_hub" in command
+
+
+def test_build_lm_eval_benchmark_command_allows_safe_overrides():
+    command = build_lm_eval_benchmark_command(
+        tasks="mmlu",
+        limit="25",
+        output_dir="runs/bench",
+        base_model="base/model",
+        adapter_repo="adapter/repo",
+        adapter_subfolder="custom/adapter",
+        batch_size="auto",
+        device="cuda:1",
+        dtype="bfloat16",
+        model_args="pretrained=merged/model,trust_remote_code=True",
+        publish_to_hub=False,
+    )
+
+    assert command[command.index("--tasks") + 1] == "mmlu"
+    assert command[command.index("--limit") + 1] == "25"
+    assert command[command.index("--output_dir") + 1] == "runs/bench"
+    assert command[command.index("--base_model") + 1] == "base/model"
+    assert command[command.index("--adapter_repo") + 1] == "adapter/repo"
+    assert command[command.index("--adapter_subfolder") + 1] == "custom/adapter"
+    assert command[command.index("--batch_size") + 1] == "auto"
+    assert command[command.index("--device") + 1] == "cuda:1"
+    assert command[command.index("--dtype") + 1] == "bfloat16"
+    assert command[command.index("--model_args") + 1] == "pretrained=merged/model,trust_remote_code=True"
+    assert "--publish_to_hub" not in command
+
 
 def test_format_shell_command_quotes_arguments_for_notebook_logging():
     command = ["python", "jamba_coconut_finetune.py", "--output_dir", "runs/with spaces"]

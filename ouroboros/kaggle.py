@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from typing import Optional
 
 from ouroboros.kaggle_contract import (
+    BENCHMARK_RUN_MODE,
     DGAC_ANCHOR_EVAL_RUN_MODE,
     DGAC_CANARY_RUN_MODE,
     DGAC_DILOCO_RUN_MODE,
@@ -400,12 +401,58 @@ def build_dgac_anchor_eval_command(
     return command
 
 
+def build_lm_eval_benchmark_command(
+    *,
+    tasks: str = "arc_easy,hellaswag,winogrande",
+    limit: str | int | None = None,
+    output_dir: str = "runs/lm_eval_benchmark",
+    base_model: str = "ai21labs/AI21-Jamba-Reasoning-3B",
+    adapter_repo: str = "WeirdRunner/Ouroboros",
+    adapter_subfolder: str = "diloco_state/anchor",
+    batch_size: str = "1",
+    device: str = "cuda:0",
+    dtype: str = "float16",
+    model_args: str | None = None,
+    publish_to_hub: bool = True,
+) -> list[str]:
+    """Build the Kaggle command for standardized lm-evaluation-harness benchmarks."""
+    command = [
+        "python",
+        "-m",
+        "ouroboros.benchmark_harness",
+        "--tasks",
+        str(tasks),
+        "--output_dir",
+        output_dir,
+        "--base_model",
+        base_model,
+        "--adapter_repo",
+        adapter_repo,
+        "--adapter_subfolder",
+        adapter_subfolder,
+        "--batch_size",
+        str(batch_size),
+        "--device",
+        device,
+        "--dtype",
+        dtype,
+    ]
+    if limit is not None and str(limit).strip():
+        command.extend(["--limit", str(limit).strip()])
+    if model_args is not None and str(model_args).strip():
+        command.extend(["--model_args", str(model_args).strip()])
+    if publish_to_hub:
+        command.append("--publish_to_hub")
+    return command
+
+
 def format_shell_command(command: list[str]) -> str:
     """Render a command list as a pasteable shell command for notebook logs."""
     return " ".join(shlex.quote(part) for part in command)
 
 
 __all__ = [
+    "BENCHMARK_RUN_MODE",
     "DGAC_ANCHOR_EVAL_RUN_MODE",
     "DGAC_TRAIN_RUN_MODE",
     "DGAC_CANARY_RUN_MODE",
@@ -415,6 +462,7 @@ __all__ = [
     "build_dgac_training_command",
     "build_dgac_canary_command",
     "build_diloco_training_command",
+    "build_lm_eval_benchmark_command",
     "format_shell_command",
     "kaggle_secret_presence",
     "resolve_diloco_worker_id",
