@@ -100,6 +100,19 @@ def test_build_lm_eval_argv_is_reproducible_and_keeps_limit_optional():
     assert "--limit" not in no_limit
 
 
+def test_build_lm_eval_argv_treats_full_limit_sentinels_as_unlimited():
+    command = build_lm_eval_argv(
+        tasks="arc_easy",
+        output_dir="runs/bench",
+        model_args="pretrained=base",
+        batch_size="1",
+        device="cuda:0",
+        limit="full",
+    )
+
+    assert "--limit" not in command
+
+
 def test_benchmark_harness_sanitizes_only_vocab_resized_adapter_tensors():
     weights = {
         "base_model.model.model.embed_tokens.weight": torch.zeros(65537, 4),

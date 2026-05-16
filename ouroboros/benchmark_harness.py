@@ -20,6 +20,8 @@ from typing import Iterable, Mapping
 
 import torch
 
+from ouroboros.runtime_env import normalize_benchmark_limit
+
 DEFAULT_BASE_MODEL = "ai21labs/AI21-Jamba-Reasoning-3B"
 DEFAULT_ADAPTER_REPO = "WeirdRunner/Ouroboros"
 DEFAULT_ADAPTER_SUBFOLDER = "diloco_state/anchor"
@@ -64,7 +66,7 @@ def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | No
     env = os.environ if env is None else env
     parser = argparse.ArgumentParser(description="Run Ouroboros lm-evaluation-harness benchmarks")
     parser.add_argument("--tasks", default=_env(env, "OUROBOROS_BENCHMARK_TASKS", DEFAULT_TASKS))
-    parser.add_argument("--limit", default=_normalize_text(env.get("OUROBOROS_BENCHMARK_LIMIT")))
+    parser.add_argument("--limit", default=normalize_benchmark_limit(env.get("OUROBOROS_BENCHMARK_LIMIT")))
     parser.add_argument("--output_dir", default=_env(env, "OUROBOROS_BENCHMARK_OUTPUT_DIR", DEFAULT_OUTPUT_DIR))
     parser.add_argument("--base_model", default=_env(env, "OUROBOROS_BENCHMARK_BASE_MODEL", DEFAULT_BASE_MODEL))
     parser.add_argument("--adapter_repo", default=_env(env, "OUROBOROS_BENCHMARK_ADAPTER_REPO", DEFAULT_ADAPTER_REPO))
@@ -298,7 +300,7 @@ def build_lm_eval_argv(
         "--output_path",
         output_dir,
     ]
-    limit = _normalize_text(limit)
+    limit = normalize_benchmark_limit(limit)
     if limit is not None:
         argv.extend(["--limit", limit])
     return argv

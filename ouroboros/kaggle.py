@@ -28,6 +28,7 @@ from ouroboros.runtime_env import (
     WANDB_KEY_ALIASES,
     WORKER_ID_ALIASES,
     WORKER_IDS,
+    normalize_benchmark_limit,
     normalize_text,
     require_known_worker_id,
     require_worker_id,
@@ -437,8 +438,9 @@ def build_lm_eval_benchmark_command(
         "--dtype",
         dtype,
     ]
-    if limit is not None and str(limit).strip():
-        command.extend(["--limit", str(limit).strip()])
+    limit = normalize_benchmark_limit(limit)
+    if limit is not None:
+        command.extend(["--limit", limit])
     if model_args is not None and str(model_args).strip():
         command.extend(["--model_args", str(model_args).strip()])
     if publish_to_hub:

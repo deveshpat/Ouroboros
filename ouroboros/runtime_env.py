@@ -26,6 +26,7 @@ KAGGLE_KEY_TEMPLATE = "KAGGLE_KEY_{worker_id}"
 
 _TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
 _FALSE_VALUES = {"0", "false", "f", "no", "n", "off"}
+_BENCHMARK_LIMIT_DISABLED_VALUES = {"0", "all", "false", "full", "no-limit", "nolimit", "none", "off", "unlimited"}
 
 
 def normalize_text(value: Any | None, *, uppercase: bool = False) -> Optional[str]:
@@ -36,6 +37,23 @@ def normalize_text(value: Any | None, *, uppercase: bool = False) -> Optional[st
     if not text:
         return None
     return text.upper() if uppercase else text
+
+
+def normalize_benchmark_limit(value: Any | None) -> Optional[str]:
+    """Normalize an optional lm-eval sample limit.
+
+    Empty values and explicit full-run sentinels disable ``--limit``. This is
+    intentionally separate from ``normalize_text`` because GitHub workflow
+    dispatch inputs with defaults can make a cleared text field ambiguous;
+    operators need a reliable value such as ``full``/``none``/``0`` to force
+    a complete benchmark.
+    """
+    text = normalize_text(value)
+    if text is None:
+        return None
+    if text.lower() in _BENCHMARK_LIMIT_DISABLED_VALUES:
+        return None
+    return text
 
 
 def normalize_worker_id(value: Any | None) -> Optional[str]:

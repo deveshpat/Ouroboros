@@ -145,8 +145,6 @@ def test_dgac_anchor_eval_uses_t4_safe_eval_and_diagnostic_microbatches():
     assert "--dgac_diagnostics" in command
 
 
-
-
 def test_dgac_anchor_eval_can_resume_at_diagnostics_only_from_env():
     command = build_launch_command(
         DGAC_ANCHOR_EVAL_RUN_MODE,
@@ -192,6 +190,24 @@ def test_benchmark_mode_builds_harness_command_from_env():
     assert "--publish_to_hub" in command
 
 
+def test_benchmark_mode_treats_empty_and_full_limit_as_full_run():
+    empty_limit = build_launch_command(
+        BENCHMARK_RUN_MODE,
+        {
+            "OUROBOROS_BENCHMARK_LIMIT": "",
+        },
+    )
+    explicit_full = build_launch_command(
+        BENCHMARK_RUN_MODE,
+        {
+            "OUROBOROS_BENCHMARK_LIMIT": "full",
+        },
+    )
+
+    assert "--limit" not in empty_limit
+    assert "--limit" not in explicit_full
+
+
 def test_launch_environment_defaults_are_centralized_and_non_destructive():
     env = {"OUROBOROS_WANDB_PROJECT": "custom-project"}
 
@@ -234,6 +250,8 @@ def test_workflow_dispatch_exposes_only_valid_matrix_modes():
     assert "default: 'dgac-diloco'" in workflow
     assert "benchmark" in workflow
     assert "benchmark_tasks" in workflow
+    assert "default: ''" in workflow
+    assert "Empty/full/none/0 = full benchmark" in workflow
     assert "OUROBOROS_BENCHMARK_TASKS" in workflow
     assert "dgac_anchor_eval_resume_mode" in workflow
     assert "diagnostics-only" in workflow

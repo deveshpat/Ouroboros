@@ -41,9 +41,9 @@ on:
         required: false
         default: 'arc_easy,hellaswag,winogrande'
       benchmark_limit:
-        description: 'Only applies when kaggle_run_mode=benchmark. Sample limit per task. Empty = full benchmark.'
+        description: 'Only applies when kaggle_run_mode=benchmark. Sample limit per task. Empty/full/none/0 = full benchmark; use 100 for a smoke run.'
         required: false
-        default: '100'
+        default: ''
       benchmark_output_dir:
         description: 'Only applies when kaggle_run_mode=benchmark. Local output directory before Hub upload.'
         required: false

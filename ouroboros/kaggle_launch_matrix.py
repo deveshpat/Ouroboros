@@ -35,7 +35,12 @@ from ouroboros.kaggle_contract import (
     get_kaggle_launch_contract,
     known_kaggle_launch_modes,
 )
-from ouroboros.runtime_env import normalize_text, require_known_worker_id, require_worker_id
+from ouroboros.runtime_env import (
+    normalize_benchmark_limit,
+    normalize_text,
+    require_known_worker_id,
+    require_worker_id,
+)
 
 
 @dataclass(frozen=True)
@@ -158,7 +163,7 @@ def _build_benchmark(env: Mapping[str, str], *, worker_id: str | None = None) ->
     del worker_id
     return build_lm_eval_benchmark_command(
         tasks=_value(env, "OUROBOROS_BENCHMARK_TASKS"),
-        limit=normalize_text(env.get("OUROBOROS_BENCHMARK_LIMIT")),
+        limit=normalize_benchmark_limit(env.get("OUROBOROS_BENCHMARK_LIMIT")),
         output_dir=_value(env, "OUROBOROS_BENCHMARK_OUTPUT_DIR"),
         base_model=_value(env, "OUROBOROS_BENCHMARK_BASE_MODEL"),
         adapter_repo=_value(env, "OUROBOROS_BENCHMARK_ADAPTER_REPO"),
