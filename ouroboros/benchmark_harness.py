@@ -11,11 +11,14 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Iterable, Mapping
+
+import torch
 
 DEFAULT_BASE_MODEL = "ai21labs/AI21-Jamba-Reasoning-3B"
 DEFAULT_ADAPTER_REPO = "WeirdRunner/Ouroboros"
@@ -26,6 +29,7 @@ DEFAULT_BATCH_SIZE = "1"
 DEFAULT_DEVICE = "cuda:0"
 DEFAULT_DTYPE = "float16"
 DEFAULT_HUB_PREFIX = "benchmarks/lm_eval"
+_VOCAB_WEIGHT_SUFFIXES = ("embed_tokens.weight", "lm_head.weight")
 
 
 def _normalize_text(value: object | None) -> str | None:
@@ -42,6 +46,13 @@ def _env(env: Mapping[str, str], name: str, default: str) -> str:
 def _truthy(value: object | None) -> bool:
     text = _normalize_text(value)
     return text is not None and text.lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    text = _normalize_text(env.get(name))
+    if text is None:
+        return default
+    return text.lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _resolve_hf_token(env: Mapping[str, str]) -> str | None:
@@ -65,6 +76,23 @@ def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | No
     parser.add_argument("--hub_results_prefix", default=_env(env, "OUROBOROS_BENCHMARK_HUB_PREFIX", DEFAULT_HUB_PREFIX))
     parser.add_argument("--publish_to_hub", action="store_true", default=_truthy(env.get("OUROBOROS_BENCHMARK_PUBLISH_TO_HUB")))
     parser.add_argument("--skip_install", action="store_true", default=_truthy(env.get("OUROBOROS_BENCHMARK_SKIP_INSTALL")))
+    parser.add_argument(
+        "--sanitize_vocab_mismatch",
+        dest="sanitize_vocab_mismatch",
+        action="store_true",
+        default=_env_bool(env, "OUROBOROS_BENCHMARK_SANITIZE_VOCAB_MISMATCH", True),
+        help=(
+            "Create an lm-eval adapter copy without saved embedding/lm_head tensors "
+            "when the DiLoCo anchor vocab includes Ouroboros' extra <|lat|> token. "
+            "Enabled by default because external text benchmarks do not use <|lat|>."
+        ),
+    )
+    parser.add_argument(
+        "--no_sanitize_vocab_mismatch",
+        dest="sanitize_vocab_mismatch",
+        action="store_false",
+        help="Disable adapter vocab-mismatch sanitization for raw PEFT loading experiments.",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -103,6 +131,109 @@ def download_adapter_snapshot(
             "Check OUROBOROS_BENCHMARK_ADAPTER_REPO/SUBFOLDER."
         )
     return adapter_dir
+
+
+
+def _adapter_weight_path(adapter_dir: Path) -> Path | None:
+    for filename in ("adapter_model.safetensors", "adapter_model.bin"):
+        candidate = adapter_dir / filename
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _infer_base_vocab_size(base_model: str, token: str | None) -> int | None:
+    """Read the base model vocab size without loading model weights."""
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(base_model, token=token, trust_remote_code=True)
+        vocab_size = getattr(config, "vocab_size", None)
+        return int(vocab_size) if vocab_size is not None else None
+    except Exception as exc:  # noqa: BLE001 - benchmark should still try raw PEFT if metadata is unavailable
+        print(f"[benchmark] Could not infer base vocab size for {base_model}: {exc}")
+        return None
+
+
+def _filter_vocab_mismatched_weights(
+    weights: Mapping[str, torch.Tensor],
+    *,
+    base_vocab_size: int | None,
+) -> tuple[dict[str, torch.Tensor], list[str]]:
+    """Drop saved token-embedding tensors that cannot fit the base lm-eval model.
+
+    Ouroboros training adds one latent token, so DiLoCo PEFT anchors can contain
+    65537-row ``embed_tokens``/``lm_head`` tensors while upstream Jamba starts at
+    65536 rows. lm-evaluation-harness initializes the base model before applying
+    PEFT and does not know to resize for the private ``<|lat|>`` token. External
+    text benchmarks never emit that token, so keeping the normal base embeddings
+    and loading only the LoRA adapter weights is the safe adapter-only baseline.
+    """
+    if base_vocab_size is None:
+        return dict(weights), []
+
+    filtered: dict[str, torch.Tensor] = {}
+    removed: list[str] = []
+    for key, value in weights.items():
+        is_vocab_weight = any(key.endswith(suffix) for suffix in _VOCAB_WEIGHT_SUFFIXES)
+        if is_vocab_weight and getattr(value, "ndim", 0) >= 2 and int(value.shape[0]) != int(base_vocab_size):
+            removed.append(key)
+            continue
+        filtered[key] = value
+    return filtered, removed
+
+
+def prepare_adapter_for_lm_eval(
+    *,
+    adapter_dir: Path,
+    base_model: str,
+    token: str | None,
+    enabled: bool = True,
+) -> Path:
+    """Return a PEFT adapter path safe for vanilla lm-eval HF loading."""
+    if not enabled:
+        return adapter_dir
+
+    weight_path = _adapter_weight_path(adapter_dir)
+    if weight_path is None:
+        return adapter_dir
+
+    base_vocab_size = _infer_base_vocab_size(base_model, token)
+    if base_vocab_size is None:
+        return adapter_dir
+
+    if weight_path.suffix == ".safetensors":
+        from safetensors.torch import load_file, save_file
+
+        weights = load_file(str(weight_path), device="cpu")
+        filtered, removed = _filter_vocab_mismatched_weights(weights, base_vocab_size=base_vocab_size)
+        if not removed:
+            return adapter_dir
+
+        sanitized_dir = adapter_dir.parent / f"{adapter_dir.name}_lm_eval_sanitized"
+        if sanitized_dir.exists():
+            shutil.rmtree(sanitized_dir)
+        shutil.copytree(adapter_dir, sanitized_dir)
+        save_file(filtered, str(sanitized_dir / weight_path.name), metadata={"format": "pt"})
+    else:
+        weights = torch.load(weight_path, map_location="cpu")
+        if not isinstance(weights, Mapping):
+            return adapter_dir
+        filtered, removed = _filter_vocab_mismatched_weights(weights, base_vocab_size=base_vocab_size)
+        if not removed:
+            return adapter_dir
+
+        sanitized_dir = adapter_dir.parent / f"{adapter_dir.name}_lm_eval_sanitized"
+        if sanitized_dir.exists():
+            shutil.rmtree(sanitized_dir)
+        shutil.copytree(adapter_dir, sanitized_dir)
+        torch.save(filtered, sanitized_dir / weight_path.name)
+
+    print(
+        "[benchmark] Created lm-eval adapter copy without vocab-resized tensors: "
+        f"{sanitized_dir} (removed: {', '.join(removed)})"
+    )
+    return sanitized_dir
 
 
 def build_model_args(*, base_model: str, adapter_path: str | None, dtype: str, override: str | None = None) -> str:
@@ -191,6 +322,12 @@ def main(argv: Iterable[str] | None = None) -> None:
         subfolder=args.adapter_subfolder,
         token=token,
         cache_dir=args.adapter_cache_dir,
+    )
+    adapter_path = prepare_adapter_for_lm_eval(
+        adapter_dir=adapter_path,
+        base_model=args.base_model,
+        token=token,
+        enabled=bool(args.sanitize_vocab_mismatch),
     )
     model_args = build_model_args(
         base_model=args.base_model,

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import sys
 
+import torch
+
 from ouroboros.benchmark_harness import (
+    _filter_vocab_mismatched_weights,
     build_lm_eval_argv,
     build_model_args,
     parse_args,
@@ -86,3 +89,31 @@ def test_build_lm_eval_argv_is_reproducible_and_keeps_limit_optional():
         limit="",
     )
     assert "--limit" not in no_limit
+
+
+def test_benchmark_harness_sanitizes_only_vocab_resized_adapter_tensors():
+    weights = {
+        "base_model.model.model.embed_tokens.weight": torch.zeros(65537, 4),
+        "base_model.model.lm_head.weight": torch.zeros(65537, 4),
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(8, 4),
+    }
+
+    filtered, removed = _filter_vocab_mismatched_weights(weights, base_vocab_size=65536)
+
+    assert removed == [
+        "base_model.model.model.embed_tokens.weight",
+        "base_model.model.lm_head.weight",
+    ]
+    assert set(filtered) == {"base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"}
+
+
+def test_benchmark_harness_keeps_matching_vocab_tensors():
+    weights = {
+        "base_model.model.model.embed_tokens.weight": torch.zeros(65536, 4),
+        "base_model.model.lm_head.weight": torch.zeros(65536, 4),
+    }
+
+    filtered, removed = _filter_vocab_mismatched_weights(weights, base_vocab_size=65536)
+
+    assert removed == []
+    assert set(filtered) == set(weights)

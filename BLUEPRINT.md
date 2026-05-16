@@ -73,6 +73,17 @@ Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle
 
 Use GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=benchmark` to dispatch one Kaggle GPU notebook that runs EleutherAI `lm-evaluation-harness` against the current `diloco_state/anchor` adapter. Defaults are intentionally bounded (`benchmark_tasks=arc_easy,hellaswag,winogrande`, `benchmark_limit=100`) so a first progress check does not accidentally burn a full benchmark pass. Clear `benchmark_limit` for a full run, or set `benchmark_model_args` to evaluate a merged/exported model instead of the default base Jamba + PEFT anchor adapter. Results are written under `runs/lm_eval_benchmark` and uploaded to `benchmarks/lm_eval/<timestamp>` in the state repo when `HF_TOKEN` is available.
 
+The default benchmark path is an adapter-only external benchmark. It now sanitizes the DiLoCo anchor copy for lm-eval by dropping saved `embed_tokens`/`lm_head` tensors when they include Ouroboros' extra `<|lat|>` token, fixing the base-vocab mismatch without mutating the canonical Hub anchor. For full Ouroboros runtime smoke tests, use the inference entrypoint instead because it loads tokenizer + resized model + PEFT adapter + optional `halt_gate.pt`:
+
+```bash
+python -m ouroboros.inference \
+  --prompt "Explain the core idea briefly." \
+  --stage_k 10 \
+  --max_new_tokens 128 \
+  --json
+```
+
+
 ## Azure H100 Corrected DGAC Checkpoint Promotion Evidence
 
 Latest evidence: `Azure H100 SCUS DGAC full budgeted` loaded `diloco_state/anchor`, restored `diloco_state/anchor/halt_gate.pt`, verified H100 BF16 + flash-attn + Mamba CUDA fast path, ran stage 10 epoch 0, then saved and uploaded `runs/azure_h100_dgac/stage_10/checkpoint-0001154` with `training_state.pt`, adapter weights, and `halt_gate.pt`. Validation/generation were skipped because the run had 299 min remaining and `--val_skip_buffer_minutes 720`. Promotion metadata shows that checkpoint was copied into `diloco_state/anchor` as adapter weights plus `halt_gate.pt`, with `mark_dgac_complete=true`; therefore the normal `dgac-anchor-eval` path is now the active quality gate.
