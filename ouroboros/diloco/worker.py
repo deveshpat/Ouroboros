@@ -281,7 +281,7 @@ def diloco_download_anchor(
             print(f"  [diloco] Loaded anchor weights from {anchor_path}")
 
         if halt_gate is not None:
-            def _download_halt_gate() -> None:
+            def _download_halt_gate() -> bool:
                 from huggingface_hub import hf_hub_download
 
                 gate_path = hf_hub_download(
@@ -290,16 +290,20 @@ def diloco_download_anchor(
                     token=hf_token,
                 )
                 halt_gate.load_state_dict(torch.load(gate_path, map_location=device))
+                return True
 
-            gate_loaded = retry_io(
-                f"  [diloco] Download halt gate {anchor_path}",
-                _download_halt_gate,
-                swallow=not required,
-                default=False,
-                verbose=_is_main_process(),
+            gate_loaded = bool(
+                retry_io(
+                    f"  [diloco] Download halt gate {anchor_path}",
+                    _download_halt_gate,
+                    swallow=not required,
+                    default=False,
+                    verbose=_is_main_process(),
+                )
             )
-            if gate_loaded is not False and _is_main_process():
-                print(f"  [diloco] Loaded halt gate from {anchor_path}/halt_gate.pt")
+            if gate_loaded:
+                if _is_main_process():
+                    print(f"  [diloco] Loaded halt gate from {anchor_path}/halt_gate.pt")
             elif required:
                 raise FileNotFoundError(f"Required DGAC halt gate missing at {anchor_path}/halt_gate.pt")
             elif _is_main_process():

@@ -274,22 +274,23 @@ def run_training_session(args: argparse.Namespace, *, script_start: float) -> No
                     f"\n  [DGAC] Loading DiLoCo anchor from {anchor_repo}/diloco_state/anchor "
                     "as base weights for Phase 3.4 DGAC training."
                 )
-            diloco_download_anchor(
-                model,
-                hf_token,
-                anchor_repo,
-                "diloco_state/anchor",
-                device,
-                halt_gate=halt_gate,
-                required=True,
-            )
             if is_main:
+                diloco_download_anchor(
+                    model,
+                    hf_token,
+                    anchor_repo,
+                    "diloco_state/anchor",
+                    device,
+                    halt_gate=halt_gate,
+                    required=True,
+                )
                 print(
-                    "  [DGAC] Anchor load complete. If the anchor contains halt_gate.pt, "
-                    "HaltGate was restored; otherwise it remains zero-init. "
-                    "Optimizer starts fresh unless this is eval-only."
+                    "  [DGAC] Anchor load complete. DiLoCo adapter and HaltGate "
+                    "were restored from the canonical anchor. Optimizer starts fresh "
+                    "unless this is eval-only."
                 )
             if distributed:
+                barrier()
                 broadcast_parameters(get_trainable_parameters(model, halt_gate), src=0)
                 barrier()
             if getattr(args, "eval_only", False):

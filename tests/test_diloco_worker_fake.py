@@ -219,6 +219,48 @@ def test_required_anchor_download_raises_instead_of_training_from_fresh_weights(
         )
 
 
+def test_required_halt_gate_success_is_not_treated_as_missing_on_non_main_rank(monkeypatch, tmp_path):
+    model = FakeCausalLM()
+    halt_gate = FakeHaltGate()
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    gate_path = tmp_path / "halt_gate.pt"
+    adapter_path.write_bytes(b"fake-adapter")
+    torch.save(halt_gate.state_dict(), gate_path)
+
+    module_type = __import__("types").ModuleType
+    hf_module = module_type("huggingface_hub")
+
+    def fake_hf_hub_download(*, repo_id, filename, token):
+        if filename.endswith("adapter_model.safetensors"):
+            return str(adapter_path)
+        if filename.endswith("halt_gate.pt"):
+            return str(gate_path)
+        raise FileNotFoundError(filename)
+
+    hf_module.hf_hub_download = fake_hf_hub_download
+    safetensors_module = module_type("safetensors")
+    safetensors_torch_module = module_type("safetensors.torch")
+    safetensors_torch_module.load_file = lambda path, device: {"fake.weight": torch.ones(1)}
+    safetensors_module.torch = safetensors_torch_module
+
+    sys_modules = __import__("sys").modules
+    monkeypatch.setitem(sys_modules, "huggingface_hub", hf_module)
+    monkeypatch.setitem(sys_modules, "safetensors", safetensors_module)
+    monkeypatch.setitem(sys_modules, "safetensors.torch", safetensors_torch_module)
+    monkeypatch.setattr(worker_module, "_set_peft_model_state_dict_compat", lambda model, weights: None)
+    monkeypatch.setattr(worker_module, "_is_main_process", lambda: False)
+
+    worker_module.diloco_download_anchor(
+        model,
+        "hf",
+        "repo",
+        "anchor",
+        torch.device("cpu"),
+        halt_gate=halt_gate,
+        required=True,
+    )
+
+
 def test_attendance_only_worker_uploads_zero_sample_status_without_training(monkeypatch, tmp_path):
     calls: dict[str, list] = {"download": [], "upload": [], "signal": []}
     monkeypatch.setattr(worker_module, "barrier", lambda: None)
