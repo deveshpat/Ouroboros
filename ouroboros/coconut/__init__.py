@@ -10,7 +10,7 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
-    "run_cli": ("runner", "run_cli"),
+    "run_cli": ("session", "run_training_session"),
     "plan_training_session": ("training_plan", "plan_training_session"),
     "TrainingSessionPlan": ("training_plan", "TrainingSessionPlan"),
     "TrainingPlanKind": ("training_plan", "TrainingPlanKind"),

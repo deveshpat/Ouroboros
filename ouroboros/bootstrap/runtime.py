@@ -56,15 +56,6 @@ def _bootstrap_wheel_bases_for_cuda_arch(cuda_capability: Tuple[int, int]) -> Li
     return bases
 
 
-def _bootstrap_pip_spec_for_wheel_base(wheel_base: str) -> Tuple[str, str]:
-    parts = wheel_base.split("-")
-    pkg_name = parts[0]
-    pkg_ver = parts[1]
-    if pkg_name == "mamba_ssm":
-        return pkg_name, f"git+https://github.com/state-spaces/mamba.git@v{pkg_ver}"
-    return pkg_name, f"{pkg_name.replace('_', '-')}=={pkg_ver}"
-
-
 def _patch_triton_math_log1p() -> List[str]:
     """
     Restore the Triton math.log1p symbol expected by mamba-ssm 1.2.2.
@@ -262,31 +253,6 @@ def _wandb_credentials_available() -> bool:
 
 def _bootstrap_resolve_token() -> Optional[str]:
     return _resolve_hf_token_common()
-
-
-def _bootstrap_strict_mac_mps_requested(
-    *,
-    torch_module: Optional[Any] = None,
-    argv: Optional[Sequence[str]] = None,
-) -> bool:
-    """Return true for the local Apple Silicon fallback path that cannot use CUDA wheels."""
-    args = list(sys.argv[1:] if argv is None else argv)
-    if "--mac_mps_mamba_kernels" not in args:
-        return False
-    if sys.platform != "darwin":
-        return False
-
-    try:
-        _torch = torch_module
-        if _torch is None:
-            import torch as _torch  # type: ignore[no-redef]
-        mps_backend = getattr(getattr(_torch, "backends", None), "mps", None)
-        cuda_backend = getattr(_torch, "cuda", None)
-        mps_available = bool(mps_backend is not None and mps_backend.is_available())
-        cuda_available = bool(cuda_backend is not None and cuda_backend.is_available())
-    except Exception:
-        return False
-    return mps_available and not cuda_available
 
 
 def _load_mamba_fast_path_symbols() -> Dict[str, Any]:
@@ -531,12 +497,6 @@ def _bootstrap_shared_install_phases() -> None:
     if _r1.returncode != 0:
         print("[bootstrap] WARNING: Phase 1 pip returned non-zero — check output above.")
 
-    if _bootstrap_strict_mac_mps_requested(torch_module=_torch):
-        print(
-            "[bootstrap] Strict Mac MPS fallback: skipping CUDA-only "
-            "causal-conv1d/mamba_ssm wheel bootstrap."
-        )
-        return
 
     print("[bootstrap] Phase 2: arch-aware Hub wheel install...")
     _hf_token = _bootstrap_resolve_token()
@@ -546,7 +506,7 @@ def _bootstrap_shared_install_phases() -> None:
         sys.exit(1)
 
     _il.invalidate_caches()
-    from huggingface_hub import hf_hub_download, HfApi  # installed in Phase 1
+    from huggingface_hub import hf_hub_download  # installed in Phase 1
 
     _cc = _torch.cuda.get_device_capability() if _torch.cuda.is_available() else (0, 0)
     _arch_suffix = f"sm{_cc[0]}{_cc[1]}"
@@ -598,68 +558,14 @@ def _bootstrap_shared_install_phases() -> None:
                 _downloaded = True
             except Exception as _dl_err:
                 print(f"[bootstrap]   {_hub_filename} not on Hub "
-                      f"({type(_dl_err).__name__}). Compiling from source...")
+                      f"({type(_dl_err).__name__}).")
 
         if not _downloaded:
-            _pkg_name, _pip_spec = _bootstrap_pip_spec_for_wheel_base(_base)
-
-            _env_vars = os.environ.copy()
-            _env_vars["MAX_JOBS"] = os.environ.get("OUROBOROS_CUDA_BUILD_MAX_JOBS", "4")
-            _env_vars["TORCH_CUDA_ARCH_LIST"] = _arch_list
-            if _pkg_name == "flash_attn":
-                _env_vars.setdefault("FLASH_ATTENTION_FORCE_BUILD", "TRUE")
-                _env_vars.setdefault("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE")
-                _env_vars.setdefault(
-                    "NVCC_THREADS",
-                    os.environ.get("OUROBOROS_FLASH_ATTN_NVCC_THREADS", "4"),
-                )
-
-            print(f"[bootstrap]   Building {_pip_spec} "
-                  f"(TORCH_CUDA_ARCH_LIST={_arch_list}) ...")
-            _build_result = subprocess.run(
-                [sys.executable, "-m", "pip", "wheel", _pip_spec,
-                 "--no-build-isolation", "--no-deps",
-                 "-w", str(_wheel_dir), "--verbose"],
-                env=_env_vars, check=False,
+            print(
+                f"[bootstrap] FATAL: {_hub_filename} not found on Hub for {_arch_suffix}. "
+                "No source compilation fallback. Add the prebuilt wheel to the Hub repo."
             )
-            if _build_result.returncode != 0:
-                print(f"[bootstrap] FATAL: Source build failed for {_pip_spec}.")
-                sys.exit(1)
-
-            _found = [
-                f for f in _wheel_dir.glob(f"{_pkg_name}*.whl")
-                if not any(f.name.endswith(f"-{s}.whl") for s in _KNOWN_ARCH_SUFFIXES)
-            ]
-            if not _found:
-                print(f"[bootstrap] FATAL: pip wheel succeeded but no .whl found "
-                      f"for {_pkg_name}.")
-                sys.exit(1)
-            _built_whl = max(_found, key=lambda p: p.stat().st_mtime)
-
-            if _built_whl.resolve() != _local_path.resolve():
-                shutil.copy2(str(_built_whl), str(_local_path))
-
-            print(f"[bootstrap]   Build succeeded: {_built_whl.name}")
-
-            _arch_whl_path = _wheel_dir / _hub_filename
-            shutil.copy2(str(_local_path), str(_arch_whl_path))
-            try:
-                _api = HfApi(token=_hf_token)
-                _api.create_repo(repo_id=_HUB_REPO_ID, repo_type="model",
-                                 private=True, exist_ok=True, token=_hf_token)
-                _api.upload_file(
-                    path_or_fileobj=str(_arch_whl_path),
-                    path_in_repo=_hub_filename,
-                    repo_id=_HUB_REPO_ID,
-                    repo_type="model",
-                    token=_hf_token,
-                    commit_message=f"Add wheel: {_hub_filename}",
-                )
-                print(f"[bootstrap]   Uploaded {_hub_filename} to Hub ✓ "
-                      f"(future sessions on {_arch_suffix} skip compilation)")
-            except Exception as _up_err:
-                print(f"[bootstrap]   [warn] Hub upload failed: {_up_err}")
-
+            sys.exit(1)
         _r = subprocess.run(
             [sys.executable, "-m", "pip", "install",
              "--force-reinstall", "--no-deps", str(_local_path)],
@@ -782,12 +688,6 @@ def _bootstrap_process_local_finalize() -> None:
     except Exception as _shim_err:
         _always(f"WARNING: transformers shim failed: {_shim_err}")
 
-    if _bootstrap_strict_mac_mps_requested(torch_module=_torch):
-        _info(
-            "Strict Mac MPS fallback: skipping CUDA kernel export shim and "
-            "CUDA-op verification; Transformers Jamba fast kernels stay disabled on MPS."
-        )
-        return
 
     try:
         _mamba_source_patches = _patch_mamba_triton_log1p_source()

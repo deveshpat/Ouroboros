@@ -94,22 +94,6 @@ def test_dgac_dedicated_round_wandb_identity_avoids_stage_round_collision():
     assert identity["config"]["dgac_round_n"] == 1
 
 
-def test_local_mac_dgac_wandb_identity_uses_claim_suffix(monkeypatch):
-    monkeypatch.setenv("OUROBOROS_MAC_DGAC_CLAIM_ID", "mac-dgac-abcdef123456")
-
-    identity = worker_module._diloco_wandb_identity(
-        _args(worker_id="A", use_halt_gate=True, resume_from_diloco_anchor=True),
-        stage_k=10,
-        round_n=3,
-        is_dgac_diloco=True,
-    )
-
-    assert identity["id"] == "dgac-a-r0003-abcdef123456"
-    assert identity["name"] == "DGAC Worker A | Dedicated Round 003 | Mac 123456"
-    assert identity["group"] == "dgac-dedicated-r0003"
-    assert identity["config"]["mac_dgac_claim_id"] == "mac-dgac-abcdef123456"
-
-
 def test_normal_diloco_wandb_identity_keeps_stage_round_shape():
     identity = worker_module._diloco_wandb_identity(
         _args(worker_id="B"),

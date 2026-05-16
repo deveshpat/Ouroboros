@@ -431,7 +431,6 @@ def load_model_and_tokenizer(
         load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
 
     _mamba_fast_path = device.type == "cuda"
-    _mac_mps_mamba_requested = device.type == "mps" and bool(getattr(args, "mac_mps_mamba_kernels", False))
     if device.type == "mps":
         load_kwargs["use_mamba_kernels"] = False
     elif not _mamba_fast_path:
@@ -439,12 +438,6 @@ def load_model_and_tokenizer(
 
     if _mamba_fast_path and device.type == "cuda" and is_main:
         print("  mamba CUDA kernels: fast path ACTIVE (verified at bootstrap)")
-    if _mac_mps_mamba_requested:
-        from ouroboros.bootstrap.mac_jamba_fastpath import install_mac_jamba_mps_fastpath
-
-        mac_scan_active = install_mac_jamba_mps_fastpath(verbose=is_main)
-        if is_main and not mac_scan_active:
-            print("  Mac Jamba MPS selective-scan patch: unavailable; using Transformers slow path")
 
     if args.use_4bit:
         load_kwargs["quantization_config"] = BitsAndBytesConfig(

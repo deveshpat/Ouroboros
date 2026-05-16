@@ -84,49 +84,6 @@ def test_training_session_planner_classifies_branches_without_heavy_imports():
         raise AssertionError("expected unsupported DGAC DiLoCo combination to fail")
 
 
-def test_worker_lifecycle_classifier_expresses_training_attendance_and_passthrough():
-    from ouroboros.coordinator.worker_lifecycle import WorkerLifecycleKind, classify_worker_lifecycle
-
-    state = {"triggered_workers": ["A"], "attendance_workers": ["B"], "stage_k": 1, "round_n": 2}
-
-    active = classify_worker_lifecycle(worker_id="a", round_state=state, shard_samples=3)
-    assert active.kind == WorkerLifecycleKind.NORMAL_DILOCO_WORKER
-    assert active.should_train is True
-    assert active.contributes_to_aggregation is True
-
-    attendance = classify_worker_lifecycle(worker_id="B", round_state=state, shard_samples=3)
-    assert attendance.kind == WorkerLifecycleKind.ATTENDANCE_ONLY
-    assert attendance.should_train is False
-    assert attendance.should_upload_status is True
-    assert attendance.contributes_to_aggregation is False
-
-    passthrough = classify_worker_lifecycle(worker_id="A", round_state=state, shard_samples=0)
-    assert passthrough.kind == WorkerLifecycleKind.EMPTY_SHARD_PASSTHROUGH
-    assert passthrough.should_train is False
-    assert passthrough.should_push_signal is True
-
-    dgac = classify_worker_lifecycle(
-        worker_id="A",
-        round_state=state,
-        shard_samples=3,
-        use_halt_gate=True,
-        resume_from_diloco_anchor=True,
-    )
-    assert dgac.kind == WorkerLifecycleKind.DGAC_DILOCO_WORKER
-    assert dgac.skip_pre_validation is False
-
-    skipped = classify_worker_lifecycle(worker_id="C", round_state=state, shard_samples=3)
-    assert skipped.kind == WorkerLifecycleKind.NOOP
-    assert skipped.should_train is False
-
-    try:
-        classify_worker_lifecycle(worker_id="A", round_state=state, shard_samples=3, use_halt_gate=True)
-    except ValueError as exc:
-        assert "resume_from_diloco_anchor" in str(exc)
-    else:
-        raise AssertionError("expected unsupported halt-gate combination")
-
-
 def test_coordinator_decision_module_plans_force_repair_and_dispatch_reconcile():
     from ouroboros.coordinator.decision import plan_force_repair, plan_round_start
     from ouroboros.coordinator.state import _reconcile_post_dispatch_state

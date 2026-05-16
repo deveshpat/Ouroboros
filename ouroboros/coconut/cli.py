@@ -62,7 +62,6 @@ def bootstrap_free_help_text() -> str:
         "  --diloco_worker_id {A,B,C}\n"
         "  --resume_from RESUME_FROM\n"
         "  --resume_from_diloco_anchor\n"
-        "  --mac_mps_mamba_kernels\n"
         "  --latent_cache\n"
         "  --mac_mps_latent_cache\n"
         "  --eval_only\n"
@@ -251,14 +250,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--mac_mps_mamba_kernels",
-        action="store_true",
-        help=(
-            "Strict local Mac fallback only: request mamba-ssm-macos MPS kernels "
-            "after preflight has proven Jamba forward/backward parity."
-        ),
-    )
-    parser.add_argument(
         "--latent_cache",
         action="store_true",
         help=(
@@ -271,7 +262,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         dest="latent_cache",
         action="store_true",
         help=(
-            "Compatibility alias for --latent_cache used by strict local Mac fallback commands."
+            "Compatibility alias for --latent_cache kept for older local commands."
         ),
     )
     parser.add_argument("--output_dir", default="runs/stage3")

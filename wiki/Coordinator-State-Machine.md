@@ -51,7 +51,3 @@ remaining samples < `min_shard_samples` -> close stage.
 empty shard -> no fake work.
 solo worker -> direct promotion, no stale-anchor blend.
 
-## Mac claim
-
-active strict Mac DGAC claim -> GitHub/Kaggle coordinator refuses work.
-Claim prevents two writers touching anchor.

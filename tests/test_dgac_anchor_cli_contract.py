@@ -6,7 +6,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COCONUT_MAIN = REPO_ROOT / "ouroboros" / "coconut" / "__main__.py"
-COCONUT_RUNNER = REPO_ROOT / "ouroboros" / "coconut" / "runner.py"
+COCONUT_INIT = REPO_ROOT / "ouroboros" / "coconut" / "__init__.py"
 SESSION_MODULE = REPO_ROOT / "ouroboros" / "coconut" / "session.py"
 BLUEPRINT = REPO_ROOT / "BLUEPRINT.md"
 CLI_MODULE = REPO_ROOT / "ouroboros" / "coconut" / "cli.py"
@@ -30,7 +30,7 @@ def test_dgac_anchor_flag_is_exposed_by_bootstrap_free_help():
 def test_dgac_anchor_launch_contract_matches_root_modular_and_cli_entrypoints():
     blueprint_source = BLUEPRINT.read_text(encoding="utf-8")
     main_source = COCONUT_MAIN.read_text(encoding="utf-8")
-    runner_source = COCONUT_RUNNER.read_text(encoding="utf-8")
+    coconut_init_source = COCONUT_INIT.read_text(encoding="utf-8")
     session_source = SESSION_MODULE.read_text(encoding="utf-8")
     cli_source = CLI_MODULE.read_text(encoding="utf-8")
 
@@ -40,7 +40,7 @@ def test_dgac_anchor_launch_contract_matches_root_modular_and_cli_entrypoints():
     assert "from ouroboros.coconut import run_cli" in main_source
     assert "from ouroboros.coconut.cli import parse_args" in main_source
 
-    assert "run_training_session" in runner_source
+    assert "\"run_cli\": (\"session\", \"run_training_session\")" in coconut_init_source
     assert "--resume_from_diloco_anchor" in session_source
     assert "diloco_download_anchor" in session_source
     assert "Loading DiLoCo anchor" in session_source

@@ -68,11 +68,6 @@ from ouroboros.coordinator.state import (
     _ordered_unique_worker_ids,
     _partition_ready_workers,
 )
-from ouroboros.coordinator.mac_dgac_fallback import (
-    MAC_DGAC_CLAIM_PATH,
-    is_active_mac_claim,
-    mac_claim_matches,
-)
 from ouroboros.utils.runtime_env import resolve_hf_token, resolve_wandb_key
 from ouroboros.utils.wandb_runtime import wandb_init_kwargs
 
@@ -239,15 +234,6 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Known forced-kmax validation CE to pass into diagnostics-only anchor eval, "
             "for example 0.4112 from a previous completed base validation."
-        ),
-    )
-    parser.add_argument(
-        "--mac_claim_id",
-        default=os.environ.get("OUROBOROS_MAC_DGAC_CLAIM_ID"),
-        help=(
-            "Allow this local coordinator process to aggregate while the matching "
-            "strict Mac DGAC fallback claim is active. GitHub Actions should leave "
-            "this empty so a valid Mac claim blocks dispatch/aggregation races."
         ),
     )
 
@@ -493,27 +479,6 @@ def _build_kaggle_creds(args: argparse.Namespace) -> Dict[str, Tuple[Optional[st
         "B": (args.kaggle_username_b, args.kaggle_key_b),
         "C": (args.kaggle_username_c, args.kaggle_key_c),
     }
-
-
-def _active_foreign_mac_claim(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
-    claim = hub_download_json(args.repo_id, MAC_DGAC_CLAIM_PATH, args.hf_token)
-    if not is_active_mac_claim(claim, now=time.time()):
-        return None
-    if mac_claim_matches(claim, getattr(args, "mac_claim_id", None)):
-        return None
-    return claim
-
-
-def _refuse_if_foreign_mac_claim_active(args: argparse.Namespace) -> bool:
-    claim = _active_foreign_mac_claim(args)
-    if claim is None:
-        return False
-    print(
-        "[coordinator] Active strict Mac DGAC fallback claim detected; "
-        "refusing GitHub/Kaggle coordinator work to avoid conflicting sessions. "
-        f"claim_id={claim.get('claim_id')} expires_at={claim.get('expires_at')}"
-    )
-    return True
 
 
 def _kaggle_eval_worker_ids(args: argparse.Namespace) -> List[str]:
@@ -810,10 +775,6 @@ def main() -> None:
     args = parse_args()
     if not args.hf_token:
         raise SystemExit("HF token required. Set HF_TOKEN or pass --hf_token.")
-
-
-    if _refuse_if_foreign_mac_claim_active(args):
-        return
 
     kaggle_run_mode = getattr(args, "kaggle_run_mode", DILOCO_RUN_MODE)
     if kaggle_run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:

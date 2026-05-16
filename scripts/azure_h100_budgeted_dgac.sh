@@ -50,16 +50,6 @@ echo "[azure-entrypoint] region=${AZURE_REGION} sku=${AZURE_H100_SKU} planned_ho
 echo "[azure-entrypoint] diloco_state_repo=${OUROBOROS_DILOCO_STATE_REPO} wandb_project=${OUROBOROS_WANDB_PROJECT}"
 echo "[azure-entrypoint] batch=${OUROBOROS_AZURE_BATCH_SIZE} grad_accum=${OUROBOROS_AZURE_GRAD_ACCUM} max_seq_len=${OUROBOROS_AZURE_MAX_SEQ_LEN}"
 
-python -m ouroboros.utils.azure_cost_guard \
-  --region "${AZURE_REGION}" \
-  --sku "${AZURE_H100_SKU}" \
-  --hourly_usd "${AZURE_HOURLY_USD}" \
-  --planned_hours "${AZURE_PLANNED_HOURS}" \
-  --budget_usd "${AZURE_BUDGET_USD}" \
-  --safety_buffer "${AZURE_SAFETY_BUFFER}" \
-  --overhead_usd "${AZURE_OVERHEAD_USD}" \
-  --require_budget_fit
-
 python -m pip install -q --upgrade pip
 if python - <<'PY'
 import importlib.util

@@ -4,7 +4,6 @@ import argparse
 from pathlib import Path
 
 from ouroboros.coordinator import coordinator
-from ouroboros.coordinator.mac_dgac_fallback import MAC_DGAC_CLAIM_PATH
 
 
 def _args(**overrides):
@@ -53,12 +52,13 @@ def test_packaged_coordinator_dgac_anchor_eval_dispatches_one_gpu_notebook_witho
         return {worker_id: "success" for worker_id in active_workers}
 
     monkeypatch.setattr(coordinator, "trigger_kaggle_workers", fake_trigger)
-    def fake_download(repo_id, path, token):
-        if path == MAC_DGAC_CLAIM_PATH:
-            return None
-        raise AssertionError("anchor eval dispatch must not read round_state")
-
-    monkeypatch.setattr(coordinator, "hub_download_json", fake_download)
+    monkeypatch.setattr(
+        coordinator,
+        "hub_download_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("anchor eval dispatch must not read Hub state")
+        ),
+    )
     monkeypatch.setattr(
         coordinator,
         "hub_upload_json",
@@ -88,12 +88,13 @@ def test_packaged_coordinator_benchmark_dispatches_one_gpu_notebook_without_roun
 
     monkeypatch.setattr(coordinator, "trigger_kaggle_workers", fake_trigger)
 
-    def fake_download(repo_id, path, token):
-        if path == MAC_DGAC_CLAIM_PATH:
-            return None
-        raise AssertionError("benchmark dispatch must not read round_state")
-
-    monkeypatch.setattr(coordinator, "hub_download_json", fake_download)
+    monkeypatch.setattr(
+        coordinator,
+        "hub_download_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("benchmark dispatch must not read Hub state")
+        ),
+    )
     monkeypatch.setattr(
         coordinator,
         "hub_upload_json",
@@ -122,12 +123,13 @@ def test_packaged_coordinator_dgac_train_dispatches_one_gpu_notebook_without_rou
         return {worker_id: "success" for worker_id in active_workers}
 
     monkeypatch.setattr(coordinator, "trigger_kaggle_workers", fake_trigger)
-    def fake_download(repo_id, path, token):
-        if path == MAC_DGAC_CLAIM_PATH:
-            return None
-        raise AssertionError("DGAC train dispatch must not read round_state")
-
-    monkeypatch.setattr(coordinator, "hub_download_json", fake_download)
+    monkeypatch.setattr(
+        coordinator,
+        "hub_download_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("DGAC train dispatch must not read Hub state")
+        ),
+    )
     monkeypatch.setattr(
         coordinator,
         "hub_upload_json",
