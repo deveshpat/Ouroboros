@@ -53,18 +53,19 @@ preserves the GPU training target selection.
 
 ```bash
 torchrun --standalone --nproc_per_node=2 jamba_coconut_finetune.py \
-  --use_halt_gate --resume_from_diloco_anchor --eval_only \
+  --use_halt_gate --resume_from_diloco_anchor --eval_only --dgac_diagnostics \
   --diloco_state_repo WeirdRunner/Ouroboros --hf_token "$HF_TOKEN" \
   --data_dir data/coconut_v1 --use_4bit --latent_cache \
   --max_stage 10 --max_grad_norm 0.3 \
-  --batch_size 4 --grad_accum 8 --val_batch_size 2 \
+  --batch_size 4 --grad_accum 8 --val_batch_size 1 \
   --val_skip_buffer_minutes 60 \
   --session_timeout_hours 12.0 --graceful_exit_buffer_minutes 20 \
   --output_dir runs/dgac_anchor_eval \
+  --dgac_diagnostics_batch_size 1 \
   --wandb_project "ouroboros-stage3-jamba"
 ```
 
-Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. This pushes one GPU Kaggle notebook in eval-only mode; it does not mutate `round_state` and loads the latest adapter + `halt_gate.pt` from `diloco_state/anchor` on Hub when present.
+Workflow path: GitHub Actions → `coordinate` → **Run workflow** with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`. Use `dgac_anchor_eval_resume_mode=full` for a fresh eval. If base validation already completed and only DGAC diagnostics failed, use `dgac_anchor_eval_resume_mode=diagnostics-only` with `dgac_diagnostics_forced_kmax_ce=<known CE>` to skip validation/generation and resume diagnostics. This pushes one GPU Kaggle notebook in eval-only mode; it does not mutate `round_state` and loads the latest adapter + `halt_gate.pt` from `diloco_state/anchor` on Hub when present.
 
 **Latest completed eval result:** Stage 10 terminal pre-DGAC anchor PASS — `val_ce=0.4863`, `val_acc=0.0889`, coherent generation samples, `Mean UWR=0.733`. `k_actual=10` for all samples was expected before DGAC because HaltGate started zero-init. After the Azure checkpoint promotion, rerun this same command against the canonical anchor and require `diloco` logs to show `Loaded halt gate from diloco_state/anchor/halt_gate.pt` before trusting halt-step distribution.
 

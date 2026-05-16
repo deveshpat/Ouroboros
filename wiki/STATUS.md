@@ -48,7 +48,7 @@ Canonical execution protocol: [Engineering-Workflow](Engineering-Workflow.md).
 
 ## Immediate Next Steps
 
-1. **Quality-check the promoted canonical DGAC anchor** — use GitHub Actions → `coordinate` with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`; trust the result only if logs include `Loaded halt gate from diloco_state/anchor/halt_gate.pt`.
+1. **Quality-check the promoted canonical DGAC anchor** — use GitHub Actions → `coordinate` with `kaggle_run_mode=dgac-anchor-eval`, `force_worker_ids=A`, `skip_trigger=false`, `dry_run=false`, and empty `workflow_validate`; leave `dgac_anchor_eval_resume_mode=full` for a fresh eval, or use `dgac_anchor_eval_resume_mode=diagnostics-only` plus `dgac_diagnostics_forced_kmax_ce=<known CE>` to resume only the DGAC diagnostics after a completed base validation. Trust the result only if logs include `Loaded halt gate from diloco_state/anchor/halt_gate.pt`.
 2. **Compare against the Azure checkpoint only if needed** — direct checkpoint eval of `runs/azure_h100_dgac/stage_10/checkpoint-0001154` is now optional forensic validation, because that checkpoint has already been copied into `diloco_state/anchor`. Do not use `--resume_from_diloco_anchor` for raw checkpoint eval.
 3. **Resume remaining H100 DGAC epochs only if anchor eval is mixed/bad** — continue from `checkpoint-0001154` with `--use_halt_gate` + the normal checkpoint resume path, `--hf_stage_subdir runs/azure_h100_dgac`, and no `--resume_from_diloco_anchor`. Lower `--val_skip_buffer_minutes` if validation/generation must run before timeout, then promote again only after reviewing eval/gen evidence.
 4. **Review DGAC research signal** — inspect HaltGate behavior / halt-step distribution and compare post-DGAC `val_ce`, `val_acc`, and generations against the terminal anchor baseline. `pct_at_1≈1.0` is acceptable only if forced-`k1` CE is near forced-full CE.
@@ -144,7 +144,7 @@ WeirdRunner/Ouroboros/
 | `min_shard_samples` | 32 (1 optimizer step) |
 | Solo mode | 1 active worker → direct weight promotion |
 | Stage close | remaining < `min_shard_samples` per active worker |
-| `workflow_dispatch` inputs | `force_worker_ids`, `skip_trigger`, `dry_run`, `workflow_validate`, `kaggle_run_mode` |
+| `workflow_dispatch` inputs | `force_worker_ids`, `skip_trigger`, `dry_run`, `workflow_validate`, `kaggle_run_mode`, `dgac_anchor_eval_resume_mode`, `dgac_diagnostics_forced_kmax_ce` |
 | Worker timeout threshold | 13h (Kaggle 12h wall + 1h grace) |
 | `triggered_at=0` semantics | Canonical "dispatch unconfirmed" signal → immediate re-dispatch. ✅ |
 | Attendance round | Worker in `attendance_workers` → skips training, uploads status(samples=0), pushes signal |

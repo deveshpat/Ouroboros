@@ -177,4 +177,9 @@ def test_workflow_dispatch_exposes_only_valid_matrix_modes():
     assert CPU_SMOKE_MODE in workflow.split("workflow_validate", 1)[1].split("kaggle_run_mode", 1)[0]
     assert CPU_SMOKE_MODE not in workflow.split("kaggle_run_mode", 1)[1].split("attendance_join_grace_minutes", 1)[0]
     assert "default: 'dgac-diloco'" in workflow
+    assert "dgac_anchor_eval_resume_mode" in workflow
+    assert "diagnostics-only" in workflow
+    assert "dgac_diagnostics_forced_kmax_ce" in workflow
+    assert "OUROBOROS_DGAC_DIAGNOSTICS_ONLY" in workflow
+    assert "OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE" in workflow
     assert get_launch_spec("dgac-diloco").mode == DGAC_DILOCO_RUN_MODE

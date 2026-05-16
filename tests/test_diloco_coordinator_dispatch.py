@@ -176,6 +176,33 @@ def test_runtime_env_can_select_dgac_anchor_eval_notebook_mode(monkeypatch):
     assert env["OUROBOROS_DILOCO_STATE_REPO"] == "state/repo"
 
 
+def test_runtime_env_can_request_dgac_anchor_diagnostics_only_from_coordinator_cli(monkeypatch):
+    monkeypatch.delenv("OUROBOROS_KAGGLE_RUN_MODE", raising=False)
+    monkeypatch.delenv("OUROBOROS_DGAC_DIAGNOSTICS_ONLY", raising=False)
+    monkeypatch.delenv("OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE", raising=False)
+
+    env = dispatch._build_worker_runtime_env(
+        argparse.Namespace(
+            hf_token="hf_fake",
+            wandb_key=None,
+            repo_id="state/repo",
+            outer_lr=0.7,
+            wandb_project=None,
+            wandb_entity=None,
+            workflow_validate=None,
+            workflow_validation_run_id=None,
+            kaggle_run_mode="dgac-anchor-eval",
+            dgac_diagnostics_only=True,
+            dgac_diagnostics_forced_kmax_ce=0.4112,
+        ),
+        "A",
+    )
+
+    assert env["OUROBOROS_KAGGLE_RUN_MODE"] == "dgac-anchor-eval"
+    assert env["OUROBOROS_DGAC_DIAGNOSTICS_ONLY"] == "1"
+    assert env["OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE"] == "0.4112"
+
+
 def test_runtime_env_can_select_dgac_training_notebook_mode(monkeypatch):
     monkeypatch.delenv("OUROBOROS_KAGGLE_RUN_MODE", raising=False)
 

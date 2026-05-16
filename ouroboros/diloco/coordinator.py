@@ -248,6 +248,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--dgac_diagnostics_only",
+        action="store_true",
+        help=(
+            "For kaggle_run_mode=dgac-anchor-eval, skip base validation/generation "
+            "and run only DGAC diagnostics. Use with --dgac_diagnostics_forced_kmax_ce "
+            "to reuse a known forced-kmax validation CE."
+        ),
+    )
+    parser.add_argument(
+        "--dgac_diagnostics_forced_kmax_ce",
+        type=float,
+        default=None,
+        help=(
+            "Known forced-kmax validation CE to pass into diagnostics-only anchor eval, "
+            "for example 0.4112 from a previous completed base validation."
+        ),
+    )
+    parser.add_argument(
         "--mac_claim_id",
         default=os.environ.get("OUROBOROS_MAC_DGAC_CLAIM_ID"),
         help=(

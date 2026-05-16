@@ -116,6 +116,11 @@ def test_workflow_dispatch_exposes_dgac_anchor_eval_and_train_gates():
     assert "dgac-diloco" in workflow
     assert "OUROBOROS_KAGGLE_RUN_MODE" in workflow
     assert "--kaggle_run_mode" in workflow
+    assert "dgac_anchor_eval_resume_mode" in workflow
+    assert "diagnostics-only" in workflow
+    assert "dgac_diagnostics_forced_kmax_ce" in workflow
+    assert "OUROBOROS_DGAC_DIAGNOSTICS_ONLY" in workflow
+    assert "OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE" in workflow
     assert "OUROBOROS_KAGGLE_RUN_MODE" in notebook
     assert "build_launch_command(run_mode, os.environ, worker_id=worker_id)" in notebook
     assert "!{shell_command}" in notebook

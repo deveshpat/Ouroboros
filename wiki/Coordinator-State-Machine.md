@@ -8,7 +8,7 @@
 | Trigger | Path |
 |---|---|
 | `push` to `signals/*.json` | Normal round completion signal |
-| `workflow_dispatch` | Manual: `force_worker_ids`, `skip_trigger`, `dry_run`, `workflow_validate=cpu-smoke` |
+| `workflow_dispatch` | Manual: `force_worker_ids`, `skip_trigger`, `dry_run`, `workflow_validate=cpu-smoke`, `kaggle_run_mode`, and DGAC anchor eval resume controls (`dgac_anchor_eval_resume_mode`, `dgac_diagnostics_forced_kmax_ce`) |
 
 Concurrency: `group: diloco-coordinate`, `cancel-in-progress: false` — runs serialize, never race.
 
