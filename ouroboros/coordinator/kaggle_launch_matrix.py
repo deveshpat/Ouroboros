@@ -173,6 +173,7 @@ def _build_benchmark(env: Mapping[str, str], *, worker_id: str | None = None) ->
         dtype=_value(env, "OUROBOROS_BENCHMARK_DTYPE"),
         model_args=normalize_text(env.get("OUROBOROS_BENCHMARK_MODEL_ARGS")),
         publish_to_hub=_truthy_value(env, "OUROBOROS_BENCHMARK_PUBLISH_TO_HUB"),
+        parallelism=normalize_text(env.get("OUROBOROS_BENCHMARK_PARALLELISM")),
     )
 
 
@@ -252,6 +253,7 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
                 "OUROBOROS_BENCHMARK_DEVICE": "cuda:0",
                 "OUROBOROS_BENCHMARK_DTYPE": "float16",
                 "OUROBOROS_BENCHMARK_PUBLISH_TO_HUB": "1",
+                "OUROBOROS_BENCHMARK_PARALLELISM": "auto",
             }
         ),
         command_builder=_build_benchmark,

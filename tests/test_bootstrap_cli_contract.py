@@ -102,3 +102,11 @@ def test_cli_defaults_and_worker_normalization_match_source_contract():
     assert "from ouroboros.coconut.cli import parse_args" in main_source
     assert "parse_args(argv)" in main_source
     assert "from ouroboros.coconut import run_cli" in main_source
+
+
+def test_bootstrap_launch_key_can_be_shared_across_independent_benchmark_children(monkeypatch):
+    from ouroboros.bootstrap import runtime
+
+    monkeypatch.setenv("OUROBOROS_BOOTSTRAP_LAUNCH_KEY", "bench-shared-key")
+
+    assert runtime._bootstrap_launch_key() == "bench-shared-key"

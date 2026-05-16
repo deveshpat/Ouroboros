@@ -14,6 +14,7 @@ from ouroboros.coordinator.kaggle_commands import (
     build_dgac_training_command,
     build_diloco_training_command,
     build_lm_eval_benchmark_command,
+    build_lm_eval_benchmark_multi_gpu_command,
     format_shell_command,
     kaggle_secret_presence,
     resolve_diloco_worker_id,
@@ -302,6 +303,23 @@ def test_build_lm_eval_benchmark_command_allows_safe_overrides():
     assert command[command.index("--dtype") + 1] == "bfloat16"
     assert command[command.index("--model_args") + 1] == "pretrained=merged/model,trust_remote_code=True"
     assert command[command.index("--adapter_cache_dir") + 1] == "/tmp/adapter-cache"
+    assert "--publish_to_hub" not in command
+
+
+
+
+def test_build_lm_eval_benchmark_multi_gpu_command_can_pin_parallelism_policy():
+    command = build_lm_eval_benchmark_multi_gpu_command(
+        devices="cuda:0,cuda:1",
+        limit="100",
+        parallelism="single",
+        publish_to_hub=False,
+    )
+
+    assert command[:3] == ["python", "-m", "ouroboros.eval.benchmark_multi_gpu"]
+    assert command[command.index("--devices") + 1] == "cuda:0,cuda:1"
+    assert command[command.index("--limit") + 1] == "100"
+    assert command[command.index("--parallelism") + 1] == "single"
     assert "--publish_to_hub" not in command
 
 

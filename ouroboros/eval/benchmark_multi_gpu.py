@@ -9,6 +9,7 @@ independent benchmark shards at once.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import threading
@@ -21,6 +22,7 @@ from ouroboros.eval.benchmark_harness import (
     DEFAULT_BASE_MODEL,
     DEFAULT_BATCH_SIZE,
     DEFAULT_DTYPE,
+    DEFAULT_DEVICE,
     DEFAULT_HUB_PREFIX,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_TASKS,
@@ -34,6 +36,7 @@ from ouroboros.coordinator.kaggle_commands import build_lm_eval_benchmark_comman
 from ouroboros.utils.runtime_env import normalize_benchmark_limit
 
 DEFAULT_DEVICES = "auto"
+DEFAULT_PARALLELISM = "auto"
 
 
 def _env(env: Mapping[str, str], name: str, default: str) -> str:
@@ -138,6 +141,94 @@ def shard_tasks(tasks: str, devices: Sequence[str]) -> list[list[str]]:
     return shards
 
 
+def resolve_benchmark_parallelism(
+    requested: str | None,
+    *,
+    limit: str | int | None,
+    tasks: str,
+    devices: Sequence[str],
+) -> str:
+    """Choose benchmark parallelism without pretending two cold starts are speedup.
+
+    ``lm-eval --limit`` runs are smoke/probe runs. For those, duplicating the
+    full Jamba + PEFT + Mamba bootstrap on two GPUs costs more than the small
+    number of examples can repay, so auto mode stays single-GPU. Full benchmarks
+    may shard whole tasks across devices unless explicitly forced otherwise.
+    """
+    value = (_normalize_text(requested) or DEFAULT_PARALLELISM).lower().replace("-", "_")
+    aliases = {
+        "single": "single",
+        "none": "single",
+        "1": "single",
+        "task": "task_shard",
+        "tasks": "task_shard",
+        "task_shard": "task_shard",
+        "shard": "task_shard",
+        "auto": "auto",
+    }
+    if value not in aliases:
+        raise ValueError("Benchmark parallelism must be one of: auto, single, task_shard")
+    mode = aliases[value]
+    if mode != "auto":
+        return mode
+    if normalize_benchmark_limit(limit) is not None:
+        return "single"
+    if len(_split_csv(tasks)) <= 1 or len([device for device in devices if str(device).strip()]) <= 1:
+        return "single"
+    return "task_shard"
+
+
+def build_lm_eval_benchmark_commands(
+    *,
+    tasks: str = DEFAULT_TASKS,
+    devices: str | Sequence[str] | None = None,
+    limit: str | int | None = None,
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+    base_model: str = DEFAULT_BASE_MODEL,
+    adapter_repo: str = DEFAULT_ADAPTER_REPO,
+    adapter_subfolder: str = DEFAULT_ADAPTER_SUBFOLDER,
+    batch_size: str = DEFAULT_BATCH_SIZE,
+    dtype: str = DEFAULT_DTYPE,
+    model_args: str | None = None,
+    publish_to_hub: bool = False,
+    parallelism: str | None = None,
+) -> list[list[str]]:
+    """Build benchmark commands using the operational auto/single/shard policy."""
+    device_names = resolve_benchmark_devices(devices)
+    mode = resolve_benchmark_parallelism(parallelism, limit=limit, tasks=tasks, devices=device_names)
+    if mode == "task_shard":
+        return build_sharded_lm_eval_benchmark_commands(
+            tasks=tasks,
+            devices=device_names,
+            limit=limit,
+            output_dir=output_dir,
+            base_model=base_model,
+            adapter_repo=adapter_repo,
+            adapter_subfolder=adapter_subfolder,
+            batch_size=batch_size,
+            dtype=dtype,
+            model_args=model_args,
+            publish_to_hub=publish_to_hub,
+        )
+    first_device = device_names[0] if device_names else DEFAULT_DEVICE
+    return [
+        build_lm_eval_benchmark_command(
+            tasks=tasks,
+            limit=limit,
+            output_dir=output_dir,
+            base_model=base_model,
+            adapter_repo=adapter_repo,
+            adapter_subfolder=adapter_subfolder,
+            batch_size=batch_size,
+            device=first_device,
+            dtype=dtype,
+            model_args=model_args,
+            publish_to_hub=publish_to_hub,
+            adapter_cache_dir="/kaggle/working/ouroboros_benchmark_adapter",
+        )
+    ]
+
+
 def build_sharded_lm_eval_benchmark_commands(
     *,
     tasks: str = DEFAULT_TASKS,
@@ -184,6 +275,11 @@ def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | No
     parser = argparse.ArgumentParser(description="Run Ouroboros lm-eval benchmarks across multiple GPUs")
     parser.add_argument("--tasks", default=_env(env, "OUROBOROS_BENCHMARK_TASKS", DEFAULT_TASKS))
     parser.add_argument("--devices", default=_env(env, "OUROBOROS_BENCHMARK_DEVICES", DEFAULT_DEVICES), help="Comma-separated devices or auto")
+    parser.add_argument(
+        "--parallelism",
+        default=_env(env, "OUROBOROS_BENCHMARK_PARALLELISM", DEFAULT_PARALLELISM),
+        help="auto, single, or task_shard. Auto keeps --limit smoke runs single-GPU to avoid duplicate cold starts.",
+    )
     parser.add_argument("--limit", default=normalize_benchmark_limit(env.get("OUROBOROS_BENCHMARK_LIMIT")))
     parser.add_argument("--output_dir", default=_env(env, "OUROBOROS_BENCHMARK_OUTPUT_DIR", DEFAULT_OUTPUT_DIR))
     parser.add_argument("--base_model", default=_env(env, "OUROBOROS_BENCHMARK_BASE_MODEL", DEFAULT_BASE_MODEL))
@@ -205,8 +301,21 @@ def _stream_output(prefix: str, pipe: object) -> None:
         print(f"[{prefix}] {line}", end="", flush=True)
 
 
+def _shared_bootstrap_env(commands: Sequence[Sequence[str]]) -> dict[str, str]:
+    env = os.environ.copy()
+    if len(commands) <= 1:
+        return env
+    launch_hash = hashlib.sha1(
+        "\n".join(" ".join(command) for command in commands).encode("utf-8")
+    ).hexdigest()[:16]
+    env.setdefault("OUROBOROS_BOOTSTRAP_SHARED_INSTALL", "1")
+    env.setdefault("OUROBOROS_BOOTSTRAP_LAUNCH_KEY", f"bench-{launch_hash}")
+    return env
+
+
 def run_commands_parallel(commands: Sequence[Sequence[str]]) -> None:
     processes: list[tuple[str, subprocess.Popen[str], threading.Thread]] = []
+    child_env = _shared_bootstrap_env(commands)
     for index, command in enumerate(commands):
         prefix = f"bench-shard-{index}"
         print(f"[{prefix}] launch: {' '.join(command)}", flush=True)
@@ -216,6 +325,7 @@ def run_commands_parallel(commands: Sequence[Sequence[str]]) -> None:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=child_env,
         )
         thread = threading.Thread(target=_stream_output, args=(prefix, process.stdout), daemon=True)
         thread.start()
@@ -235,7 +345,7 @@ def run_commands_parallel(commands: Sequence[Sequence[str]]) -> None:
 def main(argv: Iterable[str] | None = None) -> None:
     args = parse_args(argv)
     devices = resolve_benchmark_devices(args.devices)
-    commands = build_sharded_lm_eval_benchmark_commands(
+    commands = build_lm_eval_benchmark_commands(
         tasks=args.tasks,
         devices=devices,
         limit=args.limit,
@@ -247,10 +357,13 @@ def main(argv: Iterable[str] | None = None) -> None:
         dtype=args.dtype,
         model_args=args.model_args,
         publish_to_hub=False,
+        parallelism=args.parallelism,
     )
+    mode = resolve_benchmark_parallelism(args.parallelism, limit=args.limit, tasks=args.tasks, devices=devices)
     print(
         "[benchmark-multi-gpu] "
-        f"tasks={args.tasks} devices={','.join(devices)} shards={len(commands)} output_dir={args.output_dir}",
+        f"tasks={args.tasks} devices={','.join(devices)} parallelism={mode} "
+        f"commands={len(commands)} output_dir={args.output_dir}",
         flush=True,
     )
     install_lm_eval_if_needed(skip_install=bool(args.skip_install))

@@ -3,8 +3,11 @@ from __future__ import annotations
 import pytest
 
 from ouroboros.eval.benchmark_multi_gpu import (
+    _shared_bootstrap_env,
+    build_lm_eval_benchmark_commands,
     build_sharded_lm_eval_benchmark_commands,
     resolve_benchmark_devices,
+    resolve_benchmark_parallelism,
     shard_tasks,
 )
 
@@ -60,3 +63,52 @@ def test_resolve_benchmark_devices_auto_detects_cuda_visible_devices(monkeypatch
 
 def test_resolve_benchmark_devices_keeps_explicit_runtime_override():
     assert resolve_benchmark_devices("cuda:0", env={"CUDA_VISIBLE_DEVICES": "0,1"}) == ["cuda:0"]
+
+
+def test_auto_parallelism_keeps_limited_smoke_runs_single_gpu():
+    assert (
+        resolve_benchmark_parallelism(
+            "auto",
+            limit="100",
+            tasks="arc_easy,hellaswag,winogrande",
+            devices=["cuda:0", "cuda:1"],
+        )
+        == "single"
+    )
+
+
+def test_auto_parallelism_shards_full_multi_task_benchmarks():
+    assert (
+        resolve_benchmark_parallelism(
+            "auto",
+            limit=None,
+            tasks="arc_easy,hellaswag,winogrande",
+            devices=["cuda:0", "cuda:1"],
+        )
+        == "task_shard"
+    )
+
+
+def test_auto_benchmark_commands_use_single_gpu_for_limit_smoke():
+    commands = build_lm_eval_benchmark_commands(
+        tasks="arc_easy,hellaswag,winogrande",
+        devices="cuda:0,cuda:1",
+        limit="100",
+        output_dir="runs/lm_eval_benchmark",
+        publish_to_hub=False,
+    )
+
+    assert len(commands) == 1
+    assert _arg_value(commands[0], "--tasks") == "arc_easy,hellaswag,winogrande"
+    assert _arg_value(commands[0], "--device") == "cuda:0"
+    assert _arg_value(commands[0], "--output_dir") == "runs/lm_eval_benchmark"
+    assert "--publish_to_hub" not in commands[0]
+
+
+def test_task_shard_children_share_one_bootstrap_install_key(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "token")
+    env = _shared_bootstrap_env([["python", "a"], ["python", "b"]])
+
+    assert env["OUROBOROS_BOOTSTRAP_SHARED_INSTALL"] == "1"
+    assert env["OUROBOROS_BOOTSTRAP_LAUNCH_KEY"].startswith("bench-")
+    assert env["HF_TOKEN"] == "token"

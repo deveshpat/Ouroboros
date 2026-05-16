@@ -438,6 +438,10 @@ def _bootstrap_env_local_rank() -> int:
 
 
 def _bootstrap_launch_key() -> str:
+    override = _normalize_text(os.environ.get("OUROBOROS_BOOTSTRAP_LAUNCH_KEY"))
+    if override is not None:
+        return override
+
     import hashlib as _hashlib
 
     launch_components = [
@@ -577,9 +581,14 @@ def _bootstrap_shared_install_phases() -> None:
         print(f"[bootstrap]   Installed {_local_filename} ✓")
 
 
+def _bootstrap_shared_install_requested() -> bool:
+    text = _normalize_text(os.environ.get("OUROBOROS_BOOTSTRAP_SHARED_INSTALL"))
+    return text is not None and text.lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _bootstrap_wait_for_shared_install() -> None:
     world_size = _bootstrap_env_world_size()
-    if world_size <= 1:
+    if world_size <= 1 and not _bootstrap_shared_install_requested():
         _bootstrap_shared_install_phases()
         return
 

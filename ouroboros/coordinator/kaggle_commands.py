@@ -472,6 +472,7 @@ def build_lm_eval_benchmark_multi_gpu_command(
     dtype: str = "float16",
     model_args: str | None = None,
     publish_to_hub: bool = True,
+    parallelism: str | None = None,
 ) -> list[str]:
     """Build a Kaggle command that shards lm-eval tasks across multiple GPUs."""
     command = [
@@ -495,6 +496,8 @@ def build_lm_eval_benchmark_multi_gpu_command(
     ]
     if devices is not None and str(devices).strip():
         command.extend(["--devices", str(devices).strip()])
+    if parallelism is not None and str(parallelism).strip():
+        command.extend(["--parallelism", str(parallelism).strip()])
     limit = normalize_benchmark_limit(limit)
     if limit is not None:
         command.extend(["--limit", limit])
