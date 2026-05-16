@@ -415,6 +415,7 @@ def build_lm_eval_benchmark_command(
     dtype: str = "float16",
     model_args: str | None = None,
     publish_to_hub: bool = True,
+    adapter_cache_dir: str | None = None,
 ) -> list[str]:
     """Build the Kaggle command for standardized lm-evaluation-harness benchmarks."""
     command = [
@@ -443,6 +444,54 @@ def build_lm_eval_benchmark_command(
         command.extend(["--limit", limit])
     if model_args is not None and str(model_args).strip():
         command.extend(["--model_args", str(model_args).strip()])
+    if adapter_cache_dir is not None and str(adapter_cache_dir).strip():
+        command.extend(["--adapter_cache_dir", str(adapter_cache_dir).strip()])
+    if publish_to_hub:
+        command.append("--publish_to_hub")
+    return command
+
+
+def build_lm_eval_benchmark_multi_gpu_command(
+    *,
+    tasks: str = "arc_easy,hellaswag,winogrande",
+    devices: str | None = None,
+    limit: str | int | None = None,
+    output_dir: str = "runs/lm_eval_benchmark",
+    base_model: str = "ai21labs/AI21-Jamba-Reasoning-3B",
+    adapter_repo: str = "WeirdRunner/Ouroboros",
+    adapter_subfolder: str = "diloco_state/anchor",
+    batch_size: str = "1",
+    dtype: str = "float16",
+    model_args: str | None = None,
+    publish_to_hub: bool = True,
+) -> list[str]:
+    """Build a Kaggle command that shards lm-eval tasks across multiple GPUs."""
+    command = [
+        "python",
+        "-m",
+        "ouroboros.benchmark_multi_gpu",
+        "--tasks",
+        str(tasks),
+        "--output_dir",
+        output_dir,
+        "--base_model",
+        base_model,
+        "--adapter_repo",
+        adapter_repo,
+        "--adapter_subfolder",
+        adapter_subfolder,
+        "--batch_size",
+        str(batch_size),
+        "--dtype",
+        dtype,
+    ]
+    if devices is not None and str(devices).strip():
+        command.extend(["--devices", str(devices).strip()])
+    limit = normalize_benchmark_limit(limit)
+    if limit is not None:
+        command.extend(["--limit", limit])
+    if model_args is not None and str(model_args).strip():
+        command.extend(["--model_args", str(model_args).strip()])
     if publish_to_hub:
         command.append("--publish_to_hub")
     return command
@@ -465,6 +514,7 @@ __all__ = [
     "build_dgac_canary_command",
     "build_diloco_training_command",
     "build_lm_eval_benchmark_command",
+    "build_lm_eval_benchmark_multi_gpu_command",
     "format_shell_command",
     "kaggle_secret_presence",
     "resolve_diloco_worker_id",

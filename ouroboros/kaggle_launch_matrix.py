@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from ouroboros.kaggle import (
-    build_lm_eval_benchmark_command,
+    build_lm_eval_benchmark_multi_gpu_command,
     build_dgac_anchor_eval_command,
     build_dgac_canary_command,
     build_dgac_training_command,
@@ -161,15 +161,16 @@ def _build_dgac_anchor_eval(env: Mapping[str, str], *, worker_id: str | None = N
 
 def _build_benchmark(env: Mapping[str, str], *, worker_id: str | None = None) -> list[str]:
     del worker_id
-    return build_lm_eval_benchmark_command(
+    devices = normalize_text(env.get("OUROBOROS_BENCHMARK_DEVICES"))
+    return build_lm_eval_benchmark_multi_gpu_command(
         tasks=_value(env, "OUROBOROS_BENCHMARK_TASKS"),
+        devices=devices,
         limit=normalize_benchmark_limit(env.get("OUROBOROS_BENCHMARK_LIMIT")),
         output_dir=_value(env, "OUROBOROS_BENCHMARK_OUTPUT_DIR"),
         base_model=_value(env, "OUROBOROS_BENCHMARK_BASE_MODEL"),
         adapter_repo=_value(env, "OUROBOROS_BENCHMARK_ADAPTER_REPO"),
         adapter_subfolder=_value(env, "OUROBOROS_BENCHMARK_ADAPTER_SUBFOLDER"),
         batch_size=_value(env, "OUROBOROS_BENCHMARK_BATCH_SIZE"),
-        device=_value(env, "OUROBOROS_BENCHMARK_DEVICE"),
         dtype=_value(env, "OUROBOROS_BENCHMARK_DTYPE"),
         model_args=normalize_text(env.get("OUROBOROS_BENCHMARK_MODEL_ARGS")),
         publish_to_hub=_truthy_value(env, "OUROBOROS_BENCHMARK_PUBLISH_TO_HUB"),

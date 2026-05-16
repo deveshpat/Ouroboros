@@ -5,6 +5,7 @@ from pathlib import Path
 
 from ouroboros.kaggle import (
     build_lm_eval_benchmark_command,
+    build_lm_eval_benchmark_multi_gpu_command,
     build_dgac_anchor_eval_command,
     build_dgac_canary_command,
     build_dgac_training_command,
@@ -123,7 +124,7 @@ def test_launch_matrix_builds_same_commands_as_compatibility_builders():
         output_dir="runs/dgac_anchor_eval",
         wandb_project="ouroboros-stage3-jamba",
     )
-    assert build_launch_command(BENCHMARK_RUN_MODE, env) == build_lm_eval_benchmark_command(
+    assert build_launch_command(BENCHMARK_RUN_MODE, env) == build_lm_eval_benchmark_multi_gpu_command(
         tasks="arc_easy,hellaswag,winogrande",
         limit="100",
         output_dir="runs/lm_eval_benchmark",
@@ -131,7 +132,6 @@ def test_launch_matrix_builds_same_commands_as_compatibility_builders():
         adapter_repo="WeirdRunner/Ouroboros",
         adapter_subfolder="diloco_state/anchor",
         batch_size="1",
-        device="cuda:0",
         dtype="float16",
     )
 
@@ -160,7 +160,7 @@ def test_dgac_anchor_eval_can_resume_at_diagnostics_only_from_env():
     assert _arg_value(command, "--dgac_diagnostics_batch_size") == "1"
 
 
-def test_benchmark_mode_builds_harness_command_from_env():
+def test_benchmark_mode_builds_auto_detecting_multi_gpu_command_from_env():
     command = build_launch_command(
         BENCHMARK_RUN_MODE,
         {
@@ -177,7 +177,8 @@ def test_benchmark_mode_builds_harness_command_from_env():
         },
     )
 
-    assert command[:3] == ["python", "-m", "ouroboros.benchmark_harness"]
+    assert command[:3] == ["python", "-m", "ouroboros.benchmark_multi_gpu"]
+    assert "--devices" not in command
     assert _arg_value(command, "--tasks") == "mmlu,arc_challenge"
     assert _arg_value(command, "--limit") == "50"
     assert _arg_value(command, "--output_dir") == "runs/custom_benchmark"
@@ -188,6 +189,18 @@ def test_benchmark_mode_builds_harness_command_from_env():
     assert _arg_value(command, "--dtype") == "bfloat16"
     assert _arg_value(command, "--model_args") == "pretrained=merged/model,trust_remote_code=True"
     assert "--publish_to_hub" in command
+
+
+def test_benchmark_mode_keeps_advanced_runtime_device_override_outside_workflow():
+    command = build_launch_command(
+        BENCHMARK_RUN_MODE,
+        {
+            "OUROBOROS_BENCHMARK_DEVICES": "cuda:0",
+        },
+    )
+
+    assert command[:3] == ["python", "-m", "ouroboros.benchmark_multi_gpu"]
+    assert _arg_value(command, "--devices") == "cuda:0"
 
 
 def test_benchmark_mode_treats_empty_and_full_limit_as_full_run():
@@ -219,6 +232,7 @@ def test_launch_environment_defaults_are_centralized_and_non_destructive():
     apply_launch_environment_defaults(BENCHMARK_RUN_MODE, env)
     assert env["OUROBOROS_BENCHMARK_OUTPUT_DIR"] == "runs/lm_eval_benchmark"
     assert env["OUROBOROS_BENCHMARK_TASKS"] == "arc_easy,hellaswag,winogrande"
+    assert "OUROBOROS_BENCHMARK_DEVICES" not in env
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 
 

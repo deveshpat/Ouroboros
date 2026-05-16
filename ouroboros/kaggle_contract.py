@@ -147,7 +147,7 @@ _CONTRACTS: dict[str, KaggleLaunchContract] = {
             "OUROBOROS_BENCHMARK_HUB_PREFIX",
             "OUROBOROS_BENCHMARK_SKIP_INSTALL",
         ),
-        required_cli_args=("-m", "ouroboros.benchmark_harness"),
+        required_cli_args=("-m", "ouroboros.benchmark_multi_gpu"),
         notebook_path="kaggle-utils.ipynb",
         allowed_from_github_actions=True,
         allowed_manually=True,

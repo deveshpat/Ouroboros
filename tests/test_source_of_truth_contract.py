@@ -125,6 +125,7 @@ def test_workflow_dispatch_exposes_dgac_anchor_eval_and_train_gates():
     assert "OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE" in workflow
     assert "OUROBOROS_BENCHMARK_TASKS" in workflow
     assert "OUROBOROS_BENCHMARK_OUTPUT_DIR" in workflow
+    assert "OUROBOROS_BENCHMARK_DEVICES" not in workflow
     assert "OUROBOROS_BENCHMARK_PUBLISH_TO_HUB" in workflow
     assert "OUROBOROS_KAGGLE_RUN_MODE" in notebook
     assert "build_launch_command(run_mode, os.environ, worker_id=worker_id)" in notebook

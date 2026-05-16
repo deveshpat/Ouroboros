@@ -288,6 +288,7 @@ def test_build_lm_eval_benchmark_command_allows_safe_overrides():
         dtype="bfloat16",
         model_args="pretrained=merged/model,trust_remote_code=True",
         publish_to_hub=False,
+        adapter_cache_dir="/tmp/adapter-cache",
     )
 
     assert command[command.index("--tasks") + 1] == "mmlu"
@@ -300,6 +301,7 @@ def test_build_lm_eval_benchmark_command_allows_safe_overrides():
     assert command[command.index("--device") + 1] == "cuda:1"
     assert command[command.index("--dtype") + 1] == "bfloat16"
     assert command[command.index("--model_args") + 1] == "pretrained=merged/model,trust_remote_code=True"
+    assert command[command.index("--adapter_cache_dir") + 1] == "/tmp/adapter-cache"
     assert "--publish_to_hub" not in command
 
 
