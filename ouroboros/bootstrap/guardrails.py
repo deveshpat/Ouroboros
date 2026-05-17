@@ -91,19 +91,11 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         signature_patterns=('quota', 'Worker C|worker C', 'stall|waiting'),
     ),
     HardLessonGuardrail(
-        symptom='DGAC diagnostics eval-only OOM in `selective_scan_fn`/bitsandbytes dequantization',
-        kind='eval-memory-guard',
-        guardrail='DGAC diagnostics public entrypoint and CE helper are torch.inference_mode() guarded; tests assert fake forwards see grad disabled.',
-        refs=('ouroboros/coconut/evaluation.py', 'tests/test_dgac_diagnostics.py', 'tests/test_hard_lesson_guardrails.py'),
-        remediation='Run DGAC diagnostics under torch.inference_mode(); if this signature appears again, do not spend GPU time diagnosing before checking the inference guard.',
-        signature_patterns=('run_dgac_diagnostics|DGAC diagnostic', 'OutOfMemoryError|CUDA out of memory', 'selective_scan_fn|bitsandbytes|dequantize'),
-    ),
-    HardLessonGuardrail(
         symptom='OOM at val',
         kind='eval-memory-guard',
-        guardrail='Validation/generation/DGAC diagnostics run under no_grad or inference_mode and microbatch eval work.',
-        refs=('ouroboros/coconut/evaluation.py', 'tests/test_validation_no_drift.py', 'tests/test_dgac_diagnostics.py'),
-        remediation='Keep eval paths inference-only, empty CUDA cache before eval, and use small validation/diagnostic batches.',
+        guardrail='Validation/generation run under no_grad or inference_mode and microbatch eval work.',
+        refs=('ouroboros/coconut/evaluation.py', 'tests/test_validation_no_drift.py'),
+        remediation='Keep eval paths inference-only, empty CUDA cache before eval, and use small validation batches.',
         signature_patterns=('outofmemoryerror|CUDA out of memory|OOM', 'val|eval|validation'),
     ),
     HardLessonGuardrail(

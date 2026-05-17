@@ -748,14 +748,10 @@ def run_diloco_worker(
     original_push_to_hub = args.push_to_hub
     original_stage0_epochs = args.stage_0_epochs
     original_epochs_per_stage = args.epochs_per_stage
-    original_gen_every_stage = args.gen_every_stage
-
     args.push_to_hub = False
     args.epochs_per_stage = 1
     if stage_k == 0:
         args.stage_0_epochs = 1
-    args.gen_every_stage = bool(original_gen_every_stage) if is_dgac_diloco else False
-
     try:
         from ouroboros.coconut.stage_runner import run_training_stages
 
@@ -782,14 +778,12 @@ def run_diloco_worker(
             global_step=global_step_offset,
             step_in_phase=0,
             load_best_between_stages=False,
-            run_generation_at_stage_end=bool(args.gen_every_stage) if is_dgac_diloco else False,
             run_epoch_end_val=False,
         )
     finally:
         args.push_to_hub = original_push_to_hub
         args.stage_0_epochs = original_stage0_epochs
         args.epochs_per_stage = original_epochs_per_stage
-        args.gen_every_stage = original_gen_every_stage
 
     samples_seen_this_round = int(min(result["samples_seen"], len(train_shard)))
 

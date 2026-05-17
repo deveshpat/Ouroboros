@@ -14,8 +14,7 @@
 | `kaggle==1.6.17` + `"accelerator": "nvidiaTeslaT4"` → still P100 | Root cause 1: `--accelerator` added in v1.8.4. Root cause 2: wrong cap. Fix: `kaggle>=1.8.4` + cap fix + runtime fast-fail. All verified. |
 | `--use_halt_gate` starts from random LoRA weights in DiLoCo path | `--resume_from_diloco_anchor` loads `diloco_state/anchor/` before DGAC training |
 | `last_hidden_state` None | assert in all forward paths |
-| OOM at val | `empty_cache()` + `val_batch_size=2`; validation/generation/DGAC diagnostics must stay inference-only |
-| DGAC diagnostics eval-only OOM in `selective_scan_fn`/bitsandbytes dequantization | `run_dgac_diagnostics()` and DGAC CE helpers run under `torch.inference_mode()`; known log signature triages directly to this guardrail |
+| OOM at val | `empty_cache()` + small `val_batch_size`; validation/generation must stay inference-only |
 | mamba-ssm 2.x API break | Pinned to 1.2.2 |
 | NCCL watchdog kills DDP val | `timedelta(hours=4)` + env var |
 | BF16 emulation on T4 | `_amp_dtype` checks `cc >= (8,0)` |

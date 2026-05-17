@@ -12,7 +12,7 @@ adapter + config + `halt_gate.pt` -> promoted.
 
 H100 run skipped val/gen near timeout.
 So anchor = training evidence, not quality proof.
-Next gate -> `kaggle_run_mode=dgac-anchor-eval` -> compare val CE/acc/gen/diagnostics.
+Next gate -> `kaggle_run_mode=dgac-anchor-eval` -> compare val CE/acc/gen.
 
 ## Workflow
 
@@ -26,7 +26,7 @@ Utils -> provider IO.
 
 ## Dispatch controls
 
-manual inputs -> `force_worker_ids`, `skip_trigger`, `dry_run`, `kaggle_run_mode`, `benchmark_suite`, optional `benchmark_tasks`, `dgac_anchor_eval_resume_mode`, `dgac_diagnostics_forced_kmax_ce`.
+manual inputs -> `force_worker_ids`, `skip_trigger`, `dry_run`, `kaggle_run_mode`, `benchmark_suite`, optional `benchmark_tasks`, `dgac_anchor_eval_resume_mode`.
 
 ## Active risks
 

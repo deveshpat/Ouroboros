@@ -17,8 +17,7 @@ GPU cc < 7.5 -> fast-fail -> reset dispatch -> signal.
 
 ## Eval memory
 
-eval/gen/diagnostics -> no grad / inference mode.
-DGAC diagnostics -> microbatch.
+eval/gen -> no grad / inference mode.
 OOM at val -> check inference guard before burning GPU time.
 
 ## NCCL

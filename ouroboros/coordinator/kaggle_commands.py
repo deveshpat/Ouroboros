@@ -105,7 +105,6 @@ def build_diloco_training_command(
     latent_cache: bool = True,
     max_grad_norm: float | None = None,
     diloco_run_val: bool = False,
-    gen_every_stage: bool | None = None,
 ) -> list[str]:
     """Build the tested Kaggle Dual-GPU DiLoCo training command.
 
@@ -175,8 +174,6 @@ def build_diloco_training_command(
         command.extend(["--max_grad_norm", str(float(max_grad_norm))])
     if diloco_run_val:
         command.append("--diloco_run_val")
-    if gen_every_stage is not None:
-        command.append("--gen_every_stage" if gen_every_stage else "--no-gen_every_stage")
     if push_to_hub:
         command.append("--push_to_hub")
     command.extend(["--output_dir", output_dir])
@@ -197,7 +194,6 @@ def build_dgac_training_command(
     max_samples: int | None = None,
     max_train_steps: int | None = None,
     log_every: int | None = None,
-    gen_every_stage: bool | None = None,
     max_grad_norm: float = 0.3,
     batch_size: int = 4,
     grad_accum: int = 8,
@@ -259,8 +255,6 @@ def build_dgac_training_command(
         command.extend(["--max_train_steps", str(int(max_train_steps))])
     if log_every is not None:
         command.extend(["--log_every", str(int(log_every))])
-    if gen_every_stage is not None:
-        command.append("--gen_every_stage" if gen_every_stage else "--no-gen_every_stage")
     if push_to_hub:
         command.append("--push_to_hub")
     command.extend(["--output_dir", output_dir])
@@ -311,7 +305,6 @@ def build_dgac_canary_command(
         max_samples=max_samples,
         max_train_steps=max_train_steps,
         log_every=1,
-        gen_every_stage=False,
         max_grad_norm=max_grad_norm,
         batch_size=batch_size,
         grad_accum=grad_accum,
@@ -340,9 +333,6 @@ def build_dgac_anchor_eval_command(
     batch_size: int = 4,
     grad_accum: int = 8,
     val_batch_size: int = 1,
-    dgac_diagnostics_batch_size: int | None = 1,
-    dgac_diagnostics_only: bool = False,
-    dgac_diagnostics_forced_kmax_ce: float | None = None,
     val_skip_buffer_minutes: int = 60,
     session_timeout_hours: float = 12.0,
     graceful_exit_buffer_minutes: int = 20,
@@ -362,7 +352,6 @@ def build_dgac_anchor_eval_command(
         "--use_halt_gate",
         "--resume_from_diloco_anchor",
         "--eval_only",
-        "--dgac_diagnostics",
         "--diloco_state_repo",
         diloco_state_repo,
         "--data_dir",
@@ -394,12 +383,6 @@ def build_dgac_anchor_eval_command(
             output_dir,
         ]
     )
-    if dgac_diagnostics_only:
-        command.append("--dgac_diagnostics_only")
-    if dgac_diagnostics_batch_size is not None:
-        command.extend(["--dgac_diagnostics_batch_size", str(int(dgac_diagnostics_batch_size))])
-    if dgac_diagnostics_forced_kmax_ce is not None:
-        command.extend(["--dgac_diagnostics_forced_kmax_ce", str(float(dgac_diagnostics_forced_kmax_ce))])
     if wandb_project is not None:
         command.extend(["--wandb_project", wandb_project])
     if wandb_entity is not None:

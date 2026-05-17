@@ -52,7 +52,6 @@ _PUBLIC_EXPORTS = (
     "TrainingSessionPlan",
     "TrainingPlanKind",
     "HaltGate",
-    "run_dgac_diagnostics",
     "run_eval_only",
     "run_training_stages",
     "save_checkpoint",
