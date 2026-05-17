@@ -22,6 +22,10 @@ from ouroboros.coordinator.kaggle_contract import (
     known_kaggle_launch_modes,
     resolve_kaggle_launch_contract,
 )
+from ouroboros.eval.benchmark_suites import (
+    DEFAULT_BENCHMARK_SUITE,
+    resolve_benchmark_tasks,
+)
 from ouroboros.utils.runtime_env import (
     GITHUB_TOKEN_ALIASES,
     HF_TOKEN_ALIASES,
@@ -412,7 +416,8 @@ def build_dgac_anchor_eval_command(
 
 def build_lm_eval_benchmark_command(
     *,
-    tasks: str = "arc_easy,hellaswag,winogrande",
+    tasks: str | None = None,
+    suite: str = DEFAULT_BENCHMARK_SUITE,
     limit: str | int | None = None,
     output_dir: str = "runs/lm_eval_benchmark",
     base_model: str = "ai21labs/AI21-Jamba-Reasoning-3B",
@@ -426,6 +431,7 @@ def build_lm_eval_benchmark_command(
     adapter_cache_dir: str | None = None,
 ) -> list[str]:
     """Build the Kaggle command for standardized lm-evaluation-harness benchmarks."""
+    tasks = resolve_benchmark_tasks(suite=suite, tasks=tasks)
     command = [
         "python",
         "-m",
@@ -461,7 +467,8 @@ def build_lm_eval_benchmark_command(
 
 def build_lm_eval_benchmark_multi_gpu_command(
     *,
-    tasks: str = "arc_easy,hellaswag,winogrande",
+    tasks: str | None = None,
+    suite: str = DEFAULT_BENCHMARK_SUITE,
     devices: str | None = None,
     limit: str | int | None = None,
     output_dir: str = "runs/lm_eval_benchmark",
@@ -474,11 +481,8 @@ def build_lm_eval_benchmark_multi_gpu_command(
     publish_to_hub: bool = True,
     parallelism: str | None = None,
 ) -> list[str]:
-    """Build the Kaggle lm-eval benchmark command.
-
-    The called launcher runs single-GPU by default; task sharding is only used
-    when the caller explicitly passes ``parallelism="task_shard"``.
-    """
+    """Build a Kaggle command that shards lm-eval tasks across multiple GPUs."""
+    tasks = resolve_benchmark_tasks(suite=suite, tasks=tasks)
     command = [
         "python",
         "-m",

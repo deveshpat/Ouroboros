@@ -20,12 +20,18 @@ from typing import Iterable, Mapping
 
 import torch
 
+from ouroboros.eval.benchmark_suites import (
+    ANCHOR_TASKS,
+    BENCHMARK_TASK_SUITES,
+    DEFAULT_BENCHMARK_SUITE,
+    resolve_benchmark_tasks,
+)
 from ouroboros.utils.runtime_env import normalize_benchmark_limit
 
 DEFAULT_BASE_MODEL = "ai21labs/AI21-Jamba-Reasoning-3B"
 DEFAULT_ADAPTER_REPO = "WeirdRunner/Ouroboros"
 DEFAULT_ADAPTER_SUBFOLDER = "diloco_state/anchor"
-DEFAULT_TASKS = "arc_easy,hellaswag,winogrande"
+DEFAULT_TASKS = ANCHOR_TASKS
 DEFAULT_OUTPUT_DIR = "runs/lm_eval_benchmark"
 DEFAULT_BATCH_SIZE = "1"
 DEFAULT_DEVICE = "cuda:0"
@@ -65,7 +71,13 @@ def _resolve_hf_token(env: Mapping[str, str]) -> str | None:
 def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | None = None) -> argparse.Namespace:
     env = os.environ if env is None else env
     parser = argparse.ArgumentParser(description="Run Ouroboros lm-evaluation-harness benchmarks")
-    parser.add_argument("--tasks", default=_env(env, "OUROBOROS_BENCHMARK_TASKS", DEFAULT_TASKS))
+    parser.add_argument(
+        "--suite",
+        default=_env(env, "OUROBOROS_BENCHMARK_SUITE", DEFAULT_BENCHMARK_SUITE),
+        choices=sorted(BENCHMARK_TASK_SUITES),
+        help="Named benchmark suite to run when --tasks/OUROBOROS_BENCHMARK_TASKS is unset.",
+    )
+    parser.add_argument("--tasks", default=_normalize_text(env.get("OUROBOROS_BENCHMARK_TASKS")))
     parser.add_argument("--limit", default=normalize_benchmark_limit(env.get("OUROBOROS_BENCHMARK_LIMIT")))
     parser.add_argument("--output_dir", default=_env(env, "OUROBOROS_BENCHMARK_OUTPUT_DIR", DEFAULT_OUTPUT_DIR))
     parser.add_argument("--base_model", default=_env(env, "OUROBOROS_BENCHMARK_BASE_MODEL", DEFAULT_BASE_MODEL))
@@ -113,7 +125,9 @@ def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | No
         action="store_false",
         help="Disable adapter vocab-mismatch sanitization for raw PEFT loading experiments.",
     )
-    return parser.parse_args(list(argv) if argv is not None else None)
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    args.tasks = resolve_benchmark_tasks(suite=args.suite, tasks=args.tasks)
+    return args
 
 
 def install_lm_eval_if_needed(*, skip_install: bool = False) -> None:

@@ -10,7 +10,7 @@ Read first -> inspect owning package -> avoid root-wrapper thinking.
 | Coconut | curriculum -> latent passes -> DGAC/HaltGate -> train/checkpoint/resume | `python -m ouroboros.coconut ...` |
 | Models | HF CausalLM -> tokenizer -> adapter -> LoRA/PEFT -> quant/memory policy | `ouroboros.models` |
 | Inference | prompt -> latent decode -> generated output | `python -m ouroboros.inference ...` |
-| Eval | anchor eval -> gen checks -> diagnostics -> lm-eval/benchmark -> smoke | `python -m ouroboros.eval ...` |
+| Eval | anchor eval -> gen checks -> diagnostics -> named lm-eval suites/benchmark -> smoke | `python -m ouroboros.eval ...` |
 | Coordinator | DiLoCo/solo/DDP -> dispatch -> aggregate -> promote/repair | `python -m ouroboros.coordinator ...` |
 | Utils | env/provider -> Hub/W&B/Kaggle/Azure/Mac helpers | `ouroboros.utils` |
 
@@ -20,7 +20,7 @@ runtime? -> Bootstrap
 stage/latent/DGAC/train/checkpoint? -> Coconut
 model/tokenizer/adapter/quant/memory? -> Models
 prompt/generate/decode? -> Inference
-eval/gen/diagnostics/lm-eval/benchmark? -> Eval
+eval/gen/diagnostics/lm-eval/benchmark/suite? -> Eval
 worker/DDP/dispatch/aggregate/promote/repair? -> Coordinator
 provider/env/Hub/W&B helper only? -> Utils
 

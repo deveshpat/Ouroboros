@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from ouroboros.eval.benchmark_suites import REASONING_TASKS
 from ouroboros.eval.benchmark_multi_gpu import (
     _shared_bootstrap_env,
     build_lm_eval_benchmark_commands,
@@ -14,6 +15,19 @@ from ouroboros.eval.benchmark_multi_gpu import (
 
 def _arg_value(command: list[str], flag: str) -> str:
     return command[command.index(flag) + 1]
+
+
+def test_multi_gpu_command_builder_resolves_reasoning_suite():
+    commands = build_lm_eval_benchmark_commands(
+        suite="reasoning",
+        devices="cuda:0",
+        limit="100",
+        output_dir="runs/lm_eval_reasoning",
+        publish_to_hub=False,
+    )
+
+    assert len(commands) == 1
+    assert _arg_value(commands[0], "--tasks") == REASONING_TASKS
 
 
 def test_shard_tasks_round_robins_default_benchmark_across_two_gpus():
@@ -77,7 +91,7 @@ def test_auto_parallelism_keeps_limited_smoke_runs_single_gpu():
     )
 
 
-def test_auto_parallelism_keeps_full_multi_task_benchmarks_single_gpu():
+def test_auto_parallelism_shards_full_multi_task_benchmarks():
     assert (
         resolve_benchmark_parallelism(
             "auto",
@@ -85,15 +99,15 @@ def test_auto_parallelism_keeps_full_multi_task_benchmarks_single_gpu():
             tasks="arc_easy,hellaswag,winogrande",
             devices=["cuda:0", "cuda:1"],
         )
-        == "single"
+        == "task_shard"
     )
 
 
-def test_auto_benchmark_commands_use_single_gpu_for_full_default_benchmark():
+def test_auto_benchmark_commands_use_single_gpu_for_limit_smoke():
     commands = build_lm_eval_benchmark_commands(
         tasks="arc_easy,hellaswag,winogrande",
         devices="cuda:0,cuda:1",
-        limit=None,
+        limit="100",
         output_dir="runs/lm_eval_benchmark",
         publish_to_hub=False,
     )

@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from ouroboros.eval.benchmark_suites import DEFAULT_BENCHMARK_SUITE
 from ouroboros.coordinator.kaggle_commands import (
     build_lm_eval_benchmark_multi_gpu_command,
     build_dgac_anchor_eval_command,
@@ -162,7 +163,8 @@ def _build_benchmark(env: Mapping[str, str], *, worker_id: str | None = None) ->
     del worker_id
     devices = normalize_text(env.get("OUROBOROS_BENCHMARK_DEVICES"))
     return build_lm_eval_benchmark_multi_gpu_command(
-        tasks=_value(env, "OUROBOROS_BENCHMARK_TASKS"),
+        tasks=normalize_text(env.get("OUROBOROS_BENCHMARK_TASKS")),
+        suite=normalize_text(env.get("OUROBOROS_BENCHMARK_SUITE")) or DEFAULT_BENCHMARK_SUITE,
         devices=devices,
         limit=normalize_benchmark_limit(env.get("OUROBOROS_BENCHMARK_LIMIT")),
         output_dir=_value(env, "OUROBOROS_BENCHMARK_OUTPUT_DIR"),
@@ -243,7 +245,8 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
         env_defaults=_readonly(
             {
                 **_COMMON_DEFAULTS,
-                "OUROBOROS_BENCHMARK_TASKS": "arc_easy,hellaswag,winogrande",
+                "OUROBOROS_BENCHMARK_SUITE": DEFAULT_BENCHMARK_SUITE,
+                "OUROBOROS_BENCHMARK_TASKS": "",
                 "OUROBOROS_BENCHMARK_LIMIT": "100",
                 "OUROBOROS_BENCHMARK_OUTPUT_DIR": "runs/lm_eval_benchmark",
                 "OUROBOROS_BENCHMARK_BASE_MODEL": "ai21labs/AI21-Jamba-Reasoning-3B",
@@ -253,7 +256,7 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
                 "OUROBOROS_BENCHMARK_DEVICE": "cuda:0",
                 "OUROBOROS_BENCHMARK_DTYPE": "float16",
                 "OUROBOROS_BENCHMARK_PUBLISH_TO_HUB": "1",
-                "OUROBOROS_BENCHMARK_PARALLELISM": "single",
+                "OUROBOROS_BENCHMARK_PARALLELISM": "auto",
             }
         ),
         command_builder=_build_benchmark,

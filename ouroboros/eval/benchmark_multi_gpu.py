@@ -1,9 +1,9 @@
-"""Run Ouroboros lm-eval benchmarks through a single GPU by default.
+"""Run Ouroboros lm-eval benchmarks across multiple Kaggle GPUs.
 
-The launcher still accepts explicit task sharding for experiments, but the
-operational default is one lm-evaluation-harness process on the first resolved
-device. This avoids duplicate Jamba/PEFT/Mamba bootstrap work and removes the
-Kaggle dual-GPU shard race from routine benchmark runs.
+This wrapper keeps each lm-evaluation-harness process single-GPU, then shards
+whole tasks across devices. That is safer for PEFT/Jamba than trying to make one
+lm-eval process data-parallel, and it lets Kaggle's T4 x2 allocation run two
+independent benchmark shards at once.
 """
 
 from __future__ import annotations
@@ -16,6 +16,11 @@ import threading
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from ouroboros.eval.benchmark_suites import (
+    BENCHMARK_TASK_SUITES,
+    DEFAULT_BENCHMARK_SUITE,
+    resolve_benchmark_tasks,
+)
 from ouroboros.eval.benchmark_harness import (
     DEFAULT_ADAPTER_REPO,
     DEFAULT_ADAPTER_SUBFOLDER,
@@ -36,7 +41,7 @@ from ouroboros.coordinator.kaggle_commands import build_lm_eval_benchmark_comman
 from ouroboros.utils.runtime_env import normalize_benchmark_limit
 
 DEFAULT_DEVICES = "auto"
-DEFAULT_PARALLELISM = "single"
+DEFAULT_PARALLELISM = "auto"
 
 
 def _env(env: Mapping[str, str], name: str, default: str) -> str:
@@ -148,12 +153,12 @@ def resolve_benchmark_parallelism(
     tasks: str,
     devices: Sequence[str],
 ) -> str:
-    """Choose benchmark parallelism for stable single-process operation.
+    """Choose benchmark parallelism without pretending two cold starts are speedup.
 
-    Auto mode intentionally resolves to ``single``. Task sharding remains
-    available only as an explicit opt-in for experiments because each shard
-    repeats the Jamba + PEFT + Mamba bootstrap and can race on shared runtime
-    setup in Kaggle.
+    ``lm-eval --limit`` runs are smoke/probe runs. For those, duplicating the
+    full Jamba + PEFT + Mamba bootstrap on two GPUs costs more than the small
+    number of examples can repay, so auto mode stays single-GPU. Full benchmarks
+    may shard whole tasks across devices unless explicitly forced otherwise.
     """
     value = (_normalize_text(requested) or DEFAULT_PARALLELISM).lower().replace("-", "_")
     aliases = {
@@ -171,12 +176,17 @@ def resolve_benchmark_parallelism(
     mode = aliases[value]
     if mode != "auto":
         return mode
-    return "single"
+    if normalize_benchmark_limit(limit) is not None:
+        return "single"
+    if len(_split_csv(tasks)) <= 1 or len([device for device in devices if str(device).strip()]) <= 1:
+        return "single"
+    return "task_shard"
 
 
 def build_lm_eval_benchmark_commands(
     *,
-    tasks: str = DEFAULT_TASKS,
+    tasks: str | None = None,
+    suite: str = DEFAULT_BENCHMARK_SUITE,
     devices: str | Sequence[str] | None = None,
     limit: str | int | None = None,
     output_dir: str = DEFAULT_OUTPUT_DIR,
@@ -190,6 +200,7 @@ def build_lm_eval_benchmark_commands(
     parallelism: str | None = None,
 ) -> list[list[str]]:
     """Build benchmark commands using the operational auto/single/shard policy."""
+    tasks = resolve_benchmark_tasks(suite=suite, tasks=tasks)
     device_names = resolve_benchmark_devices(devices)
     mode = resolve_benchmark_parallelism(parallelism, limit=limit, tasks=tasks, devices=device_names)
     if mode == "task_shard":
@@ -227,7 +238,8 @@ def build_lm_eval_benchmark_commands(
 
 def build_sharded_lm_eval_benchmark_commands(
     *,
-    tasks: str = DEFAULT_TASKS,
+    tasks: str | None = None,
+    suite: str = DEFAULT_BENCHMARK_SUITE,
     devices: str | Sequence[str] | None = None,
     limit: str | int | None = None,
     output_dir: str = DEFAULT_OUTPUT_DIR,
@@ -240,6 +252,7 @@ def build_sharded_lm_eval_benchmark_commands(
     publish_to_hub: bool = False,
 ) -> list[list[str]]:
     """Build one benchmark command per active GPU/task shard."""
+    tasks = resolve_benchmark_tasks(suite=suite, tasks=tasks)
     device_names = resolve_benchmark_devices(devices)
     shards = shard_tasks(tasks, device_names)
     root = Path(output_dir)
@@ -269,12 +282,18 @@ def build_sharded_lm_eval_benchmark_commands(
 def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | None = None) -> argparse.Namespace:
     env = os.environ if env is None else env
     parser = argparse.ArgumentParser(description="Run Ouroboros lm-eval benchmarks across multiple GPUs")
-    parser.add_argument("--tasks", default=_env(env, "OUROBOROS_BENCHMARK_TASKS", DEFAULT_TASKS))
+    parser.add_argument(
+        "--suite",
+        default=_env(env, "OUROBOROS_BENCHMARK_SUITE", DEFAULT_BENCHMARK_SUITE),
+        choices=sorted(BENCHMARK_TASK_SUITES),
+        help="Named benchmark suite to run when --tasks/OUROBOROS_BENCHMARK_TASKS is unset.",
+    )
+    parser.add_argument("--tasks", default=_normalize_text(env.get("OUROBOROS_BENCHMARK_TASKS")))
     parser.add_argument("--devices", default=_env(env, "OUROBOROS_BENCHMARK_DEVICES", DEFAULT_DEVICES), help="Comma-separated devices or auto")
     parser.add_argument(
         "--parallelism",
         default=_env(env, "OUROBOROS_BENCHMARK_PARALLELISM", DEFAULT_PARALLELISM),
-        help="auto, single, or task_shard. Auto resolves to single-GPU for stable Kaggle benchmark runs.",
+        help="auto, single, or task_shard. Auto keeps --limit smoke runs single-GPU to avoid duplicate cold starts.",
     )
     parser.add_argument("--limit", default=normalize_benchmark_limit(env.get("OUROBOROS_BENCHMARK_LIMIT")))
     parser.add_argument("--output_dir", default=_env(env, "OUROBOROS_BENCHMARK_OUTPUT_DIR", DEFAULT_OUTPUT_DIR))
@@ -287,7 +306,9 @@ def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | No
     parser.add_argument("--hub_results_prefix", default=_env(env, "OUROBOROS_BENCHMARK_HUB_PREFIX", DEFAULT_HUB_PREFIX))
     parser.add_argument("--publish_to_hub", action="store_true", default=_truthy(env.get("OUROBOROS_BENCHMARK_PUBLISH_TO_HUB")))
     parser.add_argument("--skip_install", action="store_true", default=_truthy(env.get("OUROBOROS_BENCHMARK_SKIP_INSTALL")))
-    return parser.parse_args(list(argv) if argv is not None else None)
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    args.tasks = resolve_benchmark_tasks(suite=args.suite, tasks=args.tasks)
+    return args
 
 
 def _stream_output(prefix: str, pipe: object) -> None:

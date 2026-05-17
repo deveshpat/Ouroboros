@@ -32,10 +32,18 @@ on:
           - dgac-train
           - dgac-diloco
           - benchmark
-      benchmark_tasks:
-        description: 'Only applies when kaggle_run_mode=benchmark. lm-eval tasks, comma-separated.'
+      benchmark_suite:
+        description: 'Only applies when kaggle_run_mode=benchmark. Named lm-eval suite to use when benchmark_tasks is empty.'
         required: false
-        default: 'arc_easy,hellaswag,winogrande'
+        type: choice
+        default: 'anchor'
+        options:
+          - anchor
+          - reasoning
+      benchmark_tasks:
+        description: 'Only applies when kaggle_run_mode=benchmark. Optional explicit lm-eval tasks, comma-separated. Empty = use benchmark_suite.'
+        required: false
+        default: ''
       benchmark_limit:
         description: 'Only applies when kaggle_run_mode=benchmark. Sample limit per task. Empty/full/none/0 = full benchmark; use 100 for a smoke run.'
         required: false
@@ -112,6 +120,7 @@ jobs:
           OUROBOROS_KAGGLE_RUN_MODE: ${{ github.event.inputs.kaggle_run_mode || 'diloco' }}
           OUROBOROS_DGAC_DIAGNOSTICS_ONLY: ${{ github.event.inputs.dgac_anchor_eval_resume_mode == 'diagnostics-only' && '1' || '' }}
           OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE: ${{ github.event.inputs.dgac_diagnostics_forced_kmax_ce || '' }}
+          OUROBOROS_BENCHMARK_SUITE: ${{ github.event.inputs.benchmark_suite || 'anchor' }}
           OUROBOROS_BENCHMARK_TASKS: ${{ github.event.inputs.benchmark_tasks }}
           OUROBOROS_BENCHMARK_LIMIT: ${{ github.event.inputs.benchmark_limit }}
           OUROBOROS_BENCHMARK_OUTPUT_DIR: ${{ github.event.inputs.benchmark_output_dir }}

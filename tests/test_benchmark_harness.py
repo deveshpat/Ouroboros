@@ -4,12 +4,25 @@ import sys
 
 import torch
 
+from ouroboros.eval.benchmark_suites import REASONING_TASKS, resolve_benchmark_tasks
 from ouroboros.eval.benchmark_harness import (
     _filter_vocab_mismatched_weights,
     build_lm_eval_argv,
     build_model_args,
     parse_args,
 )
+
+
+def test_benchmark_suite_resolves_reasoning_tasks_and_allows_overrides():
+    assert resolve_benchmark_tasks(suite="reasoning") == REASONING_TASKS
+    assert resolve_benchmark_tasks(suite="reasoning", tasks="arc_easy") == "arc_easy"
+
+
+def test_benchmark_harness_uses_reasoning_suite_when_tasks_are_unset():
+    args = parse_args([], env={"OUROBOROS_BENCHMARK_SUITE": "reasoning"})
+
+    assert args.suite == "reasoning"
+    assert args.tasks == REASONING_TASKS
 
 
 def test_benchmark_harness_parses_env_defaults_without_importing_lm_eval():

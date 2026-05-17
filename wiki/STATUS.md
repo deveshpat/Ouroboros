@@ -18,6 +18,7 @@ Next gate -> `kaggle_run_mode=dgac-anchor-eval` -> compare val CE/acc/gen/diagno
 
 Coordinator -> dispatch/aggregate/promote.
 Eval -> quality gates + lm-eval.
+lm-eval suites -> `anchor` = `arc_easy,hellaswag,winogrande`; `reasoning` = `arc_challenge,openbookqa,piqa,gsm8k,truthfulqa_mc2`.
 Coconut -> training/DGAC.
 Bootstrap -> runtime guardrails.
 Models -> HF CausalLM compatibility.
@@ -25,7 +26,7 @@ Utils -> provider IO.
 
 ## Dispatch controls
 
-manual inputs -> `force_worker_ids`, `skip_trigger`, `dry_run`, `kaggle_run_mode`, `dgac_anchor_eval_resume_mode`, `dgac_diagnostics_forced_kmax_ce`.
+manual inputs -> `force_worker_ids`, `skip_trigger`, `dry_run`, `kaggle_run_mode`, `benchmark_suite`, optional `benchmark_tasks`, `dgac_anchor_eval_resume_mode`, `dgac_diagnostics_forced_kmax_ce`.
 
 ## Active risks
 

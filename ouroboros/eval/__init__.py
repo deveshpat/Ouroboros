@@ -6,6 +6,11 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
+    "ANCHOR_TASKS": ("benchmark_suites", "ANCHOR_TASKS"),
+    "BENCHMARK_TASK_SUITES": ("benchmark_suites", "BENCHMARK_TASK_SUITES"),
+    "DEFAULT_BENCHMARK_SUITE": ("benchmark_suites", "DEFAULT_BENCHMARK_SUITE"),
+    "REASONING_TASKS": ("benchmark_suites", "REASONING_TASKS"),
+    "resolve_benchmark_tasks": ("benchmark_suites", "resolve_benchmark_tasks"),
     "build_lm_eval_argv": ("benchmark_harness", "build_lm_eval_argv"),
     "run_lm_eval": ("benchmark_harness", "run_lm_eval"),
     "main": ("benchmark_harness", "main"),

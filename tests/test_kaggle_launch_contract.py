@@ -276,6 +276,12 @@ def test_build_lm_eval_benchmark_command_loads_anchor_adapter_with_harness():
     assert "--publish_to_hub" in command
 
 
+def test_build_lm_eval_benchmark_command_can_select_reasoning_suite():
+    command = build_lm_eval_benchmark_command(suite="reasoning", publish_to_hub=False)
+
+    assert command[command.index("--tasks") + 1] == "arc_challenge,openbookqa,piqa,gsm8k,truthfulqa_mc2"
+
+
 def test_build_lm_eval_benchmark_command_allows_safe_overrides():
     command = build_lm_eval_benchmark_command(
         tasks="mmlu",

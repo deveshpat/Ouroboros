@@ -51,3 +51,15 @@ def test_launch_matrix_covers_every_declared_mode_and_contract():
         assert spec.contract == get_kaggle_launch_contract(mode)
         assert spec.workflow_label
         assert spec.mode == mode
+
+
+def test_benchmark_launch_defaults_to_anchor_suite_when_tasks_are_blank():
+    command = build_launch_command(
+        BENCHMARK_RUN_MODE,
+        {
+            "OUROBOROS_BENCHMARK_TASKS": "",
+            "OUROBOROS_BENCHMARK_SUITE": "reasoning",
+        },
+    )
+
+    assert _arg_value(command, "--tasks") == "arc_challenge,openbookqa,piqa,gsm8k,truthfulqa_mc2"
