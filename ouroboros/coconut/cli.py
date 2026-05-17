@@ -39,7 +39,7 @@ def bootstrap_free_help_text() -> str:
         "[--batch_size BATCH_SIZE] [--grad_accum GRAD_ACCUM] "
         "[--diloco_mode] [--diloco_worker_id {A,B,C}] "
         "[--val_batch_size VAL_BATCH_SIZE] "
-        "[--gen_every_stage | --no-gen_every_stage] [--wandb_mode {online,offline,disabled}]\n\n"
+        "[--wandb_mode {online,offline,disabled}]\n\n"
         "Jamba Reasoning 3B Coconut-Ouroboros fine-tuning\n\n"
         "Key options preserved from the source monolith:\n"
         "  --model_id MODEL_ID\n"
@@ -63,12 +63,7 @@ def bootstrap_free_help_text() -> str:
         "  --resume_from RESUME_FROM\n"
         "  --resume_from_diloco_anchor\n"
         "  --latent_cache\n"
-        "  --mac_mps_latent_cache\n"
         "  --eval_only\n"
-        "  --dgac_diagnostics\n"
-        "  --dgac_diagnostics_only\n"
-        "  --dgac_diagnostics_batch_size DGAC_DIAGNOSTICS_BATCH_SIZE\n"
-        "  --dgac_diagnostics_forced_kmax_ce DGAC_DIAGNOSTICS_FORCED_KMAX_CE\n"
         "  --dgac_halt_supervision_weight DGAC_HALT_SUPERVISION_WEIGHT\n"
         "  --dgac_halt_ce_tolerance DGAC_HALT_CE_TOLERANCE\n"
         "  --dgac_halt_probe_steps DGAC_HALT_PROBE_STEPS\n"
@@ -76,8 +71,6 @@ def bootstrap_free_help_text() -> str:
         "  --profile_training_timing\n"
         "  --val_batch_size VAL_BATCH_SIZE\n"
         "  --eval_progress_every EVAL_PROGRESS_EVERY\n"
-        "  --gen_every_stage, --no-gen_every_stage\n"
-        "  --gen_max_tokens GEN_MAX_TOKENS\n"
         "  --wandb_mode {online,offline,disabled}\n"
     )
 
@@ -199,8 +192,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=float,
         default=60.0,
         help=(
-            "Skip val+gen if remaining session time is below this threshold (minutes). "
-            "With DDP val on Dual T4 (val_batch_size=2, 50 acc samples), val takes ~37min. "
+            "Skip val if remaining session time is below this threshold (minutes). "
+            "With DDP val on Dual T4 (val_batch_size=2), val takes ~37min. "
             "Default 60min provides a 23min safety margin."
         ),
     )
@@ -270,46 +263,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--eval_only",
         action="store_true",
         help=(
-            "Load the requested checkpoint/DiLoCo anchor, run validation and optional "
-            "generation, then exit without optimizer steps or checkpoint writes."
+            "Load the requested checkpoint/DiLoCo anchor, run validation and "
+            "then exit without optimizer steps or checkpoint writes."
         ),
     )
-    parser.add_argument(
-        "--dgac_diagnostics",
-        action="store_true",
-        help=(
-            "During eval-only HaltGate runs, log DGAC diagnostics: k_actual "
-            "histogram plus forced-k and gated validation CE comparisons."
-        ),
-    )
-    parser.add_argument(
-        "--dgac_diagnostics_only",
-        action="store_true",
-        help=(
-            "During eval-only DGAC runs, skip the normal validation/generation preflight "
-            "and run only HaltGate diagnostics. Use with "
-            "--dgac_diagnostics_forced_kmax_ce to reuse a known forced-kmax CE from a "
-            "previous successful eval."
-        ),
-    )
-    parser.add_argument(
-        "--dgac_diagnostics_batch_size",
-        type=int,
-        default=1,
-        help=(
-            "Microbatch size for DGAC diagnostic HaltGate planning and forced-k CE. "
-            "Keep at 1 on 16GB T4 because diagnostics run multiple extra full-depth forwards."
-        ),
-    )
-    parser.add_argument(
-        "--dgac_diagnostics_forced_kmax_ce",
-        type=float,
-        default=None,
-        help=(
-            "Optional known forced-kmax validation CE to reuse in --dgac_diagnostics_only "
-            "instead of recomputing the full-depth validation CE."
-        ),
-    )
+    
     parser.add_argument("--keep_checkpoints_per_stage", type=int, default=2)
 
     # Monitoring
@@ -330,12 +288,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=25,
         help=(
-            "Print rank-0 validation/diagnostic progress every N local samples; "
+            "Print rank-0 validation progress every N local samples; "
             "set 0 to disable progress logs."
         ),
     )
-    _add_bool_arg(parser, "--gen_every_stage", True, "Run generation callback at stage end.")
-    parser.add_argument("--gen_max_tokens", type=int, default=200)
 
     # wandb
     parser.add_argument("--wandb_project", default="ouroboros-stage3-jamba")

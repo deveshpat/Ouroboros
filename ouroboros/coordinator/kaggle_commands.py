@@ -13,7 +13,6 @@ from collections.abc import Mapping
 from typing import Optional
 
 from ouroboros.coordinator.kaggle_contract import (
-    BENCHMARK_RUN_MODE,
     DGAC_ANCHOR_EVAL_RUN_MODE,
     DGAC_CANARY_RUN_MODE,
     DGAC_DILOCO_RUN_MODE,
@@ -22,17 +21,13 @@ from ouroboros.coordinator.kaggle_contract import (
     known_kaggle_launch_modes,
     resolve_kaggle_launch_contract,
 )
-from ouroboros.eval.benchmark_suites import (
-    DEFAULT_BENCHMARK_SUITE,
-    resolve_benchmark_tasks,
-)
+
 from ouroboros.utils.runtime_env import (
     GITHUB_TOKEN_ALIASES,
     HF_TOKEN_ALIASES,
     WANDB_KEY_ALIASES,
     WORKER_ID_ALIASES,
     WORKER_IDS,
-    normalize_benchmark_limit,
     normalize_text,
     require_known_worker_id,
     require_worker_id,
@@ -414,115 +409,12 @@ def build_dgac_anchor_eval_command(
     return command
 
 
-def build_lm_eval_benchmark_command(
-    *,
-    tasks: str | None = None,
-    suite: str = DEFAULT_BENCHMARK_SUITE,
-    limit: str | int | None = None,
-    output_dir: str = "runs/lm_eval_benchmark",
-    base_model: str = "ai21labs/AI21-Jamba-Reasoning-3B",
-    adapter_repo: str = "WeirdRunner/Ouroboros",
-    adapter_subfolder: str = "diloco_state/anchor",
-    batch_size: str = "1",
-    device: str = "cuda:0",
-    dtype: str = "float16",
-    model_args: str | None = None,
-    publish_to_hub: bool = True,
-    adapter_cache_dir: str | None = None,
-) -> list[str]:
-    """Build the Kaggle command for standardized lm-evaluation-harness benchmarks."""
-    tasks = resolve_benchmark_tasks(suite=suite, tasks=tasks)
-    command = [
-        "python",
-        "-m",
-        "ouroboros.eval.benchmark_harness",
-        "--tasks",
-        str(tasks),
-        "--output_dir",
-        output_dir,
-        "--base_model",
-        base_model,
-        "--adapter_repo",
-        adapter_repo,
-        "--adapter_subfolder",
-        adapter_subfolder,
-        "--batch_size",
-        str(batch_size),
-        "--device",
-        device,
-        "--dtype",
-        dtype,
-    ]
-    limit = normalize_benchmark_limit(limit)
-    if limit is not None:
-        command.extend(["--limit", limit])
-    if model_args is not None and str(model_args).strip():
-        command.extend(["--model_args", str(model_args).strip()])
-    if adapter_cache_dir is not None and str(adapter_cache_dir).strip():
-        command.extend(["--adapter_cache_dir", str(adapter_cache_dir).strip()])
-    if publish_to_hub:
-        command.append("--publish_to_hub")
-    return command
-
-
-def build_lm_eval_benchmark_multi_gpu_command(
-    *,
-    tasks: str | None = None,
-    suite: str = DEFAULT_BENCHMARK_SUITE,
-    devices: str | None = None,
-    limit: str | int | None = None,
-    output_dir: str = "runs/lm_eval_benchmark",
-    base_model: str = "ai21labs/AI21-Jamba-Reasoning-3B",
-    adapter_repo: str = "WeirdRunner/Ouroboros",
-    adapter_subfolder: str = "diloco_state/anchor",
-    batch_size: str = "1",
-    dtype: str = "float16",
-    model_args: str | None = None,
-    publish_to_hub: bool = True,
-    parallelism: str | None = None,
-) -> list[str]:
-    """Build a Kaggle command that shards lm-eval tasks across multiple GPUs."""
-    tasks = resolve_benchmark_tasks(suite=suite, tasks=tasks)
-    command = [
-        "python",
-        "-m",
-        "ouroboros.eval.benchmark_multi_gpu",
-        "--tasks",
-        str(tasks),
-        "--output_dir",
-        output_dir,
-        "--base_model",
-        base_model,
-        "--adapter_repo",
-        adapter_repo,
-        "--adapter_subfolder",
-        adapter_subfolder,
-        "--batch_size",
-        str(batch_size),
-        "--dtype",
-        dtype,
-    ]
-    if devices is not None and str(devices).strip():
-        command.extend(["--devices", str(devices).strip()])
-    if parallelism is not None and str(parallelism).strip():
-        command.extend(["--parallelism", str(parallelism).strip()])
-    limit = normalize_benchmark_limit(limit)
-    if limit is not None:
-        command.extend(["--limit", limit])
-    if model_args is not None and str(model_args).strip():
-        command.extend(["--model_args", str(model_args).strip()])
-    if publish_to_hub:
-        command.append("--publish_to_hub")
-    return command
-
-
 def format_shell_command(command: list[str]) -> str:
     """Render a command list as a pasteable shell command for notebook logs."""
     return " ".join(shlex.quote(part) for part in command)
 
 
 __all__ = [
-    "BENCHMARK_RUN_MODE",
     "DGAC_ANCHOR_EVAL_RUN_MODE",
     "DGAC_TRAIN_RUN_MODE",
     "DGAC_CANARY_RUN_MODE",
@@ -532,8 +424,6 @@ __all__ = [
     "build_dgac_training_command",
     "build_dgac_canary_command",
     "build_diloco_training_command",
-    "build_lm_eval_benchmark_command",
-    "build_lm_eval_benchmark_multi_gpu_command",
     "format_shell_command",
     "kaggle_secret_presence",
     "resolve_diloco_worker_id",

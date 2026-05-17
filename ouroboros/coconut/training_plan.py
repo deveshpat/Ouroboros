@@ -25,7 +25,6 @@ class TrainingSessionPlan:
     kind: TrainingPlanKind
     should_train: bool
     should_validate: bool
-    should_generate: bool
     should_resume_checkpoint: bool = False
     resume_source: Optional[str] = None
     delegates_to_diloco: bool = False
@@ -46,7 +45,6 @@ def plan_training_session(args: Any) -> TrainingSessionPlan:
     eval_only = _truthy_attr(args, "eval_only")
     resume_from = normalize_text(getattr(args, "resume_from", None))
     max_train_steps = getattr(args, "max_train_steps", None)
-    gen_every_stage = _truthy_attr(args, "gen_every_stage", True)
 
     if resume_from_anchor and not use_halt_gate:
         raise ValueError("resume_from_diloco_anchor requires use_halt_gate")
@@ -59,7 +57,6 @@ def plan_training_session(args: Any) -> TrainingSessionPlan:
             kind=TrainingPlanKind.DGAC_DILOCO_WORKER if is_dgac else TrainingPlanKind.DILOCO_WORKER,
             should_train=True,
             should_validate=bool(getattr(args, "diloco_run_val", False)),
-            should_generate=gen_every_stage if is_dgac else False,
             delegates_to_diloco=True,
             skip_worker_pre_validation=False,
             reason="worker execution delegated to DiLoCo runtime",
@@ -71,7 +68,6 @@ def plan_training_session(args: Any) -> TrainingSessionPlan:
             kind=TrainingPlanKind.DGAC_EVAL_ONLY if is_dgac else TrainingPlanKind.EVAL_ONLY,
             should_train=False,
             should_validate=True,
-            should_generate=True,
             reason="eval-only CLI branch",
         )
 
@@ -81,7 +77,6 @@ def plan_training_session(args: Any) -> TrainingSessionPlan:
             kind=TrainingPlanKind.DGAC_CANARY if is_canary else TrainingPlanKind.DGAC_TRAIN,
             should_train=True,
             should_validate=True,
-            should_generate=gen_every_stage,
             reason="DGAC training from terminal DiLoCo anchor",
         )
 
@@ -90,7 +85,6 @@ def plan_training_session(args: Any) -> TrainingSessionPlan:
             kind=TrainingPlanKind.RESUME_TRAIN,
             should_train=True,
             should_validate=True,
-            should_generate=gen_every_stage,
             should_resume_checkpoint=True,
             resume_source=resume_from,
             reason="checkpoint resume",
@@ -100,6 +94,5 @@ def plan_training_session(args: Any) -> TrainingSessionPlan:
         kind=TrainingPlanKind.STANDARD_TRAIN,
         should_train=True,
         should_validate=True,
-        should_generate=gen_every_stage,
         reason="standard sequential curriculum training",
     )

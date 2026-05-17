@@ -32,7 +32,7 @@ from ouroboros.coconut.checkpointing import (
     prune_epoch_checkpoints,
     save_checkpoint,
 )
-from ouroboros.coconut.evaluation import evaluate_stage, run_generation_callback
+from ouroboros.coconut.evaluation import evaluate_stage
 
 _SCRIPT_START = time.perf_counter()
 
@@ -154,7 +154,6 @@ def run_training_stages(
     global_step: int = 0,
     step_in_phase: int = 0,
     load_best_between_stages: bool = True,
-    run_generation_at_stage_end: bool = True,
     run_epoch_end_val: bool = True,
 ) -> Dict[str, Any]:
     if not train_samples:
@@ -442,7 +441,7 @@ def run_training_stages(
                     if is_main:
                         tqdm.write(
                             f"  [canary] reached --max_train_steps={max_train_steps}; "
-                            "saving checkpoint and exiting before val/gen."
+                            "saving checkpoint and exiting before val."
                         )
                         save_checkpoint(
                             output_dir=output_dir,
@@ -471,14 +470,14 @@ def run_training_stages(
             if timeout_triggered or max_train_steps_triggered:
                 break
 
-            should_budget_guard = run_epoch_end_val or run_generation_at_stage_end
+            should_budget_guard = run_epoch_end_val
             if is_main and should_budget_guard:
                 elapsed = time.perf_counter() - session_start
                 remaining_min = (args.session_timeout_hours * 3600 - elapsed) / 60.0
                 val_budget_exhausted = check_timeout() or (remaining_min < args.val_skip_buffer_minutes)
                 if val_budget_exhausted:
                     tqdm.write(
-                        f"  [timeout] Skipping val/gen at epoch {epoch} - "
+                        f"  [timeout] Skipping val at epoch {epoch} - "
                         f"{remaining_min:.0f}min remaining "
                         f"(< {args.val_skip_buffer_minutes:.0f}min val budget)."
                     )
@@ -596,21 +595,6 @@ def run_training_stages(
         if timeout_triggered or stage_val_budget_triggered or max_train_steps_triggered:
             val_budget_triggered = val_budget_triggered or stage_val_budget_triggered
             break
-
-        if is_main and run_generation_at_stage_end:
-            if not (check_timeout() or val_budget_exhausted):
-                run_generation_callback(
-                    model=model,
-                    tokenizer=tokenizer,
-                    halt_gate=halt_gate if args.use_halt_gate else None,
-                    stage_k=stage_k,
-                    device=device,
-                    args=args,
-                    step=global_step,
-                    wandb_run=wandb_run,
-                )
-            else:
-                tqdm.write("  [timeout] Skipping gen callback - insufficient time.")
 
         barrier()
 

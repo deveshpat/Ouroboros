@@ -137,14 +137,6 @@ def _build_worker_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[
     if kaggle_run_mode:
         runtime_env["OUROBOROS_KAGGLE_RUN_MODE"] = kaggle_run_mode.lower()
 
-    if bool(getattr(args, "dgac_diagnostics_only", False)):
-        runtime_env["OUROBOROS_DGAC_DIAGNOSTICS_ONLY"] = "1"
-    _set_env_if_present(
-        runtime_env,
-        "OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE",
-        getattr(args, "dgac_diagnostics_forced_kmax_ce", None),
-    )
-
     hf_token = resolve_hf_token(getattr(args, "hf_token", None))
     if hf_token:
         runtime_env["HF_TOKEN"] = hf_token

@@ -9,7 +9,6 @@ from __future__ import annotations
 from .runtime_env import (
     env_bool,
     env_int,
-    normalize_benchmark_limit,
     normalize_text,
     parse_worker_id_list,
     require_known_worker_id,
@@ -26,7 +25,6 @@ from .kaggle_runtime import KaggleRepoSpec, resolve_kaggle_repo_spec
 __all__ = (
     "env_bool",
     "env_int",
-    "normalize_benchmark_limit",
     "normalize_text",
     "parse_worker_id_list",
     "require_known_worker_id",

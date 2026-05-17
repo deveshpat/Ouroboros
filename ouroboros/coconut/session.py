@@ -305,7 +305,6 @@ def run_training_session(args: argparse.Namespace, *, script_start: float) -> No
                     args=args,
                     step=0,
                     wandb_run=wandb_run,
-                    run_generation=bool(args.gen_every_stage),
                 )
                 return
             run_training_stages(
@@ -331,7 +330,6 @@ def run_training_session(args: argparse.Namespace, *, script_start: float) -> No
                 global_step=0,
                 step_in_phase=0,
                 load_best_between_stages=False,
-                run_generation_at_stage_end=bool(args.gen_every_stage),
                 run_epoch_end_val=True,
             )
             return  # finally in main() handles destroy_process_group and wandb.finish
@@ -435,7 +433,6 @@ def run_training_session(args: argparse.Namespace, *, script_start: float) -> No
                 args=args,
                 step=global_step,
                 wandb_run=wandb_run,
-                run_generation=bool(args.gen_every_stage),
             )
             _cleanup_distributed_resume_artifacts(output_dir, hub_resume_dir, distributed, is_main)
             return
@@ -469,7 +466,6 @@ def run_training_session(args: argparse.Namespace, *, script_start: float) -> No
             global_step=global_step,
             step_in_phase=step_in_phase,
             load_best_between_stages=not args.use_halt_gate,
-            run_generation_at_stage_end=bool(args.gen_every_stage),
             run_epoch_end_val=True,
         )
 

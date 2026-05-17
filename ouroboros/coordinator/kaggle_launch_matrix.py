@@ -16,16 +16,13 @@ from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from ouroboros.eval.benchmark_suites import DEFAULT_BENCHMARK_SUITE
 from ouroboros.coordinator.kaggle_commands import (
-    build_lm_eval_benchmark_multi_gpu_command,
     build_dgac_anchor_eval_command,
     build_dgac_canary_command,
     build_dgac_training_command,
     build_diloco_training_command,
 )
 from ouroboros.coordinator.kaggle_contract import (
-    BENCHMARK_RUN_MODE,
     DGAC_ANCHOR_EVAL_RUN_MODE,
     DGAC_CANARY_RUN_MODE,
     DGAC_DILOCO_RUN_MODE,
@@ -36,7 +33,6 @@ from ouroboros.coordinator.kaggle_contract import (
     known_kaggle_launch_modes,
 )
 from ouroboros.utils.runtime_env import (
-    normalize_benchmark_limit,
     normalize_text,
     require_known_worker_id,
     require_worker_id,
@@ -120,7 +116,6 @@ def _build_dgac_diloco(env: Mapping[str, str], *, worker_id: str | None = None) 
         resume_from_diloco_anchor=True,
         max_grad_norm=0.3,
         diloco_run_val=True,
-        gen_every_stage=True,
     )
 
 
@@ -152,30 +147,6 @@ def _build_dgac_anchor_eval(env: Mapping[str, str], *, worker_id: str | None = N
         diloco_state_repo=_value(env, "OUROBOROS_DILOCO_STATE_REPO"),
         output_dir=_value(env, "OUROBOROS_DGAC_ANCHOR_EVAL_OUTPUT_DIR"),
         wandb_project=_value(env, "OUROBOROS_WANDB_PROJECT"),
-        dgac_diagnostics_only=_truthy_value(env, "OUROBOROS_DGAC_DIAGNOSTICS_ONLY"),
-        dgac_diagnostics_forced_kmax_ce=_optional_float_value(
-            env, "OUROBOROS_DGAC_DIAGNOSTICS_FORCED_KMAX_CE"
-        ),
-    )
-
-
-def _build_benchmark(env: Mapping[str, str], *, worker_id: str | None = None) -> list[str]:
-    del worker_id
-    devices = normalize_text(env.get("OUROBOROS_BENCHMARK_DEVICES"))
-    return build_lm_eval_benchmark_multi_gpu_command(
-        tasks=normalize_text(env.get("OUROBOROS_BENCHMARK_TASKS")),
-        suite=normalize_text(env.get("OUROBOROS_BENCHMARK_SUITE")) or DEFAULT_BENCHMARK_SUITE,
-        devices=devices,
-        limit=normalize_benchmark_limit(env.get("OUROBOROS_BENCHMARK_LIMIT")),
-        output_dir=_value(env, "OUROBOROS_BENCHMARK_OUTPUT_DIR"),
-        base_model=_value(env, "OUROBOROS_BENCHMARK_BASE_MODEL"),
-        adapter_repo=_value(env, "OUROBOROS_BENCHMARK_ADAPTER_REPO"),
-        adapter_subfolder=_value(env, "OUROBOROS_BENCHMARK_ADAPTER_SUBFOLDER"),
-        batch_size=_value(env, "OUROBOROS_BENCHMARK_BATCH_SIZE"),
-        dtype=_value(env, "OUROBOROS_BENCHMARK_DTYPE"),
-        model_args=normalize_text(env.get("OUROBOROS_BENCHMARK_MODEL_ARGS")),
-        publish_to_hub=_truthy_value(env, "OUROBOROS_BENCHMARK_PUBLISH_TO_HUB"),
-        parallelism=normalize_text(env.get("OUROBOROS_BENCHMARK_PARALLELISM")),
     )
 
 
@@ -187,7 +158,7 @@ _COMMON_DEFAULTS = {
 }
 
 _RUNTIME_ENV_DEFAULTS = {
-    # The eval/diagnostic path runs close to the T4 memory ceiling. This allocator
+    # The eval path runs close to the T4 memory ceiling. This allocator
     # setting avoids avoidable fragmentation OOMs without changing model behavior.
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
 }
@@ -237,32 +208,6 @@ _SPECS: dict[str, KaggleLaunchModeSpec] = {
         output_env_key="OUROBOROS_DGAC_DILOCO_OUTPUT_DIR",
         requires_worker_id=True,
         workflow_label="DGAC dedicated worker rounds",
-    ),
-
-    BENCHMARK_RUN_MODE: KaggleLaunchModeSpec(
-        mode=BENCHMARK_RUN_MODE,
-        contract=get_kaggle_launch_contract(BENCHMARK_RUN_MODE),
-        env_defaults=_readonly(
-            {
-                **_COMMON_DEFAULTS,
-                "OUROBOROS_BENCHMARK_SUITE": DEFAULT_BENCHMARK_SUITE,
-                "OUROBOROS_BENCHMARK_TASKS": "",
-                "OUROBOROS_BENCHMARK_LIMIT": "100",
-                "OUROBOROS_BENCHMARK_OUTPUT_DIR": "runs/lm_eval_benchmark",
-                "OUROBOROS_BENCHMARK_BASE_MODEL": "ai21labs/AI21-Jamba-Reasoning-3B",
-                "OUROBOROS_BENCHMARK_ADAPTER_REPO": "WeirdRunner/Ouroboros",
-                "OUROBOROS_BENCHMARK_ADAPTER_SUBFOLDER": "diloco_state/anchor",
-                "OUROBOROS_BENCHMARK_BATCH_SIZE": "1",
-                "OUROBOROS_BENCHMARK_DEVICE": "cuda:0",
-                "OUROBOROS_BENCHMARK_DTYPE": "float16",
-                "OUROBOROS_BENCHMARK_PUBLISH_TO_HUB": "1",
-                "OUROBOROS_BENCHMARK_PARALLELISM": "auto",
-            }
-        ),
-        command_builder=_build_benchmark,
-        output_env_key="OUROBOROS_BENCHMARK_OUTPUT_DIR",
-        requires_worker_id=False,
-        workflow_label="lm-evaluation-harness benchmark",
     ),
 }
 
