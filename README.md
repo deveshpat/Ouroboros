@@ -41,8 +41,8 @@ Ouroboros is being structured so the research path and the release path stay con
 ```text
 train anchor
 -> restore exact adapter/HaltGate runtime
--> run reproducible in-domain sanity eval
--> run unbiased Jamba-vs-Ouroboros comparison eval
+-> run ID-backed Coconut validation comparison
+-> then run unbiased external benchmark evals
 -> publish model card + results table
 -> deploy faithful demo
 -> then optimize/quantize only after behavior is preserved
@@ -57,7 +57,7 @@ train anchor
 | `ouroboros.models` | Hugging Face model/tokenizer loading, PEFT adapter loading, quant/memory policy | `ouroboros.models` |
 | `ouroboros.inference` | prompt formatting, latent decode, text generation | package API exists; module CLI is a release blocker |
 | `ouroboros.coordinator` | DiLoCo/solo/DDP dispatch, aggregation, promotion, repair | `python -m ouroboros.coordinator ...` |
-| planned `ouroboros.eval` | comparison eval, lm-eval wrapper, release gates, benchmark manifests | not implemented yet |
+| planned `ouroboros.eval` | Coconut validation comparison, artifact wrapper, lm-eval bridge later | not implemented yet |
 | `ouroboros.utils` | provider IO helpers for Hub, W&B, Kaggle, local runtime | helper layer only |
 
 ## What works today
@@ -80,10 +80,10 @@ These are intentional blockers before public claims or a world-facing deployment
 ```text
 1. implement/restore `python -m ouroboros.inference --help`
 2. add planned `ouroboros.eval` package or remove stale references
-3. create unbiased comparison eval: base Jamba vs Ouroboros
-4. define immutable fresh eval manifests that were not used for training/tuning
-5. add minimal tests for public CLIs and eval manifest parsing
-6. publish research-style results only after comparison eval passes
+3. create ID-backed Coconut validation comparison: base Jamba vs Ouroboros
+4. record dataset repo/config/split/revision, validation IDs, source fields, and claim boundary
+5. add minimal tests for public CLIs and dry-run eval artifacts
+6. publish research-style results only after generated artifacts exist
 7. deploy a faithful demo that uses the actual Ouroboros latent/HaltGate runtime
 ```
 
@@ -96,7 +96,7 @@ what model was evaluated?
 what checkpoint/adapter was used?
 what prompt template was used?
 what dataset or benchmark split was used?
-was the split seen during training, tuning, debugging, or checkpoint selection?
+what split/revision was used, and what is its contamination/claim boundary?
 what decoding settings were used?
 what exact scoring script produced the metric?
 can the base model run through the same harness?
@@ -115,7 +115,7 @@ candidate -> same base + Ouroboros adapter + <|lat|> + DGAC HaltGate + latent ru
 BLUEPRINT.md                         -> package ownership and public command map
 wiki/STATUS.md                       -> current project truth and next gates
 wiki/Engineering-Workflow.md          -> repo-change workflow
-docs/prds/public-alpha-release.md     -> PRD for comparison eval, release docs, deployment, optimization
+plans/public-alpha-release.md          -> implementation plan for CLI, eval artifacts, demo, lm-eval bridge
 docs/release/HF_MODEL_CARD_DRAFT.md   -> Hugging Face model card draft
 terminal_log.md                       -> latest relevant run evidence
 ```

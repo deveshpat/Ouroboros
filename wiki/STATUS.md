@@ -26,9 +26,9 @@ result -> healthy checkpoint signal
 
 Healthy anchor != benchmark win.
 
-The latest eval-only run proves the canonical anchor can be restored and evaluated. It does not prove Ouroboros beats `ai21labs/AI21-Jamba-Reasoning-3B`, and it does not prove the validation split is independent enough for public claims.
+The latest eval-only run proves the canonical anchor can be restored and evaluated. It does not prove Ouroboros beats `ai21labs/AI21-Jamba-Reasoning-3B`, and it does not prove broad benchmark superiority.
 
-Next gate -> unbiased comparison eval:
+Next gate -> ID-backed in-domain holdout comparison on the canonical Coconut validation split:
 
 ```text
 baseline -> ai21labs/AI21-Jamba-Reasoning-3B
@@ -40,7 +40,7 @@ candidate -> same base + Ouroboros adapter + <|lat|> + DGAC HaltGate + latent ru
 ```text
 docs alignment
 -> public CLI smoke repair
--> unbiased comparison eval
+-> ID-backed Coconut validation comparison
 -> research README + HF model card
 -> faithful cloud demo
 -> optimization/edge experiments
@@ -50,7 +50,7 @@ docs alignment
 
 ```text
 README.md -> research-style alpha overview
-docs/prds/public-alpha-release.md -> PRD for comparison eval, docs, deployment, optimization
+plans/public-alpha-release.md -> implementation plan for CLI repair, Coconut val artifacts, demo, lm-eval bridge
 docs/release/HF_MODEL_CARD_DRAFT.md -> Hugging Face model card draft
 ```
 
@@ -70,7 +70,7 @@ Utils -> provider IO
 Planned/release-blocking package root:
 
 ```text
-Eval -> comparison eval + benchmark manifests + lm-eval wrapper
+Eval -> Coconut validation comparison + artifacts + lm-eval bridge
 ```
 
 ## Dispatch controls
@@ -80,7 +80,7 @@ manual inputs -> `force_worker_ids`, `skip_trigger`, `dry_run`, `kaggle_run_mode
 ## Active risks
 
 ```text
-validation contamination -> do not claim benchmark win from reused val split
+validation claim boundary -> Coconut val is ID-backed in-domain holdout, not external benchmark
 missing eval package -> docs must not imply implemented comparison harness
 missing inference __main__ -> public CLI repair required before demo
 quota exhaustion -> attendance/timeout path

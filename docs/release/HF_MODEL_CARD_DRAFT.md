@@ -86,10 +86,9 @@ Pending comparison eval:
 
 | Suite | Dataset/Split | Jamba baseline | Ouroboros | Notes |
 |---|---:|---:|---:|---|
-| In-domain sanity | `data/coconut_v1/val` | TBD | TBD | Use only if not contaminated by tuning/checkpoint selection |
-| Anchor suite | `arc_easy`, `hellaswag`, `winogrande` | TBD | TBD | Same prompt/template/decoding required |
-| Reasoning suite | `arc_challenge`, `openbookqa`, `piqa`, `gsm8k`, `truthfulqa_mc2` | TBD | TBD | Candidate must use latent/HaltGate runtime |
-| Fresh custom set | immutable `eval_manifest.jsonl` | TBD | TBD | Must be unseen by both models |
+| In-domain holdout | `WeirdRunner/Ouroboros`, config `coconut-v1`, split `validation`, revision `6a52cd0c47be1e7b85d9018225387950aefc4631` | TBD | TBD | ID-backed Coconut validation; not an external benchmark |
+| Anchor suite | `arc_easy`, `hellaswag`, `winogrande` | TBD | TBD | Later lm-eval bridge; same prompt/template/decoding required |
+| Reasoning suite | `arc_challenge`, `openbookqa`, `piqa`, `gsm8k`, `truthfulqa_mc2` | TBD | TBD | Later lm-eval bridge; candidate must use latent/HaltGate runtime |
 
 ## Training and Data
 
@@ -105,17 +104,17 @@ Before public release, the final card must disclose:
 
 ```text
 training data source and construction process
-validation split policy
+validation split policy and exact revision
 whether validation influenced checkpoint selection
-fresh eval manifest source
-known contamination risks
+source/ID fields used for auditability
+known contamination and claim-boundary risks
 ```
 
 ## Limitations
 
 ```text
 comparison against base Jamba is not complete
-validation result is a health signal, not a public benchmark claim
+Coconut validation result is an ID-backed in-domain holdout signal, not a public external benchmark claim
 latent/HaltGate runtime may not export cleanly to GGUF/Ollama yet
 quantized paths must be compared against faithful runtime before release
 model inherits limitations and risks from the base model
@@ -126,7 +125,7 @@ model inherits limitations and risks from the base model
 ```text
 [ ] public inference CLI works
 [ ] eval package exists
-[ ] unbiased Jamba-vs-Ouroboros eval completed
+[ ] ID-backed Coconut validation Jamba-vs-Ouroboros eval completed
 [ ] benchmark artifacts uploaded or committed
 [ ] README table filled from artifacts
 [ ] demo uses faithful runtime
