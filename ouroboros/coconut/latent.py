@@ -16,6 +16,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
+DEFAULT_EVAL_GEN_MAX_TOKENS = 32
+
+
 from ouroboros.models import (
     _amp_dtype,
     _autocast_ctx,
@@ -93,8 +96,9 @@ def compute_ce_from_hidden(
     runtime: LatentRuntime,
     hidden: torch.Tensor,
     labels: torch.Tensor,
-) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]:
-    """Compute CE by projecting only supervised next-token positions."""
+    include_token_accuracy: bool = False,
+) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor, Optional[int]]:
+    """Compute teacher-forced CE and optional next-token accuracy on supervised labels."""
     shift_hidden = hidden[:, :-1, :]
     shift_labels = labels[:, 1:]
     valid = shift_labels != -100
@@ -102,7 +106,7 @@ def compute_ce_from_hidden(
     n_valid = int(valid_by_row.sum().item())
     if n_valid == 0:
         zeros = hidden.new_zeros((labels.size(0),), dtype=torch.float32)
-        return hidden.new_zeros((), dtype=torch.float32), 0, zeros, valid_by_row
+        return hidden.new_zeros((), dtype=torch.float32), 0, zeros, valid_by_row, 0 if include_token_accuracy else None
 
     selected_hidden = shift_hidden[valid]
     selected_labels = shift_labels[valid]
@@ -110,13 +114,18 @@ def compute_ce_from_hidden(
         selected_logits = runtime.lm_head(selected_hidden).float()
     losses = F.cross_entropy(selected_logits, selected_labels, reduction="none")
     ce_sum = losses.sum()
+    token_correct = (
+        int((selected_logits.argmax(dim=-1) == selected_labels).sum().item())
+        if include_token_accuracy
+        else None
+    )
 
     row_ids = torch.arange(labels.size(0), device=labels.device).unsqueeze(1).expand_as(valid)
     selected_rows = row_ids[valid]
     row_sums = losses.new_zeros((labels.size(0),), dtype=losses.dtype)
     row_sums.index_add_(0, selected_rows, losses)
     ce_by_row = row_sums / valid_by_row.clamp_min(1).to(dtype=losses.dtype)
-    return ce_sum, n_valid, ce_by_row.to(dtype=torch.float32), valid_by_row
+    return ce_sum, n_valid, ce_by_row.to(dtype=torch.float32), valid_by_row, token_correct
 
 
 def build_question_context(
@@ -388,6 +397,7 @@ def forward_latent_batch(
     args: argparse.Namespace,
     n_latents: Optional[torch.Tensor] = None,
     include_hidden_sequences: bool = False,
+    include_token_accuracy: bool = False,
 ) -> Dict[str, Any]:
     """Run a full Coconut latent batch forward and return CE/latent artifacts."""
     device = runtime.device
@@ -436,10 +446,11 @@ def forward_latent_batch(
         outputs = runtime.backbone(inputs_embeds=patched, attention_mask=attention_mask, use_cache=False)
         hidden = _extract_last_hidden_state(outputs, "coconut batched full forward")
 
-    ce_sum, n_valid, ce_by_row, valid_by_row = compute_ce_from_hidden(
+    ce_sum, n_valid, ce_by_row, valid_by_row, token_correct = compute_ce_from_hidden(
         runtime=runtime,
         hidden=hidden,
         labels=labels,
+        include_token_accuracy=include_token_accuracy,
     )
     ce_value = float(ce_sum.item() / max(n_valid, 1))
     hidden_sequences = (
@@ -453,6 +464,7 @@ def forward_latent_batch(
         "ce": ce_value,
         "ce_by_row": ce_by_row,
         "valid_by_row": valid_by_row,
+        "token_correct": token_correct,
         "actual_n_latents": actual_n_latents,
         "hidden_sequences": hidden_sequences,
         "latent_ctx": latent_ctx,
@@ -472,7 +484,8 @@ def decode_from_latent_context(
     """Greedily decode tokens from an existing latent context."""
     generated: List[int] = []
     eos_id = tokenizer.eos_token_id
-    for _ in range(args.gen_max_tokens):
+    gen_max_tokens = max(0, int(getattr(args, "gen_max_tokens", DEFAULT_EVAL_GEN_MAX_TOKENS)))
+    for _ in range(gen_max_tokens):
         if ctx.size(1) > args.max_seq_len:
             ctx = ctx[:, -args.max_seq_len :, :]
             ctx_mask = ctx_mask[:, -args.max_seq_len :]

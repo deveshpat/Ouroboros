@@ -59,4 +59,4 @@ Thumbs.db
 .vscode/settings.json
 
 # Ignore shell scripts that are used for local development and testing, but not intended to be part of the main codebase
-.sh
+*.sh

@@ -731,13 +731,14 @@ def run_diloco_worker(
             halt_gate=halt_gate if args.use_halt_gate else None,
         )
         if _is_main_process():
-            print(f"  [diloco] Pre-training val: stage={stage_k} ce={val_ce:.4f} acc={val_acc:.4f}")
+            print(f"  [diloco] Pre-training val: stage={stage_k} ce={val_ce:.4f} token_acc={val_acc:.4f}")
             if diloco_wandb_run is not None:
                 import wandb
                 wandb.log(
                     {
                         "diloco/pre_val_ce": val_ce,
                         "diloco/pre_val_acc": val_acc,
+                        "diloco/pre_val_token_acc": val_acc,
                         "diloco/stage": stage_k,
                         "diloco/round": round_n,
                     },

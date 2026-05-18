@@ -71,6 +71,7 @@ def bootstrap_free_help_text() -> str:
         "  --profile_training_timing\n"
         "  --val_batch_size VAL_BATCH_SIZE\n"
         "  --eval_progress_every EVAL_PROGRESS_EVERY\n"
+        "  --gen_max_tokens GEN_MAX_TOKENS\n"
         "  --wandb_mode {online,offline,disabled}\n"
     )
 
@@ -290,6 +291,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "Print rank-0 validation progress every N local samples; "
             "set 0 to disable progress logs."
+        ),
+    )
+    parser.add_argument(
+        "--gen_max_tokens",
+        type=int,
+        default=32,
+        help=(
+            "Maximum greedy decode tokens per validation accuracy sample. "
+            "Keep small for Kaggle eval-only runs."
         ),
     )
 

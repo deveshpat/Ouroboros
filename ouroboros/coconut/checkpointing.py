@@ -71,7 +71,7 @@ def save_checkpoint(
     tmp.replace(ckpt)
     label = "best" if tag == "best" else "saved"
     if _is_main_process():
-        print(f"  [ckpt] {label} -> {ckpt}  acc={val_acc}  ce={val_ce}")
+        print(f"  [ckpt] {label} -> {ckpt}  token_acc={val_acc}  ce={val_ce}")
 
     hf_token  = getattr(args, "_resolved_hf_token", None)
     push      = getattr(args, "push_to_hub", False)

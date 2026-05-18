@@ -540,12 +540,12 @@ def run_training_stages(
             if is_main:
                 tqdm.write(
                     f"  [val] s={stage_k} ep={epoch} "
-                    f"val_ce={val_ce:.4f} val_acc={val_acc:.4f}"
+                    f"val_ce={val_ce:.4f} val_token_acc={val_acc:.4f}"
                 )
                 if wandb_run is not None:
                     import wandb
                     wandb.log(
-                        {"val/ce": val_ce, "val/acc": val_acc, "val/stage": stage_k},
+                        {"val/ce": val_ce, "val/acc": val_acc, "val/token_acc": val_acc, "val/stage": stage_k},
                         step=global_step,
                     )
 
@@ -588,7 +588,7 @@ def run_training_stages(
                         val_acc=val_acc,
                         tag="best",
                     )
-                    tqdm.write(f"  [best] stage={stage_k} new best acc={best_val_acc:.4f}")
+                    tqdm.write(f"  [best] stage={stage_k} new best token_acc={best_val_acc:.4f}")
 
             barrier()
 
@@ -601,7 +601,7 @@ def run_training_stages(
         if load_best_between_stages and best_ckpt is not None and not args.use_halt_gate:
             if is_main:
                 print(
-                    f"  [stage] Stage {stage_k} done. Best acc={best_val_acc:.4f}. "
+                    f"  [stage] Stage {stage_k} done. Best token_acc={best_val_acc:.4f}. "
                     "Loading best ckpt before advancing."
                 )
             best_dir = output_dir / f"stage_{stage_k}" / "best"
