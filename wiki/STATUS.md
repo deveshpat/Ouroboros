@@ -1,6 +1,6 @@
 # Status
 
-Current truth -> seven-package runtime.
+Current truth -> alpha research runtime with healthy DGAC anchor signal, pre-claim release state.
 
 ## Anchor
 
@@ -8,21 +8,70 @@ canonical anchor -> `WeirdRunner/Ouroboros/diloco_state/anchor`.
 source checkpoint -> `runs/azure_h100_dgac/stage_10/checkpoint-0001154`.
 adapter + config + `halt_gate.pt` -> promoted.
 
+## Latest eval-only health signal
+
+```text
+dataset -> 36,906 train / 1,940 val
+stage -> 10
+gpu -> Tesla T4 16GB fp16
+mamba fast path -> active
+anchor restore -> adapter + halt_gate.pt restored from canonical anchor
+mode -> eval-only
+val_ce -> 0.4114
+val_token_acc -> 0.8693
+result -> healthy checkpoint signal
+```
+
 ## Caveat
 
-H100 run skipped val/gen near timeout.
-So anchor = training evidence, not quality proof.
-Next gate -> `kaggle_run_mode=dgac-anchor-eval` -> compare val CE/acc/gen.
+Healthy anchor != benchmark win.
 
-## Workflow
+The latest eval-only run proves the canonical anchor can be restored and evaluated. It does not prove Ouroboros beats `ai21labs/AI21-Jamba-Reasoning-3B`, and it does not prove the validation split is independent enough for public claims.
 
-Coordinator -> dispatch/aggregate/promote.
-Eval -> quality gates + lm-eval.
-lm-eval suites -> `anchor` = `arc_easy,hellaswag,winogrande`; `reasoning` = `arc_challenge,openbookqa,piqa,gsm8k,truthfulqa_mc2`.
-Coconut -> training/DGAC.
-Bootstrap -> runtime guardrails.
-Models -> HF CausalLM compatibility.
-Utils -> provider IO.
+Next gate -> unbiased comparison eval:
+
+```text
+baseline -> ai21labs/AI21-Jamba-Reasoning-3B
+candidate -> same base + Ouroboros adapter + <|lat|> + DGAC HaltGate + latent runtime
+```
+
+## Release-readiness workflow
+
+```text
+docs alignment
+-> public CLI smoke repair
+-> unbiased comparison eval
+-> research README + HF model card
+-> faithful cloud demo
+-> optimization/edge experiments
+```
+
+## Current docs/release artifacts
+
+```text
+README.md -> research-style alpha overview
+docs/prds/public-alpha-release.md -> PRD for comparison eval, docs, deployment, optimization
+docs/release/HF_MODEL_CARD_DRAFT.md -> Hugging Face model card draft
+```
+
+## Runtime/package truth
+
+Implemented package roots:
+
+```text
+Bootstrap -> runtime guardrails
+Coconut -> training/DGAC/eval-only
+Models -> HF CausalLM compatibility
+Inference -> package API exists; module CLI needs __main__.py
+Coordinator -> dispatch/aggregate/promote
+Utils -> provider IO
+```
+
+Planned/release-blocking package root:
+
+```text
+Eval -> comparison eval + benchmark manifests + lm-eval wrapper
+```
 
 ## Dispatch controls
 
@@ -30,7 +79,13 @@ manual inputs -> `force_worker_ids`, `skip_trigger`, `dry_run`, `kaggle_run_mode
 
 ## Active risks
 
-quota exhaustion -> attendance/timeout path.
-Kaggle push false-success -> strict output parser.
-wrong GPU -> accelerator + runtime fast-fail.
-DGAC eval OOM -> inference-mode guard.
+```text
+validation contamination -> do not claim benchmark win from reused val split
+missing eval package -> docs must not imply implemented comparison harness
+missing inference __main__ -> public CLI repair required before demo
+quota exhaustion -> attendance/timeout path
+Kaggle push false-success -> strict output parser
+wrong GPU -> accelerator + runtime fast-fail
+DGAC eval OOM -> inference-mode guard
+optimization drift -> quantized/edge path must be compared against faithful runtime
+```
