@@ -11,7 +11,7 @@ base model      -> ai21labs/AI21-Jamba-Reasoning-3B
 adapter target  -> WeirdRunner/Ouroboros/diloco_state/anchor
 method          -> PEFT adapter + <|lat|> token + DGAC HaltGate
 runtime state   -> package-based runtime extracted from notebook/root-script shape
-release state   -> alpha, pre-claim, comparison eval pending
+release state   -> alpha, pre-claim, generated-answer comparison harness implemented; real artifacts pending
 ```
 
 Latest anchor health signal:
@@ -20,14 +20,14 @@ Latest anchor health signal:
 dataset loaded      -> 36,906 train / 1,940 validation
 stage               -> 10
 eval mode           -> eval-only
-validation CE       -> 0.4114
-validation token acc-> 0.8693
+teacher-forced CE  -> 0.4114
+teacher-forced token acc -> 0.8693
 mamba fast path     -> active
 anchor restored     -> adapter + halt_gate.pt restored
 status              -> healthy checkpoint signal, not a benchmark claim
 ```
 
-This result is promising, but it is not yet enough to claim that Ouroboros beats the base Jamba model. The next release gate is an unbiased comparison evaluation where the base model and Ouroboros are evaluated under the same prompt template, decoding settings, hardware constraints, and scoring scripts.
+This result is a training-health side metric, not real generated-answer progress. The next release gate is an unbiased generated-answer exact-match comparison where the true base model and Ouroboros are evaluated on the same validation IDs, prompt policy, decoding settings, normalization, and scoring scripts.
 
 ## Why this exists
 
@@ -55,9 +55,9 @@ train anchor
 | `ouroboros.bootstrap` | runtime setup, device/dtype guardrails, known-failure triage | imported before heavy runtime |
 | `ouroboros.coconut` | curriculum, latent passes, DGAC/HaltGate, train/checkpoint/resume | `python -m ouroboros.coconut ...` |
 | `ouroboros.models` | Hugging Face model/tokenizer loading, PEFT adapter loading, quant/memory policy | `ouroboros.models` |
-| `ouroboros.inference` | prompt formatting, latent decode, text generation | package API exists; module CLI is a release blocker |
+| `ouroboros.inference` | prompt formatting, latent decode, text generation | `python -m ouroboros.inference ...` |
 | `ouroboros.coordinator` | DiLoCo/solo/DDP dispatch, aggregation, promotion, repair | `python -m ouroboros.coordinator ...` |
-| planned `ouroboros.eval` | Coconut validation comparison, artifact wrapper, lm-eval bridge later | not implemented yet |
+| `ouroboros.eval` | Coconut validation inspection/dry-run artifacts and generated-answer comparison; lm-eval bridge later | `python -m ouroboros.eval ...` |
 | `ouroboros.utils` | provider IO helpers for Hub, W&B, Kaggle, local runtime | helper layer only |
 
 ## What works today
@@ -65,12 +65,16 @@ train anchor
 ```bash
 python -m ouroboros.coconut --help
 python -m ouroboros.coordinator --help
+python -m ouroboros.inference --help
+python -m ouroboros.eval --help
+python -m ouroboros.eval dry-run-coconut-val ...
+python -m ouroboros.eval inspect-coconut-val ...
 ```
 
-Recent eval-only anchor validation completed successfully through the Coconut runtime. The current public package shape also compiles successfully:
+Recent eval-only anchor validation completed successfully through the Coconut runtime as a teacher-forced training-health signal. The public package compiles successfully:
 
 ```bash
-python -m compileall -q ouroboros
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m compileall -q ouroboros
 ```
 
 ## Known release blockers
@@ -78,13 +82,12 @@ python -m compileall -q ouroboros
 These are intentional blockers before public claims or a world-facing deployment:
 
 ```text
-1. implement/restore `python -m ouroboros.inference --help`
-2. add planned `ouroboros.eval` package or remove stale references
-3. create ID-backed Coconut validation comparison: base Jamba vs Ouroboros
-4. record dataset repo/config/split/revision, validation IDs, source fields, and claim boundary
-5. add minimal tests for public CLIs and dry-run eval artifacts
-6. publish research-style results only after generated artifacts exist
-7. deploy a faithful demo that uses the actual Ouroboros latent/HaltGate runtime
+1. run sampled `compare-coconut-val` with real model weights and local validation data
+2. inspect generated `run_config.json`, `summary.json`, and `results.jsonl`
+3. run the full Coconut validation split only after sampled artifacts pass inspection
+4. copy/generate public metric tables only from real artifacts
+5. deploy a faithful demo that uses the actual Ouroboros latent/HaltGate runtime
+6. add optional lm-eval bridge later, after latent-aware loglikelihood is implemented
 ```
 
 ## Evaluation standard
@@ -98,7 +101,7 @@ what prompt template was used?
 what dataset or benchmark split was used?
 what split/revision was used, and what is its contamination/claim boundary?
 what decoding settings were used?
-what exact scoring script produced the metric?
+what exact scoring script produced generated-answer exact match?
 can the base model run through the same harness?
 ```
 
@@ -116,7 +119,7 @@ BLUEPRINT.md                         -> package ownership and public command map
 wiki/STATUS.md                       -> current project truth and next gates
 wiki/Engineering-Workflow.md          -> repo-change workflow
 plans/public-alpha-release.md          -> implementation plan for CLI, eval artifacts, demo, lm-eval bridge
-docs/release/HF_MODEL_CARD_DRAFT.md   -> Hugging Face model card draft
+docs/release/HF_MODEL_CARD_DRAFT.md   -> Hugging Face model card draft, metric tables pending real artifacts
 terminal_log.md                       -> latest relevant run evidence
 ```
 

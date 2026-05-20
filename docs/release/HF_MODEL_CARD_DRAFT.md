@@ -37,11 +37,11 @@ This model card is a draft for the public alpha release. Comparison benchmarks a
 
 ```text
 release stage -> alpha research checkpoint
-latest health signal -> stage 10 eval-only pass
-validation CE -> 0.4114
-validation token accuracy -> 0.8693
+latest health signal -> stage 10 teacher-forced eval-only pass
+teacher-forced CE -> 0.4114
+teacher-forced token accuracy -> 0.8693
 anchor path -> WeirdRunner/Ouroboros/diloco_state/anchor
-claim status -> healthy checkpoint, not yet benchmark superiority
+claim status -> healthy checkpoint, not generated-answer progress or benchmark superiority
 ```
 
 ## Intended Use
@@ -78,17 +78,17 @@ python -m ouroboros.inference \
   --use_halt_gate
 ```
 
-Note: the package CLI is a release blocker until `ouroboros/inference/__main__.py` is added and tested. Until then, use the repo's internal inference API or Coconut eval-only path.
+The package CLI now has a lightweight help path. Real inference still requires access to the base model, adapter, and `halt_gate.pt` when HaltGate-backed runtime is required.
 
 ## Evaluation
 
-Pending comparison eval:
+Pending real generated-answer comparison artifacts:
 
 | Suite | Dataset/Split | Jamba baseline | Ouroboros | Notes |
-|---|---:|---:|---:|---|
+|---|---|---:|---:|---|
 | In-domain holdout | `WeirdRunner/Ouroboros`, config `coconut-v1`, split `validation`, revision `6a52cd0c47be1e7b85d9018225387950aefc4631` | TBD | TBD | ID-backed Coconut validation; not an external benchmark |
-| Anchor suite | `arc_easy`, `hellaswag`, `winogrande` | TBD | TBD | Later lm-eval bridge; same prompt/template/decoding required |
-| Reasoning suite | `arc_challenge`, `openbookqa`, `piqa`, `gsm8k`, `truthfulqa_mc2` | TBD | TBD | Later lm-eval bridge; candidate must use latent/HaltGate runtime |
+| Anchor suite | `arc_easy`, `hellaswag`, `winogrande` | TBD | TBD | Later optional lm-eval bridge after latent-aware loglikelihood |
+| Reasoning suite | `arc_challenge`, `openbookqa`, `piqa`, `gsm8k`, `truthfulqa_mc2` | TBD | TBD | Later optional lm-eval bridge; no external claims until artifacts exist |
 
 ## Training and Data
 
@@ -123,9 +123,9 @@ model inherits limitations and risks from the base model
 ## Release Checklist
 
 ```text
-[ ] public inference CLI works
-[ ] eval package exists
-[ ] ID-backed Coconut validation Jamba-vs-Ouroboros eval completed
+[x] public inference CLI help works
+[x] eval package help/dry-run shell exists
+[ ] ID-backed Coconut generated-answer Jamba-vs-Ouroboros eval completed with real artifacts
 [ ] benchmark artifacts uploaded or committed
 [ ] README table filled from artifacts
 [ ] demo uses faithful runtime

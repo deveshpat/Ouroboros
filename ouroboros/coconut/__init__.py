@@ -40,6 +40,7 @@ _EXPORTS = {
     "find_latest_resume_checkpoint": ("checkpointing", "find_latest_resume_checkpoint"),
     "startup_hub_sync_and_prune": ("checkpointing", "startup_hub_sync_and_prune"),
     "evaluate_stage": ("evaluation", "evaluate_stage"),
+    "evaluate_stage_health_metrics": ("evaluation", "evaluate_stage_health_metrics"),
     "run_eval_only": ("evaluation", "run_eval_only"),
     "run_training_stages": ("stage_runner", "run_training_stages"),
     "make_timeout_checker": ("stage_runner", "make_timeout_checker"),

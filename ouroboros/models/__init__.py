@@ -13,5 +13,6 @@ _export_module(_loading)
 __all__ = (
     "MODEL_ID",
     "load_model_and_tokenizer",
+    "load_base_model_and_tokenizer",
     "barrier",
 )

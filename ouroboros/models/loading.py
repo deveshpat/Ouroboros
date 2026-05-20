@@ -372,6 +372,128 @@ def _wandb_config(args: argparse.Namespace) -> Dict[str, Any]:
     return config
 
 
+
+def _arg_value(args: argparse.Namespace, *names: str, default: Any = None) -> Any:
+    for name in names:
+        if hasattr(args, name):
+            value = getattr(args, name)
+            if value is not None:
+                return value
+    return default
+
+
+def load_base_model_and_tokenizer(
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    add_lat_token: bool = False,
+) -> Tuple[nn.Module, Any, int, Optional[int]]:
+    """Load an unadapted base CausalLM and tokenizer.
+
+    This is the release-eval baseline seam: with ``add_lat_token=False`` it does
+    not add ``<|lat|>``, resize embeddings, attach LoRA adapters, or create a
+    HaltGate. ``add_lat_token=True`` is reserved for adapter/candidate setup
+    code that needs the tokenizer/model vocabulary prepared before loading a
+    PEFT adapter.
+    """
+    is_main = _is_main_process()
+    rank = _rank()
+    amp_dtype = _amp_dtype(device)
+    model_id = str(_arg_value(args, "model_id", "base_model", default=MODEL_ID))
+
+    if bool(_arg_value(args, "use_4bit", default=False)) and device.type != "cuda":
+        raise SystemExit("--use_4bit requires CUDA + bitsandbytes.")
+
+    if is_main:
+        mode = "with <|lat|>" if add_lat_token else "true base"
+        print(f"Loading tokenizer: {model_id} ({mode})")
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    lat_token_id: Optional[int] = None
+    if add_lat_token:
+        lat_token = "<|lat|>"
+        existing_id = tokenizer.convert_tokens_to_ids(lat_token)
+        if existing_id is None or existing_id == tokenizer.unk_token_id:
+            tokenizer.add_special_tokens({"additional_special_tokens": [lat_token]})
+        lat_token_id = int(tokenizer.convert_tokens_to_ids(lat_token))
+        if is_main:
+            print(f"  <|lat|> token id: {lat_token_id}  vocab: {len(tokenizer)}")
+
+    attn_impl = "eager"
+    if device.type == "cuda":
+        try:
+            import flash_attn  # noqa: F401
+            attn_impl = "flash_attention_2"
+            if is_main:
+                print("  flash-attn available: using flash_attention_2")
+        except ImportError:
+            if is_main:
+                print("  flash-attn not installed: falling back to eager attention")
+    elif is_main:
+        print("  non-CUDA device: using eager attention")
+
+    load_kwargs: Dict[str, Any] = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+        "attn_implementation": attn_impl,
+    }
+    if device.type == "cuda":
+        load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
+
+    disable_mamba = bool(_arg_value(args, "disable_mamba_kernels", default=False))
+    mamba_fast_path = device.type == "cuda" and not disable_mamba
+    if not mamba_fast_path:
+        load_kwargs["use_mamba_kernels"] = False
+    elif is_main:
+        print("  mamba CUDA kernels: fast path ACTIVE (verified at bootstrap)")
+
+    use_4bit = bool(_arg_value(args, "use_4bit", default=False))
+    if use_4bit:
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=amp_dtype if amp_dtype != torch.float32 else torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+    else:
+        load_kwargs["torch_dtype"] = amp_dtype
+
+    if is_main:
+        print(f"Loading model: {model_id}")
+        print(f"  device={device} amp_dtype={str(amp_dtype).replace('torch.', '')}")
+
+    if device.type == "cuda" and mamba_fast_path:
+        _patch_transformers_jamba_fast_path_globals()
+
+    model = _safe_from_pretrained(model_id, load_kwargs)
+    model.config.use_cache = False
+
+    if add_lat_token:
+        embed_module = _get_embed_tokens(model)
+        embed_size = int(embed_module.num_embeddings) if hasattr(embed_module, "num_embeddings") else int(embed_module.weight.shape[0])
+        if len(tokenizer) > embed_size:
+            if is_main:
+                print(f"  Resizing embed_tokens: {embed_size} -> {len(tokenizer)}")
+            model.resize_token_embeddings(len(tokenizer))
+
+    grad_checkpoint = bool(_arg_value(args, "grad_checkpoint", default=False))
+    if grad_checkpoint and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+    elif device.type != "cuda" and not use_4bit:
+        model = model.to(device)
+
+    model.eval()
+    d_model = int(getattr(model.config, "hidden_size"))
+    if is_main:
+        num_layers = getattr(model.config, "num_hidden_layers", "?")
+        print(f"  d_model={d_model}  layers={num_layers}")
+    return model, tokenizer, d_model, lat_token_id
+
 def load_model_and_tokenizer(
     args: argparse.Namespace,
     device: torch.device,

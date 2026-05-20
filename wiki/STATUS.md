@@ -1,6 +1,6 @@
 # Status
 
-Current truth -> alpha research runtime with healthy DGAC anchor signal, pre-claim release state.
+Current truth -> alpha research runtime with healthy DGAC anchor signal, public CLI/eval artifact shell implemented, generated-answer comparison artifacts pending.
 
 ## Anchor
 
@@ -8,7 +8,7 @@ canonical anchor -> `WeirdRunner/Ouroboros/diloco_state/anchor`.
 source checkpoint -> `runs/azure_h100_dgac/stage_10/checkpoint-0001154`.
 adapter + config + `halt_gate.pt` -> promoted.
 
-## Latest eval-only health signal
+## Latest teacher-forced health signal
 
 ```text
 dataset -> 36,906 train / 1,940 val
@@ -17,16 +17,16 @@ gpu -> Tesla T4 16GB fp16
 mamba fast path -> active
 anchor restore -> adapter + halt_gate.pt restored from canonical anchor
 mode -> eval-only
-val_ce -> 0.4114
-val_token_acc -> 0.8693
-result -> healthy checkpoint signal
+teacher_forced_ce -> 0.4114
+teacher_forced_token_acc -> 0.8693
+result -> healthy checkpoint signal, not generated-answer progress
 ```
 
 ## Caveat
 
 Healthy anchor != benchmark win.
 
-The latest eval-only run proves the canonical anchor can be restored and evaluated. It does not prove Ouroboros beats `ai21labs/AI21-Jamba-Reasoning-3B`, and it does not prove broad benchmark superiority.
+The latest eval-only run proves the canonical anchor can be restored for teacher-forced training-health validation. It does not prove generated-answer progress, does not prove Ouroboros beats `ai21labs/AI21-Jamba-Reasoning-3B`, and does not prove broad benchmark superiority.
 
 Next gate -> ID-backed in-domain holdout comparison on the canonical Coconut validation split:
 
@@ -39,10 +39,13 @@ candidate -> same base + Ouroboros adapter + <|lat|> + DGAC HaltGate + latent ru
 
 ```text
 docs alignment
--> public CLI smoke repair
--> ID-backed Coconut validation comparison
--> research README + HF model card
+-> public CLI smoke repair [done]
+-> dry-run/inspect artifact shell [done]
+-> sampled ID-backed Coconut generated-answer comparison [pending real weights/data]
+-> full Coconut validation after sampled artifact inspection
+-> research README + HF model card metrics from artifacts
 -> faithful cloud demo
+-> optional lm-eval bridge later
 -> optimization/edge experiments
 ```
 
@@ -62,15 +65,10 @@ Implemented package roots:
 Bootstrap -> runtime guardrails
 Coconut -> training/DGAC/eval-only
 Models -> HF CausalLM compatibility
-Inference -> package API exists; module CLI needs __main__.py
+Inference -> package API + `python -m ouroboros.inference --help`
 Coordinator -> dispatch/aggregate/promote
+Eval -> Coconut validation inspection/dry-run artifacts + generated-answer comparison CLI; lm-eval bridge pending
 Utils -> provider IO
-```
-
-Planned/release-blocking package root:
-
-```text
-Eval -> Coconut validation comparison + artifacts + lm-eval bridge
 ```
 
 ## Dispatch controls
@@ -81,8 +79,7 @@ manual inputs -> `force_worker_ids`, `skip_trigger`, `dry_run`, `kaggle_run_mode
 
 ```text
 validation claim boundary -> Coconut val is ID-backed in-domain holdout, not external benchmark
-missing eval package -> docs must not imply implemented comparison harness
-missing inference __main__ -> public CLI repair required before demo
+missing real generated-answer artifacts -> docs/model card must not publish wins
 quota exhaustion -> attendance/timeout path
 Kaggle push false-success -> strict output parser
 wrong GPU -> accelerator + runtime fast-fail

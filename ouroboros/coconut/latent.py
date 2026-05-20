@@ -396,6 +396,7 @@ def forward_latent_batch(
     batch: Mapping[str, torch.Tensor],
     args: argparse.Namespace,
     n_latents: Optional[torch.Tensor] = None,
+    halt_gate: Optional[Any] = None,
     include_hidden_sequences: bool = False,
     include_token_accuracy: bool = False,
 ) -> Dict[str, Any]:
@@ -418,7 +419,7 @@ def forward_latent_batch(
         ctx=q_ctx,
         ctx_mask=q_ctx_mask,
         n_latent=actual_target_latents,
-        halt_gate=None,
+        halt_gate=halt_gate,
         args=args,
     )
     actual_n_latents = actual_k if isinstance(actual_k, torch.Tensor) else torch.full_like(actual_target_latents, int(actual_k))

@@ -32,7 +32,7 @@ from ouroboros.coconut.checkpointing import (
     prune_epoch_checkpoints,
     save_checkpoint,
 )
-from ouroboros.coconut.evaluation import evaluate_stage
+from ouroboros.coconut.evaluation import evaluate_stage_health_metrics
 
 _SCRIPT_START = time.perf_counter()
 
@@ -526,7 +526,7 @@ def run_training_stages(
                 barrier()
                 continue
 
-            val_ce, val_acc = evaluate_stage(
+            health = evaluate_stage_health_metrics(
                 model=model,
                 val_samples=val_samples,
                 tokenizer=tokenizer,
@@ -536,16 +536,31 @@ def run_training_stages(
                 args=args,
                 halt_gate=halt_gate if args.use_halt_gate else None,
             )
+            tf = health["health_metrics"]["teacher_forced"]
+            val_ce = float(tf["ce"])
+            val_acc = float(tf["token_acc"])
 
             if is_main:
                 tqdm.write(
                     f"  [val] s={stage_k} ep={epoch} "
-                    f"val_ce={val_ce:.4f} val_token_acc={val_acc:.4f}"
+                    f"val_ce={val_ce:.4f} val_token_acc={val_acc:.4f} "
+                    f"halt_gate_used={tf['halt_gate_used']} actual_latents_mean={tf['actual_latents_mean']:.2f}"
                 )
                 if wandb_run is not None:
                     import wandb
                     wandb.log(
-                        {"val/ce": val_ce, "val/acc": val_acc, "val/token_acc": val_acc, "val/stage": stage_k},
+                        {
+                            "val/ce": val_ce,
+                            "val/acc": val_acc,
+                            "val/token_acc": val_acc,
+                            "val/stage": stage_k,
+                            "health_metrics/teacher_forced/ce": val_ce,
+                            "health_metrics/teacher_forced/token_acc": val_acc,
+                            "health_metrics/teacher_forced/halt_gate_used": bool(tf["halt_gate_used"]),
+                            "health_metrics/teacher_forced/actual_latents_mean": tf["actual_latents_mean"],
+                            "health_metrics/teacher_forced/actual_latents_min": tf["actual_latents_min"],
+                            "health_metrics/teacher_forced/actual_latents_max": tf["actual_latents_max"],
+                        },
                         step=global_step,
                     )
 

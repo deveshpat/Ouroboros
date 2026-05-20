@@ -170,6 +170,10 @@ def load_components(args: argparse.Namespace):
         token=token,
         cache_dir=args.adapter_cache_dir,
     )
+    if bool(getattr(args, "use_halt_gate", False)) and bool(getattr(args, "require_halt_gate", False)):
+        gate_path = adapter_dir / "halt_gate.pt"
+        if not gate_path.exists():
+            raise FileNotFoundError(f"Required halt_gate.pt not found at {gate_path}.")
 
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype, device)
@@ -204,6 +208,8 @@ def load_components(args: argparse.Namespace):
             halt_gate.load_state_dict(torch.load(gate_path, map_location=device))
             halt_gate.eval()
         else:
+            if bool(getattr(args, "require_halt_gate", False)):
+                raise FileNotFoundError(f"Required halt_gate.pt not found at {gate_path}.")
             print(f"[inference] halt_gate.pt not found at {gate_path}; using fixed-depth latent inference.")
 
     return model, tokenizer, halt_gate, device
