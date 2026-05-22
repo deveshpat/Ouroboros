@@ -79,10 +79,6 @@ DEFAULT_KAGGLE_NOTEBOOK_PATH = Path(__file__).resolve().parents[2] / "kaggle-uti
 DEFAULT_IO_RETRIES = 3
 DEFAULT_IO_RETRY_BASE_DELAY_S = 1.5
 DILOCO_TERMINAL_STAGE = 10
-DILOCO_RUN_MODE = "diloco"
-DGAC_ANCHOR_EVAL_RUN_MODE = "dgac-anchor-eval"
-DGAC_TRAIN_RUN_MODE = "dgac-train"
-DGAC_CANARY_RUN_MODE = "dgac-canary"
 DGAC_DILOCO_RUN_MODE = "dgac-diloco"
 DGAC_COMPLETE_MODE = "dgac-complete"
 
@@ -152,11 +148,17 @@ def parse_args() -> argparse.Namespace:
              "without aggregating or triggering anything.",
     )
     parser.add_argument(
+        "--launch_worker_ids",
+        default="",
+        help=(
+            "Comma-separated worker IDs to launch on Kaggle, e.g. 'A,B'. "
+            "Empty means aggregate/check only and do not push notebooks."
+        ),
+    )
+    parser.add_argument(
         "--force_worker_ids",
         default=None,
-        help="Comma-separated worker IDs to force-trigger regardless of shard size, "
-             "e.g. 'A,B'. Bypasses min_shard_samples check. "
-             "Useful for quota-exhausted scenarios.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--outer_lr", type=float, default=0.7)
     parser.add_argument(
@@ -177,20 +179,6 @@ def parse_args() -> argparse.Namespace:
             "before promoting a partial attendance set. Default 5.0."
         ),
     )
-    parser.add_argument(
-        "--kaggle_run_mode",
-        default=os.environ.get("OUROBOROS_KAGGLE_RUN_MODE", DILOCO_RUN_MODE),
-        choices=[DILOCO_RUN_MODE, DGAC_ANCHOR_EVAL_RUN_MODE, DGAC_TRAIN_RUN_MODE, DGAC_CANARY_RUN_MODE, DGAC_DILOCO_RUN_MODE],
-        help=(
-            "Kaggle notebook launch mode. Use 'dgac-anchor-eval' to push one "
-            "GPU eval-only notebook for the terminal DiLoCo anchor; use "
-            "'dgac-train' to launch Phase 3.4 DGAC from the terminal anchor, "
-            "'dgac-canary' to launch a bounded short DGAC objective canary, "
-            "'dgac-diloco' to initialize DGAC as a DiLoCo worker round."
-            "Anchor eval, dgac-train, skip DiLoCo round_state mutations; dgac-diloco intentionally uses them."
-        ),
-    )
-
     # Per-worker Kaggle credentials (each account can only trigger its own notebook)
     parser.add_argument(
         "--kaggle_username_a",
@@ -216,7 +204,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb_project", default="ouroboros-stage3-jamba")
     parser.add_argument("--wandb_entity", default=None)
     parser.add_argument("--total_train_samples", type=int, default=36906)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.force_worker_ids and not args.launch_worker_ids:
+        args.launch_worker_ids = args.force_worker_ids
+    args.force_worker_ids = args.launch_worker_ids or None
+    return args
 
 
 
@@ -408,252 +400,29 @@ def _build_kaggle_creds(args: argparse.Namespace) -> Dict[str, Tuple[Optional[st
     }
 
 
-def _kaggle_eval_worker_ids(args: argparse.Namespace) -> List[str]:
-    if args.force_worker_ids:
-        requested = _ordered_unique_worker_ids(
-            [w.strip().upper() for w in str(args.force_worker_ids).split(",") if w.strip()]
-        )
-        if requested:
-            return requested
-    # One anchor eval is sufficient; default to Worker A for a deterministic one-click path.
-    return ["A"]
 
-def _kaggle_dgac_worker_ids(args: argparse.Namespace) -> List[str]:
-    if args.force_worker_ids:
-        requested = _ordered_unique_worker_ids(
-            [w.strip().upper() for w in str(args.force_worker_ids).split(",") if w.strip()]
-        )
-        if requested:
-            # DGAC is a single training job, not a DiLoCo quorum. Honor the first
-            # requested worker only to avoid duplicate jobs racing Hub checkpoint writes.
-            return [requested[0]]
-    # DGAC is a single training job, not a DiLoCo quorum. Default to Worker A.
-    return ["A"]
+def _requested_launch_worker_ids(args: argparse.Namespace) -> List[str]:
+    raw = getattr(args, "launch_worker_ids", None) or getattr(args, "force_worker_ids", None)
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        values = raw
+    else:
+        values = [part.strip() for part in str(raw).split(",")]
+    return _ordered_unique_worker_ids([str(value).upper() for value in values if str(value).strip()])
 
 
-def _kaggle_dgac_diloco_worker_ids(args: argparse.Namespace) -> List[str]:
-    if args.force_worker_ids:
-        requested = _ordered_unique_worker_ids(
-            [w.strip().upper() for w in str(args.force_worker_ids).split(",") if w.strip()]
-        )
-        if requested:
-            return requested
-    kaggle_creds = _build_kaggle_creds(args)
-    credentialed = [worker_id for worker_id in WORKER_IDS if kaggle_creds[worker_id][0] and kaggle_creds[worker_id][1]]
-    return credentialed or ["A"]
-
-
-def run_kaggle_anchor_eval(args: argparse.Namespace) -> None:
-    worker_ids = _kaggle_eval_worker_ids(args)
-    kaggle_creds = _build_kaggle_creds(args)
-    print(
-        "[kaggle-eval] Dispatching DGAC anchor eval-only notebook "
-        f"workers={worker_ids} repo={args.repo_id}"
-    )
-    if args.dry_run:
-        print("[kaggle-eval] DRY RUN — no Kaggle dispatch.")
-        return
-
-    dispatch_results = trigger_kaggle_workers(
-        kaggle_creds,
-        active_workers=worker_ids,
-        notebook_path=Path(args.kaggle_notebook_path),
-        coordinator_args=args,
-    )
-    if any(dispatch_results.get(worker_id) != "success" for worker_id in worker_ids):
-        raise RuntimeError(
-            "DGAC anchor eval-only dispatch failed: "
-            f"{dispatch_results}"
-        )
-    print(
-        "[kaggle-eval] Dispatch accepted by Kaggle. Monitor the Kaggle kernel "
-        "and W&B eval_only/* metrics; this mode does not mutate round_state."
-    )
-
-def _dispatch_post_dgac_completion_anchor_eval(args: argparse.Namespace) -> None:
-    """Launch one eval-only notebook after DGAC DiLoCo reaches its sample target."""
-    if args.skip_trigger:
-        print("[kaggle-eval] --skip_trigger set. Skipping automatic DGAC anchor eval.")
-        return
-    original_mode = getattr(args, "kaggle_run_mode", DILOCO_RUN_MODE)
-    try:
-        args.kaggle_run_mode = DGAC_ANCHOR_EVAL_RUN_MODE
-        run_kaggle_anchor_eval(args)
-    finally:
-        args.kaggle_run_mode = original_mode
-
-
-def run_kaggle_dgac_train(args: argparse.Namespace) -> None:
-    worker_ids = _kaggle_dgac_worker_ids(args)
-    kaggle_creds = _build_kaggle_creds(args)
-    run_mode = getattr(args, "kaggle_run_mode", DGAC_TRAIN_RUN_MODE)
-    label = "DGAC canary" if run_mode == DGAC_CANARY_RUN_MODE else "Phase 3.4 DGAC training"
-    print(
-        f"[kaggle-dgac] Dispatching {label} notebook "
-        f"workers={worker_ids} repo={args.repo_id}"
-    )
-    if args.dry_run:
-        print("[kaggle-dgac] DRY RUN — no Kaggle dispatch.")
-        return
-
-    dispatch_results = trigger_kaggle_workers(
-        kaggle_creds,
-        active_workers=worker_ids,
-        notebook_path=Path(args.kaggle_notebook_path),
-        coordinator_args=args,
-    )
-    if any(dispatch_results.get(worker_id) != "success" for worker_id in worker_ids):
-        raise RuntimeError(
-            "DGAC training dispatch failed: "
-            f"{dispatch_results}"
-        )
-    print(
-        "[kaggle-dgac] Dispatch accepted by Kaggle. Monitor the Kaggle kernel, "
-        "W&B train metrics, and any mode-specific output directory; "
-        "this mode does not mutate DiLoCo round_state."
-    )
-
-
-def _initial_dgac_diloco_state(
+def _planning_credentialed_workers(
     *,
-    previous_state: Optional[Dict[str, Any]],
-    worker_ids: List[str],
-    projected_shards: Dict[str, int],
-    seed: int,
-    dgac_round_n: int = 0,
-) -> Dict[str, Any]:
-    previous_state = dict(previous_state or {})
-    dedicated_round = max(int(dgac_round_n), 0)
-    return {
-        "stage_k": DILOCO_TERMINAL_STAGE,
-        "round_n": dedicated_round,
-        "dgac_round_n": dedicated_round,
-        "dgac_round_label": f"DGAC dedicated round {dedicated_round:03d}",
-        "mode": DGAC_DILOCO_RUN_MODE,
-        "triggered_workers": worker_ids,
-        "attendance_workers": [],
-        "projected_shards": projected_shards,
-        "anchor_path": ANCHOR_PREFIX,
-        "total_samples_seen": {str(DILOCO_TERMINAL_STAGE): 0},
-        "completed_stages": sorted({int(x) for x in previous_state.get("completed_stages", [])} | {DILOCO_TERMINAL_STAGE}),
-        "dgac_manual_gate": False,
-        "dgac_diloco": True,
-        "pre_dgac_total_samples_seen": previous_state.get("total_samples_seen", {}),
-        "last_updated": time.time(),
-        "triggered_at": time.time(),
-        "dispatch_failures": [],
-        "last_round_workers": [],
-        "last_round_samples": 0,
-        "seed": seed,
-    }
-
-
-def _next_dgac_dedicated_round_n(previous_state: Optional[Dict[str, Any]]) -> int:
-    """Return the next external DGAC dedicated round number.
-
-    Normal DiLoCo terminal state is the pre-DGAC gate, so its first dedicated
-    round is 000. Once any DGAC worker/complete state exists, a manual relaunch
-    must advance the number to avoid reusing W&B ids such as dgac-a-r000.
-    """
-    state = dict(previous_state or {})
-    if not state:
-        return 0
-
-    is_dgac_state = (
-        state.get("mode") in {DGAC_DILOCO_RUN_MODE, DGAC_COMPLETE_MODE}
-        or bool(state.get("dgac_diloco"))
-        or bool(state.get("dgac_diloco_complete"))
-        or "dgac_round_n" in state
-        or "next_dgac_round_n" in state
-    )
-    if not is_dgac_state:
-        return 0
-
-    if state.get("next_dgac_round_n") is not None:
-        return max(int(state["next_dgac_round_n"]), 0)
-
-    candidates: List[int] = []
-    for key in ("dgac_round_n", "round_n"):
-        value = state.get(key)
-        if value is None:
-            continue
-        try:
-            candidates.append(int(value))
-        except (TypeError, ValueError):
-            continue
-    return max(candidates or [-1]) + 1
-
-
-def run_kaggle_dgac_diloco(args: argparse.Namespace) -> None:
-    worker_ids = _kaggle_dgac_diloco_worker_ids(args)
-    kaggle_creds = _build_kaggle_creds(args)
-    seed = int(getattr(args, "seed", 42))
-    previous_state = None if args.dry_run else hub_download_json(args.repo_id, ROUND_STATE_PATH, args.hf_token)
-    dgac_round_n = _next_dgac_dedicated_round_n(previous_state)
-    projected_shards = _compute_projected_shards(
-        total_samples=args.total_train_samples,
-        stage_k=DILOCO_TERMINAL_STAGE,
-        round_n=dgac_round_n,
-        seed=seed,
-        total_samples_seen=0,
-    )
-    print(
-        "[kaggle-dgac-diloco] Initializing DGAC dedicated round "
-        f"{dgac_round_n:03d} workers={worker_ids} repo={args.repo_id}"
-    )
-    if args.dry_run:
-        print("[kaggle-dgac-diloco] DRY RUN — no round_state mutation or Kaggle dispatch.")
-        print(f"  dgac_round_n={dgac_round_n}")
-        print(f"  projected_shards={projected_shards}")
-        return
-
-    new_state = _initial_dgac_diloco_state(
-        previous_state=previous_state,
-        worker_ids=worker_ids,
-        projected_shards=projected_shards,
-        seed=seed,
-        dgac_round_n=dgac_round_n,
-    )
-    hub_upload_json(
-        args.repo_id,
-        ROUND_STATE_PATH,
-        new_state,
-        args.hf_token,
-        message=f"DGAC dedicated round {dgac_round_n:03d} start: workers={worker_ids}",
-    )
-
-    dispatch_results = trigger_kaggle_workers(
-        kaggle_creds,
-        active_workers=worker_ids,
-        notebook_path=Path(args.kaggle_notebook_path),
-        coordinator_args=args,
-    )
-    reconcile_plan = plan_dispatch_reconciliation(
-        state=new_state,
-        planned_active_workers=worker_ids,
-        planned_attendance_workers=[],
-        dispatch_results=dispatch_results,
-    )
-    if reconcile_plan.corrected_state is not None:
-        hub_upload_json(
-            args.repo_id,
-            ROUND_STATE_PATH,
-            reconcile_plan.corrected_state,
-            args.hf_token,
-            message=(
-                f"DGAC dedicated round {dgac_round_n:03d} dispatch reconcile: "
-                f"mode={reconcile_plan.corrected_state['mode']}"
-            ),
-        )
-    if any(dispatch_results.get(worker_id) != "success" for worker_id in worker_ids):
-        raise RuntimeError(
-            f"DGAC dedicated round {dgac_round_n:03d} dispatch failed: "
-            f"{dispatch_results}"
-        )
-    print(
-        f"[kaggle-dgac-diloco] DGAC dedicated round {dgac_round_n:03d} dispatch accepted. "
-        "Worker signals will resume aggregation for adapter + HaltGate anchors."
-    )
+    credentialed_workers: List[str],
+    launch_worker_ids: List[str],
+) -> List[str]:
+    # Non-empty launch_worker_ids is the explicit dispatch contract: the
+    # coordinator may only push selected worker notebooks. Credentials are still
+    # checked during dispatch; missing credentials become manual dispatches.
+    if launch_worker_ids:
+        return launch_worker_ids
+    return credentialed_workers
 
 
 def main() -> None:
@@ -661,16 +430,13 @@ def main() -> None:
     if not args.hf_token:
         raise SystemExit("HF token required. Set HF_TOKEN or pass --hf_token.")
 
-    kaggle_run_mode = getattr(args, "kaggle_run_mode", DILOCO_RUN_MODE)
-    if kaggle_run_mode == DGAC_ANCHOR_EVAL_RUN_MODE:
-        run_kaggle_anchor_eval(args)
-        return
-    if kaggle_run_mode in {DGAC_TRAIN_RUN_MODE, DGAC_CANARY_RUN_MODE}:
-        run_kaggle_dgac_train(args)
-        return
-    if kaggle_run_mode == DGAC_DILOCO_RUN_MODE:
-        run_kaggle_dgac_diloco(args)
-        return
+    launch_worker_ids = _requested_launch_worker_ids(args)
+    if not launch_worker_ids:
+        args.skip_trigger = True
+        print("[coordinator] launch_worker_ids empty: aggregate/check only; no Kaggle notebooks will be pushed.")
+    else:
+        args.force_worker_ids = ",".join(launch_worker_ids)
+        print(f"[coordinator] Explicit Kaggle launch workers: {launch_worker_ids}")
 
     print("[coordinator] Reading round state...")
     state = hub_download_json(args.repo_id, ROUND_STATE_PATH, args.hf_token)
@@ -680,13 +446,17 @@ def main() -> None:
 
     kaggle_creds = _build_kaggle_creds(args)
     credentialed = [w for w in WORKER_IDS if kaggle_creds[w][0] and kaggle_creds[w][1]]
+    planning_credentialed = _planning_credentialed_workers(
+        credentialed_workers=credentialed,
+        launch_worker_ids=launch_worker_ids,
+    )
 
     round_plan = plan_round_start(
         state=state,
         total_train_samples=args.total_train_samples,
         min_shard_samples=args.min_shard_samples,
-        credentialed_workers=credentialed,
-        force_worker_ids=args.force_worker_ids,
+        credentialed_workers=planning_credentialed,
+        force_worker_ids=launch_worker_ids or None,
         worker_timeout_hours=args.worker_timeout_hours,
     )
     stage_k = round_plan.stage_k
@@ -696,8 +466,6 @@ def main() -> None:
     expected_workers = round_plan.expected_workers
     seed = int(state.get("seed", 42))
     current_mode = round_plan.current_mode
-    if bool(state.get("dgac_diloco")) and current_mode != DGAC_COMPLETE_MODE:
-        args.kaggle_run_mode = DGAC_DILOCO_RUN_MODE
     triggered_at = float(state.get("triggered_at", 0.0))
 
     if current_mode == DGAC_COMPLETE_MODE or bool(state.get("dgac_diloco_complete")):
@@ -755,7 +523,7 @@ def main() -> None:
             state=state,
             round_plan=round_plan,
             responded_worker_ids=[str(w.get("worker_id", "")).upper() for w in responded_in_waiting],
-            credentialed_workers=credentialed,
+            credentialed_workers=planning_credentialed,
             total_train_samples=args.total_train_samples,
             min_shard_samples=args.min_shard_samples,
             attendance_join_grace_minutes=args.attendance_join_grace_minutes,
@@ -874,7 +642,7 @@ def main() -> None:
                     force_worker_ids=force_ids or [],
                     ready_worker_ids=ready_ids,
                     attendance_ready_ids=_positive_ready_worker_ids(attendance_ready_workers),
-                    credentialed_workers=credentialed,
+                    credentialed_workers=planning_credentialed,
                     is_round_timed_out=is_round_timed_out,
                     now=time.time(),
                 )
@@ -1049,8 +817,8 @@ def main() -> None:
             current_mode=current_mode,
             total_train_samples=args.total_train_samples,
             min_shard_samples=args.min_shard_samples,
-            credentialed_workers=credentialed,
-            force_worker_ids=force_ids,
+            credentialed_workers=planning_credentialed,
+            force_worker_ids=launch_worker_ids or None,
             expected_workers=expected_workers,
             attendance_workers=attendance_workers_prev,
             attendance_ready_ids=attendance_ready_ids,
@@ -1080,8 +848,7 @@ def main() -> None:
                 wandb.log({"coordinator/dgac_diloco_complete": 1}, step=round_n)
                 wandb.finish()
                 coordinator_wandb_run = None
-            _dispatch_post_dgac_completion_anchor_eval(args)
-            print("[coordinator] Done (DGAC dedicated round complete; anchor eval dispatched).")
+            print("[coordinator] Done (DGAC dedicated round complete; no automatic anchor eval dispatch).")
             return
 
         if post_decision.kind == "terminal_manual_gate":
@@ -1126,7 +893,7 @@ def main() -> None:
         # ── Trigger next workers ──────────────────────────────────────────────
         all_workers_to_trigger = _transition_dispatch_workers(post_decision)
         if args.skip_trigger:
-            print("[coordinator] --skip_trigger set. Skipping worker trigger.")
+            print("[coordinator] No Kaggle notebook push requested; skipping worker trigger.")
         elif not all_workers_to_trigger:
             print("[coordinator] No workers to trigger (stage complete or waiting with no dispatch needed).")
         else:

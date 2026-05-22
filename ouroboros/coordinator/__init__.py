@@ -1,4 +1,4 @@
-"""Coordinator public interface: orchestration, workers, dispatch, aggregation, and launch planning."""
+"""Coordinator public interface: orchestration, workers, dispatch, and aggregation."""
 
 from __future__ import annotations
 
@@ -13,9 +13,6 @@ _EXPORTS = {
     "run_diloco_worker": ("worker", "run_diloco_worker"),
     "RoundState": ("shared", "RoundState"),
     "CoordinatorTransitionDecision": ("decision", "CoordinatorTransitionDecision"),
-    "build_launch_command": ("kaggle_launch_matrix", "build_launch_command"),
-    "build_diloco_training_command": ("kaggle_commands", "build_diloco_training_command"),
-    "format_shell_command": ("kaggle_commands", "format_shell_command"),
 }
 
 __all__ = tuple(_EXPORTS)

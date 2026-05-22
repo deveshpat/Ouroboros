@@ -586,7 +586,33 @@ def _bootstrap_shared_install_requested() -> bool:
     return text is not None and text.lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _bootstrap_kaggle_preflight_done() -> bool:
+    text = _normalize_text(os.environ.get("OUROBOROS_KAGGLE_PREFLIGHT_DONE"))
+    return text is not None and text.lower() in {"1", "true", "yes", "y", "on"}
+
+
+def run_shared_install_preflight() -> None:
+    """Run filesystem-mutating bootstrap once from the Kaggle notebook process.
+
+    Torchrun child processes inherit ``OUROBOROS_KAGGLE_PREFLIGHT_DONE=1`` and
+    skip this expensive shared install phase, but they still run process-local
+    CUDA/import/shim finalization through :func:`ensure_environment`.
+    """
+    if _bootstrap_kaggle_preflight_done():
+        print("[bootstrap] Kaggle notebook preflight already marked complete; skipping shared install.")
+        return
+    _bootstrap_shared_install_phases()
+    os.environ["OUROBOROS_KAGGLE_PREFLIGHT_DONE"] = "1"
+    print("[bootstrap] Kaggle notebook preflight complete; child processes will skip shared install.")
+
+
 def _bootstrap_wait_for_shared_install() -> None:
+    if _bootstrap_kaggle_preflight_done():
+        rank = _bootstrap_env_rank()
+        prefix = "[bootstrap]" if rank == 0 else f"[bootstrap][rank={rank}]"
+        print(f"{prefix} Kaggle preflight marker detected; skipping shared install phase.")
+        return
+
     world_size = _bootstrap_env_world_size()
     if world_size <= 1 and not _bootstrap_shared_install_requested():
         _bootstrap_shared_install_phases()

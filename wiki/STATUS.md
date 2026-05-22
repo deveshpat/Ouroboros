@@ -73,7 +73,9 @@ Utils -> provider IO
 
 ## Dispatch controls
 
-manual inputs -> `force_worker_ids`, `skip_trigger`, `dry_run`, `kaggle_run_mode`, `benchmark_suite`, optional `benchmark_tasks`, `dgac_anchor_eval_resume_mode`.
+manual inputs -> `launch_worker_ids`, `dry_run`, `attendance_join_grace_minutes`.
+
+Kaggle launch model -> edit visible command in `kaggle-utils.ipynb`; run coordinator with `launch_worker_ids=A,B` to push selected workers. Empty `launch_worker_ids` means aggregate/check only.
 
 ## Active risks
 

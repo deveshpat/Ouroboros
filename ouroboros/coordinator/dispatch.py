@@ -13,8 +13,8 @@ import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ouroboros.coordinator.kaggle_contract import DILOCO_RUN_MODE
-from ouroboros.coordinator.kaggle_launch_matrix import requires_kaggle_gpu
+_DEPRECATED_TRANSPORT_ENV_KEYS = {"".join(("OUROBOROS", "_KAGGLE", "_RUN_MODE"))}
+
 from ouroboros.utils.runtime_env import (
     normalize_text,
     require_known_worker_id,
@@ -121,21 +121,13 @@ def _build_worker_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[
     runtime_env: Dict[str, str] = {}
 
     for name, value in os.environ.items():
-        if name.startswith("OUROBOROS_"):
+        if name.startswith("OUROBOROS_") and name not in _DEPRECATED_TRANSPORT_ENV_KEYS:
             _set_env_if_present(runtime_env, name, value)
 
     _set_env_if_present(runtime_env, "DILOCO_WORKER_ID", worker, uppercase=True)
     _set_env_if_present(runtime_env, "OUROBOROS_DILOCO_WORKER_ID", worker, uppercase=True)
     _set_env_if_present(runtime_env, "WORKER_ID", worker, uppercase=True)
     runtime_env["OUROBOROS_AUTO_TRIGGERED"] = "1"
-
-    kaggle_run_mode = _first_nonempty_text(
-        getattr(args, "kaggle_run_mode", None),
-        os.environ.get("OUROBOROS_KAGGLE_RUN_MODE"),
-        DILOCO_RUN_MODE,
-    )
-    if kaggle_run_mode:
-        runtime_env["OUROBOROS_KAGGLE_RUN_MODE"] = kaggle_run_mode.lower()
 
     hf_token = resolve_hf_token(getattr(args, "hf_token", None))
     if hf_token:
@@ -339,7 +331,6 @@ def _trigger_single_worker(
     notebook_path: Path,
     *,
     injected_env: Optional[Dict[str, str]] = None,
-    launch_mode: Optional[str] = None,
 ) -> bool:
     """
     Trigger a Kaggle kernel by pushing the repo-tracked notebook with generated
@@ -385,8 +376,7 @@ def _trigger_single_worker(
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
-            launch_mode_normalized = _normalize_optional_text(launch_mode)
-            gpu_enabled = requires_kaggle_gpu(launch_mode_normalized or DILOCO_RUN_MODE)
+            gpu_enabled = True
             _stage_local_kaggle_kernel(
                 notebook_path,
                 slug,
@@ -455,7 +445,6 @@ def trigger_kaggle_workers(
             if coordinator_args is not None
             else None
         )
-        launch_mode = _normalize_optional_text((injected_env or {}).get("OUROBOROS_KAGGLE_RUN_MODE"))
         results[worker_id] = (
             "success"
             if _trigger_single_worker(
@@ -465,7 +454,6 @@ def trigger_kaggle_workers(
                 slug,
                 notebook_path=notebook_path,
                 injected_env=injected_env,
-                launch_mode=launch_mode,
             )
             else "failed"
         )

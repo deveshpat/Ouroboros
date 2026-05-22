@@ -13,6 +13,7 @@
 | Kaggle CLI prints `Kernel push error`/quota text with non-fatal process behavior | Classify push output strictly: require `successfully pushed`; treat quota/error markers as failed dispatch for immediate reconciliation |
 | `kaggle==1.6.17` + `"accelerator": "nvidiaTeslaT4"` → still P100 | Root cause 1: `--accelerator` added in v1.8.4. Root cause 2: wrong cap. Fix: `kaggle>=1.8.4` + cap fix + runtime fast-fail. All verified. |
 | `--use_halt_gate` starts from random LoRA weights in DiLoCo path | `--resume_from_diloco_anchor` loads `diloco_state/anchor/` before DGAC training |
+| Kaggle command hidden behind launch-mode modules | `kaggle-utils.ipynb` owns the visible `torchrun` command; coordinator only injects transport env and pushes selected workers |
 | `last_hidden_state` None | assert in all forward paths |
 | OOM at val | `empty_cache()` + small `val_batch_size`; validation/generation must stay inference-only |
 | mamba-ssm 2.x API break | Pinned to 1.2.2 |

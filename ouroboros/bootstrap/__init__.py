@@ -14,6 +14,7 @@ _export_module(_guardrails)
 
 __all__ = (
     "ensure_environment",
+    "run_shared_install_preflight",
     "install_or_verify_dependencies",
     "detect_runtime_context",
     "classify_failure_log",

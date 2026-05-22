@@ -15,7 +15,9 @@ download anchor -> train shard -> upload adapter -> upload status -> push signal
 
 ## Coordinator
 
-read statuses -> load anchor + worker weights -> aggregate -> promote new anchor -> write next round -> dispatch workers.
+read statuses -> load anchor + worker weights -> aggregate -> promote new anchor -> write next round.
+
+Dispatch is explicit: `launch_worker_ids=A,B` pushes selected staged notebooks; empty `launch_worker_ids` performs aggregate/check only. The staged notebook injection remains the transport seam for worker id, tokens, repo/ref/commit, state/signal repos, and W&B metadata.
 
 ## Aggregation
 
@@ -29,5 +31,5 @@ Coordinator needs presence, not fake samples.
 
 ## DGAC DiLoCo
 
-terminal anchor -> DGAC worker round -> adapter + HaltGate aggregation.
-DGAC start must load `diloco_state/anchor` with `halt_gate.pt` when present.
+terminal anchor -> explicit `launch_worker_ids` DGAC worker round -> adapter + HaltGate aggregation.
+DGAC start must load `diloco_state/anchor` with `halt_gate.pt` when present. The visible Kaggle command in `kaggle-utils.ipynb` owns the DGAC/DiLoCo launch args.
