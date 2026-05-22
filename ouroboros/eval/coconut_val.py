@@ -74,14 +74,29 @@ def inspect_local_validation(data_dir: str | Path) -> dict[str, Any]:
     rows = _load_jsonl(path)
     ids = [str(row.get(ID_FIELD, "")).strip() for row in rows]
     sources = [str(row.get(SOURCE_FIELD, "")).strip() or "<missing>" for row in rows]
+    answers = [str(row.get(ANSWER_FIELD, "")).strip() for row in rows]
     missing_positions = [idx for idx, value in enumerate(ids) if not value]
     duplicate_ids = sorted([value for value, count in Counter(ids).items() if value and count > 1])
+    missing_answer_ids = [
+        ids[idx] or f"<row:{idx}>"
+        for idx, value in enumerate(answers)
+        if value == ""
+    ]
+    missing_answer_sources = Counter(
+        sources[idx]
+        for idx, value in enumerate(answers)
+        if value == ""
+    )
     status = "ok" if not missing_positions and not duplicate_ids else "invalid"
     return {
         "status": status,
         "path": str(path),
         "row_count": len(rows),
         "source_counts": dict(sorted(Counter(sources).items())),
+        "scorable_answer_count": len(rows) - len(missing_answer_ids),
+        "missing_answer_norm_count": len(missing_answer_ids),
+        "missing_answer_norm_ids": missing_answer_ids[:50],
+        "missing_answer_norm_by_source": dict(sorted(missing_answer_sources.items())),
         "missing_id_count": len(missing_positions),
         "missing_ids": missing_positions[:50],
         "duplicate_id_count": len(duplicate_ids),
@@ -153,6 +168,7 @@ def _iter_validation_rows(data_dir: str | Path, limit_samples: int | None) -> li
         )
     rows = _load_jsonl(path)
     valid_rows: list[dict[str, Any]] = []
+    skipped_missing_answers: list[str] = []
     for row in rows:
         sample_id = str(row.get(ID_FIELD, "")).strip()
         question = str(row.get(QUESTION_FIELD, "")).strip()
@@ -162,10 +178,18 @@ def _iter_validation_rows(data_dir: str | Path, limit_samples: int | None) -> li
         if not question:
             raise ValueError(f"validation row {sample_id!r} missing required {QUESTION_FIELD!r}")
         if answer_norm == "":
-            raise ValueError(f"validation row {sample_id!r} missing required {ANSWER_FIELD!r}")
+            skipped_missing_answers.append(sample_id)
+            continue
         valid_rows.append(row)
         if limit_samples is not None and len(valid_rows) >= int(limit_samples):
             break
+    if skipped_missing_answers:
+        preview = ", ".join(skipped_missing_answers[:10])
+        suffix = "" if len(skipped_missing_answers) <= 10 else f", +{len(skipped_missing_answers) - 10} more"
+        print(
+            f"[eval] Skipped {len(skipped_missing_answers)} validation rows without {ANSWER_FIELD!r} "
+            f"before selecting {len(valid_rows)} scorable rows: {preview}{suffix}"
+        )
     return valid_rows
 
 
