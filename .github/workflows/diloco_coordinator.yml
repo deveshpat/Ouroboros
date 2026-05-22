@@ -20,6 +20,28 @@ on:
         description: 'Waiting-mode attendance barrier grace. Default 5 minutes.'
         required: false
         default: '5'
+      eval_mode:
+        description: 'Dispatch generated-answer eval instead of coordinate loop.'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - sample-25
+          - full
+      eval_worker_id:
+        description: 'Kaggle worker notebook/account to use for eval dispatch.'
+        required: false
+        default: 'A'
+        type: choice
+        options:
+          - A
+          - B
+          - C
+      eval_output_dir:
+        description: 'Optional explicit eval artifact directory. Empty uses mode default under runs/eval/.'
+        required: false
+        default: ''
 
 concurrency:
   group: diloco-coordinate
@@ -82,5 +104,8 @@ jobs:
             --kaggle_key_c      "$KAGGLE_KEY_C" \
             --total_train_samples 36906 \
             --min_shard_samples  32 \
+            --eval_mode         "${{ github.event.inputs.eval_mode || 'none' }}" \
+            --eval_worker_id    "${{ github.event.inputs.eval_worker_id || 'A' }}" \
+            --eval_output_dir   "${{ github.event.inputs.eval_output_dir || '' }}" \
             --launch_worker_ids "${{ github.event.inputs.launch_worker_ids || '' }}" \
             ${{ github.event.inputs.dry_run == 'true' && '--dry_run' || '' }}

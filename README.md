@@ -77,6 +77,14 @@ Recent eval-only anchor validation completed successfully through the Coconut ru
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m compileall -q ouroboros
 ```
 
+The `coordinate` GitHub Actions workflow can now dispatch the generated-answer eval to a Kaggle worker notebook:
+
+```text
+eval_mode=sample-25 -> compare-coconut-val with --limit_samples 25
+inspect artifacts  -> runs/eval/coconut_val_compare_sample_25
+eval_mode=full      -> compare-coconut-val over the full validation split
+```
+
 ## Known release blockers
 
 These are intentional blockers before public claims or a world-facing deployment:

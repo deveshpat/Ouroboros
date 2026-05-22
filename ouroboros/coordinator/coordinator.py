@@ -204,6 +204,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb_project", default="ouroboros-stage3-jamba")
     parser.add_argument("--wandb_entity", default=None)
     parser.add_argument("--total_train_samples", type=int, default=36906)
+    parser.add_argument(
+        "--eval_mode",
+        choices=("none", "sample-25", "full"),
+        default="none",
+        help=(
+            "Dispatch a generated-answer Coconut validation eval notebook instead of "
+            "running the DiLoCo coordinator loop. sample-25 uses --limit_samples 25; "
+            "full runs the whole validation split."
+        ),
+    )
+    parser.add_argument(
+        "--eval_worker_id",
+        default="A",
+        help="Kaggle worker account/notebook used for eval dispatch. Default: A.",
+    )
+    parser.add_argument("--eval_data_dir", default="data/coconut_v1")
+    parser.add_argument("--eval_dataset_repo", default="WeirdRunner/Ouroboros")
+    parser.add_argument("--eval_dataset_config", default="coconut-v1")
+    parser.add_argument("--eval_dataset_split", default="validation")
+    parser.add_argument(
+        "--eval_dataset_revision",
+        default="6a52cd0c47be1e7b85d9018225387950aefc4631",
+    )
+    parser.add_argument("--eval_baseline_model_id", default="ai21labs/AI21-Jamba-Reasoning-3B")
+    parser.add_argument("--eval_candidate_repo_id", default="WeirdRunner/Ouroboros")
+    parser.add_argument("--eval_candidate_subdir", default="diloco_state/anchor")
+    parser.add_argument("--eval_stage_k", type=int, default=10)
+    parser.add_argument("--eval_max_seq_len", type=int, default=512)
+    parser.add_argument("--eval_gen_max_tokens", type=int, default=128)
+    parser.add_argument("--eval_halt_threshold", type=float, default=0.5)
+    parser.add_argument("--eval_device", default="auto")
+    parser.add_argument("--eval_dtype", default="auto")
+    parser.add_argument(
+        "--eval_output_root",
+        default="runs/eval",
+        help="Root directory for generated eval artifacts inside the Kaggle notebook runtime.",
+    )
+    parser.add_argument(
+        "--eval_output_dir",
+        default="",
+        help="Optional explicit output directory for generated eval artifacts.",
+    )
+    parser.add_argument(
+        "--eval_disable_mamba_kernels",
+        action="store_true",
+        help="Forward --disable_mamba_kernels to compare-coconut-val.",
+    )
     args = parser.parse_args()
     if args.force_worker_ids and not args.launch_worker_ids:
         args.launch_worker_ids = args.force_worker_ids
@@ -425,10 +472,96 @@ def _planning_credentialed_workers(
     return credentialed_workers
 
 
+def _eval_limit_samples(args: argparse.Namespace) -> Optional[int]:
+    if args.eval_mode == "sample-25":
+        return 25
+    if args.eval_mode == "full":
+        return None
+    raise ValueError(f"Unsupported eval_mode: {args.eval_mode!r}")
+
+
+def _eval_output_dir(args: argparse.Namespace) -> str:
+    explicit = str(getattr(args, "eval_output_dir", "") or "").strip()
+    if explicit:
+        return explicit
+    leaf = "coconut_val_compare_sample_25" if args.eval_mode == "sample-25" else "coconut_val_compare_full"
+    return str(Path(args.eval_output_root) / leaf)
+
+
+def _build_eval_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[str, str]:
+    runtime_env = _build_worker_runtime_env(args, worker_id)
+    runtime_env.update(
+        {
+            "OUROBOROS_KAGGLE_RUN_KIND": "eval",
+            "OUROBOROS_EVAL_MODE": str(args.eval_mode),
+            "OUROBOROS_EVAL_DATA_DIR": str(args.eval_data_dir),
+            "OUROBOROS_EVAL_DATASET_REPO": str(args.eval_dataset_repo),
+            "OUROBOROS_EVAL_DATASET_CONFIG": str(args.eval_dataset_config),
+            "OUROBOROS_EVAL_DATASET_SPLIT": str(args.eval_dataset_split),
+            "OUROBOROS_EVAL_DATASET_REVISION": str(args.eval_dataset_revision),
+            "OUROBOROS_EVAL_BASELINE_MODEL_ID": str(args.eval_baseline_model_id),
+            "OUROBOROS_EVAL_CANDIDATE_REPO_ID": str(args.eval_candidate_repo_id),
+            "OUROBOROS_EVAL_CANDIDATE_SUBDIR": str(args.eval_candidate_subdir),
+            "OUROBOROS_EVAL_STAGE_K": str(int(args.eval_stage_k)),
+            "OUROBOROS_EVAL_MAX_SEQ_LEN": str(int(args.eval_max_seq_len)),
+            "OUROBOROS_EVAL_GEN_MAX_TOKENS": str(int(args.eval_gen_max_tokens)),
+            "OUROBOROS_EVAL_HALT_THRESHOLD": str(float(args.eval_halt_threshold)),
+            "OUROBOROS_EVAL_DEVICE": str(args.eval_device),
+            "OUROBOROS_EVAL_DTYPE": str(args.eval_dtype),
+            "OUROBOROS_EVAL_OUTPUT_DIR": _eval_output_dir(args),
+            "OUROBOROS_EVAL_CANDIDATE_REQUIRES_HALT_GATE": "1",
+        }
+    )
+    limit_samples = _eval_limit_samples(args)
+    if limit_samples is not None:
+        runtime_env["OUROBOROS_EVAL_LIMIT_SAMPLES"] = str(limit_samples)
+    if bool(getattr(args, "eval_disable_mamba_kernels", False)):
+        runtime_env["OUROBOROS_EVAL_DISABLE_MAMBA_KERNELS"] = "1"
+    return runtime_env
+
+
+def _dispatch_eval_notebook(args: argparse.Namespace) -> None:
+    worker_id = str(args.eval_worker_id or "").strip().upper()
+    if worker_id not in WORKER_IDS:
+        raise SystemExit(f"Invalid --eval_worker_id {args.eval_worker_id!r}; expected one of {WORKER_IDS}.")
+
+    kaggle_creds = _build_kaggle_creds(args)
+    username, key = kaggle_creds.get(worker_id, (None, None))
+    if not username or not key:
+        raise SystemExit(
+            f"Eval dispatch requested on worker {worker_id}, but its Kaggle credentials are missing."
+        )
+
+    _, slug = WORKER_KAGGLE_SLUGS[worker_id]
+    limit_samples = _eval_limit_samples(args)
+    limit_label = "full validation split" if limit_samples is None else f"{limit_samples} samples"
+    output_dir = _eval_output_dir(args)
+    print(
+        f"[coordinator] Dispatching generated-answer eval ({args.eval_mode}, {limit_label}) "
+        f"to Kaggle worker {worker_id}: {slug}"
+    )
+    print(f"[coordinator] Eval artifacts will be written under: {output_dir}")
+    ok = _trigger_single_worker(
+        worker_id,
+        username,
+        key,
+        slug,
+        notebook_path=Path(args.kaggle_notebook_path),
+        injected_env=_build_eval_runtime_env(args, worker_id),
+    )
+    if not ok:
+        raise SystemExit(2)
+    print("[coordinator] Eval notebook dispatched. Review Kaggle output/artifacts before launching the full run.")
+
+
 def main() -> None:
     args = parse_args()
     if not args.hf_token:
         raise SystemExit("HF token required. Set HF_TOKEN or pass --hf_token.")
+
+    if args.eval_mode != "none":
+        _dispatch_eval_notebook(args)
+        return
 
     launch_worker_ids = _requested_launch_worker_ids(args)
     if not launch_worker_ids:
