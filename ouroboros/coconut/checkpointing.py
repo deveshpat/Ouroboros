@@ -19,7 +19,8 @@ from ouroboros.utils.hub import (
     _parse_stage_dir_name,
     _read_training_state,
 )
-from ouroboros.models import _is_main_process, barrier
+from ouroboros.models import barrier
+from ouroboros.utils.runtime_env import is_main_process
 
 def save_checkpoint(
     output_dir: Path,
@@ -70,14 +71,14 @@ def save_checkpoint(
         shutil.rmtree(ckpt, ignore_errors=True)
     tmp.replace(ckpt)
     label = "best" if tag == "best" else "saved"
-    if _is_main_process():
+    if is_main_process():
         print(f"  [ckpt] {label} -> {ckpt}  token_acc={val_acc}  ce={val_ce}")
 
     hf_token  = getattr(args, "_resolved_hf_token", None)
     push      = getattr(args, "push_to_hub", False)
     repo_id   = getattr(args, "hf_repo_id", "WeirdRunner/Ouroboros")
     subdir    = getattr(args, "hf_stage_subdir", "runs/stage3")
-    if push and hf_token and _is_main_process():
+    if push and hf_token and is_main_process():
       stage_remote_prefix = f"{subdir.strip('/')}/stage_{stage_k}"
       _hub_upload_checkpoint(ckpt, repo_id, hf_token, remote_prefix=stage_remote_prefix)
     return ckpt
@@ -190,7 +191,7 @@ def find_latest_resume_checkpoint(
     if not hf_token:
         return None
 
-    if _is_main_process():
+    if is_main_process():
         print("  [resume] No local checkpoints found. Scanning Hub...")
 
     hub_candidates = _list_hub_stage_checkpoints(hf_repo_id, hf_token, hf_stage_subdir)
@@ -199,7 +200,7 @@ def find_latest_resume_checkpoint(
 
     for stage_k, step, rel_name in hub_candidates:
         ckpt_name = rel_name.split("/")[-1]
-        if _is_main_process():
+        if is_main_process():
             print(f"  [hub] downloading {rel_name} ...")
         downloaded = _hub_download_checkpoint(
             ckpt_name=ckpt_name,
@@ -209,7 +210,7 @@ def find_latest_resume_checkpoint(
             remote_prefix=f"{hf_stage_subdir}/stage_{stage_k}",
         )
         if downloaded is not None and (downloaded / "training_state.pt").exists():
-            if _is_main_process():
+            if is_main_process():
                 print(f"  [hub] using {rel_name} as resume checkpoint")
             return downloaded
 
@@ -233,7 +234,7 @@ def startup_hub_sync_and_prune(
     logged, but local pruning still follows the keep policy so stale numbered
     checkpoints do not accumulate across sessions.
     """
-    if not _is_main_process():
+    if not is_main_process():
         return
 
     all_ckpts: List[Tuple[Path, bool]] = []  # (path, is_resume)

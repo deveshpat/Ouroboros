@@ -10,7 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from ouroboros.models import _is_main_process, _maybe_apply_chat_template
+from ouroboros.models.loading import _maybe_apply_chat_template
+from ouroboros.utils.runtime_env import is_main_process
 
 def _download_dataset_from_hub(
     data_dir: Path,
@@ -22,7 +23,7 @@ def _download_dataset_from_hub(
     except ImportError:
         raise ImportError("pip install datasets")
 
-    is_main = _is_main_process()
+    is_main = is_main_process()
     if is_main:
         print(f"  [data] Local files missing. Downloading {hf_repo_id}[{hf_config}] from Hub...")
 
@@ -136,7 +137,7 @@ def load_canonical_dataset(
         train   = train[:n_train]
         val     = val[:n_val] if n_val else []
 
-    if _is_main_process():
+    if is_main_process():
         print(f"  Loaded {len(train)} train / {len(val)} val from {data_dir}")
         if stats:
             t = stats.get("train", {})
@@ -152,10 +153,10 @@ def get_max_stage(args: argparse.Namespace, stats: Dict[str, Any]) -> int:
         return int(args.max_stage)
     median = stats.get("train", {}).get("n_steps_median")
     if median is not None:
-        if _is_main_process():
+        if is_main_process():
             print(f"  --max_stage not set; using n_steps_median={median} from stats.json")
         return int(median)
-    if _is_main_process():
+    if is_main_process():
         print("  [warn] --max_stage not set and stats.json absent; defaulting to 10")
     return 10
 

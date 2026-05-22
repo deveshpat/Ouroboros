@@ -1,21 +1,22 @@
 """Inference public interface: prompt-to-generation runtime."""
 from __future__ import annotations
-from . import generation as _generation
 
-def _export_module(module):
-    for name in dir(module):
-        if name.startswith("__"):
-            continue
-        globals()[name] = getattr(module, name)
+from .generation import (
+    InferenceResult,
+    load_components,
+    main,
+    resolve_device,
+    resolve_dtype,
+    resolve_prompt,
+    run_single_prompt,
+)
 
-_export_module(_generation)
-
-__all__ = (
+__all__ = [
     "InferenceResult",
-    "resolve_prompt",
+    "load_components",
+    "main",
     "resolve_device",
     "resolve_dtype",
-    "load_components",
+    "resolve_prompt",
     "run_single_prompt",
-    "main",
-)
+]

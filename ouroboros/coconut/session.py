@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from ouroboros.bootstrap import (
+from ouroboros.bootstrap.runtime import (
     _require_valid_diloco_worker_id,
     _resolve_github_token_common,
     _wandb_credentials_available,
@@ -19,19 +19,18 @@ from ouroboros.bootstrap import (
 from ouroboros.coconut.data import get_max_stage, load_canonical_dataset
 from ouroboros.coconut.dgac import HaltGate
 from ouroboros.utils.hub import _resolve_hf_token
-from ouroboros.models import (
+from ouroboros.models import barrier, load_model_and_tokenizer
+from ouroboros.models.loading import (
     _distributed_is_initialized,
-    _is_main_process,
     _local_rank,
     _rank,
     _wandb_config,
     _world_size,
-    barrier,
     broadcast_parameters,
     get_trainable_parameters,
-    load_model_and_tokenizer,
     set_seed,
 )
+from ouroboros.utils.runtime_env import is_main_process
 from ouroboros.coconut.checkpointing import (
     _cleanup_distributed_resume_artifacts,
     _distributed_resume_marker,
@@ -189,7 +188,7 @@ def run_training_session(args: argparse.Namespace, *, script_start: float) -> No
     # ─────────────────────────────────────────────────────────────────────────
 
     if getattr(args, "push_to_hub", False) and not hf_token:
-        if _is_main_process():
+        if is_main_process():
             print("[warn] --push_to_hub set but no HF token found; Hub sync disabled.")
         args.push_to_hub = False
 

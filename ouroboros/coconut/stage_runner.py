@@ -19,11 +19,11 @@ from tqdm.auto import tqdm
 from ouroboros.coconut.data import build_sample_at_stage, collate_stage_k
 from ouroboros.coconut.dgac import HaltGate, coconut_forward
 from ouroboros.utils.hub import _read_training_state
-from ouroboros.models import (
+from ouroboros.models import barrier
+from ouroboros.models.loading import (
     _rank,
     _world_size,
     all_reduce_gradients,
-    barrier,
     broadcast_bool,
     get_trainable_parameters,
 )

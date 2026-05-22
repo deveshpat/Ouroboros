@@ -1,7 +1,7 @@
 # Lessons Learned
 > Operational hard lessons. Load when debugging a recurring failure class.
 >
-> **Guardrail rule:** this page is not allowed to be passive memory. Every table row must have a matching executable guardrail record in `ouroboros/hard_lesson_guardrails.py`; tests fail when a new lesson is documented without a preflight, runtime guard, regression test, or known-error signature.
+> **Guardrail rule:** this page is not allowed to be passive memory. Every table row must have a matching executable guardrail record in `ouroboros/bootstrap/guardrails.py`; local validation can use temporary inline commands instead of committed test files.
 
 | Symptom / Mistake | Fix Applied |
 |---|---|
@@ -19,3 +19,4 @@
 | mamba-ssm 2.x API break | Pinned to 1.2.2 |
 | NCCL watchdog kills DDP val | `timedelta(hours=4)` + env var |
 | BF16 emulation on T4 | `_amp_dtype` checks `cc >= (8,0)` |
+| Jamba fast path declared active but generation raises `Fast Mamba kernels are not available` | Shared post-load model runtime probe gates baseline, candidate, and inference loaders before eval/generation loops |

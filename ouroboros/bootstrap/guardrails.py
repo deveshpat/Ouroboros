@@ -3,8 +3,8 @@
 This module is intentionally stdlib-only so it can be imported by Kaggle
 preflight and local log triage without torch/CUDA/bootstrap side effects.
 Docs are not the source of enforcement by themselves: every row in
-``wiki/Lessons-Learned.md`` must have a matching registry entry here, and tests
-ratchet that contract so new lessons cannot be added as passive prose only.
+``wiki/Lessons-Learned.md`` must have a matching registry entry here. Local
+validation can use temporary inline commands instead of committed test files.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ class HardLessonGuardrail:
     refs: tuple[str, ...]
     remediation: str
     signature_patterns: tuple[str, ...] = ()
+    validation_command: str = ""
 
     def matches(self, text: str) -> bool:
         """Return True when this lesson's error signature is present in text."""
@@ -38,7 +39,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom='`kaggle kernels pull` → 403 in CI',
         kind='workflow-test',
         guardrail='Notebook/dispatch tests exercise push-only Kaggle publishing; CI never needs a pull step.',
-        refs=('tests/test_diloco_coordinator_dispatch.py',),
+        refs=('ouroboros/coordinator/dispatch.py', '.github/workflows/diloco_coordinator.yml'),
         remediation='Use local kernel metadata plus kernels push; do not introduce a kernels pull dependency in CI.',
         signature_patterns=('kaggle kernels pull', '403'),
     ),
@@ -54,7 +55,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom='Kaggle CLI prints `Kernel push error`/quota text with non-fatal process behavior',
         kind='error-signature-test',
         guardrail='Dispatch tests classify Kaggle stdout/stderr strictly and require a success marker.',
-        refs=('tests/test_diloco_coordinator_dispatch.py', 'ouroboros/coordinator/dispatch.py'),
+        refs=('ouroboros/coordinator/dispatch.py', 'wiki/Lessons-Learned.md'),
         remediation='Treat Kernel push error/quota markers as failed dispatch even if the process return code looks benign.',
         signature_patterns=('Kernel push error|quota', 'kaggle'),
     ),
@@ -70,7 +71,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom='Coordinator writes `triggered_workers` but push fails silently',
         kind='dispatch-reconcile-test',
         guardrail='Dispatch classification requires successful push output and coordinator re-dispatches triggered_at=0 states.',
-        refs=('tests/test_diloco_coordinator_dispatch.py', 'tests/test_diloco_coordinator_state.py'),
+        refs=('ouroboros/coordinator/dispatch.py', 'ouroboros/coordinator/state.py'),
         remediation='Mark failed dispatches with triggered_at=0 so the next coordinator pass re-dispatches immediately.',
         signature_patterns=('triggered_workers', 'push failed|failed dispatch|triggered_at=0'),
     ),
@@ -78,7 +79,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom='Solo mode with outer_lr=0.7 blends stale anchor into new weights',
         kind='aggregation-test',
         guardrail='Aggregation tests keep solo-worker promotion on the direct-promotion path instead of outer-LR blending.',
-        refs=('tests/test_diloco_coordinator_aggregation.py', 'ouroboros/coordinator/aggregation.py'),
+        refs=('ouroboros/coordinator/aggregation.py', 'wiki/Coordinator-State-Machine.md'),
         remediation='When only one worker contributes, promote its weights directly and skip the outer update blend.',
         signature_patterns=('solo', 'outer_lr', 'stale anchor|blend'),
     ),
@@ -86,7 +87,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom='Worker C quota exhausted → coordinator stalls forever',
         kind='coordinator-timeout',
         guardrail='Coordinator state tests demote timed-out attendance/workers via triggered_at and timeout policy.',
-        refs=('tests/test_diloco_coordinator_state.py', 'tests/test_deep_module_contracts.py'),
+        refs=('ouroboros/coordinator/state.py', 'wiki/Coordinator-State-Machine.md'),
         remediation='Use triggered_at plus timeout/attendance reconciliation; do not wait forever for exhausted accounts.',
         signature_patterns=('quota', 'Worker C|worker C', 'stall|waiting'),
     ),
@@ -94,7 +95,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom='OOM at val',
         kind='eval-memory-guard',
         guardrail='Validation/generation run under no_grad or inference_mode and microbatch eval work.',
-        refs=('ouroboros/coconut/evaluation.py', 'tests/test_validation_no_drift.py'),
+        refs=('ouroboros/coconut/evaluation.py', 'wiki/GPU-Guardrails.md'),
         remediation='Keep eval paths inference-only, empty CUDA cache before eval, and use small validation batches.',
         signature_patterns=('outofmemoryerror|CUDA out of memory|OOM', 'val|eval|validation'),
     ),
@@ -102,7 +103,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom='`last_hidden_state` None',
         kind='runtime-assertion',
         guardrail='Latent/model seams assert last_hidden_state is present in every forward path.',
-        refs=('ouroboros/models/loading.py', 'ouroboros/coconut/latent.py', 'tests/test_validation_no_drift.py'),
+        refs=('ouroboros/models/loading.py', 'ouroboros/coconut/latent.py'),
         remediation='Fail immediately at the forward seam with context instead of propagating None into later math.',
         signature_patterns=('last_hidden_state', 'None'),
     ),
@@ -110,7 +111,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom='BF16 emulation on T4',
         kind='dtype-runtime-guard',
         guardrail='AMP dtype selection uses BF16 only on sm80+ and FP16 on T4/V100.',
-        refs=('ouroboros/models/loading.py', 'tests/test_model_memory_policy.py'),
+        refs=('ouroboros/models/loading.py', 'wiki/GPU-Guardrails.md'),
         remediation='Use float16 on T4 sm75; reserve bfloat16 for Ampere/Hopper or equivalent native BF16 hardware.',
         signature_patterns=('BF16|bfloat16', 'T4|sm75|emulation'),
     ),
@@ -118,7 +119,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom='NCCL watchdog kills DDP val',
         kind='bootstrap-env-guard',
         guardrail='Root entrypoint sets NCCL watchdog/heartbeat timeout env vars before torch imports.',
-        refs=('ouroboros/coconut/__main__.py', 'tests/test_bootstrap_cli_contract.py'),
+        refs=('ouroboros/coconut/__main__.py', 'wiki/GPU-Guardrails.md'),
         remediation='Set TORCH_NCCL_* and NCCL_TIMEOUT before importing torch/distributed.',
         signature_patterns=('NCCL', 'watchdog|heartbeat|timeout', 'DDP|val|validation'),
     ),
@@ -126,7 +127,7 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom='mamba-ssm 2.x API break',
         kind='bootstrap-contract',
         guardrail='Bootstrap pins/installs the known-good mamba-ssm fast-path wheel and tests cover bootstrap CLI contract.',
-        refs=('ouroboros/bootstrap/runtime.py', 'tests/test_bootstrap_cli_contract.py', 'tests/requirements.sh'),
+        refs=('ouroboros/bootstrap/runtime.py', 'requirements.sh', 'wiki/Mamba-Bootstrap.md'),
         remediation='Use mamba-ssm 1.2.2 for this Jamba path until the 2.x API is explicitly migrated and tested.',
         signature_patterns=('mamba[-_]ssm', '2\\.x|API break|undefined symbol|module has no attribute|signature mismatch'),
     ),
@@ -134,9 +135,28 @@ HARD_LESSON_GUARDRAILS: tuple[HardLessonGuardrail, ...] = (
         symptom='`--use_halt_gate` starts from random LoRA weights in DiLoCo path',
         kind='cli-contract-test',
         guardrail='Training plan and worker lifecycle tests require resume_from_diloco_anchor for DGAC DiLoCo.',
-        refs=('tests/test_deep_module_contracts.py', 'tests/test_dgac_anchor_cli_contract.py', 'ouroboros/coconut/training_plan.py'),
+        refs=('ouroboros/coconut/training_plan.py', 'wiki/DiLoCo-Protocol.md'),
         remediation='Pair --use_halt_gate with --resume_from_diloco_anchor for DGAC anchor-start paths.',
         signature_patterns=('--use_halt_gate', 'random LoRA|resume_from_diloco_anchor'),
+    ),
+
+    HardLessonGuardrail(
+        symptom='Kaggle command hidden behind launch-mode modules',
+        kind='workflow-visibility',
+        guardrail='kaggle-utils.ipynb owns the visible torchrun command; coordinator only injects transport env and selected workers.',
+        refs=('kaggle-utils.ipynb', 'ouroboros/coordinator/dispatch.py'),
+        remediation='Keep the notebook launch cell readable and avoid hiding the torchrun command inside launch-mode-only Python modules.',
+        signature_patterns=('launch-mode|torchrun|kaggle-utils', 'hidden|not visible|command'),
+        validation_command='PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m compileall -q ouroboros',
+    ),
+    HardLessonGuardrail(
+        symptom='Jamba fast path declared active but generation raises `Fast Mamba kernels are not available`',
+        kind='runtime-readiness-contract',
+        guardrail='All Jamba model-load paths must pass the shared post-load runtime probe before logging the Mamba fast path as active.',
+        refs=('ouroboros/models/runtime.py', 'ouroboros/models/loading.py', 'ouroboros/inference/generation.py', 'ouroboros/eval/generation_runtime.py', 'wiki/Mamba-Bootstrap.md'),
+        remediation='Route baseline, candidate, and inference loading through the shared model runtime readiness seam and fail before the evaluation loop if the probe cannot pass.',
+        signature_patterns=('mamba CUDA kernels: fast path ACTIVE', 'Fast Mamba kernels are not available'),
+        validation_command='python - <<\'PY\'\nfrom ouroboros.bootstrap.guardrails import triage_failure_log_path\nprint(triage_failure_log_path("/mnt/data/kaggle-utils.log.txt"))\nPY',
     ),
 )
 

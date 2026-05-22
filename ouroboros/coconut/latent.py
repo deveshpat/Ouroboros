@@ -19,7 +19,7 @@ import torch.nn.functional as F
 DEFAULT_EVAL_GEN_MAX_TOKENS = 32
 
 
-from ouroboros.models import (
+from ouroboros.models.loading import (
     _amp_dtype,
     _autocast_ctx,
     _extract_last_hidden_state,

@@ -21,7 +21,9 @@ import torch
 
 from ouroboros.coconut import HaltGate
 from ouroboros.coconut import decode_from_latent_context, prepare_latent_runtime, run_latent_passes
-from ouroboros.models import MODEL_ID, _amp_dtype
+from ouroboros.models import MODEL_ID, load_base_model_and_tokenizer
+from ouroboros.models.loading import _amp_dtype
+from ouroboros.utils.runtime_env import resolve_hf_token
 
 DEFAULT_ADAPTER_REPO = "WeirdRunner/Ouroboros"
 DEFAULT_ADAPTER_SUBFOLDER = "diloco_state/anchor"
@@ -57,10 +59,6 @@ def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
     if text is None:
         return default
     return text.lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _resolve_hf_token(env: Mapping[str, str]) -> str | None:
-    return _normalize_text(env.get("HF_TOKEN")) or _normalize_text(env.get("HUGGINGFACE_HUB_TOKEN"))
 
 
 def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | None = None) -> argparse.Namespace:
@@ -161,9 +159,8 @@ def _load_tokenizer(base_model: str):
 def load_components(args: argparse.Namespace):
     """Load base model, resized tokenizer, PEFT adapter, and optional HaltGate."""
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM
 
-    token = _resolve_hf_token(os.environ)
+    token = resolve_hf_token(env=os.environ)
     adapter_dir = Path(args.adapter_dir) if args.adapter_dir else download_adapter_snapshot(
         repo_id=args.adapter_repo,
         subfolder=args.adapter_subfolder,
@@ -176,25 +173,19 @@ def load_components(args: argparse.Namespace):
             raise FileNotFoundError(f"Required halt_gate.pt not found at {gate_path}.")
 
     device = resolve_device(args.device)
-    dtype = resolve_dtype(args.dtype, device)
-    tokenizer = _load_tokenizer(args.base_model)
-
-    load_kwargs: dict[str, object] = {
-        "trust_remote_code": True,
-        "low_cpu_mem_usage": True,
-        "torch_dtype": dtype,
-    }
-    if args.disable_mamba_kernels or device.type != "cuda":
-        load_kwargs["use_mamba_kernels"] = False
-    if device.type == "cuda":
-        load_kwargs["device_map"] = {"": device.index or 0}
-
-    base_model = AutoModelForCausalLM.from_pretrained(args.base_model, **load_kwargs)
-    base_model.config.use_cache = False
-    if len(tokenizer) > int(base_model.get_input_embeddings().num_embeddings):
-        base_model.resize_token_embeddings(len(tokenizer))
-    if device.type != "cuda":
-        base_model = base_model.to(device)
+    _ = resolve_dtype(args.dtype, device)  # validates explicit dtype requests; model seam owns auto dtype policy.
+    base_model, tokenizer, _, lat_token_id = load_base_model_and_tokenizer(
+        SimpleNamespace(
+            model_id=args.base_model,
+            use_4bit=False,
+            grad_checkpoint=False,
+            disable_mamba_kernels=bool(getattr(args, "disable_mamba_kernels", False)),
+        ),
+        device,
+        add_lat_token=True,
+    )
+    if lat_token_id is None:
+        raise RuntimeError("inference model load did not add the required <|lat|> token")
 
     model = PeftModel.from_pretrained(base_model, str(adapter_dir), is_trainable=False)
     model.eval()

@@ -29,7 +29,7 @@ import tempfile
 import time
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -68,11 +68,11 @@ from ouroboros.coordinator.state import (
     _ordered_unique_worker_ids,
     _partition_ready_workers,
 )
+from ouroboros.coordinator.providers import HubProvider
+from ouroboros.coordinator.shared import retry_io as _retry_io
 from ouroboros.utils.runtime_env import resolve_hf_token, resolve_wandb_key
 from ouroboros.utils.wandb_runtime import wandb_init_kwargs
 
-
-T = TypeVar("T")
 
 ROUND_STATE_PATH = "diloco_state/round_state.json"
 DEFAULT_KAGGLE_NOTEBOOK_PATH = Path(__file__).resolve().parents[2] / "kaggle-utils.ipynb"
@@ -82,42 +82,6 @@ DILOCO_TERMINAL_STAGE = 10
 DGAC_DILOCO_RUN_MODE = "dgac-diloco"
 DGAC_COMPLETE_MODE = "dgac-complete"
 
-
-def _retry_io(
-    label: str,
-    fn: Callable[[], T],
-    *,
-    attempts: int = DEFAULT_IO_RETRIES,
-    base_delay_s: float = DEFAULT_IO_RETRY_BASE_DELAY_S,
-    swallow: bool = False,
-    default: Optional[T] = None,
-) -> Optional[T]:
-    """Retry transient coordinator I/O with exponential backoff."""
-    last_exc: Optional[Exception] = None
-    attempts = max(int(attempts), 1)
-    for attempt in range(1, attempts + 1):
-        try:
-            return fn()
-        except Exception as exc:  # noqa: BLE001 - coordinator must keep going on transient I/O errors
-            last_exc = exc
-            if attempt >= attempts:
-                if swallow:
-                    print(
-                        f"[coordinator] {label} failed after {attempts} attempts: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    return default
-                raise
-            delay = base_delay_s * (2 ** (attempt - 1))
-            print(
-                f"[coordinator] {label} failed (attempt {attempt}/{attempts}): "
-                f"{type(exc).__name__}: {exc}. Retrying in {delay:.1f}s..."
-            )
-            time.sleep(delay)
-    if swallow:
-        return default
-    assert last_exc is not None
-    raise last_exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -259,54 +223,25 @@ def parse_args() -> argparse.Namespace:
 
 
 
-def hub_download_json(repo_id: str, path: str, token: str) -> Optional[Dict]:
-    from huggingface_hub import hf_hub_download
-
-    def _download() -> Dict:
-        local = hf_hub_download(repo_id=repo_id, filename=path, token=token)
-        with open(local, encoding="utf-8") as f:
-            return json.load(f)
-
-    return _retry_io(
-        f"Download JSON {path}",
-        _download,
-        swallow=True,
-        default=None,
+def _hub_provider(repo_id: str, token: str) -> HubProvider:
+    return HubProvider(
+        repo_id=repo_id,
+        token=token,
+        attempts=DEFAULT_IO_RETRIES,
+        base_delay_s=DEFAULT_IO_RETRY_BASE_DELAY_S,
     )
 
 
+def hub_download_json(repo_id: str, path: str, token: str) -> Optional[Dict]:
+    return _hub_provider(repo_id, token).download_json(path, default=None)
+
 
 def hub_upload_json(repo_id: str, path: str, data: Dict, token: str, message: str) -> None:
-    from huggingface_hub import HfApi
+    _hub_provider(repo_id, token).upload_json(path, data, message=message)
 
-    api = HfApi(token=token)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tf:
-        json.dump(data, tf, indent=2)
-        tmp = tf.name
-    try:
-        _retry_io(
-            f"Upload JSON {path}",
-            lambda: api.upload_file(
-                path_or_fileobj=tmp,
-                path_in_repo=path,
-                repo_id=repo_id,
-                token=token,
-                commit_message=message,
-            ),
-        )
-    finally:
-        Path(tmp).unlink(missing_ok=True)
 
 def hub_download_text(repo_id: str, path: str, token: str) -> str:
-    from huggingface_hub import hf_hub_download
-
-    def _download() -> str:
-        local = hf_hub_download(repo_id=repo_id, filename=path, token=token)
-        return Path(local).read_text(encoding="utf-8")
-
-    result = _retry_io(f"Download text {path}", _download)
-    assert result is not None
-    return result
+    return _hub_provider(repo_id, token).download_text(path)
 
 def collect_ready_workers(
     repo_id: str,

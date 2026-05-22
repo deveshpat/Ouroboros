@@ -10,14 +10,14 @@ import torch
 from ouroboros.coconut.data import build_sample_at_stage, collate_stage_k
 from ouroboros.coconut.dgac import HaltGate
 from ouroboros.coconut.latent import forward_latent_batch, prepare_latent_runtime
-from ouroboros.models import (
+from ouroboros.models.loading import (
     _ddp_sum,
-    _is_main_process,
     _maybe_empty_cuda_cache,
     _rank,
     _world_size,
-    barrier,
 )
+from ouroboros.models import barrier
+from ouroboros.utils.runtime_env import is_main_process
 
 
 def _eval_progress_every(args: argparse.Namespace) -> int:
@@ -27,7 +27,7 @@ def _eval_progress_every(args: argparse.Namespace) -> int:
 
 def _emit_progress(message: str) -> None:
     """Print rank-0 progress immediately so Kaggle logs do not look stalled."""
-    if _is_main_process():
+    if is_main_process():
         print(message, flush=True)
 
 
@@ -179,7 +179,7 @@ def evaluate_stage_health_metrics(
             }
         }
     }
-    if _is_main_process():
+    if is_main_process():
         tf = metrics["health_metrics"]["teacher_forced"]
         _emit_progress(
             "  [eval] teacher-forced health: "
@@ -258,7 +258,7 @@ def run_eval_only(
         "health_metrics.teacher_forced.actual_latents_min": float(tf["actual_latents_min"]),
         "health_metrics.teacher_forced.actual_latents_max": float(tf["actual_latents_max"]),
     }
-    if _is_main_process():
+    if is_main_process():
         print(
             f"\n  [eval-only] stage={stage_k} val_ce={val_ce:.4f} val_token_acc={val_acc:.4f} "
             f"halt_gate_used={tf['halt_gate_used']} actual_latents_mean={tf['actual_latents_mean']:.2f}"

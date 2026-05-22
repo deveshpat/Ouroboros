@@ -16,17 +16,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from ouroboros.bootstrap import _resolve_github_token_common
+from ouroboros.bootstrap.runtime import _resolve_github_token_common
 from ouroboros.coordinator.shared import RoundState, ordered_unique_workers, retry_io
 from ouroboros.utils.wandb_runtime import wandb_init_kwargs
-from ouroboros.models import (
-    _is_main_process,
+from ouroboros.models import barrier
+from ouroboros.models.loading import (
+    _wandb_config,
     _world_size,
-    barrier,
     broadcast_parameters,
     get_trainable_parameters,
-    _wandb_config,
 )
+from ouroboros.utils.runtime_env import is_main_process
 
 _DILOCO_SHARD_STEP_FALLBACK = 385
 
@@ -137,7 +137,7 @@ def diloco_read_round_state(hf_token: str, repo_id: str) -> Dict[str, Any]:
         _download,
         swallow=True,
         default=None,
-        verbose=_is_main_process(),
+        verbose=is_main_process(),
     )
     if state is not None:
         return state
@@ -185,7 +185,7 @@ def diloco_upload_worker_state(
                     token=hf_token,
                     commit_message=f"Worker {worker_id} round {round_n} stage {stage_k}",
                 ),
-                verbose=_is_main_process(),
+                verbose=is_main_process(),
             )
 
     status = {
@@ -212,7 +212,7 @@ def diloco_upload_worker_state(
                 token=hf_token,
                 commit_message=f"Worker {worker_id} status update",
             ),
-            verbose=_is_main_process(),
+            verbose=is_main_process(),
         )
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -269,8 +269,8 @@ def diloco_download_anchor(
             weights = load_file(dl_path, device=str(device))
             _set_peft_model_state_dict_compat(model, weights)
 
-        retry_io(f"  [diloco] Download anchor {anchor_path}", _download, verbose=_is_main_process())
-        if _is_main_process():
+        retry_io(f"  [diloco] Download anchor {anchor_path}", _download, verbose=is_main_process())
+        if is_main_process():
             print(f"  [diloco] Loaded anchor weights from {anchor_path}")
 
         if halt_gate is not None:
@@ -291,20 +291,20 @@ def diloco_download_anchor(
                     _download_halt_gate,
                     swallow=not required,
                     default=False,
-                    verbose=_is_main_process(),
+                    verbose=is_main_process(),
                 )
             )
             if gate_loaded:
-                if _is_main_process():
+                if is_main_process():
                     print(f"  [diloco] Loaded halt gate from {anchor_path}/halt_gate.pt")
             elif required:
                 raise FileNotFoundError(f"Required DGAC halt gate missing at {anchor_path}/halt_gate.pt")
-            elif _is_main_process():
+            elif is_main_process():
                 print("  [diloco] No halt gate anchor found; using zero-init HaltGate.")
     except Exception as exc:
         if required:
             raise RuntimeError(f"Required DiLoCo anchor load failed at {anchor_path}: {exc}") from exc
-        if _is_main_process():
+        if is_main_process():
             print(f"  [diloco] No anchor found at {anchor_path} ({exc}); using current weights.")
 
 
@@ -346,7 +346,7 @@ def diloco_push_signal(
         lambda: requests.get(url, headers=headers, timeout=30),
         swallow=True,
         default=None,
-        verbose=_is_main_process(),
+        verbose=is_main_process(),
     )
     payload = {
         "message": f"Worker {worker_id} done: stage {stage_k} round {round_n}",
@@ -360,13 +360,13 @@ def diloco_push_signal(
         lambda: requests.put(url, headers=headers, json=payload, timeout=30),
         swallow=True,
         default=None,
-        verbose=_is_main_process(),
+        verbose=is_main_process(),
     )
     if resp is not None and resp.status_code in (200, 201):
-        if _is_main_process():
+        if is_main_process():
             print(f"  [diloco] Signal pushed to GitHub: {signal_path}")
     else:
-        if _is_main_process():
+        if is_main_process():
             if resp is None:
                 print(f"  [diloco] WARNING: GitHub signal push failed: no response for {signal_path}")
             else:
@@ -418,9 +418,9 @@ def _diloco_reset_triggered_at(hf_token: str, repo_id: str) -> None:
         "  [diloco] Reset triggered_at in round_state.json",
         _reset,
         swallow=True,
-        verbose=_is_main_process(),
+        verbose=is_main_process(),
     )
-    if _is_main_process():
+    if is_main_process():
         print(
             "  [diloco] triggered_at reset to 0 in round_state.json ✓ "
             "— coordinator will re-dispatch on next run (≤30 min)."
@@ -452,7 +452,7 @@ def run_diloco_worker(
         raise ValueError("--diloco_worker_id required with --diloco_mode")
     if not hf_token:
         raise ValueError("HF token required for DiLoCo mode")
-    if args.resume_from and _is_main_process():
+    if args.resume_from and is_main_process():
         print("  [diloco] Ignoring --resume_from; the shared anchor defines worker startup state.")
 
     round_state = diloco_read_round_state(hf_token, args.diloco_state_repo)
@@ -461,7 +461,7 @@ def run_diloco_worker(
     anchor_path = round_state.get("anchor_path", "diloco_state/anchor")
 
     if stage_k > curriculum_max_stage:
-        if _is_main_process():
+        if is_main_process():
             print(f"  [diloco] stage={stage_k} exceeds max configured stage={curriculum_max_stage}. Nothing to do.")
         return {"stage_k": stage_k, "round_n": round_n, "samples_seen": 0}
 
@@ -483,7 +483,7 @@ def run_diloco_worker(
     )
 
     if not is_selected_for_training and not is_attendance_only:
-        if _is_main_process():
+        if is_main_process():
             print(
                 f"  [diloco] Worker {args.diloco_worker_id} not scheduled for "
                 f"stage={stage_k} round={round_n}; exiting without training."
@@ -501,7 +501,7 @@ def run_diloco_worker(
         }
 
     if is_attendance_only:
-        if _is_main_process():
+        if is_main_process():
             print(
                 f"  [diloco] Worker {args.diloco_worker_id} in attendance mode — "
                 f"signaling presence (no training this round)."
@@ -558,7 +558,7 @@ def run_diloco_worker(
             "stages": [stage_k],
         }
 
-    if _is_main_process():
+    if is_main_process():
         print(f"  [diloco] Worker {args.diloco_worker_id} | stage={stage_k} round={round_n}")
         if args.push_to_hub:
             print("  [diloco] Regular stage checkpoint Hub sync is disabled in DiLoCo mode; worker uploads go to diloco_state/ only.")
@@ -590,7 +590,7 @@ def run_diloco_worker(
         args.seed,
         samples_already_seen=stage_samples_seen,
     )
-    if _is_main_process():
+    if is_main_process():
         print(
             f"  [diloco] Stage progress before round: "
             f"{stage_samples_seen}/{len(train_samples)} samples"
@@ -599,7 +599,7 @@ def run_diloco_worker(
         print(f"  [diloco] Shard size: {len(train_shard)} samples")
 
     if len(train_shard) == 0:
-        if _is_main_process():
+        if is_main_process():
             print("  [diloco] Empty shard — uploading passthrough status and signal.")
             # Save current adapter (anchor weights, unchanged) for status upload
             _passthrough_dir = output_dir / "diloco_worker_upload" / f"worker_{args.diloco_worker_id}_stage_{stage_k}_round_{round_n}_passthrough"
@@ -659,7 +659,7 @@ def run_diloco_worker(
     # Normal DiLoCo keeps stage/round names. DGAC uses dedicated-round names so
     # manual relaunches never collide with prior W&B run ids such as r0.
     diloco_wandb_run = None
-    if _is_main_process() and args.wandb_mode != "disabled":
+    if is_main_process() and args.wandb_mode != "disabled":
         try:
             import wandb as _wandb
             identity = _diloco_wandb_identity(
@@ -707,7 +707,7 @@ def run_diloco_worker(
         and args.diloco_worker_id == pre_val_leader
     )
     should_run_pre_val = bool(forced_pre_val or default_stage_pre_val)
-    if is_dgac_diloco and _is_main_process():
+    if is_dgac_diloco and is_main_process():
         if should_run_pre_val:
             print(
                 "  [dgac-diloco] Running leader pre-val before DGAC shard training "
@@ -730,7 +730,7 @@ def run_diloco_worker(
             args=args,
             halt_gate=halt_gate if args.use_halt_gate else None,
         )
-        if _is_main_process():
+        if is_main_process():
             print(f"  [diloco] Pre-training val: stage={stage_k} ce={val_ce:.4f} token_acc={val_acc:.4f}")
             if diloco_wandb_run is not None:
                 import wandb
@@ -789,7 +789,7 @@ def run_diloco_worker(
     samples_seen_this_round = int(min(result["samples_seen"], len(train_shard)))
 
     barrier()
-    if _is_main_process():
+    if is_main_process():
         upload_dir = output_dir / "diloco_worker_upload" / f"worker_{args.diloco_worker_id}_stage_{stage_k}_round_{round_n}"
         if upload_dir.exists():
             shutil.rmtree(upload_dir, ignore_errors=True)

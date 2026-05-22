@@ -164,3 +164,27 @@ def env_int(env: Mapping[str, Any] | None, name: str, *, default: int = 0) -> in
         return int(value)
     except ValueError:
         return int(default)
+
+
+def process_rank(env: Mapping[str, Any] | None = None) -> int:
+    env = os.environ if env is None else env
+    return env_int(env, "RANK", default=0)
+
+
+def local_process_rank(env: Mapping[str, Any] | None = None) -> int:
+    env = os.environ if env is None else env
+    value = normalize_text(env.get("LOCAL_RANK"))
+    if value is not None:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    return process_rank(env)
+
+
+def world_size(env: Mapping[str, Any] | None = None) -> int:
+    return env_int(env, "WORLD_SIZE", default=1)
+
+
+def is_main_process(env: Mapping[str, Any] | None = None) -> bool:
+    return process_rank(env) == 0

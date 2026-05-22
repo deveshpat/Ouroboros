@@ -9,52 +9,15 @@ from __future__ import annotations
 
 import json
 import tempfile
-import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, TypeVar
+from typing import Dict, List, Optional
 
-T = TypeVar("T")
+from ouroboros.coordinator.shared import retry_io as _retry_io
 
 ANCHOR_PREFIX = "diloco_state/anchor"
 DEFAULT_IO_RETRIES = 3
 DEFAULT_IO_RETRY_BASE_DELAY_S = 1.5
 
-
-def _retry_io(
-    label: str,
-    fn: Callable[[], T],
-    *,
-    attempts: int = DEFAULT_IO_RETRIES,
-    base_delay_s: float = DEFAULT_IO_RETRY_BASE_DELAY_S,
-    swallow: bool = False,
-    default: Optional[T] = None,
-) -> Optional[T]:
-    """Retry transient coordinator I/O with exponential backoff."""
-    last_exc: Optional[Exception] = None
-    attempts = max(int(attempts), 1)
-    for attempt in range(1, attempts + 1):
-        try:
-            return fn()
-        except Exception as exc:  # noqa: BLE001 - coordinator must keep going on transient I/O errors
-            last_exc = exc
-            if attempt >= attempts:
-                if swallow:
-                    print(
-                        f"[coordinator] {label} failed after {attempts} attempts: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    return default
-                raise
-            delay = base_delay_s * (2 ** (attempt - 1))
-            print(
-                f"[coordinator] {label} failed (attempt {attempt}/{attempts}): "
-                f"{type(exc).__name__}: {exc}. Retrying in {delay:.1f}s..."
-            )
-            time.sleep(delay)
-    if swallow:
-        return default
-    assert last_exc is not None
-    raise last_exc
 
 
 

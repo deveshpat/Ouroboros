@@ -11,8 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from ouroboros.bootstrap import _resolve_hf_token_common
-from ouroboros.models import _is_main_process
+from ouroboros.utils.runtime_env import is_main_process, resolve_hf_token
 
 def _parse_stage_dir_name(name: str) -> Optional[int]:
     if not name.startswith("stage_"):
@@ -26,7 +25,7 @@ def _read_training_state(ckpt_dir: Path, map_location: str = "cpu") -> Dict[str,
 
 
 def _resolve_hf_token(cli_value: Optional[str]) -> Optional[str]:
-    return _resolve_hf_token_common(cli_value)
+    return resolve_hf_token(cli_value)
 
 
 def _hub_upload_checkpoint(
@@ -54,11 +53,11 @@ def _hub_upload_checkpoint(
             run_as_future=True,
         )
         future.result(timeout=timeout_s)
-        if _is_main_process():
+        if is_main_process():
             print(f"  [hub] uploaded {remote_name} -> {hf_repo_id}")
         return True
     except Exception as exc:
-        if _is_main_process():
+        if is_main_process():
             print(f"  [hub] upload failed for {remote_name}: {exc}")
         return False
 
@@ -89,7 +88,7 @@ def _hub_download_checkpoint(
         )
         return dest if dest.exists() else None
     except Exception as exc:
-        if _is_main_process():
+        if is_main_process():
             print(f"  [hub] download failed for {remote_path}: {exc}")
         return None
 

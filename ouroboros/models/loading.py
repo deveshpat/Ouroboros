@@ -26,7 +26,7 @@ except ImportError:
     LoraConfig = get_peft_model = None  # type: ignore[assignment]
     _TF_VERSION = (0, 0)
 
-from ouroboros.bootstrap import _load_mamba_fast_path_symbols
+from . import runtime as model_runtime
 
 MODEL_ID = "ai21labs/AI21-Jamba-Reasoning-3B"
 
@@ -235,77 +235,23 @@ def _maybe_apply_chat_template(tokenizer, question: str) -> str:
 
 
 def _patch_transformers_jamba_fast_path_globals() -> bool:
-    """
-    Patch transformers.models.jamba.modeling_jamba module globals so the
-    runtime fast-path check sees the verified kernel symbols.
-    """
-    try:
-        import importlib as _il
-        _il.invalidate_caches()
-        import transformers.models.jamba.modeling_jamba as _jamba_mod
-        symbols = _load_mamba_fast_path_symbols()
-        changed = False
-        for name, value in symbols.items():
-            if getattr(_jamba_mod, name, None) is not value:
-                setattr(_jamba_mod, name, value)
-                changed = True
-        is_available = all(symbols.values())
-        if getattr(_jamba_mod, "is_fast_path_available", None) != is_available:
-            _jamba_mod.is_fast_path_available = is_available
-            changed = True
-        return is_available
-    except Exception:
-        return False
+    """Compatibility wrapper around the shared model runtime seam."""
+    return model_runtime.patch_transformers_jamba_fast_path_globals()
 
 
 def _probe_jamba_runtime_fast_path(model, device: torch.device, amp_dtype: torch.dtype) -> None:
-    if device.type != "cuda":
-        return
-
-    backbone = _get_backbone(model)
-    probe_ids = torch.tensor([[1, 2]], dtype=torch.long, device=device)
-    probe_mask = torch.ones_like(probe_ids, dtype=torch.bool, device=device)
-
-    def _run_once() -> None:
-        with torch.no_grad():
-            with _autocast_ctx(device, amp_dtype):
-                outputs = backbone(input_ids=probe_ids, attention_mask=probe_mask, use_cache=False)
-                _ = _extract_last_hidden_state(outputs, "post-load Jamba runtime probe")
-        torch.cuda.synchronize()
-
-    try:
-        _run_once()
-    except ValueError as exc:
-        if "Fast Mamba kernels are not available" not in str(exc):
-            raise
-        if _is_main_process():
-            print("  [warn] Jamba runtime probe hit stale fast-path globals; patching transformers Jamba module and retrying once.")
-        if not _patch_transformers_jamba_fast_path_globals():
-            raise SystemExit(
-                "Jamba runtime probe failed and transformers Jamba globals could not be refreshed. "
-                "This environment would fall back to an unusably slow path."
-            ) from exc
-        _run_once()
-        if _is_main_process():
-            print("  [ok] Jamba runtime probe passed after fast-path refresh.")
+    """Compatibility wrapper around the shared post-load readiness probe."""
+    model_runtime.ensure_jamba_runtime_ready(
+        model,
+        device=device,
+        amp_dtype=amp_dtype,
+        fast_path_requested=True,
+        context="legacy loading probe",
+    )
 
 
 def _safe_from_pretrained(model_id: str, load_kwargs: Dict[str, Any]):
-    try:
-        return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-    except Exception as exc:
-        message = str(exc)
-        retry_kwargs = dict(load_kwargs)
-        changed = False
-        for key in ["use_mamba_kernels", "attn_implementation"]:
-            if key in retry_kwargs and key in message:
-                retry_kwargs.pop(key, None)
-                changed = True
-                if _is_main_process():
-                    print(f"  [warn] model load rejected '{key}'; retrying without it.")
-        if changed:
-            return AutoModelForCausalLM.from_pretrained(model_id, **retry_kwargs)
-        raise
+    return model_runtime.safe_from_pretrained(AutoModelForCausalLM, model_id, load_kwargs)
 
 
 def _distributed_is_initialized() -> bool:
@@ -447,8 +393,6 @@ def load_base_model_and_tokenizer(
     mamba_fast_path = device.type == "cuda" and not disable_mamba
     if not mamba_fast_path:
         load_kwargs["use_mamba_kernels"] = False
-    elif is_main:
-        print("  mamba CUDA kernels: fast path ACTIVE (verified at bootstrap)")
 
     use_4bit = bool(_arg_value(args, "use_4bit", default=False))
     if use_4bit:
@@ -470,6 +414,13 @@ def load_base_model_and_tokenizer(
 
     model = _safe_from_pretrained(model_id, load_kwargs)
     model.config.use_cache = False
+    model_runtime.ensure_jamba_runtime_ready(
+        model,
+        device=device,
+        amp_dtype=amp_dtype,
+        fast_path_requested=mamba_fast_path,
+        context=f"base model load ({model_id})",
+    )
 
     if add_lat_token:
         embed_module = _get_embed_tokens(model)
@@ -552,14 +503,10 @@ def load_model_and_tokenizer(
     if device.type == "cuda":
         load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
 
-    _mamba_fast_path = device.type == "cuda"
-    if device.type == "mps":
-        load_kwargs["use_mamba_kernels"] = False
-    elif not _mamba_fast_path:
+    _mamba_fast_path = device.type == "cuda" and not bool(getattr(args, "disable_mamba_kernels", False))
+    if not _mamba_fast_path:
         load_kwargs["use_mamba_kernels"] = False
 
-    if _mamba_fast_path and device.type == "cuda" and is_main:
-        print("  mamba CUDA kernels: fast path ACTIVE (verified at bootstrap)")
 
     if args.use_4bit:
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -580,10 +527,13 @@ def load_model_and_tokenizer(
 
     model = _safe_from_pretrained(args.model_id, load_kwargs)
     model.config.use_cache = False
-
-    if device.type == "cuda" and _mamba_fast_path:
-        _patch_transformers_jamba_fast_path_globals()
-        _probe_jamba_runtime_fast_path(model, device, amp_dtype)
+    model_runtime.ensure_jamba_runtime_ready(
+        model,
+        device=device,
+        amp_dtype=amp_dtype,
+        fast_path_requested=_mamba_fast_path,
+        context=f"training model load ({args.model_id})",
+    )
 
     embed_module = _get_embed_tokens(model)
     if hasattr(embed_module, "num_embeddings"):

@@ -1,18 +1,11 @@
-"""Models public interface: HF CausalLM loading, tokenizer/adapters, quantization, and memory policy."""
+"""Models public interface: runtime model loading and distributed barrier helpers."""
 from __future__ import annotations
-from . import loading as _loading
 
-def _export_module(module):
-    for name in dir(module):
-        if name.startswith("__"):
-            continue
-        globals()[name] = getattr(module, name)
+from .loading import MODEL_ID, barrier, load_base_model_and_tokenizer, load_model_and_tokenizer
 
-_export_module(_loading)
-
-__all__ = (
+__all__ = [
     "MODEL_ID",
-    "load_model_and_tokenizer",
-    "load_base_model_and_tokenizer",
     "barrier",
-)
+    "load_base_model_and_tokenizer",
+    "load_model_and_tokenizer",
+]
