@@ -82,7 +82,7 @@ The `coordinate` GitHub Actions workflow can now dispatch the generated-answer e
 ```text
 eval_mode=sample-25 -> compare-coconut-val with --limit_samples 25
 inspect artifacts  -> runs/eval/coconut_val_compare_sample_25
-fixed-depth ablation -> set OUROBOROS_EVAL_DISABLE_CANDIDATE_HALT_GATE=1 before full validation
+fixed-depth ablation -> workflow input eval_disable_candidate_halt_gate=true or set OUROBOROS_EVAL_DISABLE_CANDIDATE_HALT_GATE=1
 eval_mode=full      -> compare-coconut-val over the full validation split
 ```
 
@@ -115,7 +115,7 @@ what exact scoring script produced generated-answer exact match?
 can the base model run through the same harness?
 ```
 
-Generated-answer comparison writes artifacts before enforcing the release gate. By default it exits non-zero when candidate exact match is below baseline exact match. Use `--allow_candidate_regression` only for diagnostics, not promotion. Use `--disable_candidate_halt_gate` to run a fixed-depth latent ablation while still comparing the same rows and scoring path.
+Generated-answer comparison writes artifacts before enforcing the release gate. By default it exits non-zero when candidate exact match is below baseline exact match. Use `--allow_candidate_regression` only for diagnostics, not promotion. Use `--disable_candidate_halt_gate` to run a fixed-depth latent ablation while still comparing the same rows and scoring path. When paired with `--candidate_requires_halt_gate`, the eval still verifies that `halt_gate.pt` exists; it just bypasses HaltGate decisions for the ablation.
 
 The first comparison target is:
 

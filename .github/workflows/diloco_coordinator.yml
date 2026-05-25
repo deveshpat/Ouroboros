@@ -42,6 +42,10 @@ on:
         description: 'Optional explicit eval artifact directory. Empty uses mode default under runs/eval/.'
         required: false
         default: ''
+      eval_disable_candidate_halt_gate:
+        description: 'Run eval as fixed-depth ablation: verify halt_gate.pt exists but do not use HaltGate decisions.'
+        required: false
+        default: 'false'
 
 concurrency:
   group: diloco-coordinate
@@ -107,5 +111,6 @@ jobs:
             --eval_mode         "${{ github.event.inputs.eval_mode || 'none' }}" \
             --eval_worker_id    "${{ github.event.inputs.eval_worker_id || 'A' }}" \
             --eval_output_dir   "${{ github.event.inputs.eval_output_dir || '' }}" \
+            ${{ github.event.inputs.eval_disable_candidate_halt_gate == 'true' && '--eval_disable_candidate_halt_gate' || '' }} \
             --launch_worker_ids "${{ github.event.inputs.launch_worker_ids || '' }}" \
             ${{ github.event.inputs.dry_run == 'true' && '--dry_run' || '' }}

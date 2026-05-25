@@ -84,7 +84,9 @@ def load_candidate_runtime(args) -> CandidateRuntime:
         json=False,
     )
     model, tokenizer, halt_gate, device = load_components(candidate_args)
-    if bool(getattr(args, "candidate_requires_halt_gate", False)) and halt_gate is None:
+    requires_halt_gate = bool(getattr(args, "candidate_requires_halt_gate", False))
+    fixed_depth_ablation = bool(getattr(args, "disable_candidate_halt_gate", False))
+    if requires_halt_gate and not fixed_depth_ablation and halt_gate is None:
         raise RuntimeError("candidate_requires_halt_gate was set, but no HaltGate was loaded")
     return CandidateRuntime(model=model, tokenizer=tokenizer, halt_gate=halt_gate, device=device)
 

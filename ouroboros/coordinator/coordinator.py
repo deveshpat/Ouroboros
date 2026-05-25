@@ -198,6 +198,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_max_seq_len", type=int, default=512)
     parser.add_argument("--eval_gen_max_tokens", type=int, default=128)
     parser.add_argument("--eval_halt_threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--eval_disable_candidate_halt_gate",
+        action="store_true",
+        help=(
+            "Dispatch compare-coconut-val with --disable_candidate_halt_gate while "
+            "still requiring the candidate halt_gate.pt artifact. Use for fixed-depth "
+            "HaltGate ablations after sampled early-stop diagnostics."
+        ),
+    )
     parser.add_argument("--eval_device", default="auto")
     parser.add_argument("--eval_dtype", default="auto")
     parser.add_argument(
@@ -419,7 +428,11 @@ def _eval_output_dir(args: argparse.Namespace) -> str:
     explicit = str(getattr(args, "eval_output_dir", "") or "").strip()
     if explicit:
         return explicit
-    leaf = "coconut_val_compare_sample_25" if args.eval_mode == "sample-25" else "coconut_val_compare_full"
+    fixed_depth = bool(getattr(args, "eval_disable_candidate_halt_gate", False))
+    if args.eval_mode == "sample-25":
+        leaf = "coconut_val_compare_sample_25_fixed_depth" if fixed_depth else "coconut_val_compare_sample_25"
+    else:
+        leaf = "coconut_val_compare_full_fixed_depth" if fixed_depth else "coconut_val_compare_full"
     return str(Path(args.eval_output_root) / leaf)
 
 
@@ -450,6 +463,8 @@ def _build_eval_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[st
     limit_samples = _eval_limit_samples(args)
     if limit_samples is not None:
         runtime_env["OUROBOROS_EVAL_LIMIT_SAMPLES"] = str(limit_samples)
+    if bool(getattr(args, "eval_disable_candidate_halt_gate", False)):
+        runtime_env["OUROBOROS_EVAL_DISABLE_CANDIDATE_HALT_GATE"] = "1"
     if bool(getattr(args, "eval_disable_mamba_kernels", False)):
         runtime_env["OUROBOROS_EVAL_DISABLE_MAMBA_KERNELS"] = "1"
     return runtime_env
@@ -471,8 +486,9 @@ def _dispatch_eval_notebook(args: argparse.Namespace) -> None:
     limit_samples = _eval_limit_samples(args)
     limit_label = "full validation split" if limit_samples is None else f"{limit_samples} samples"
     output_dir = _eval_output_dir(args)
+    ablation_label = "fixed-depth HaltGate ablation, " if bool(getattr(args, "eval_disable_candidate_halt_gate", False)) else ""
     print(
-        f"[coordinator] Dispatching generated-answer eval ({args.eval_mode}, {limit_label}) "
+        f"[coordinator] Dispatching generated-answer eval ({ablation_label}{args.eval_mode}, {limit_label}) "
         f"to Kaggle worker {worker_id}: {slug}"
     )
     print(f"[coordinator] Eval artifacts will be written under: {output_dir}")
