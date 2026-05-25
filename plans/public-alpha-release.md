@@ -20,6 +20,17 @@
 - **No repo-bloating tests**: permanent test files are out of scope. Implementers validate with temporary scripts/snippets and standard smoke commands.
 - **lm-eval position**: later optional bridge for external benchmark compatibility/generalization. Do not add lm-eval to the default install path and do not run MC benchmark suites until latent-aware loglikelihood is implemented.
 
+## Current artifact status: HaltGate blocker
+
+Sampled generated-answer evaluation produced two important artifacts on the same 25 scorable validation rows:
+
+```text
+HaltGate enabled -> baseline 0.08, candidate 0.04, actual_latents histogram 1:19 / 10:6, failed_candidate_regression
+fixed-depth ablation -> baseline 0.08, candidate 0.12, actual_latents histogram 10:25, passed diagnostic-only gate
+```
+
+Conclusion: the adapter/tokenizer/runtime path is unlikely to be the primary blocker. The learned HaltGate currently over-stops under `halt_threshold=0.5` and must be trained/calibrated before any DGAC/HaltGate-backed release claim. Full validation should wait until a sampled HaltGate-enabled generated-answer comparison passes.
+
 ---
 
 ## Phase 0: Plan amendment and guardrails
@@ -438,6 +449,13 @@ If HaltGate appears to stop too early, run fixed-depth ablation before full vali
 python -m ouroboros.eval compare-coconut-val ... --limit_samples 10 --disable_candidate_halt_gate
 ```
 
+Promotion rule after ablation:
+
+```text
+fixed-depth pass + HaltGate-enabled fail -> train/calibrate HaltGate; do not promote and do not run full validation yet
+HaltGate-enabled pass + sane latent histogram -> inspect artifacts, then consider full validation
+```
+
 Manually inspect:
 
 ```text
@@ -674,7 +692,7 @@ Use this order:
 2. Phase 2: dry-run/inspect artifact shell.
 3. Phase 3: loader seam + HaltGate-aware stage eval.
 4. Phase 4: sampled generated-answer compare-coconut-val.
-5. Phase 4: full Coconut validation after sample artifacts pass inspection.
+5. Phase 4: full Coconut validation only after HaltGate-enabled sample artifacts pass inspection.
 6. Phase 5: docs/model-card update from produced artifacts.
 7. Phase 6: faithful demo only after artifacts exist.
 8. Phase 7: lm-eval generation smoke -> loglikelihood -> suites.
@@ -687,6 +705,7 @@ Stop conditions:
 - Stop before docs claims if artifacts are missing.
 - Stop before demo if faithful runtime cannot load.
 - Stop before lm-eval MC suites if loglikelihood is unsupported.
+- Stop before full validation/promotion if HaltGate-enabled sampled generated-answer eval regresses or over-stops.
 - Stop before optimization if Phase 4 generated eval is not stable.
 ```
 

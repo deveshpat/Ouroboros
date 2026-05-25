@@ -11,7 +11,7 @@ base model      -> ai21labs/AI21-Jamba-Reasoning-3B
 adapter target  -> WeirdRunner/Ouroboros/diloco_state/anchor
 method          -> PEFT adapter + <|lat|> token + DGAC HaltGate
 runtime state   -> package-based runtime extracted from notebook/root-script shape
-release state   -> alpha, pre-claim, generated-answer comparison harness implemented; real artifacts pending
+release state   -> alpha, pre-claim; HaltGate-enabled sample failed, fixed-depth diagnostic passed
 ```
 
 Latest anchor health signal:
@@ -27,7 +27,15 @@ anchor restored     -> adapter + halt_gate.pt restored
 status              -> healthy checkpoint signal, not a benchmark claim
 ```
 
-This result is a training-health side metric, not real generated-answer progress. The next release gate is an unbiased generated-answer exact-match comparison where the true base model and Ouroboros are evaluated on the same validation IDs, prompt policy, decoding settings, normalization, and scoring scripts.
+This result is a training-health side metric, not real generated-answer progress. Generated-answer artifacts now show a split diagnosis:
+
+```text
+HaltGate enabled sample-25   -> baseline 0.08, candidate 0.04, actual_latents 1:19 / 10:6, failed_candidate_regression
+fixed-depth diagnostic       -> baseline 0.08, candidate 0.12, actual_latents 10:25, passed diagnostic-only gate
+current interpretation       -> adapter/tokenizer path is likely sound; HaltGate is over-stopping and needs more training/calibration
+```
+
+The fixed-depth ablation is not a public win claim because it bypasses learned HaltGate decisions. A release-valid DGAC/HaltGate-backed claim requires the HaltGate-enabled generated-answer gate to pass.
 
 ## Why this exists
 
@@ -42,7 +50,9 @@ Ouroboros is being structured so the research path and the release path stay con
 train anchor
 -> restore exact adapter/HaltGate runtime
 -> run ID-backed Coconut validation comparison
--> then run unbiased external benchmark evals
+-> diagnose HaltGate vs fixed-depth behavior before promotion
+-> train/calibrate HaltGate until sampled release gate passes
+-> then run full in-domain validation and unbiased external benchmark evals
 -> publish model card + results table
 -> deploy faithful demo
 -> then optimize/quantize only after behavior is preserved
@@ -91,13 +101,14 @@ eval_mode=full      -> compare-coconut-val over the full validation split
 These are intentional blockers before public claims or a world-facing deployment:
 
 ```text
-1. run sampled `compare-coconut-val` with real model weights and local validation data
-2. inspect generated `run_config.json`, `summary.json`, and `results.jsonl`
-3. if HaltGate stops early or candidate regresses, run fixed-depth ablation before promotion
-4. run the full Coconut validation split only after sampled artifacts pass inspection
-5. copy/generate public metric tables only from real artifacts
-6. deploy a faithful demo that uses the actual Ouroboros latent/HaltGate runtime
-7. add optional lm-eval bridge later, after latent-aware loglikelihood is implemented
+1. keep HaltGate-enabled sample-25 failure as the current release blocker
+2. treat fixed-depth sample-25 pass as diagnostic evidence only, not a public metric claim
+3. train/calibrate HaltGate until it no longer over-stops at one latent on sampled generated-answer eval
+4. rerun sampled `compare-coconut-val` with HaltGate enabled and inspect `run_config.json`, `summary.json`, and `results.jsonl`
+5. run the full Coconut validation split only after HaltGate-enabled sampled artifacts pass inspection
+6. copy/generate public metric tables only from release-valid artifacts
+7. deploy a faithful demo that uses the actual Ouroboros latent/HaltGate runtime
+8. add optional lm-eval bridge later, after latent-aware loglikelihood is implemented
 ```
 
 ## Evaluation standard
@@ -116,6 +127,8 @@ can the base model run through the same harness?
 ```
 
 Generated-answer comparison writes artifacts before enforcing the release gate. By default it exits non-zero when candidate exact match is below baseline exact match. Use `--allow_candidate_regression` only for diagnostics, not promotion. Use `--disable_candidate_halt_gate` to run a fixed-depth latent ablation while still comparing the same rows and scoring path. When paired with `--candidate_requires_halt_gate`, the eval still verifies that `halt_gate.pt` exists; it just bypasses HaltGate decisions for the ablation.
+
+Current sampled evidence says the learned HaltGate is the release blocker: with HaltGate enabled, 19/25 rows stopped at one latent and the candidate regressed to 0.04 exact match; with fixed depth, 25/25 rows used 10 latents and the candidate reached 0.12 exact match. Therefore, fixed-depth results may guide debugging/training, but only HaltGate-enabled generated-answer results are release-valid for DGAC/HaltGate claims.
 
 The first comparison target is:
 
@@ -137,10 +150,10 @@ terminal_log.md                       -> latest relevant run evidence
 
 ## Non-claims
 
-Until the comparison eval is complete, this project does **not** claim:
+Until the HaltGate-enabled generated-answer comparison passes, this project does **not** claim:
 
 ```text
-Ouroboros beats Jamba
+Ouroboros beats Jamba in the declared DGAC/HaltGate runtime
 Ouroboros is production-ready
 Ouroboros is safety-aligned beyond the base model
 Ouroboros is fully edge-compatible

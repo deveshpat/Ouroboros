@@ -41,7 +41,7 @@ latest health signal -> stage 10 teacher-forced eval-only pass
 teacher-forced CE -> 0.4114
 teacher-forced token accuracy -> 0.8693
 anchor path -> WeirdRunner/Ouroboros/diloco_state/anchor
-claim status -> healthy checkpoint, not generated-answer progress or benchmark superiority
+claim status -> HaltGate-enabled sample failed; fixed-depth ablation passed diagnostic-only; no benchmark superiority claim
 ```
 
 ## Intended Use
@@ -82,11 +82,12 @@ The package CLI now has a lightweight help path. Real inference still requires a
 
 ## Evaluation
 
-Pending real generated-answer comparison artifacts:
+Current generated-answer artifacts are diagnostic, not release-valid model-card metrics:
 
 | Suite | Dataset/Split | Jamba baseline | Ouroboros | Notes |
 |---|---|---:|---:|---|
-| In-domain holdout | `WeirdRunner/Ouroboros`, config `coconut-v1`, split `validation`, revision `6a52cd0c47be1e7b85d9018225387950aefc4631` | TBD | TBD | ID-backed Coconut validation; not an external benchmark |
+| In-domain holdout sample-25, HaltGate enabled | `WeirdRunner/Ouroboros`, config `coconut-v1`, split `validation`, revision `6a52cd0c47be1e7b85d9018225387950aefc4631` | 0.08 | 0.04 | Failed release gate; candidate over-stopped at one latent on 19/25 rows |
+| In-domain holdout sample-25, fixed-depth diagnostic | same sample as above | 0.08 | 0.12 | Diagnostic-only pass with `--disable_candidate_halt_gate`; not valid for DGAC/HaltGate release claims |
 | Anchor suite | `arc_easy`, `hellaswag`, `winogrande` | TBD | TBD | Later optional lm-eval bridge after latent-aware loglikelihood |
 | Reasoning suite | `arc_challenge`, `openbookqa`, `piqa`, `gsm8k`, `truthfulqa_mc2` | TBD | TBD | Later optional lm-eval bridge; no external claims until artifacts exist |
 
@@ -113,7 +114,8 @@ known contamination and claim-boundary risks
 ## Limitations
 
 ```text
-comparison against base Jamba is not complete
+HaltGate-enabled generated-answer sample currently regresses against base Jamba
+fixed-depth ablation passed sample-25 but bypasses learned HaltGate decisions, so it is diagnostic-only
 Coconut validation result is an ID-backed in-domain holdout signal, not a public external benchmark claim
 latent/HaltGate runtime may not export cleanly to GGUF/Ollama yet
 quantized paths must be compared against faithful runtime before release
@@ -125,9 +127,11 @@ model inherits limitations and risks from the base model
 ```text
 [x] public inference CLI help works
 [x] eval package help/dry-run shell exists
-[ ] ID-backed Coconut generated-answer Jamba-vs-Ouroboros eval completed with real artifacts
+[x] sampled ID-backed Coconut generated-answer eval produced real artifacts
+[x] fixed-depth ablation isolated HaltGate over-stop as current blocker
+[ ] HaltGate-trained/calibrated sample passes with learned HaltGate decisions enabled
 [ ] benchmark artifacts uploaded or committed
-[ ] README table filled from artifacts
+[ ] README table filled from release-valid artifacts
 [ ] demo uses faithful runtime
 [ ] limitations/non-claims preserved
 ```

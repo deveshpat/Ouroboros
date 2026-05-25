@@ -3,7 +3,9 @@
 Rolling buffer -> last relevant run only.
 Keep <=80 lines.
 
-## Last run -> sampled generated-answer comparison failed
+## Last relevant result -> HaltGate over-stop confirmed by fixed-depth ablation
+
+### HaltGate-enabled sampled generated-answer comparison
 
 ```text
 mode -> compare-coconut-val
@@ -22,8 +24,22 @@ baseline generated_answer_exact_match -> 0.08
 candidate generated_answer_exact_match -> 0.04
 candidate actual_latents_mean -> 3.16
 candidate actual_latents histogram -> 1:19, 10:6
+one_latent_fraction -> 0.76
+status -> failed_candidate_regression
 ```
 
-Result -> failed generated-answer diagnostic. Do not promote anchor or run full validation yet.
+### Fixed-depth diagnostic ablation
 
-Next -> run fixed-depth ablation using `--disable_candidate_halt_gate` with `--candidate_requires_halt_gate`; if sampled fixed-depth still fails, investigate checkpoint/runtime/prompt path before spending full-validation quota.
+```text
+mode -> compare-coconut-val --disable_candidate_halt_gate --candidate_requires_halt_gate
+sample -> same 25 scorable rows
+baseline generated_answer_exact_match -> 0.08
+candidate generated_answer_exact_match -> 0.12
+candidate actual_latents_mean -> 10.0
+candidate actual_latents histogram -> 10:25
+status -> passed diagnostic-only gate
+```
+
+Result -> adapter/tokenizer/runtime path is unlikely to be the primary fault. HaltGate decisions are the current blocker; the gate over-stops at one latent under threshold 0.5.
+
+Next -> train/calibrate HaltGate, then rerun sampled HaltGate-enabled `compare-coconut-val`. Do not promote, publish claims, or spend full-validation quota until sampled HaltGate-enabled artifacts pass inspection.

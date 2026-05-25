@@ -1,12 +1,12 @@
 # Status
 
-Current truth -> alpha research runtime with healthy teacher-forced DGAC anchor signal, generated-answer comparison harness implemented, latest sampled generated-answer run failed the release gate.
+Current truth -> alpha research runtime with healthy teacher-forced DGAC anchor signal and a working generated-answer comparison harness. The canonical anchor is **not release-safe with HaltGate enabled**: sampled generated-answer eval shows the HaltGate over-stops at one latent for most rows. The same adapter improves over baseline only in fixed-depth diagnostic mode with the HaltGate bypassed.
 
 ## Anchor
 
 canonical anchor -> `WeirdRunner/Ouroboros/diloco_state/anchor`.
 source checkpoint -> `runs/azure_h100_dgac/stage_10/checkpoint-0001154`.
-adapter + config + `halt_gate.pt` -> promoted, but not generated-answer validated.
+adapter + config + `halt_gate.pt` -> promoted to anchor path, but HaltGate behavior is not generated-answer validated.
 
 ## Latest teacher-forced health signal
 
@@ -22,7 +22,9 @@ teacher_forced_token_acc -> 0.8693
 result -> healthy checkpoint signal, not generated-answer progress
 ```
 
-## Latest generated-answer gate
+## Latest generated-answer evidence
+
+### HaltGate-enabled release path
 
 ```text
 mode -> compare-coconut-val
@@ -33,17 +35,33 @@ stage_k -> 10
 halt_threshold -> 0.5
 baseline generated_answer_exact_match -> 0.08
 candidate generated_answer_exact_match -> 0.04
-candidate actual_latents -> 19 rows at 1 latent, 6 rows at 10 latents
-result -> failed_candidate_regression; do not promote or claim win
+candidate actual_latents_mean -> 3.16
+candidate actual_latents histogram -> 1:19, 10:6
+one_latent_fraction -> 0.76
+result -> failed_candidate_regression; HaltGate over-stop suspected/confirmed by ablation
 ```
 
-Next diagnostic -> fixed-depth ablation with `--disable_candidate_halt_gate` while keeping `--candidate_requires_halt_gate`; only run full validation after sampled generated-answer comparison passes.
+### Fixed-depth diagnostic ablation
+
+```text
+mode -> compare-coconut-val --disable_candidate_halt_gate --candidate_requires_halt_gate
+sample -> same 25 scorable validation rows
+baseline generated_answer_exact_match -> 0.08
+candidate generated_answer_exact_match -> 0.12
+candidate actual_latents_mean -> 10.0
+candidate actual_latents histogram -> 10:25
+result -> passed diagnostic only; adapter/runtime path can produce coherent gains when HaltGate decisions are bypassed
+```
+
+Interpretation -> tokenizer/adapter loading is unlikely to be the root cause. The current blocker is HaltGate training/calibration. Fixed-depth pass is not a release claim because the declared DGAC/HaltGate-backed runtime did not use learned HaltGate decisions.
+
+Next work -> train/calibrate HaltGate, then rerun sampled HaltGate-enabled `compare-coconut-val`. Do not run full validation, promote claims, or publish benchmark tables until the HaltGate-enabled sampled gate passes.
 
 ## Caveat
 
 Healthy anchor != benchmark win.
 
-The latest eval-only run proves the canonical anchor can be restored for teacher-forced training-health validation. It does not prove generated-answer progress, does not prove Ouroboros beats `ai21labs/AI21-Jamba-Reasoning-3B`, and does not prove broad benchmark superiority.
+The eval-only run proves the canonical anchor can be restored for teacher-forced training-health validation. The fixed-depth ablation proves the adapter/runtime path is not obviously broken. Neither proves that the DGAC/HaltGate-backed model beats `ai21labs/AI21-Jamba-Reasoning-3B`, and neither proves broad benchmark superiority.
 
 ## Release-readiness workflow
 
@@ -51,10 +69,12 @@ The latest eval-only run proves the canonical anchor can be restored for teacher
 docs alignment
 -> public CLI smoke repair [done]
 -> dry-run/inspect artifact shell [done]
--> sampled ID-backed Coconut generated-answer comparison [failed diagnostic]
--> fixed-depth HaltGate ablation [next]
--> full Coconut validation after sampled artifact inspection
--> research README + HF model card metrics from artifacts
+-> sampled ID-backed Coconut generated-answer comparison, HaltGate enabled [failed: over-stop]
+-> fixed-depth HaltGate ablation [done: passed diagnostic]
+-> HaltGate training/calibration [next]
+-> sampled HaltGate-enabled comparison [required before full validation]
+-> full Coconut validation after sampled HaltGate-enabled artifact inspection
+-> research README + HF model card metrics from release-valid artifacts
 -> faithful cloud demo
 -> optional lm-eval bridge later
 -> optimization/edge experiments
@@ -91,8 +111,9 @@ Kaggle launch model -> edit visible command in `kaggle-utils.ipynb`; run coordin
 ## Active risks
 
 ```text
-latest generated-answer sample regressed vs base
-HaltGate may be stopping too early at threshold 0.5
+HaltGate-enabled generated-answer sample regressed vs base
+HaltGate over-stops at threshold 0.5: 19/25 rows used one latent
+fixed-depth ablation passed sample-25 but is diagnostic-only, not release-valid
 canonical anchor may not be the best generated-answer checkpoint
 PEFT config compatibility warnings need version alignment before public claims
 ```
