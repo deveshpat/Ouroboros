@@ -82,6 +82,7 @@ The `coordinate` GitHub Actions workflow can now dispatch the generated-answer e
 ```text
 eval_mode=sample-25 -> compare-coconut-val with --limit_samples 25
 inspect artifacts  -> runs/eval/coconut_val_compare_sample_25
+fixed-depth ablation -> set OUROBOROS_EVAL_DISABLE_CANDIDATE_HALT_GATE=1 before full validation
 eval_mode=full      -> compare-coconut-val over the full validation split
 ```
 
@@ -92,10 +93,11 @@ These are intentional blockers before public claims or a world-facing deployment
 ```text
 1. run sampled `compare-coconut-val` with real model weights and local validation data
 2. inspect generated `run_config.json`, `summary.json`, and `results.jsonl`
-3. run the full Coconut validation split only after sampled artifacts pass inspection
-4. copy/generate public metric tables only from real artifacts
-5. deploy a faithful demo that uses the actual Ouroboros latent/HaltGate runtime
-6. add optional lm-eval bridge later, after latent-aware loglikelihood is implemented
+3. if HaltGate stops early or candidate regresses, run fixed-depth ablation before promotion
+4. run the full Coconut validation split only after sampled artifacts pass inspection
+5. copy/generate public metric tables only from real artifacts
+6. deploy a faithful demo that uses the actual Ouroboros latent/HaltGate runtime
+7. add optional lm-eval bridge later, after latent-aware loglikelihood is implemented
 ```
 
 ## Evaluation standard
@@ -112,6 +114,8 @@ what decoding settings were used?
 what exact scoring script produced generated-answer exact match?
 can the base model run through the same harness?
 ```
+
+Generated-answer comparison writes artifacts before enforcing the release gate. By default it exits non-zero when candidate exact match is below baseline exact match. Use `--allow_candidate_regression` only for diagnostics, not promotion. Use `--disable_candidate_halt_gate` to run a fixed-depth latent ablation while still comparing the same rows and scoring path.
 
 The first comparison target is:
 

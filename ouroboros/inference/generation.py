@@ -167,7 +167,7 @@ def load_components(args: argparse.Namespace):
         token=token,
         cache_dir=args.adapter_cache_dir,
     )
-    if bool(getattr(args, "use_halt_gate", False)) and bool(getattr(args, "require_halt_gate", False)):
+    if bool(getattr(args, "require_halt_gate", False)):
         gate_path = adapter_dir / "halt_gate.pt"
         if not gate_path.exists():
             raise FileNotFoundError(f"Required halt_gate.pt not found at {gate_path}.")

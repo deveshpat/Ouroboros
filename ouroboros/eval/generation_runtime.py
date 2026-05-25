@@ -78,7 +78,7 @@ def load_candidate_runtime(args) -> CandidateRuntime:
         max_seq_len=int(getattr(args, "max_seq_len", DEFAULT_MAX_SEQ_LEN)),
         halt_threshold=float(getattr(args, "halt_threshold", DEFAULT_HALT_THRESHOLD)),
         use_chat_template=bool(getattr(args, "use_chat_template", True)),
-        use_halt_gate=True,
+        use_halt_gate=not bool(getattr(args, "disable_candidate_halt_gate", False)),
         require_halt_gate=bool(getattr(args, "candidate_requires_halt_gate", False)),
         disable_mamba_kernels=bool(getattr(args, "disable_mamba_kernels", False)),
         json=False,

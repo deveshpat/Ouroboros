@@ -46,6 +46,14 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--candidate_subdir", default="")
     compare.add_argument("--candidate_adapter_dir")
     compare.add_argument("--candidate_requires_halt_gate", action="store_true")
+    compare.add_argument(
+        "--disable_candidate_halt_gate",
+        action="store_true",
+        help=(
+            "Verify/load the candidate adapter but run fixed-depth latent inference without "
+            "consulting HaltGate. Use this for HaltGate-vs-fixed-depth ablations."
+        ),
+    )
     compare.add_argument("--gen_max_tokens", type=int, default=128)
     compare.add_argument("--stage_k", type=int, default=10)
     compare.add_argument("--max_seq_len", type=int, default=512)
@@ -56,6 +64,20 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--no_chat_template", dest="use_chat_template", action="store_false")
     compare.add_argument("--disable_mamba_kernels", action="store_true")
     compare.add_argument("--limit_samples", type=int)
+    compare.add_argument(
+        "--min_candidate_margin",
+        type=float,
+        default=0.0,
+        help=(
+            "Required candidate exact-match margin over baseline. The comparison writes "
+            "artifacts, then exits non-zero if candidate < baseline + margin."
+        ),
+    )
+    compare.add_argument(
+        "--allow_candidate_regression",
+        action="store_true",
+        help="Keep exit code 0 even when the candidate underperforms the baseline.",
+    )
     compare.add_argument("--output_dir", required=True)
     compare.set_defaults(_handler="compare_coconut_val")
 

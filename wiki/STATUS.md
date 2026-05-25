@@ -1,12 +1,12 @@
 # Status
 
-Current truth -> alpha research runtime with healthy DGAC anchor signal, public CLI/eval artifact shell implemented, generated-answer comparison artifacts pending.
+Current truth -> alpha research runtime with healthy teacher-forced DGAC anchor signal, generated-answer comparison harness implemented, latest sampled generated-answer run failed the release gate.
 
 ## Anchor
 
 canonical anchor -> `WeirdRunner/Ouroboros/diloco_state/anchor`.
 source checkpoint -> `runs/azure_h100_dgac/stage_10/checkpoint-0001154`.
-adapter + config + `halt_gate.pt` -> promoted.
+adapter + config + `halt_gate.pt` -> promoted, but not generated-answer validated.
 
 ## Latest teacher-forced health signal
 
@@ -22,18 +22,28 @@ teacher_forced_token_acc -> 0.8693
 result -> healthy checkpoint signal, not generated-answer progress
 ```
 
+## Latest generated-answer gate
+
+```text
+mode -> compare-coconut-val
+sample -> 25 scorable validation rows
+baseline -> ai21labs/AI21-Jamba-Reasoning-3B
+candidate -> WeirdRunner/Ouroboros/diloco_state/anchor
+stage_k -> 10
+halt_threshold -> 0.5
+baseline generated_answer_exact_match -> 0.08
+candidate generated_answer_exact_match -> 0.04
+candidate actual_latents -> 19 rows at 1 latent, 6 rows at 10 latents
+result -> failed_candidate_regression; do not promote or claim win
+```
+
+Next diagnostic -> fixed-depth ablation with `--disable_candidate_halt_gate` while keeping `--candidate_requires_halt_gate`; only run full validation after sampled generated-answer comparison passes.
+
 ## Caveat
 
 Healthy anchor != benchmark win.
 
 The latest eval-only run proves the canonical anchor can be restored for teacher-forced training-health validation. It does not prove generated-answer progress, does not prove Ouroboros beats `ai21labs/AI21-Jamba-Reasoning-3B`, and does not prove broad benchmark superiority.
-
-Next gate -> ID-backed in-domain holdout comparison on the canonical Coconut validation split:
-
-```text
-baseline -> ai21labs/AI21-Jamba-Reasoning-3B
-candidate -> same base + Ouroboros adapter + <|lat|> + DGAC HaltGate + latent runtime
-```
 
 ## Release-readiness workflow
 
@@ -41,7 +51,8 @@ candidate -> same base + Ouroboros adapter + <|lat|> + DGAC HaltGate + latent ru
 docs alignment
 -> public CLI smoke repair [done]
 -> dry-run/inspect artifact shell [done]
--> sampled ID-backed Coconut generated-answer comparison [pending real weights/data]
+-> sampled ID-backed Coconut generated-answer comparison [failed diagnostic]
+-> fixed-depth HaltGate ablation [next]
 -> full Coconut validation after sampled artifact inspection
 -> research README + HF model card metrics from artifacts
 -> faithful cloud demo
@@ -80,11 +91,8 @@ Kaggle launch model -> edit visible command in `kaggle-utils.ipynb`; run coordin
 ## Active risks
 
 ```text
-validation claim boundary -> Coconut val is ID-backed in-domain holdout, not external benchmark
-missing real generated-answer artifacts -> docs/model card must not publish wins
-quota exhaustion -> attendance/timeout path
-Kaggle push false-success -> strict output parser
-wrong GPU -> accelerator + runtime fast-fail
-DGAC eval OOM -> inference-mode guard
-optimization drift -> quantized/edge path must be compared against faithful runtime
+latest generated-answer sample regressed vs base
+HaltGate may be stopping too early at threshold 0.5
+canonical anchor may not be the best generated-answer checkpoint
+PEFT config compatibility warnings need version alignment before public claims
 ```

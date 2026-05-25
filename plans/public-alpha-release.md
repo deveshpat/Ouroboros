@@ -287,7 +287,9 @@ health_metrics.teacher_forced.actual_latents_max
 - [ ] `evaluate_stage()` remains available and teacher-forced, but is HaltGate-aware by default when a HaltGate exists.
 - [ ] Pre-DGAC/no-HaltGate stages still work with fixed-depth validation.
 - [ ] Stage eval logs/returns whether HaltGate was used and aggregate actual latent usage.
-- [ ] Release comparison has a hard-fail path for missing required HaltGate artifacts.
+- [x] Release comparison has a hard-fail path for missing required HaltGate artifacts.
+- [x] Release comparison writes artifacts, then fails non-zero when the candidate regresses below baseline unless explicitly allowed for diagnostics.
+- [x] Release comparison supports fixed-depth candidate ablation with `--disable_candidate_halt_gate` while preserving required HaltGate artifact checks.
 
 ### Implementer-only validation
 
@@ -412,14 +414,15 @@ Summary shape:
 
 ### Acceptance criteria
 
-- [ ] Candidate eval uses real adapter + `<|lat|>` + required HaltGate + latent runtime.
-- [ ] Missing required `halt_gate.pt` fails loudly.
+- [x] Candidate eval uses real adapter + `<|lat|>` + required HaltGate + latent runtime.
+- [x] Missing required `halt_gate.pt` fails loudly.
 - [ ] Baseline is true base Jamba with no latent token or adapter modifications.
 - [ ] Baseline and candidate use the same validation IDs, prompt policy, decode budget, normalization, and scoring function.
 - [ ] Prompt uses question only; no answer/step leakage.
 - [ ] Results are keyed by validation IDs.
-- [ ] Summary clearly labels the result as in-domain holdout validation, not external benchmark superiority.
-- [ ] Teacher-forced metrics, if emitted, are nested under health/side metrics only.
+- [x] Summary clearly labels the result as in-domain holdout validation, not external benchmark superiority.
+- [x] Summary includes release-gate status, exact correct counts, candidate-vs-baseline margin, and latent-depth diagnostics.
+- [x] Teacher-forced metrics, if emitted, are nested under health/side metrics only.
 
 ### Implementer-only validation
 
@@ -427,6 +430,12 @@ Run sampled first:
 
 ```bash
 python -m ouroboros.eval compare-coconut-val ... --limit_samples 10
+```
+
+If HaltGate appears to stop too early, run fixed-depth ablation before full validation:
+
+```bash
+python -m ouroboros.eval compare-coconut-val ... --limit_samples 10 --disable_candidate_halt_gate
 ```
 
 Manually inspect:
