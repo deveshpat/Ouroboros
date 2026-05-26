@@ -242,6 +242,41 @@ def _cache_model_lookup(model, cache_name: str, resolver):
     return resolved
 
 
+def _clear_model_handle_cache(model) -> None:
+    """Drop cached module handles after structural model mutations.
+
+    ``resize_token_embeddings`` can replace the input embedding module and may
+    retie or replace the LM head.  The lightweight resolver cache is valuable in
+    hot latent loops, but it must not survive a resize or later inference can use
+    stale embedding/head modules.
+    """
+    seen = set()
+    stack = [model]
+    try:
+        base = _unwrap_peft_model(model)
+    except Exception:
+        base = None
+    if base is not None and base is not model:
+        stack.append(base)
+    for obj in list(stack):
+        nested = getattr(obj, "model", None)
+        if nested is not None and nested is not obj:
+            stack.append(nested)
+
+    for obj in stack:
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        for cache_name in ("_ouro_cache_backbone", "_ouro_cache_embed_tokens", "_ouro_cache_lm_head"):
+            try:
+                delattr(obj, cache_name)
+            except AttributeError:
+                pass
+
+
 def _get_backbone(model):
     def _resolve():
         base = _unwrap_peft_model(model)
@@ -512,6 +547,7 @@ def load_base_model_and_tokenizer(
             if is_main:
                 print(f"  Resizing embed_tokens: {embed_size} -> {len(tokenizer)}")
             model.resize_token_embeddings(len(tokenizer))
+            _clear_model_handle_cache(model)
 
     grad_checkpoint = bool(_arg_value(args, "grad_checkpoint", default=False))
     if grad_checkpoint and hasattr(model, "gradient_checkpointing_enable"):
@@ -628,6 +664,7 @@ def load_model_and_tokenizer(
         if is_main:
             print(f"  Resizing embed_tokens: {embed_size} -> {len(tokenizer)}")
         model.resize_token_embeddings(len(tokenizer))
+        _clear_model_handle_cache(model)
 
     # ── [perf] Auto-disable gradient checkpointing on high-VRAM GPUs ────────
     # GC is mandatory on T4 (16GB) to avoid OOM at k>=2, but wastes 20-40%

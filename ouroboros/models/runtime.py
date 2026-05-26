@@ -63,6 +63,32 @@ def unwrap_peft_model(model: Any) -> Any:
     return model
 
 
+def module_first_device(module: Any, fallback: torch.device) -> torch.device:
+    """Return the first real device owned by ``module``.
+
+    ``from_pretrained(device_map=...)`` can shard a model across multiple CUDA
+    devices.  In that case the caller's requested device (usually ``cuda:0``)
+    is not necessarily the device that owns the input embedding table.  Forward
+    probes and manual token creation must start on the embedding device, not on
+    the launcher/default device, otherwise PyTorch raises device mismatch errors
+    before Accelerate can dispatch through the sharded model.
+    """
+    for iterator_name in ("parameters", "buffers"):
+        iterator = getattr(module, iterator_name, None)
+        if not callable(iterator):
+            continue
+        try:
+            first = next(iterator())
+        except StopIteration:
+            continue
+        except Exception:
+            continue
+        device = getattr(first, "device", None)
+        if isinstance(device, torch.device):
+            return device
+    return fallback
+
+
 def resolve_backbone(model: Any) -> Any:
     """Locate the backbone object used by Jamba forward probes."""
     base = unwrap_peft_model(model)
@@ -105,13 +131,16 @@ def extract_last_hidden_state(outputs: Any, context: str) -> torch.Tensor:
 
 def _run_jamba_probe_once(model: Any, device: torch.device, amp_dtype: torch.dtype) -> None:
     backbone = resolve_backbone(model)
-    probe_ids = torch.tensor([[1, 2]], dtype=torch.long, device=device)
-    probe_mask = torch.ones_like(probe_ids, dtype=torch.bool, device=device)
+    input_module = getattr(backbone, "embed_tokens", backbone)
+    input_device = module_first_device(input_module, device)
+    probe_ids = torch.tensor([[1, 2]], dtype=torch.long, device=input_device)
+    probe_mask = torch.ones_like(probe_ids, dtype=torch.bool, device=input_device)
     with torch.no_grad():
-        with autocast_context(device, amp_dtype):
+        with autocast_context(input_device, amp_dtype):
             outputs = backbone(input_ids=probe_ids, attention_mask=probe_mask, use_cache=False)
             _ = extract_last_hidden_state(outputs, "post-load Jamba runtime probe")
-    torch.cuda.synchronize()
+    if input_device.type == "cuda":
+        torch.cuda.synchronize(input_device)
 
 
 def ensure_jamba_runtime_ready(
@@ -161,6 +190,7 @@ __all__ = [
     "extract_last_hidden_state",
     "patch_transformers_jamba_fast_path_globals",
     "resolve_backbone",
+    "module_first_device",
     "safe_from_pretrained",
     "unwrap_peft_model",
 ]

@@ -59,13 +59,15 @@ def prepare_latent_runtime(
     amp_dtype: Optional[torch.dtype] = None,
 ) -> LatentRuntime:
     """Resolve and cache the model handles needed for latent execution."""
-    resolved_amp_dtype = _amp_dtype(device) if amp_dtype is None else amp_dtype
+    embed_tokens = _get_embed_tokens(model)
+    resolved_device = module_first_device(embed_tokens, device)
+    resolved_amp_dtype = _amp_dtype(resolved_device) if amp_dtype is None else amp_dtype
     return LatentRuntime(
         model=model,
-        device=device,
+        device=resolved_device,
         amp_dtype=resolved_amp_dtype,
         backbone=_get_backbone(model),
-        embed_tokens=_get_embed_tokens(model),
+        embed_tokens=embed_tokens,
         lm_head=_get_lm_head(model),
     )
 
