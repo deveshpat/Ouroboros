@@ -148,6 +148,234 @@ def dry_run_coconut_val(args: argparse.Namespace) -> None:
     print(f"wrote dry-run artifacts -> {output_dir}")
 
 
+
+
+def _load_tokenizer_only(tokenizer_model_id: str):
+    """Load only the tokenizer needed for prompt-budget accounting.
+
+    This intentionally avoids base/adaptor model loading so release eval can fail
+    fast on CPU when a proposed max_seq_len would truncate validation prompts.
+    """
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_model_id,
+        use_fast=True,
+        trust_remote_code=True,
+    )
+    if getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def _measure_prompt_budget(
+    tokenizer: Any,
+    prompt: str,
+    *,
+    max_seq_len: int,
+    reserve_tokens: int = 0,
+    context: str = "prompt",
+) -> dict[str, Any]:
+    input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    if not input_ids:
+        raise ValueError(f"{context} encoded to an empty token sequence.")
+    max_seq_len = max(1, int(max_seq_len))
+    reserve_tokens = max(0, int(reserve_tokens))
+    budget = max(1, max_seq_len - reserve_tokens)
+    original_tokens = len(input_ids)
+    dropped = max(0, original_tokens - budget)
+    return {
+        "context": context,
+        "original_tokens": original_tokens,
+        "budget_tokens": budget,
+        "max_seq_len": max_seq_len,
+        "reserve_tokens": reserve_tokens,
+        "final_tokens": original_tokens - dropped,
+        "truncated": bool(dropped),
+        "dropped_tokens": dropped,
+        "required_max_seq_len_for_no_truncation": original_tokens + reserve_tokens,
+    }
+
+
+def _token_budget_summary(result_rows: list[dict[str, Any]], *, max_seq_len: int, stage_k: int) -> dict[str, Any]:
+    by_phase: dict[str, dict[str, Any]] = {}
+    truncated_ids: set[str] = set()
+    required_max_seq_len = 0
+    for phase in ("baseline", "candidate"):
+        key = f"{phase}_prompt_budget"
+        reports = [row.get(key) for row in result_rows if isinstance(row.get(key), dict)]
+        truncated_reports = [report for report in reports if bool(report.get("truncated"))]
+        phase_truncated_ids = [
+            str(row.get("id", ""))
+            for row in result_rows
+            if isinstance(row.get(key), dict) and bool(row[key].get("truncated"))
+        ]
+        truncated_ids.update(sample_id for sample_id in phase_truncated_ids if sample_id)
+        phase_required = max(
+            (int(report.get("required_max_seq_len_for_no_truncation", 0)) for report in reports),
+            default=0,
+        )
+        required_max_seq_len = max(required_max_seq_len, phase_required)
+        by_phase[phase] = {
+            "rows_seen": len(reports),
+            "truncated_rows": len(truncated_reports),
+            "truncated_fraction": (len(truncated_reports) / len(reports)) if reports else 0.0,
+            "max_original_tokens": max((int(report.get("original_tokens", 0)) for report in reports), default=0),
+            "max_dropped_tokens": max((int(report.get("dropped_tokens", 0)) for report in reports), default=0),
+            "total_dropped_tokens": sum(int(report.get("dropped_tokens", 0)) for report in reports),
+            "required_max_seq_len_for_no_truncation": phase_required,
+            "truncated_ids_preview": phase_truncated_ids[:25],
+        }
+    any_truncated = any(phase["truncated_rows"] for phase in by_phase.values())
+    return {
+        "status": "truncated_inputs" if any_truncated else "clean",
+        "loads_model_weights": False,
+        "current_max_seq_len": int(max_seq_len),
+        "stage_k": int(stage_k),
+        "candidate_reserve_tokens": max(0, int(stage_k)),
+        "required_max_seq_len_for_no_truncation": required_max_seq_len,
+        "recommended_action": (
+            f"increase max_seq_len to at least {required_max_seq_len} before generated-answer scoring, "
+            "or rerun with --allow_truncated_eval only for a knowingly truncated score"
+            if any_truncated
+            else "run generated-answer eval; prompt budget is clean"
+        ),
+        "any_prompt_truncated": any_truncated,
+        "truncated_unique_rows": len(truncated_ids),
+        "truncated_ids_preview": sorted(truncated_ids)[:25],
+        "by_phase": by_phase,
+    }
+
+
+def audit_token_budget_for_rows(
+    rows: list[dict[str, Any]],
+    *,
+    tokenizer_model_id: str,
+    max_seq_len: int,
+    stage_k: int,
+    use_chat_template: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Measure baseline/candidate prompt budgets without loading model weights."""
+    from ouroboros.inference.generation import format_prompt
+
+    tokenizer = _load_tokenizer_only(tokenizer_model_id)
+    result_rows: list[dict[str, Any]] = []
+    for row in rows:
+        question = str(row[QUESTION_FIELD])
+        formatted_prompt = format_prompt(tokenizer, question, use_chat_template=use_chat_template)
+        result_rows.append(
+            {
+                "id": row[ID_FIELD],
+                "source": row.get(SOURCE_FIELD, ""),
+                "baseline_prompt_budget": _measure_prompt_budget(
+                    tokenizer,
+                    formatted_prompt,
+                    max_seq_len=max_seq_len,
+                    reserve_tokens=0,
+                    context="baseline prompt",
+                ),
+                "candidate_prompt_budget": _measure_prompt_budget(
+                    tokenizer,
+                    formatted_prompt,
+                    max_seq_len=max_seq_len,
+                    reserve_tokens=max(0, int(stage_k)),
+                    context="candidate prompt",
+                ),
+            }
+        )
+    return _token_budget_summary(result_rows, max_seq_len=max_seq_len, stage_k=stage_k), result_rows
+
+
+
+
+def _select_rows_by_budget(
+    rows: list[dict[str, Any]],
+    *,
+    limit_samples: int | None,
+    sample_strategy: str,
+    tokenizer_model_id: str,
+    max_seq_len: int,
+    stage_k: int,
+    use_chat_template: bool,
+) -> list[dict[str, Any]]:
+    strategy = str(sample_strategy or "first").strip().lower()
+    if limit_samples is None or strategy == "first":
+        return rows[: int(limit_samples)] if limit_samples is not None else rows
+    if strategy != "longest":
+        raise ValueError(f"Unsupported sample_strategy={sample_strategy!r}. Use 'first' or 'longest'.")
+
+    _, budget_rows = audit_token_budget_for_rows(
+        rows,
+        tokenizer_model_id=tokenizer_model_id,
+        max_seq_len=max_seq_len,
+        stage_k=stage_k,
+        use_chat_template=use_chat_template,
+    )
+    required_by_id: dict[str, int] = {}
+    for row in budget_rows:
+        reports = [row.get("baseline_prompt_budget"), row.get("candidate_prompt_budget")]
+        required_by_id[str(row.get(ID_FIELD, ""))] = max(
+            (int(report.get("required_max_seq_len_for_no_truncation", 0)) for report in reports if isinstance(report, dict)),
+            default=0,
+        )
+    indexed_rows = list(enumerate(rows))
+    indexed_rows.sort(key=lambda item: (-required_by_id.get(str(item[1].get(ID_FIELD, "")), 0), item[0]))
+    selected = [row for _, row in indexed_rows[: int(limit_samples)]]
+    if selected:
+        longest_required = max(required_by_id.get(str(row.get(ID_FIELD, "")), 0) for row in selected)
+        shortest_required = min(required_by_id.get(str(row.get(ID_FIELD, "")), 0) for row in selected)
+        print(
+            f"[eval] sample_strategy=longest selected {len(selected)} rows "
+            f"with required_max_seq_len range {shortest_required}..{longest_required}."
+        )
+    return selected
+
+
+def _truncation_audit_failure_message(summary: dict[str, Any]) -> str:
+    return (
+        "Eval prompt truncation would occur before any model load; refusing generated-answer scoring. "
+        f"truncated_unique_rows={summary['truncated_unique_rows']}; "
+        f"current_max_seq_len={summary['current_max_seq_len']}; "
+        f"required_max_seq_len_for_no_truncation={summary['required_max_seq_len_for_no_truncation']}. "
+        "Increase --max_seq_len or rerun with --allow_truncated_eval only when a truncated-input score is acceptable."
+    )
+
+
+def audit_coconut_val_budget(args: argparse.Namespace) -> None:
+    """Run the CPU/tokenizer-only truncation audit and optionally write artifacts."""
+    local_inspection = inspect_local_validation(args.data_dir)
+    if local_inspection["status"] == "invalid":
+        raise SystemExit(f"Invalid validation file; refusing token-budget audit: {local_inspection}")
+    rows = _iter_validation_rows(
+        args.data_dir,
+        args.limit_samples,
+        sample_strategy=getattr(args, "sample_strategy", "first"),
+        tokenizer_model_id=str(args.tokenizer_model_id),
+        max_seq_len=int(args.max_seq_len),
+        stage_k=int(args.stage_k),
+        use_chat_template=bool(args.use_chat_template),
+    )
+    if not rows:
+        raise SystemExit("No validation rows selected for audit-coconut-val-budget.")
+    summary, result_rows = audit_token_budget_for_rows(
+        rows,
+        tokenizer_model_id=str(args.tokenizer_model_id),
+        max_seq_len=int(args.max_seq_len),
+        stage_k=int(args.stage_k),
+        use_chat_template=bool(args.use_chat_template),
+    )
+    output_dir_arg = getattr(args, "output_dir", None)
+    if output_dir_arg:
+        output_dir = ensure_output_dir(output_dir_arg)
+        write_json(output_dir / "token_budget.summary.json", {"local_validation": local_inspection, "token_budget": summary})
+        write_jsonl(output_dir / "token_budget.results.jsonl", result_rows)
+        print(f"wrote token-budget artifacts -> {output_dir}")
+    else:
+        print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+    if summary["any_prompt_truncated"] and not bool(getattr(args, "allow_truncated_eval", False)):
+        raise SystemExit(_truncation_audit_failure_message(summary))
+
+
 def normalize_generated_answer(text: str) -> str:
     """Normalize generated answers with the existing Coconut answer extractor."""
     from ouroboros.coconut.dgac import normalize_pred
@@ -159,7 +387,16 @@ def normalize_generated_answer(text: str) -> str:
     return value
 
 
-def _iter_validation_rows(data_dir: str | Path, limit_samples: int | None) -> list[dict[str, Any]]:
+def _iter_validation_rows(
+    data_dir: str | Path,
+    limit_samples: int | None,
+    *,
+    sample_strategy: str = "first",
+    tokenizer_model_id: str | None = None,
+    max_seq_len: int = 1024,
+    stage_k: int = 10,
+    use_chat_template: bool = True,
+) -> list[dict[str, Any]]:
     path = _val_path(data_dir)
     if not path.exists():
         raise FileNotFoundError(
@@ -181,16 +418,24 @@ def _iter_validation_rows(data_dir: str | Path, limit_samples: int | None) -> li
             skipped_missing_answers.append(sample_id)
             continue
         valid_rows.append(row)
-        if limit_samples is not None and len(valid_rows) >= int(limit_samples):
-            break
+
+    selected_rows = _select_rows_by_budget(
+        valid_rows,
+        limit_samples=limit_samples,
+        sample_strategy=sample_strategy,
+        tokenizer_model_id=tokenizer_model_id or "",
+        max_seq_len=max_seq_len,
+        stage_k=stage_k,
+        use_chat_template=use_chat_template,
+    )
     if skipped_missing_answers:
         preview = ", ".join(skipped_missing_answers[:10])
         suffix = "" if len(skipped_missing_answers) <= 10 else f", +{len(skipped_missing_answers) - 10} more"
         print(
             f"[eval] Skipped {len(skipped_missing_answers)} validation rows without {ANSWER_FIELD!r} "
-            f"before selecting {len(valid_rows)} scorable rows: {preview}{suffix}"
+            f"before selecting {len(selected_rows)} scorable rows: {preview}{suffix}"
         )
-    return valid_rows
+    return selected_rows
 
 
 def _actual_latents_mean(values: list[Any]) -> float:

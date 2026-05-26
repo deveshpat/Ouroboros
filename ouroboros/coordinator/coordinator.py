@@ -170,12 +170,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total_train_samples", type=int, default=36906)
     parser.add_argument(
         "--eval_mode",
-        choices=("none", "sample-25", "full"),
+        choices=("none", "sample-25", "longest-25", "full"),
         default="none",
         help=(
             "Dispatch a generated-answer Coconut validation eval notebook instead of "
-            "running the DiLoCo coordinator loop. sample-25 uses --limit_samples 25; "
-            "full runs the whole validation split."
+            "running the DiLoCo coordinator loop. sample-25 uses the first 25 rows; "
+            "longest-25 probes the 25 longest prompt-budget rows; full runs the whole validation split."
         ),
     )
     parser.add_argument(
@@ -195,7 +195,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_candidate_repo_id", default="WeirdRunner/Ouroboros")
     parser.add_argument("--eval_candidate_subdir", default="diloco_state/anchor")
     parser.add_argument("--eval_stage_k", type=int, default=10)
-    parser.add_argument("--eval_max_seq_len", type=int, default=512)
+    parser.add_argument(
+        "--eval_max_seq_len",
+        type=int,
+        default=0,
+        help="Eval context length. 0 = auto: sample-25 uses 512, longest-25/full use 8192.",
+    )
     parser.add_argument("--eval_gen_max_tokens", type=int, default=128)
     parser.add_argument("--eval_halt_threshold", type=float, default=0.5)
     parser.add_argument(
@@ -210,6 +215,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_device", default="auto")
     parser.add_argument("--eval_dtype", default="auto")
     parser.add_argument(
+        "--eval_model_device_map",
+        choices=("single", "auto", "balanced", "balanced_low_0", "sequential"),
+        default="balanced_low_0",
+        help="Eval-only model placement. balanced_low_0 uses multi-GPU sharding while leaving GPU 0 lighter for inputs/decode.",
+    )
+    parser.add_argument(
         "--eval_output_root",
         default="runs/eval",
         help="Root directory for generated eval artifacts inside the Kaggle notebook runtime.",
@@ -223,6 +234,17 @@ def parse_args() -> argparse.Namespace:
         "--eval_disable_mamba_kernels",
         action="store_true",
         help="Forward --disable_mamba_kernels to compare-coconut-val.",
+    )
+    parser.add_argument(
+        "--eval_allow_truncated_eval",
+        action="store_true",
+        help="Allow compare-coconut-val to exit 0 when prompt truncation occurred.",
+    )
+    parser.add_argument(
+        "--eval_cleanup_every_n_samples",
+        type=int,
+        default=25,
+        help="Forward memory cleanup cadence to compare-coconut-val. Use 0 to disable.",
     )
     args = parser.parse_args()
     if args.force_worker_ids and not args.launch_worker_ids:
@@ -417,10 +439,29 @@ def _planning_credentialed_workers(
 
 
 def _eval_limit_samples(args: argparse.Namespace) -> Optional[int]:
-    if args.eval_mode == "sample-25":
+    if args.eval_mode in {"sample-25", "longest-25"}:
         return 25
     if args.eval_mode == "full":
         return None
+    raise ValueError(f"Unsupported eval_mode: {args.eval_mode!r}")
+
+
+def _eval_sample_strategy(args: argparse.Namespace) -> str:
+    if args.eval_mode == "longest-25":
+        return "longest"
+    if args.eval_mode in {"sample-25", "full"}:
+        return "first"
+    raise ValueError(f"Unsupported eval_mode: {args.eval_mode!r}")
+
+
+def _eval_max_seq_len(args: argparse.Namespace) -> int:
+    explicit = int(getattr(args, "eval_max_seq_len", 0) or 0)
+    if explicit > 0:
+        return explicit
+    if args.eval_mode in {"full", "longest-25"}:
+        return 8192
+    if args.eval_mode == "sample-25":
+        return 512
     raise ValueError(f"Unsupported eval_mode: {args.eval_mode!r}")
 
 
@@ -431,6 +472,8 @@ def _eval_output_dir(args: argparse.Namespace) -> str:
     fixed_depth = bool(getattr(args, "eval_disable_candidate_halt_gate", False))
     if args.eval_mode == "sample-25":
         leaf = "coconut_val_compare_sample_25_fixed_depth" if fixed_depth else "coconut_val_compare_sample_25"
+    elif args.eval_mode == "longest-25":
+        leaf = "coconut_val_compare_longest_25_fixed_depth" if fixed_depth else "coconut_val_compare_longest_25"
     else:
         leaf = "coconut_val_compare_full_fixed_depth" if fixed_depth else "coconut_val_compare_full"
     return str(Path(args.eval_output_root) / leaf)
@@ -451,13 +494,16 @@ def _build_eval_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[st
             "OUROBOROS_EVAL_CANDIDATE_REPO_ID": str(args.eval_candidate_repo_id),
             "OUROBOROS_EVAL_CANDIDATE_SUBDIR": str(args.eval_candidate_subdir),
             "OUROBOROS_EVAL_STAGE_K": str(int(args.eval_stage_k)),
-            "OUROBOROS_EVAL_MAX_SEQ_LEN": str(int(args.eval_max_seq_len)),
+            "OUROBOROS_EVAL_MAX_SEQ_LEN": str(_eval_max_seq_len(args)),
             "OUROBOROS_EVAL_GEN_MAX_TOKENS": str(int(args.eval_gen_max_tokens)),
             "OUROBOROS_EVAL_HALT_THRESHOLD": str(float(args.eval_halt_threshold)),
             "OUROBOROS_EVAL_DEVICE": str(args.eval_device),
             "OUROBOROS_EVAL_DTYPE": str(args.eval_dtype),
+            "OUROBOROS_EVAL_MODEL_DEVICE_MAP": str(args.eval_model_device_map),
+            "OUROBOROS_EVAL_SAMPLE_STRATEGY": _eval_sample_strategy(args),
             "OUROBOROS_EVAL_OUTPUT_DIR": _eval_output_dir(args),
             "OUROBOROS_EVAL_CANDIDATE_REQUIRES_HALT_GATE": "1",
+            "OUROBOROS_EVAL_CLEANUP_EVERY_N_SAMPLES": str(int(args.eval_cleanup_every_n_samples)),
         }
     )
     limit_samples = _eval_limit_samples(args)
@@ -467,6 +513,8 @@ def _build_eval_runtime_env(args: argparse.Namespace, worker_id: str) -> Dict[st
         runtime_env["OUROBOROS_EVAL_DISABLE_CANDIDATE_HALT_GATE"] = "1"
     if bool(getattr(args, "eval_disable_mamba_kernels", False)):
         runtime_env["OUROBOROS_EVAL_DISABLE_MAMBA_KERNELS"] = "1"
+    if bool(getattr(args, "eval_allow_truncated_eval", False)):
+        runtime_env["OUROBOROS_EVAL_ALLOW_TRUNCATED_EVAL"] = "1"
     return runtime_env
 
 

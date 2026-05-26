@@ -28,6 +28,7 @@ on:
         options:
           - none
           - sample-25
+          - longest-25
           - full
       eval_worker_id:
         description: 'Kaggle worker notebook/account to use for eval dispatch.'
@@ -46,6 +47,29 @@ on:
         description: 'Run eval as fixed-depth ablation: verify halt_gate.pt exists but do not use HaltGate decisions.'
         required: false
         default: 'false'
+      eval_max_seq_len:
+        description: 'Eval context length. Empty/0 = auto: sample-25 uses 512, longest-25/full use 8192.'
+        required: false
+        default: '0'
+      eval_allow_truncated_eval:
+        description: 'Allow eval to exit 0 even if prompt truncation is detected.'
+        required: false
+        default: 'false'
+      eval_model_device_map:
+        description: 'Eval-only model placement. balanced_low_0 shards across dual GPUs while keeping GPU 0 lighter.'
+        required: false
+        default: 'balanced_low_0'
+        type: choice
+        options:
+          - single
+          - auto
+          - balanced
+          - balanced_low_0
+          - sequential
+      eval_cleanup_every_n_samples:
+        description: 'Memory cleanup cadence during eval. 25 default; 0 disables.'
+        required: false
+        default: '25'
 
 concurrency:
   group: diloco-coordinate
@@ -111,6 +135,10 @@ jobs:
             --eval_mode         "${{ github.event.inputs.eval_mode || 'none' }}" \
             --eval_worker_id    "${{ github.event.inputs.eval_worker_id || 'A' }}" \
             --eval_output_dir   "${{ github.event.inputs.eval_output_dir || '' }}" \
+            --eval_max_seq_len  "${{ github.event.inputs.eval_max_seq_len || '0' }}" \
+            --eval_model_device_map "${{ github.event.inputs.eval_model_device_map || 'balanced_low_0' }}" \
+            --eval_cleanup_every_n_samples "${{ github.event.inputs.eval_cleanup_every_n_samples || '25' }}" \
             ${{ github.event.inputs.eval_disable_candidate_halt_gate == 'true' && '--eval_disable_candidate_halt_gate' || '' }} \
+            ${{ github.event.inputs.eval_allow_truncated_eval == 'true' && '--eval_allow_truncated_eval' || '' }} \
             --launch_worker_ids "${{ github.event.inputs.launch_worker_ids || '' }}" \
             ${{ github.event.inputs.dry_run == 'true' && '--dry_run' || '' }}

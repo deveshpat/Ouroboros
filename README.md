@@ -90,10 +90,15 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m compileall -q ouroboros
 The `coordinate` GitHub Actions workflow can now dispatch the generated-answer eval to a Kaggle worker notebook:
 
 ```text
-eval_mode=sample-25 -> compare-coconut-val with --limit_samples 25
-inspect artifacts  -> runs/eval/coconut_val_compare_sample_25
-fixed-depth ablation -> workflow input eval_disable_candidate_halt_gate=true or set OUROBOROS_EVAL_DISABLE_CANDIDATE_HALT_GATE=1
-eval_mode=full      -> compare-coconut-val over the full validation split
+eval_mode=sample-25   -> CPU token-budget preflight, then compare-coconut-val on the first 25 scorable rows with max_seq_len=512 unless overridden
+eval_mode=longest-25  -> CPU token-budget preflight, then compare-coconut-val on the 25 longest prompt-budget rows with max_seq_len=8192 unless overridden
+inspect artifacts     -> runs/eval/coconut_val_compare_<mode>
+fixed-depth ablation  -> workflow input eval_disable_candidate_halt_gate=true or set OUROBOROS_EVAL_DISABLE_CANDIDATE_HALT_GATE=1
+eval_mode=full       -> CPU token-budget preflight over the full validation split, then compare-coconut-val with max_seq_len=8192 unless overridden
+multi-GPU eval       -> eval_model_device_map=balanced_low_0 by default; use single to reproduce old cuda:0 pinning
+truncation policy    -> token_budget.preflight.json records tokenizer-only counts before model loading; truncation exits non-zero unless --allow_truncated_eval is set
+memory guardrail     -> eval cleanup runs every 25 samples by default; this does not replace bounded context
+training note        -> training remains DDP/torchrun; eval model sharding is not a drop-in replacement for gradient-synchronized training
 ```
 
 ## Known release blockers

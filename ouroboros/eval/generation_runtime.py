@@ -16,10 +16,18 @@ from ouroboros.inference.generation import (
     DEFAULT_HALT_THRESHOLD,
     DEFAULT_MAX_SEQ_LEN,
     DEFAULT_STAGE_K,
+    encode_prompt_ids_with_report,
     format_prompt,
     load_components,
     resolve_device,
     run_single_prompt,
+)
+from ouroboros.models.loading import (
+    _autocast_ctx,
+    _get_embed_tokens,
+    _requested_amp_dtype,
+    model_device_map_summary,
+    module_first_device,
 )
 from ouroboros.models import load_base_model_and_tokenizer
 
@@ -29,6 +37,8 @@ class BaselineRuntime:
     model: Any
     tokenizer: Any
     device: torch.device
+    amp_dtype: torch.dtype
+    device_map: dict[str, str] | None = None
 
 
 @dataclass
@@ -37,6 +47,13 @@ class CandidateRuntime:
     tokenizer: Any
     halt_gate: Any
     device: torch.device
+    device_map: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class BaselineGenerationResult:
+    text: str
+    prompt_budget: dict[str, Any]
 
 
 def _common_device(args) -> torch.device:
@@ -49,7 +66,9 @@ def load_baseline_runtime(args) -> BaselineRuntime:
         model_id=args.baseline_model_id,
         use_4bit=False,
         grad_checkpoint=False,
+        dtype=getattr(args, "dtype", "auto"),
         disable_mamba_kernels=bool(getattr(args, "disable_mamba_kernels", False)),
+        model_device_map=getattr(args, "model_device_map", "single"),
     )
     model, tokenizer, _, lat_token_id = load_base_model_and_tokenizer(
         baseline_args,
@@ -59,7 +78,14 @@ def load_baseline_runtime(args) -> BaselineRuntime:
     if lat_token_id is not None:
         raise RuntimeError("baseline loader unexpectedly added a latent token")
     model.eval()
-    return BaselineRuntime(model=model, tokenizer=tokenizer, device=device)
+    input_device = module_first_device(_get_embed_tokens(model), device)
+    return BaselineRuntime(
+        model=model,
+        tokenizer=tokenizer,
+        device=input_device,
+        amp_dtype=_requested_amp_dtype(baseline_args, input_device),
+        device_map=model_device_map_summary(model),
+    )
 
 
 def load_candidate_runtime(args) -> CandidateRuntime:
@@ -81,6 +107,7 @@ def load_candidate_runtime(args) -> CandidateRuntime:
         use_halt_gate=not bool(getattr(args, "disable_candidate_halt_gate", False)),
         require_halt_gate=bool(getattr(args, "candidate_requires_halt_gate", False)),
         disable_mamba_kernels=bool(getattr(args, "disable_mamba_kernels", False)),
+        model_device_map=getattr(args, "model_device_map", "single"),
         json=False,
     )
     model, tokenizer, halt_gate, device = load_components(candidate_args)
@@ -88,31 +115,59 @@ def load_candidate_runtime(args) -> CandidateRuntime:
     fixed_depth_ablation = bool(getattr(args, "disable_candidate_halt_gate", False))
     if requires_halt_gate and not fixed_depth_ablation and halt_gate is None:
         raise RuntimeError("candidate_requires_halt_gate was set, but no HaltGate was loaded")
-    return CandidateRuntime(model=model, tokenizer=tokenizer, halt_gate=halt_gate, device=device)
+    input_device = module_first_device(_get_embed_tokens(model), device)
+    return CandidateRuntime(
+        model=model,
+        tokenizer=tokenizer,
+        halt_gate=halt_gate,
+        device=input_device,
+        device_map=model_device_map_summary(model),
+    )
 
 
 @torch.no_grad()
-def generate_baseline(runtime: BaselineRuntime, question: str, args) -> str:
+def generate_baseline_result(runtime: BaselineRuntime, question: str, args) -> BaselineGenerationResult:
     prompt = format_prompt(
         runtime.tokenizer,
         question,
         use_chat_template=bool(getattr(args, "use_chat_template", True)),
     )
-    input_ids = runtime.tokenizer.encode(prompt, add_special_tokens=False)
-    if not input_ids:
-        raise ValueError("Question encoded to an empty token sequence.")
-    input_tensor = torch.tensor(input_ids, device=runtime.device, dtype=torch.long).unsqueeze(0)
-    attention_mask = torch.ones_like(input_tensor, dtype=torch.long, device=runtime.device)
-    output = runtime.model.generate(
-        input_ids=input_tensor,
-        attention_mask=attention_mask,
-        max_new_tokens=int(args.gen_max_tokens),
-        do_sample=False,
-        pad_token_id=runtime.tokenizer.pad_token_id,
-        eos_token_id=runtime.tokenizer.eos_token_id,
+    max_seq_len = max(1, int(getattr(args, "max_seq_len", DEFAULT_MAX_SEQ_LEN)))
+    input_ids, prompt_budget = encode_prompt_ids_with_report(
+        runtime.tokenizer,
+        prompt,
+        max_seq_len=max_seq_len,
+        context="baseline prompt",
     )
-    generated = output[0, input_tensor.size(1):].detach().cpu().tolist()
-    return runtime.tokenizer.decode(generated, skip_special_tokens=True).strip()
+    input_tensor = torch.tensor(input_ids, device=runtime.device, dtype=torch.long).unsqueeze(0)
+    generated: list[int] = []
+    eos_token_id = runtime.tokenizer.eos_token_id
+    for _ in range(max(0, int(args.gen_max_tokens))):
+        if input_tensor.size(1) > max_seq_len:
+            input_tensor = input_tensor[:, -max_seq_len:]
+        attention_mask = torch.ones_like(input_tensor, dtype=torch.long, device=runtime.device)
+        with _autocast_ctx(runtime.device, runtime.amp_dtype):
+            outputs = runtime.model(
+                input_ids=input_tensor,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            next_id = int(outputs.logits[:, -1, :].argmax(dim=-1).item())
+        if eos_token_id is not None and next_id == eos_token_id:
+            break
+        generated.append(next_id)
+        next_token = torch.tensor([[next_id]], device=runtime.device, dtype=torch.long)
+        input_tensor = torch.cat([input_tensor, next_token], dim=1)
+    return BaselineGenerationResult(
+        text=runtime.tokenizer.decode(generated, skip_special_tokens=True).strip(),
+        prompt_budget=prompt_budget.__dict__,
+    )
+
+
+def generate_baseline(runtime: BaselineRuntime, question: str, args) -> str:
+    """Backward-compatible baseline text generation helper."""
+    return generate_baseline_result(runtime, question, args).text
 
 
 @torch.no_grad()
@@ -122,6 +177,7 @@ def generate_candidate(runtime: CandidateRuntime, question: str, args):
         max_new_tokens=int(args.gen_max_tokens),
         max_seq_len=int(getattr(args, "max_seq_len", DEFAULT_MAX_SEQ_LEN)),
         halt_threshold=float(getattr(args, "halt_threshold", DEFAULT_HALT_THRESHOLD)),
+        dtype=getattr(args, "dtype", "auto"),
         latent_cache=False,
         mac_mps_latent_cache=False,
     )

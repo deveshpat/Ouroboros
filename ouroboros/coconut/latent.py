@@ -26,6 +26,7 @@ from ouroboros.models.loading import (
     _get_backbone,
     _get_embed_tokens,
     _get_lm_head,
+    module_first_device,
 )
 
 
@@ -110,21 +111,23 @@ def compute_ce_from_hidden(
 
     selected_hidden = shift_hidden[valid]
     selected_labels = shift_labels[valid]
+    lm_head_device = module_first_device(runtime.lm_head, runtime.device)
     with runtime.autocast():
-        selected_logits = runtime.lm_head(selected_hidden).float()
-    losses = F.cross_entropy(selected_logits, selected_labels, reduction="none")
+        selected_logits = runtime.lm_head(selected_hidden.to(lm_head_device)).float()
+    selected_labels_for_logits = selected_labels.to(selected_logits.device)
+    losses = F.cross_entropy(selected_logits, selected_labels_for_logits, reduction="none")
     ce_sum = losses.sum()
     token_correct = (
-        int((selected_logits.argmax(dim=-1) == selected_labels).sum().item())
+        int((selected_logits.argmax(dim=-1) == selected_labels_for_logits).sum().item())
         if include_token_accuracy
         else None
     )
 
     row_ids = torch.arange(labels.size(0), device=labels.device).unsqueeze(1).expand_as(valid)
-    selected_rows = row_ids[valid]
+    selected_rows = row_ids[valid].to(losses.device)
     row_sums = losses.new_zeros((labels.size(0),), dtype=losses.dtype)
     row_sums.index_add_(0, selected_rows, losses)
-    ce_by_row = row_sums / valid_by_row.clamp_min(1).to(dtype=losses.dtype)
+    ce_by_row = row_sums / valid_by_row.to(losses.device).clamp_min(1).to(dtype=losses.dtype)
     return ce_sum, n_valid, ce_by_row.to(dtype=torch.float32), valid_by_row, token_correct
 
 
@@ -221,8 +224,9 @@ def run_latent_passes(
                 use_cache=False,
             )
         hidden = _extract_last_hidden_state(outputs, f"latent pass step={latent_step}")
-        last_positions = prefix_lens - 1
-        h_step = hidden[torch.arange(active_indices.numel(), device=device), last_positions, :]
+        hidden_device = hidden.device
+        last_positions = (prefix_lens - 1).to(hidden_device)
+        h_step = hidden[torch.arange(active_indices.numel(), device=hidden_device), last_positions, :].to(device)
 
         append_mask = torch.ones(active_indices.numel(), dtype=torch.bool, device=device)
         if halt_gate is not None:
@@ -336,8 +340,13 @@ def _try_run_latent_passes_with_cache(
         if cache is None:
             return None
         hidden = _extract_last_hidden_state(outputs, "cached latent pass step=0")
+        hidden_device = hidden.device
         prefix_lens = ctx_mask.sum(dim=1).to(dtype=torch.long).clamp_min(1)
-        h_step = hidden[torch.arange(batch_size, device=runtime.device), prefix_lens - 1, :]
+        h_step = hidden[
+            torch.arange(batch_size, device=hidden_device),
+            (prefix_lens - 1).to(hidden_device),
+            :,
+        ].to(runtime.device)
 
         for latent_step in range(max_steps):
             active_mask = target_steps > latent_step
@@ -364,7 +373,7 @@ def _try_run_latent_passes_with_cache(
             cache = getattr(outputs, "past_key_values", None)
             if cache is None:
                 return None
-            h_step = _extract_last_hidden_state(outputs, f"cached latent pass step={latent_step + 1}")[:, -1, :]
+            h_step = _extract_last_hidden_state(outputs, f"cached latent pass step={latent_step + 1}")[:, -1, :].to(runtime.device)
     finally:
         if checkpointing_was_enabled:
             _set_gradient_checkpointing(runtime.model, True)
@@ -486,14 +495,15 @@ def decode_from_latent_context(
     generated: List[int] = []
     eos_id = tokenizer.eos_token_id
     gen_max_tokens = max(0, int(getattr(args, "gen_max_tokens", DEFAULT_EVAL_GEN_MAX_TOKENS)))
+    max_seq_len = max(1, int(getattr(args, "max_seq_len", ctx.size(1))))
     for _ in range(gen_max_tokens):
-        if ctx.size(1) > args.max_seq_len:
-            ctx = ctx[:, -args.max_seq_len :, :]
-            ctx_mask = ctx_mask[:, -args.max_seq_len :]
+        if ctx.size(1) > max_seq_len:
+            ctx = ctx[:, -max_seq_len:, :]
+            ctx_mask = ctx_mask[:, -max_seq_len:]
         with runtime.autocast():
             outputs = runtime.backbone(inputs_embeds=ctx, attention_mask=ctx_mask, use_cache=False)
             hidden = _extract_last_hidden_state(outputs, context)
-            logits = runtime.lm_head(hidden)
+            logits = runtime.lm_head(hidden.to(module_first_device(runtime.lm_head, runtime.device)))
         next_id = int(logits[:, -1, :].argmax(-1).item())
         if eos_id is not None and next_id == eos_id:
             break

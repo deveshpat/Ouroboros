@@ -43,6 +43,71 @@ LORA_TARGET_MODULES = [
 ]
 
 
+INFERENCE_DEVICE_MAP_CHOICES = {"single", "auto", "balanced", "balanced_low_0", "sequential"}
+
+
+def _cuda_device_count() -> int:
+    try:
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+
+def _normalize_inference_device_map(value: Any) -> str:
+    requested = str(value or "single").strip().lower()
+    if requested in {"", "none"}:
+        requested = "single"
+    if requested not in INFERENCE_DEVICE_MAP_CHOICES:
+        choices = ", ".join(sorted(INFERENCE_DEVICE_MAP_CHOICES))
+        raise ValueError(f"Unsupported model_device_map={requested!r}. Use one of: {choices}.")
+    return requested
+
+
+def _resolve_from_pretrained_device_map(args: argparse.Namespace, device: torch.device, rank: int) -> tuple[Any, str]:
+    """Return a Transformers device_map plus a normalized label for artifacts.
+
+    Training remains single-device/DDP by default because `device_map` inference
+    sharding is not a safe drop-in replacement for gradient-synchronized
+    training.  Eval/inference callers may pass model_device_map to let
+    Transformers/Accelerate shard layers across visible CUDA devices.
+    """
+    requested = _normalize_inference_device_map(_arg_value(args, "model_device_map", default="single"))
+    if device.type != "cuda":
+        return None, "single"
+    if requested == "single":
+        return {"": device.index if device.index is not None else rank}, "single"
+    if _cuda_device_count() < 2 and requested in {"auto", "balanced", "balanced_low_0"}:
+        if _is_main_process():
+            print(f"  [warn] model_device_map={requested} requested, but only one CUDA device is visible; using single-device load.")
+        return {"": device.index if device.index is not None else rank}, "single"
+    return requested, requested
+
+
+def module_first_device(module: Any, fallback: torch.device) -> torch.device:
+    """Best-effort execution device for a potentially sharded module."""
+    for iterator_name in ("parameters", "buffers"):
+        iterator = getattr(module, iterator_name, None)
+        if not callable(iterator):
+            continue
+        try:
+            first = next(iterator())
+        except StopIteration:
+            continue
+        except Exception:
+            continue
+        device = getattr(first, "device", None)
+        if isinstance(device, torch.device):
+            return device
+    return fallback
+
+
+def model_device_map_summary(model: Any) -> dict[str, str] | None:
+    mapping = getattr(model, "hf_device_map", None)
+    if not isinstance(mapping, dict):
+        return None
+    return {str(key): str(value) for key, value in mapping.items()}
+
+
 _CHAT_TEMPLATE_WARNED = False
 
 
@@ -117,6 +182,23 @@ def _amp_dtype(device: torch.device) -> torch.dtype:
     if device.type == "mps":
         return torch.float16
     return torch.float32
+
+
+def _requested_amp_dtype(args: argparse.Namespace, device: torch.device) -> torch.dtype:
+    requested = str(_arg_value(args, "dtype", default="auto") or "auto").strip().lower()
+    if requested == "auto":
+        return _amp_dtype(device)
+    mapping = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    if requested not in mapping:
+        raise ValueError(f"Unsupported dtype {requested!r}. Use auto, float32, float16, or bfloat16.")
+    return mapping[requested]
 
 
 def _autocast_ctx(device: torch.device, dtype: torch.dtype):
@@ -344,7 +426,7 @@ def load_base_model_and_tokenizer(
     """
     is_main = _is_main_process()
     rank = _rank()
-    amp_dtype = _amp_dtype(device)
+    amp_dtype = _requested_amp_dtype(args, device)
     model_id = str(_arg_value(args, "model_id", "base_model", default=MODEL_ID))
 
     if bool(_arg_value(args, "use_4bit", default=False)) and device.type != "cuda":
@@ -386,8 +468,9 @@ def load_base_model_and_tokenizer(
         "low_cpu_mem_usage": True,
         "attn_implementation": attn_impl,
     }
-    if device.type == "cuda":
-        load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
+    hf_device_map, resolved_device_map = _resolve_from_pretrained_device_map(args, device, rank)
+    if hf_device_map is not None:
+        load_kwargs["device_map"] = hf_device_map
 
     disable_mamba = bool(_arg_value(args, "disable_mamba_kernels", default=False))
     mamba_fast_path = device.type == "cuda" and not disable_mamba
@@ -407,7 +490,7 @@ def load_base_model_and_tokenizer(
 
     if is_main:
         print(f"Loading model: {model_id}")
-        print(f"  device={device} amp_dtype={str(amp_dtype).replace('torch.', '')}")
+        print(f"  device={device} amp_dtype={str(amp_dtype).replace('torch.', '')} model_device_map={resolved_device_map}")
 
     if device.type == "cuda" and mamba_fast_path:
         _patch_transformers_jamba_fast_path_globals()
@@ -451,7 +534,7 @@ def load_model_and_tokenizer(
 ) -> Tuple[nn.Module, Any, int, int]:
     is_main = _is_main_process()
     rank = _rank()
-    amp_dtype = _amp_dtype(device)
+    amp_dtype = _requested_amp_dtype(args, device)
 
     # ── [perf] Prominent GPU capability log — visible every session ──────────
     if is_main and device.type == "cuda":
@@ -500,8 +583,9 @@ def load_model_and_tokenizer(
         "attn_implementation": attn_impl,
     }
 
-    if device.type == "cuda":
-        load_kwargs["device_map"] = {"": device.index if device.index is not None else rank}
+    hf_device_map, resolved_device_map = _resolve_from_pretrained_device_map(args, device, rank)
+    if hf_device_map is not None:
+        load_kwargs["device_map"] = hf_device_map
 
     _mamba_fast_path = device.type == "cuda" and not bool(getattr(args, "disable_mamba_kernels", False))
     if not _mamba_fast_path:
@@ -520,7 +604,7 @@ def load_model_and_tokenizer(
 
     if is_main:
         print(f"Loading model: {args.model_id}")
-        print(f"  device={device} amp_dtype={str(amp_dtype).replace('torch.', '')}")
+        print(f"  device={device} amp_dtype={str(amp_dtype).replace('torch.', '')} model_device_map={resolved_device_map}")
 
     if device.type == "cuda" and _mamba_fast_path:
         _patch_transformers_jamba_fast_path_globals()

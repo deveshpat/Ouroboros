@@ -32,6 +32,31 @@ def build_parser() -> argparse.ArgumentParser:
     dry_run.add_argument("--output_dir", required=True)
     dry_run.set_defaults(_handler="dry_run_coconut_val")
 
+    budget = subparsers.add_parser(
+        "audit-coconut-val-budget",
+        help="CPU/tokenizer-only Coconut validation truncation audit without model loading.",
+    )
+    budget.add_argument("--data_dir", required=True)
+    budget.add_argument("--tokenizer_model_id", required=True)
+    budget.add_argument("--max_seq_len", type=int, default=1024)
+    budget.add_argument("--stage_k", type=int, default=10)
+    budget.add_argument("--limit_samples", type=int)
+    budget.add_argument(
+        "--sample_strategy",
+        choices=("first", "longest"),
+        default="first",
+        help="When --limit_samples is set, choose the first rows or the rows with the largest token-budget requirement.",
+    )
+    budget.add_argument("--use_chat_template", action="store_true", default=True)
+    budget.add_argument("--no_chat_template", dest="use_chat_template", action="store_false")
+    budget.add_argument(
+        "--allow_truncated_eval",
+        action="store_true",
+        help="Keep exit code 0 when the tokenizer-only audit detects prompt truncation.",
+    )
+    budget.add_argument("--output_dir")
+    budget.set_defaults(_handler="audit_coconut_val_budget")
+
     compare = subparsers.add_parser(
         "compare-coconut-val",
         help="Run generated-answer base-vs-Ouroboros Coconut validation comparison.",
@@ -56,14 +81,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compare.add_argument("--gen_max_tokens", type=int, default=128)
     compare.add_argument("--stage_k", type=int, default=10)
-    compare.add_argument("--max_seq_len", type=int, default=512)
+    compare.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=8192,
+        help=(
+            "Bounded eval context length. Default 8192 for full release scoring after token-budget audit; "
+            "use 512 for T4 smoke runs if needed."
+        ),
+    )
     compare.add_argument("--halt_threshold", type=float, default=0.5)
     compare.add_argument("--device", default="auto")
     compare.add_argument("--dtype", default="auto")
+    compare.add_argument(
+        "--model_device_map",
+        choices=("single", "auto", "balanced", "balanced_low_0", "sequential"),
+        default="balanced_low_0",
+        help=(
+            "Eval-only model placement. single preserves the old cuda:0 pinning; "
+            "balanced_low_0/auto/balanced let Transformers shard model layers across visible CUDA GPUs."
+        ),
+    )
     compare.add_argument("--use_chat_template", action="store_true", default=True)
     compare.add_argument("--no_chat_template", dest="use_chat_template", action="store_false")
     compare.add_argument("--disable_mamba_kernels", action="store_true")
     compare.add_argument("--limit_samples", type=int)
+    compare.add_argument(
+        "--sample_strategy",
+        choices=("first", "longest"),
+        default="first",
+        help="When --limit_samples is set, choose the first rows or the rows with the largest token-budget requirement.",
+    )
     compare.add_argument(
         "--min_candidate_margin",
         type=float,
@@ -77,6 +125,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow_candidate_regression",
         action="store_true",
         help="Keep exit code 0 even when the candidate underperforms the baseline.",
+    )
+    compare.add_argument(
+        "--allow_truncated_eval",
+        action="store_true",
+        help=(
+            "Keep exit code 0 when prompts are truncated. By default, artifacts are written "
+            "and the command exits non-zero because the score is not clean."
+        ),
+    )
+    compare.add_argument(
+        "--cleanup_every_n_samples",
+        type=int,
+        default=25,
+        help="Run Python/CUDA memory cleanup between eval rows every N samples. Use 0 to disable.",
     )
     compare.add_argument("--output_dir", required=True)
     compare.set_defaults(_handler="compare_coconut_val")
