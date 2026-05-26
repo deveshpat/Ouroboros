@@ -46,7 +46,7 @@ on:
       eval_disable_candidate_halt_gate:
         description: 'Run eval as fixed-depth ablation: verify halt_gate.pt exists but do not use HaltGate decisions.'
         required: false
-        default: 'false'
+        default: 'true'
       eval_max_seq_len:
         description: 'Eval context length. Empty/0 = auto: sample-25 uses 512, longest-25/full use 8192.'
         required: false
