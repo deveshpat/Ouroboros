@@ -20,3 +20,7 @@
 | NCCL watchdog kills DDP val | `timedelta(hours=4)` + env var |
 | BF16 emulation on T4 | `_amp_dtype` checks `cc >= (8,0)` |
 | Jamba fast path declared active but generation raises `Fast Mamba kernels are not available` | Shared post-load model runtime probe gates baseline, candidate, and inference loaders before eval/generation loops |
+| HaltGate target can look good under teacher-forced CE while generated answers degrade | Treat teacher-forced CE as health-only; gate release on generated-answer artifacts and raw output inspection |
+| Fixed-depth ablation can pass a small slice but fail the hardest slice | Label fixed-depth runs as diagnostic/OOM checks unless full release-valid artifacts pass |
+| PEFT adapter config loaded with ignored keys | Align PEFT version with training/runtime or reproduce both paths before making public claims |
+| OOM fixes can make eval complete without proving model quality | Separate memory-stability success from generated-answer quality success |

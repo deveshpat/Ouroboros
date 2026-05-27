@@ -1,8 +1,8 @@
-# Plan: Public Alpha Release Spine — Finalized
+# Plan: Evaluation-First Public Alpha Spine
 
 > Source context: `plans/public-alpha-release.md`, repo inspection, and planning discussion on faithful validation, HaltGate use, generated-answer evaluation, and lm-eval boundaries.
 >
-> Status: replaces the previous public alpha plan. The old plan was directionally useful but unsafe because it allowed committed test bloat, teacher-forced metrics to stand in for real progress, non-HaltGate stage validation, and an underspecified lm-eval bridge.
+> Status: current pivot after HaltGate degeneration and longest-25 fixed-depth OOM/regression check. The project is not ready for release framing or more blind training. The next phase is generation/eval-harness sanity, with lm-eval-compatible configuration, PEFT runtime fidelity, and raw-output inspection before benchmark claims or JEPA/HaltGate curriculum work.
 
 ## Durable architectural decisions
 
@@ -13,23 +13,34 @@
   - `evaluate_stage()` remains available as a teacher-forced training-health eval.
   - `evaluate_stage()` must become HaltGate-aware by default whenever a HaltGate object exists.
   - Generated-answer exact match is the release gate and real progress metric.
-- **Candidate path**: base Jamba + `<|lat|>` token + Ouroboros PEFT adapter + DGAC HaltGate + Coconut latent runtime.
+- **Candidate path**: base Jamba + `<|lat|>` token + Ouroboros PEFT adapter + Coconut latent runtime. DGAC HaltGate is optional/experimental and must be explicitly declared when tested.
 - **Baseline path**: true `ai21labs/AI21-Jamba-Reasoning-3B` base model. No LoRA, no `<|lat|>`, no resized tokenizer, no HaltGate, no latent runtime.
-- **HaltGate release rule**: if a candidate is declared DGAC/HaltGate-backed, release comparison must fail loudly when `halt_gate.pt` is missing. No silent fixed-depth fallback for release artifacts.
+- **HaltGate release rule**: if a candidate is declared DGAC/HaltGate-backed, release comparison must fail loudly when `halt_gate.pt` is missing. No silent fixed-depth fallback for dynamic-stopping claims. Fixed-depth runs are diagnostic/OOM checks unless separately release-gated.
 - **Artifacts before claims**: README/HF/model-card metrics must come from generated `run_config.json`, `summary.json`, and `results.jsonl` artifacts.
 - **No repo-bloating tests**: permanent test files are out of scope. Implementers validate with temporary scripts/snippets and standard smoke commands.
-- **lm-eval position**: later optional bridge for external benchmark compatibility/generalization. Do not add lm-eval to the default install path and do not run MC benchmark suites until latent-aware loglikelihood is implemented.
+- **lm-eval position**: immediate eval-harness sanity track for standardized decoding/configuration and generation smoke. Keep lm-eval optional/non-default. Do not run or claim MC/loglikelihood suites until latent-aware loglikelihood and wrapper parity are implemented.
 
-## Current artifact status: HaltGate blocker
+## Current artifact status: eval-harness blocker
 
-Sampled generated-answer evaluation produced two important artifacts on the same 25 scorable validation rows:
+Generated-answer evidence now separates three facts:
 
 ```text
-HaltGate enabled -> baseline 0.08, candidate 0.04, actual_latents histogram 1:19 / 10:6, failed_candidate_regression
-fixed-depth ablation -> baseline 0.08, candidate 0.12, actual_latents histogram 10:25, passed diagnostic-only gate
+HaltGate enabled sample-25 -> baseline 0.08, candidate 0.04, actual_latents 1:19 / 10:6, failed_candidate_regression, degenerate/over-stopped generations
+fixed-depth earlier diagnostic -> baseline 0.08, candidate 0.12, actual_latents 10:25, diagnostic-only pass on one small slice
+fixed-depth longest-25 OOM check -> baseline 0.12, candidate 0.08, actual_latents 10:25, failed_candidate_regression but completed after memory fixes
 ```
 
-Conclusion: the adapter/tokenizer/runtime path is unlikely to be the primary blocker. The learned HaltGate currently over-stops under `halt_threshold=0.5` and must be trained/calibrated before any DGAC/HaltGate-backed release claim. Full validation should wait until a sampled HaltGate-enabled generated-answer comparison passes.
+Conclusion: the current evidence does not justify release, benchmark claims, or blind HaltGate retraining. The longest-25 run is valuable because it shows the post-fix harness can complete the hardest slice; it is not a quality win. The next decision gate is whether the model is being allowed to generate answers properly and whether the runtime faithfully loads the adapter.
+
+Current next work:
+
+```text
+PEFT/runtime version fidelity
+-> raw generation inspection
+-> decoding/answer-extraction sanity
+-> lm-eval-compatible generation smoke
+-> then choose full eval vs HaltGate objective repair vs JEPA/curriculum branch
+```
 
 ---
 
@@ -452,8 +463,9 @@ python -m ouroboros.eval compare-coconut-val ... --limit_samples 10 --disable_ca
 Promotion rule after ablation:
 
 ```text
-fixed-depth pass + HaltGate-enabled fail -> train/calibrate HaltGate; do not promote and do not run full validation yet
-HaltGate-enabled pass + sane latent histogram -> inspect artifacts, then consider full validation
+fixed-depth pass + HaltGate-enabled fail -> do not promote; inspect raw generations and HaltGate target/objective before training
+fixed-depth hardest-slice regression -> do not publish fixed-depth preview; treat as eval/harness/model-quality blocker
+HaltGate-enabled pass + sane latent histogram -> inspect raw artifacts, then consider broader validation
 ```
 
 Manually inspect:
@@ -492,7 +504,7 @@ Coconut validation = ID-backed in-domain holdout
 not external benchmark
 teacher-forced CE/token accuracy = training-health side metric
 generated exact match = real progress metric
-lm-eval = pending external benchmark bridge until artifacts exist
+lm-eval = current generation-sanity/benchmark-harness bridge; external claims still blocked until artifacts exist
 ```
 
 ### Acceptance criteria
@@ -535,17 +547,17 @@ alpha warning visible
 
 ---
 
-## Phase 7: lm-eval bridge
+## Phase 7: lm-eval-compatible eval harness
 
 **User stories covered**: benchmark reviewer wants standard benchmark artifacts; researcher wants comparable external metrics; maintainer wants no invalid benchmark claims.
 
 ### What to build
 
-Add an optional lm-eval bridge over the faithful Ouroboros runtime. This phase is not required for public alpha existence, but is required before external benchmark tables/claims.
+Add an optional lm-eval bridge over the faithful Ouroboros runtime. This phase is now required before public benchmark claims and before deciding whether failures are caused by undertraining, HaltGate, PEFT/runtime drift, or the local scoring harness.
 
-Do not add lm-eval to the default installation path. Keep it optional/release-only and record exact lm-eval version/extras in artifacts.
+Do not add lm-eval to the default installation path. Keep it optional/eval-only and record exact lm-eval version/extras in artifacts.
 
-### Phase 7A: generation-only smoke
+### Phase 7A: generation-only smoke and raw-output sanity
 
 Build:
 
@@ -564,9 +576,9 @@ loglikelihood_rolling -> explicit unsupported error for now
 Acceptance:
 
 - [ ] lm-eval can import/register/call the Ouroboros wrapper.
-- [ ] Candidate generation path uses adapter + `<|lat|>` + required HaltGate.
-- [ ] Missing required HaltGate fails loudly.
-- [ ] Smoke artifact records lm-eval version, task, limit, model IDs, adapter path, prompt settings, and runtime mode.
+- [ ] Candidate generation path uses adapter + `<|lat|>` + declared runtime mode: fixed-depth diagnostic or required HaltGate.
+- [ ] Missing required HaltGate fails loudly when HaltGate mode is declared.
+- [ ] Smoke artifact records lm-eval version, task, limit, model IDs, adapter path, PEFT/transformers versions, decoding settings, raw outputs, and runtime mode.
 - [ ] Multiple-choice/loglikelihood tasks are not claimed supported yet.
 
 ### Phase 7B: latent-aware loglikelihood
@@ -687,16 +699,16 @@ faithful FP16/BF16 runtime
 Use this order:
 
 ```text
-0. Replace old plan with this finalized plan.
-1. Phase 1: public CLI smoke repair.
-2. Phase 2: dry-run/inspect artifact shell.
-3. Phase 3: loader seam + HaltGate-aware stage eval.
-4. Phase 4: sampled generated-answer compare-coconut-val.
-5. Phase 4: full Coconut validation only after HaltGate-enabled sample artifacts pass inspection.
-6. Phase 5: docs/model-card update from produced artifacts.
-7. Phase 6: faithful demo only after artifacts exist.
-8. Phase 7: lm-eval generation smoke -> loglikelihood -> suites.
-9. Phase 8: optimization only after faithful metrics exist.
+0. Replace old plan with this evaluation-first plan.
+1. Keep public CLI/eval artifact shell working.
+2. Verify PEFT/runtime fidelity against training-time expectations.
+3. Inspect raw generations and answer extraction on tiny samples.
+4. Run lm-eval-compatible generation smoke with faithful baseline/candidate wrappers.
+5. Only then run larger in-domain validation or external benchmark suites.
+6. If generation is sane but quality fails, decide between HaltGate objective repair, more base latent training, or JEPA/curriculum branch.
+7. Update README/HF model card only from release-valid artifacts.
+8. Build faithful demo only after artifacts exist.
+9. Optimize/edge-export only after faithful metrics exist.
 ```
 
 Stop conditions:
@@ -705,8 +717,9 @@ Stop conditions:
 - Stop before docs claims if artifacts are missing.
 - Stop before demo if faithful runtime cannot load.
 - Stop before lm-eval MC suites if loglikelihood is unsupported.
-- Stop before full validation/promotion if HaltGate-enabled sampled generated-answer eval regresses or over-stops.
-- Stop before optimization if Phase 4 generated eval is not stable.
+- Stop before full validation/promotion if sample-level generated-answer eval regresses, over-stops, or produces degenerate raw outputs.
+- Stop before new HaltGate/JEPA curriculum work if PEFT/runtime fidelity or answer extraction is unresolved.
+- Stop before optimization if generated eval is not stable.
 ```
 
 Standard validation per commit-worthy slice:
@@ -729,6 +742,6 @@ No permanent test files are required. Use temporary snippets under `/tmp` or inl
 - [ ] No phase is merely “backend”, “CLI”, “docs”, or another horizontal slice without behavior acceptance.
 - [ ] Durable decisions are separated from volatile implementation details.
 - [ ] Teacher-forced metrics cannot be confused with generated-answer progress.
-- [ ] HaltGate is default whenever a trained HaltGate exists.
+- [ ] HaltGate is default only for declared dynamic-stopping evaluations; fixed-depth runs are labeled diagnostic.
 - [ ] Baseline is a true unmodified base model.
-- [ ] lm-eval external claims are blocked until valid bridge artifacts exist.
+- [ ] lm-eval external claims are blocked until valid bridge artifacts and wrapper parity exist.
