@@ -1,15 +1,35 @@
-"""Ouroboros minimal runtime.
+"""Ouroboros Coconut adapter workflow."""
 
-Public concepts are exposed through seven package roots:
-bootstrap, coconut, models, inference, eval, coordinator, and utils.
-"""
+from ouroboros.coconut import (
+    DEFAULT_BASE_MODEL,
+    DEFAULT_LATENT_TOKEN,
+    DEFAULT_LORA_TARGETS,
+    CoconutCollator,
+    GenerationResult,
+    JsonlCoconutDataset,
+    OuroborosCoconutForCausalLM,
+    build_features,
+    generate,
+    load_lora_coconut,
+    load_published_coconut,
+    load_rows,
+    push_release_bundle,
+    save_release_bundle,
+)
 
 __all__ = (
-    "bootstrap",
-    "coconut",
-    "models",
-    "inference",
-    "eval",
-    "coordinator",
-    "utils",
+    "DEFAULT_BASE_MODEL",
+    "DEFAULT_LATENT_TOKEN",
+    "DEFAULT_LORA_TARGETS",
+    "CoconutCollator",
+    "GenerationResult",
+    "JsonlCoconutDataset",
+    "OuroborosCoconutForCausalLM",
+    "build_features",
+    "generate",
+    "load_lora_coconut",
+    "load_published_coconut",
+    "load_rows",
+    "push_release_bundle",
+    "save_release_bundle",
 )
