@@ -302,7 +302,7 @@ def load_published_coconut(
 
     device = resolve_device("auto") if device is None else device
     dtype = resolve_dtype("auto", device) if dtype is None else dtype
-    tokenizer = AutoTokenizer.from_pretrained(adapter_id_or_path, use_fast=True, trust_remote_code=trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=trust_remote_code)
     base = AutoModelForCausalLM.from_pretrained(
         base_model,
         torch_dtype=dtype,
