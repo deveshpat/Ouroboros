@@ -1,6 +1,6 @@
 # Local custom modules with installation constraints
---force-reinstall --no-deps /hf_cache/wheels/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64-sm75.whl
---force-reinstall --no-deps /hf_cache/wheels/mamba_ssm-1.2.2-cp312-cp312-linux_x86_64-sm75.whl
+/hf_cache/wheels/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64-sm75.whl
+/hf_cache/wheels/mamba_ssm-1.2.2-cp312-cp312-linux_x86_64-sm75.whl
 
 # Standard PyPI packages
 torch>=2.5
