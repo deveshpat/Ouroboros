@@ -14,3 +14,5 @@ tqdm>=4.66
 bitsandbytes>=0.46
 lm_eval>=0.4.5
 wandb>=0.18
+sentencepiece>=0.1.99
+tiktoken>=0.7.0
