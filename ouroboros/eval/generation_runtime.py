@@ -56,12 +56,8 @@ class BaselineGenerationResult:
     prompt_budget: dict[str, Any]
 
 
-def _common_device(args) -> torch.device:
-    return resolve_device(str(getattr(args, "device", "auto")))
-
-
 def load_baseline_runtime(args) -> BaselineRuntime:
-    device = _common_device(args)
+    device = resolve_device(str(getattr(args, "device", "auto")))
     baseline_args = SimpleNamespace(
         model_id=args.baseline_model_id,
         use_4bit=False,

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
+from statistics import fmean, median_high
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -67,17 +69,13 @@ def _download_dataset_from_hub(
         if not rows:
             return {}
         n_steps = [r["n_steps"] for r in rows]
-        by_source: Dict[str, int] = {}
-        for r in rows:
-            by_source[r["source"]] = by_source.get(r["source"], 0) + 1
-        sorted_steps = sorted(n_steps)
         return {
             "n_samples":      len(rows),
-            "n_steps_mean":   round(sum(n_steps) / len(n_steps), 2),
+            "n_steps_mean":   round(fmean(n_steps), 2),
             "n_steps_min":    min(n_steps),
             "n_steps_max":    max(n_steps),
-            "n_steps_median": sorted_steps[len(sorted_steps) // 2],
-            "by_source":      by_source,
+            "n_steps_median": int(median_high(n_steps)),
+            "by_source":      dict(Counter(r["source"] for r in rows)),
         }
 
     stats = {"train": _quick_stats(train_rows), "val": _quick_stats(val_rows)}

@@ -38,10 +38,6 @@ from ouroboros.coconut.training_plan import plan_training_session
 from ouroboros.utils.wandb_runtime import wandb_init_kwargs
 
 
-def _truthy_anchor_resume(args: argparse.Namespace) -> bool:
-    return bool(getattr(args, "resume_from_anchor", False))
-
-
 def _fail_fast_on_unsupported_cuda(device: torch.device) -> None:
     if device.type != "cuda":
         return
@@ -115,7 +111,7 @@ def _select_training_device(local_rank: int) -> torch.device:
 
 def run_training_session(args: argparse.Namespace, *, script_start: float) -> None:
     plan_training_session(args)
-    resume_from_anchor = _truthy_anchor_resume(args)
+    resume_from_anchor = bool(getattr(args, "resume_from_anchor", False))
     if resume_from_anchor and not args.use_halt_gate:
         raise ValueError(
             "--resume_from_anchor requires --use_halt_gate. "

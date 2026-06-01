@@ -20,11 +20,6 @@ from ouroboros.models import barrier
 from ouroboros.utils.runtime_env import is_main_process
 
 
-def _eval_progress_every(args: argparse.Namespace) -> int:
-    """Return the validation progress cadence. Zero disables progress logs."""
-    return max(int(getattr(args, "eval_progress_every", 25) or 0), 0)
-
-
 def _emit_progress(message: str) -> None:
     """Print rank-0 progress immediately so Kaggle logs do not look stalled."""
     if is_main_process():
@@ -89,7 +84,7 @@ def evaluate_stage_health_metrics(
     halt_gate_used = halt_gate is not None
 
     local_val_samples = val_samples[rank::world_size]
-    progress_every = _eval_progress_every(args)
+    progress_every = max(int(getattr(args, "eval_progress_every", 25) or 0), 0)
     _emit_progress(
         f"  [eval] teacher-forced CE/token-acc start: rank0_shard={len(local_val_samples)} "
         f"global_samples={len(val_samples)} batch_size={batch_size} stage={stage_k} "

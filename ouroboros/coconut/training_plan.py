@@ -28,16 +28,12 @@ class TrainingSessionPlan:
     reason: str = ""
 
 
-def _truthy_attr(args: Any, name: str, default: bool = False) -> bool:
-    return bool(getattr(args, name, default))
-
-
 def plan_training_session(args: Any) -> TrainingSessionPlan:
     """Classify the requested run before heavy model/dataset execution."""
 
-    use_halt_gate = _truthy_attr(args, "use_halt_gate")
-    resume_from_anchor = _truthy_attr(args, "resume_from_anchor")
-    eval_only = _truthy_attr(args, "eval_only")
+    use_halt_gate = bool(getattr(args, "use_halt_gate", False))
+    resume_from_anchor = bool(getattr(args, "resume_from_anchor", False))
+    eval_only = bool(getattr(args, "eval_only", False))
     resume_from = normalize_text(getattr(args, "resume_from", None))
     max_train_steps = getattr(args, "max_train_steps", None)
 

@@ -7,6 +7,7 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
+from statistics import fmean
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
 
@@ -445,7 +446,7 @@ def _actual_latents_mean(values: list[Any]) -> float:
             flat.extend(float(v) for v in value)
         elif value is not None:
             flat.append(float(value))
-    return sum(flat) / len(flat) if flat else 0.0
+    return fmean(flat) if flat else 0.0
 
 
 def _ensure_required_halt_gate(adapter_dir: Path) -> None:
@@ -461,4 +462,3 @@ def compare_coconut_val(args: argparse.Namespace) -> None:
     from ouroboros.eval.comparison import run_generated_answer_comparison
 
     run_generated_answer_comparison(args)
-
