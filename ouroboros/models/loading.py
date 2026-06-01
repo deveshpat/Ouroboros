@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import random
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -18,6 +17,13 @@ except ImportError:
     LoraConfig = get_peft_model = None  # type: ignore[assignment]
 
 from . import runtime as model_runtime
+from ouroboros.utils.runtime_env import (
+    env_bool,
+    is_main_process as runtime_is_main_process,
+    local_process_rank,
+    process_rank,
+    world_size as runtime_world_size,
+)
 
 MODEL_ID = "ai21labs/AI21-Jamba-Reasoning-3B"
 
@@ -89,19 +95,19 @@ _CHAT_TEMPLATE_WARNED = False
 
 
 def _is_main_process() -> bool:
-    return int(os.environ.get("RANK", "0")) == 0
+    return runtime_is_main_process()
 
 
 def _rank() -> int:
-    return int(os.environ.get("RANK", "0"))
+    return process_rank()
 
 
 def _world_size() -> int:
-    return int(os.environ.get("WORLD_SIZE", "1"))
+    return runtime_world_size()
 
 
 def _local_rank() -> int:
-    return int(os.environ.get("LOCAL_RANK", str(_rank())))
+    return local_process_rank()
 
 
 def _maybe_empty_cuda_cache() -> None:
@@ -110,7 +116,7 @@ def _maybe_empty_cuda_cache() -> None:
 
 
 def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+    return env_bool(None, name, default=False)
 
 
 def _coerce_positive_int(value: Any, default: int) -> int:
@@ -333,6 +339,14 @@ def barrier() -> None:
 
 
 def set_seed(seed: int) -> None:
+    try:
+        from accelerate.utils import set_seed as accelerate_set_seed
+
+        accelerate_set_seed(seed)
+        return
+    except ImportError:
+        pass
+
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():

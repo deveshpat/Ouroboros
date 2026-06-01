@@ -14,9 +14,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ouroboros.utils.runtime_env import (
     WANDB_KEY_ALIASES,
+    env_bool,
+    local_process_rank,
     normalize_text,
+    process_rank,
     resolve_env_alias,
     resolve_hf_token,
+    world_size as runtime_world_size,
 )
 
 _MAMBA_HUB_WHEEL_BASES = [
@@ -347,25 +351,15 @@ def _bootstrap_verify_flash_attention() -> bool:
 
 
 def _bootstrap_env_rank() -> int:
-    try:
-        return int(os.environ.get("RANK", "0"))
-    except (TypeError, ValueError):
-        return 0
+    return process_rank()
 
 
 def _bootstrap_env_world_size() -> int:
-    try:
-        return max(int(os.environ.get("WORLD_SIZE", "1")), 1)
-    except (TypeError, ValueError):
-        return 1
+    return max(runtime_world_size(), 1)
 
 
 def _bootstrap_env_local_rank() -> int:
-    raw = os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))
-    try:
-        return max(int(raw), 0)
-    except (TypeError, ValueError):
-        return 0
+    return max(local_process_rank(), 0)
 
 
 def _bootstrap_launch_key() -> str:
@@ -513,13 +507,11 @@ def _bootstrap_shared_install_phases() -> None:
 
 
 def _bootstrap_shared_install_requested() -> bool:
-    text = normalize_text(os.environ.get("OUROBOROS_BOOTSTRAP_SHARED_INSTALL"))
-    return text is not None and text.lower() in {"1", "true", "yes", "y", "on"}
+    return env_bool(None, "OUROBOROS_BOOTSTRAP_SHARED_INSTALL", default=False)
 
 
 def _bootstrap_kaggle_preflight_done() -> bool:
-    text = normalize_text(os.environ.get("OUROBOROS_KAGGLE_PREFLIGHT_DONE"))
-    return text is not None and text.lower() in {"1", "true", "yes", "y", "on"}
+    return env_bool(None, "OUROBOROS_KAGGLE_PREFLIGHT_DONE", default=False)
 
 
 def run_shared_install_preflight() -> None:
