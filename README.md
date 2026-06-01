@@ -1,26 +1,21 @@
 # Ouroboros
 
-Ouroboros is a compact latent-reasoning research repo built directly on
-HuggingFace, PEFT, Accelerate, and lm-eval. It no longer carries coordinators,
-workers, runtime bootstrapping, or custom Hub sync systems.
+Ouroboros is a modular research runtime for experimenting with Coconut/DGAC-style latent reasoning on top of `ai21labs/AI21-Jamba-Reasoning-3B`.
 
-The whole active path is intentionally flat:
+The current direction is intentionally simple without becoming flat: keep the package boundaries that make architecture work easy, remove dead orchestration, and lean on proven libraries such as Hugging Face Hub, Transformers, PEFT, Accelerate-backed device maps, bitsandbytes, and lm-evaluation-harness.
+
+## Current Shape
 
 ```text
-train.py                  -> python train.py
-eval.py                   -> python eval.py
-ouroboros/config.py       -> defaults and tiny dataclasses
-ouroboros/data.py         -> JSON/JSONL loading and latent stage samples
-ouroboros/latent.py       -> Coconut wrapper plus DGAC HaltGate
-ouroboros/generation.py   -> latent-aware greedy generation
-ouroboros/train.py        -> staged Accelerate training loop
-ouroboros/eval.py         -> teacher-forced eval and lm-eval bridge
-ouroboros/callbacks.py    -> save bundle, W&B, push to Hub
-ouroboros/utils.py        -> small shared helpers
+bootstrap   -> Kaggle/runtime setup and hard-won Jamba/Mamba guardrails
+coconut     -> dataset, latent passes, DGAC HaltGate, training, checkpoints
+models      -> Transformers/PEFT loading, dtype, quant, runtime probes
+inference   -> faithful adapter + latent generation smoke path
+eval        -> Coconut artifacts plus generated-answer and lm-eval smoke paths
+utils       -> small env, Hub, W&B helpers
 ```
 
-If an old infrastructure path is needed later, Git history has it. The active
-repo should stay boring and experiment-shaped.
+There is no active multi-worker control loop. The older orchestration lessons remain documented as failure patterns, but Kaggle runs now go through the visible `kaggle-utils.ipynb` command cell.
 
 ## Install
 
@@ -28,98 +23,107 @@ repo should stay boring and experiment-shaped.
 python -m pip install -r requirements.txt
 ```
 
-For GPU training, install the PyTorch build appropriate for the machine first if
-the default pip resolver does not pick the right CUDA wheel.
+On Kaggle, attach the cached `ouroboros-cache` dataset so the Mamba wheels and HF cache are reused instead of rebuilt each session.
 
-## Train
+## Kaggle
 
-```bash
-python train.py \
-  --train data/coconut_v1/train.jsonl \
-  --validation data/coconut_v1/val.jsonl \
-  --base-model ai21labs/AI21-Jamba-Reasoning-3B \
-  --stages 0-10 \
-  --epochs-per-stage 1 \
-  --batch-size 1 \
-  --grad-accum 8 \
-  --output-dir runs/ouroboros
-```
-
-This saves a release bundle to:
+Open `kaggle-utils.ipynb`, set `OUROBOROS_KAGGLE_RUN_MODE`, and run all cells.
 
 ```text
-runs/ouroboros/final
+infer        -> normal faithful adapter/DGAC inference smoke
+infer_edge   -> 4-bit edge-oriented inference smoke
+train_canary -> short QLoRA training canary
+eval_lm      -> lm-eval stock HF/PEFT smoke; not latent-aware scoring
 ```
 
-To train the optional DGAC HaltGate regularizer:
+The notebook prints the exact command before launching it.
+
+## Inference
+
+Normal runtime:
 
 ```bash
-python train.py --use-halt-gate --stages 0-10
-```
-
-## Publish
-
-```bash
-python -m ouroboros publish \
-  --bundle-dir runs/ouroboros/final \
-  --hub-model-id WeirdRunner/Ouroboros
-```
-
-Publishing uses HuggingFace Hub APIs directly. There is no internal checkpoint
-sync service.
-
-## Evaluate
-
-```bash
-python eval.py \
-  --adapter WeirdRunner/Ouroboros \
-  --data data/coconut_v1/val.jsonl \
-  --max-samples 128
-```
-
-This reports teacher-forced latent loss. It is a training sanity check, not a
-public benchmark claim.
-
-For standard benchmarks, call lm-eval through the repo wrapper:
-
-```bash
-python eval.py \
-  --adapter WeirdRunner/Ouroboros \
-  --tasks hellaswag,arc_easy \
-  --lm-eval
-```
-
-That path evaluates the HF model plus PEFT adapter through lm-eval. The local
-teacher-forced path is the latent-aware sanity check.
-
-## Infer
-
-```bash
-python -m ouroboros infer \
-  --adapter WeirdRunner/Ouroboros \
+python -m ouroboros.inference \
+  --adapter_repo WeirdRunner/Ouroboros \
+  --adapter_subfolder diloco_state/anchor \
   --prompt "Explain the idea in one paragraph."
 ```
 
-## Data Format
+Edge-oriented 4-bit runtime:
 
-JSONL or JSON rows should contain:
-
-```json
-{
-  "question": "question text",
-  "steps": ["reasoning step 1", "reasoning step 2"],
-  "answer": "final answer"
-}
+```bash
+python -m ouroboros.inference \
+  --adapter_repo WeirdRunner/Ouroboros \
+  --adapter_subfolder diloco_state/anchor \
+  --prompt "Explain the idea in one paragraph." \
+  --use_4bit \
+  --model_device_map auto \
+  --dtype float16
 ```
 
-The loader also accepts the existing local fields `answer_full` and
-`answer_norm`.
+## Training
 
-## What This Does Not Do
+Sequential canary:
 
-This simplified repo does not run distributed orchestration, worker lifecycle
-management, benchmark automation, or environment self-repair. The current goal
-is to make the core model experiment easy to run, save, publish, and inspect.
+```bash
+python -m ouroboros.coconut \
+  --data_dir data/coconut_v1 \
+  --max_stage 1 \
+  --max_samples 128 \
+  --max_train_steps 10 \
+  --use_4bit \
+  --output_dir runs/stage3_canary
+```
+
+DGAC continuation from a Hub anchor:
+
+```bash
+python -m ouroboros.coconut \
+  --use_halt_gate \
+  --resume_from_anchor \
+  --resume_anchor_repo_id WeirdRunner/Ouroboros \
+  --resume_anchor_subdir diloco_state/anchor \
+  --max_train_steps 10 \
+  --output_dir runs/stage3_dgac_canary
+```
+
+## Evaluation
+
+Coconut generated-answer comparison remains the faithful latent runtime path:
+
+```bash
+python -m ouroboros.eval compare-coconut-val ...
+```
+
+lm-eval integration is available for standard HF/PEFT smoke tests:
+
+```bash
+python -m ouroboros.eval lm-eval-hf \
+  --model_id ai21labs/AI21-Jamba-Reasoning-3B \
+  --adapter WeirdRunner/Ouroboros \
+  --tasks arc_easy \
+  --limit 10 \
+  --output_path runs/lm_eval_smoke
+```
+
+Boundary: `lm-eval-hf` uses lm-evaluation-harness' stock HF backend. It is useful for harness setup and PEFT smoke testing, but it does not execute Coconut latent passes yet.
+
+## Guardrails Kept
+
+The simplification keeps the fixes that were expensive to learn:
+
+```text
+Mamba/Jamba fast-path probe before generation/eval loops
+T4 uses fp16 instead of bf16 emulation
+cc < 7.5 fast-fails before cached-wheel training runs
+prompt truncation audits for generated-answer eval
+HaltGate missing/disabled states are explicit
+Kaggle launch command stays visible in the notebook
+```
+
+## Non-Claims
+
+Ouroboros does not currently claim SOTA quality, a public benchmark win, working dynamic stopping, or behavior-preserving quantized export. The goal is to make architecture experiments fast, faithful, and easy to run.
 
 ## License
 

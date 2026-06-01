@@ -1,26 +1,14 @@
-"""Ouroboros: a compact latent-reasoning research core."""
+"""Ouroboros minimal runtime.
 
-from ouroboros.callbacks import push_release_bundle, save_release_bundle
-from ouroboros.config import DEFAULT_BASE_MODEL, DEFAULT_LATENT_TOKEN, DEFAULT_LORA_TARGETS
-from ouroboros.data import CoconutCollator, JsonlCoconutDataset, PromptFeature, build_features, load_rows
-from ouroboros.generation import GenerationResult, generate
-from ouroboros.latent import HaltGate, OuroborosCoconutForCausalLM, load_lora_coconut, load_published_coconut
+Public concepts are exposed through six package roots:
+bootstrap, coconut, models, inference, eval, and utils.
+"""
 
 __all__ = (
-    "DEFAULT_BASE_MODEL",
-    "DEFAULT_LATENT_TOKEN",
-    "DEFAULT_LORA_TARGETS",
-    "CoconutCollator",
-    "GenerationResult",
-    "HaltGate",
-    "JsonlCoconutDataset",
-    "OuroborosCoconutForCausalLM",
-    "PromptFeature",
-    "build_features",
-    "generate",
-    "load_lora_coconut",
-    "load_published_coconut",
-    "load_rows",
-    "push_release_bundle",
-    "save_release_bundle",
+    "bootstrap",
+    "coconut",
+    "models",
+    "inference",
+    "eval",
+    "utils",
 )
