@@ -3,28 +3,19 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
-import functools
 import os
 import random
-import sys
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
 
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    import transformers as _tf
-    _TF_VERSION = tuple(int(x) for x in _tf.__version__.split(".")[:2])
     from peft import LoraConfig, get_peft_model
 except ImportError:
     AutoModelForCausalLM = AutoTokenizer = BitsAndBytesConfig = None  # type: ignore[assignment]
     LoraConfig = get_peft_model = None  # type: ignore[assignment]
-    _TF_VERSION = (0, 0)
 
 from . import runtime as model_runtime
 
@@ -44,6 +35,10 @@ LORA_TARGET_MODULES = [
 
 
 INFERENCE_DEVICE_MAP_CHOICES = {"single", "auto", "balanced", "balanced_low_0", "sequential"}
+
+module_first_device = model_runtime.module_first_device
+_autocast_ctx = model_runtime.autocast_context
+_extract_last_hidden_state = model_runtime.extract_last_hidden_state
 
 
 def _cuda_device_count() -> int:
@@ -81,24 +76,6 @@ def _resolve_from_pretrained_device_map(args: argparse.Namespace, device: torch.
             print(f"  [warn] model_device_map={requested} requested, but only one CUDA device is visible; using single-device load.")
         return {"": device.index if device.index is not None else rank}, "single"
     return requested, requested
-
-
-def module_first_device(module: Any, fallback: torch.device) -> torch.device:
-    """Best-effort execution device for a potentially sharded module."""
-    for iterator_name in ("parameters", "buffers"):
-        iterator = getattr(module, iterator_name, None)
-        if not callable(iterator):
-            continue
-        try:
-            first = next(iterator())
-        except StopIteration:
-            continue
-        except Exception:
-            continue
-        device = getattr(first, "device", None)
-        if isinstance(device, torch.device):
-            return device
-    return fallback
 
 
 def model_device_map_summary(model: Any) -> dict[str, str] | None:
@@ -201,38 +178,6 @@ def _requested_amp_dtype(args: argparse.Namespace, device: torch.device) -> torc
     return mapping[requested]
 
 
-def _autocast_ctx(device: torch.device, dtype: torch.dtype):
-    if device.type == "cuda":
-        return torch.autocast(device_type="cuda", dtype=dtype)
-    if device.type == "mps":
-        try:
-            is_available = torch.amp.autocast_mode.is_autocast_available("mps")
-        except Exception:
-            is_available = False
-        if is_available:
-            return torch.autocast(device_type="mps", dtype=dtype)
-    return contextlib.nullcontext()
-
-
-def _extract_last_hidden_state(outputs, context: str) -> torch.Tensor:
-    last_hidden = getattr(outputs, "last_hidden_state", None)
-    assert last_hidden is not None, (
-        f"{context}: model backbone returned None for last_hidden_state. "
-        "Pass output_hidden_states=True and use out.hidden_states[-1] instead."
-    )
-    return last_hidden
-
-
-def _unwrap_peft_model(model):
-    try:
-        base = model.get_base_model()
-        if base is not None:
-            return base
-    except Exception:
-        pass
-    return model
-
-
 def _cache_model_lookup(model, cache_name: str, resolver):
     cached = getattr(model, cache_name, None)
     if cached is not None:
@@ -253,7 +198,7 @@ def _clear_model_handle_cache(model) -> None:
     seen = set()
     stack = [model]
     try:
-        base = _unwrap_peft_model(model)
+        base = model_runtime.unwrap_peft_model(model)
     except Exception:
         base = None
     if base is not None and base is not model:
@@ -279,20 +224,7 @@ def _clear_model_handle_cache(model) -> None:
 
 def _get_backbone(model):
     def _resolve():
-        base = _unwrap_peft_model(model)
-        candidates = [
-            getattr(model, "model", None),
-            getattr(base, "model", None),
-            getattr(getattr(base, "model", None), "model", None),
-        ]
-        for cand in candidates:
-            if cand is not None and hasattr(cand, "forward") and hasattr(cand, "embed_tokens"):
-                return cand
-        raise AttributeError(
-            "Cannot locate backbone model. Inspect:\n"
-            "  print(type(model))\n"
-            "  print([n for n, _ in model.named_modules()][:40])"
-        )
+        return model_runtime.resolve_backbone(model)
 
     return _cache_model_lookup(model, "_ouro_cache_backbone", _resolve)
 
@@ -303,7 +235,7 @@ def _get_embed_tokens(model):
         if getattr(backbone, "embed_tokens", None) is not None:
             return backbone.embed_tokens
 
-        base = _unwrap_peft_model(model)
+        base = model_runtime.unwrap_peft_model(model)
         for obj in [model, base]:
             if obj is None:
                 continue
@@ -323,7 +255,7 @@ def _get_embed_tokens(model):
 
 def _get_lm_head(model):
     def _resolve():
-        base = _unwrap_peft_model(model)
+        base = model_runtime.unwrap_peft_model(model)
         for obj in [model, base, getattr(base, "model", None)]:
             if obj is None:
                 continue
@@ -349,26 +281,6 @@ def _maybe_apply_chat_template(tokenizer, question: str) -> str:
             print("  [warn] tokenizer.apply_chat_template failed; using plain prompt fallback.")
             _CHAT_TEMPLATE_WARNED = True
         return f"User: {question}\nAssistant: "
-
-
-def _patch_transformers_jamba_fast_path_globals() -> bool:
-    """Compatibility wrapper around the shared model runtime seam."""
-    return model_runtime.patch_transformers_jamba_fast_path_globals()
-
-
-def _probe_jamba_runtime_fast_path(model, device: torch.device, amp_dtype: torch.dtype) -> None:
-    """Compatibility wrapper around the shared post-load readiness probe."""
-    model_runtime.ensure_jamba_runtime_ready(
-        model,
-        device=device,
-        amp_dtype=amp_dtype,
-        fast_path_requested=True,
-        context="legacy loading probe",
-    )
-
-
-def _safe_from_pretrained(model_id: str, load_kwargs: Dict[str, Any]):
-    return model_runtime.safe_from_pretrained(AutoModelForCausalLM, model_id, load_kwargs)
 
 
 def _distributed_is_initialized() -> bool:
@@ -528,9 +440,9 @@ def load_base_model_and_tokenizer(
         print(f"  device={device} amp_dtype={str(amp_dtype).replace('torch.', '')} model_device_map={resolved_device_map}")
 
     if device.type == "cuda" and mamba_fast_path:
-        _patch_transformers_jamba_fast_path_globals()
+        model_runtime.patch_transformers_jamba_fast_path_globals()
 
-    model = _safe_from_pretrained(model_id, load_kwargs)
+    model = model_runtime.safe_from_pretrained(AutoModelForCausalLM, model_id, load_kwargs)
     model.config.use_cache = False
     model_runtime.ensure_jamba_runtime_ready(
         model,
@@ -627,7 +539,6 @@ def load_model_and_tokenizer(
     if not _mamba_fast_path:
         load_kwargs["use_mamba_kernels"] = False
 
-
     if args.use_4bit:
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -643,9 +554,9 @@ def load_model_and_tokenizer(
         print(f"  device={device} amp_dtype={str(amp_dtype).replace('torch.', '')} model_device_map={resolved_device_map}")
 
     if device.type == "cuda" and _mamba_fast_path:
-        _patch_transformers_jamba_fast_path_globals()
+        model_runtime.patch_transformers_jamba_fast_path_globals()
 
-    model = _safe_from_pretrained(args.model_id, load_kwargs)
+    model = model_runtime.safe_from_pretrained(AutoModelForCausalLM, args.model_id, load_kwargs)
     model.config.use_cache = False
     model_runtime.ensure_jamba_runtime_ready(
         model,

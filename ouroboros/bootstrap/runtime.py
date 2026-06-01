@@ -19,11 +19,6 @@ from ouroboros.utils.runtime_env import (
     resolve_hf_token,
 )
 
-
-def _normalize_text(value: Optional[Any], *, uppercase: bool = False) -> Optional[str]:
-    return normalize_text(value, uppercase=uppercase)
-
-
 _MAMBA_HUB_WHEEL_BASES = [
     "causal_conv1d-1.6.1-cp312-cp312-linux_x86_64",
     "mamba_ssm-1.2.2-cp312-cp312-linux_x86_64",
@@ -133,7 +128,7 @@ def _maybe_get_kaggle_secret(label: str) -> Optional[str]:
         value = client_cls().get_secret(label)
     except Exception:
         return None
-    return _normalize_text(value)
+    return normalize_text(value)
 
 
 def _maybe_get_colab_secret(label: str) -> Optional[str]:
@@ -145,7 +140,7 @@ def _maybe_get_colab_secret(label: str) -> Optional[str]:
         value = userdata.get(label)
     except Exception:
         return None
-    return _normalize_text(value)
+    return normalize_text(value)
 
 
 def _resolve_hf_token_common(cli_value: Optional[str] = None) -> Optional[str]:
@@ -166,7 +161,7 @@ def _resolve_hf_token_common(cli_value: Optional[str] = None) -> Optional[str]:
         ("HF_TOKEN", _maybe_get_kaggle_secret),
         ("HF_TOKEN", _maybe_get_colab_secret),
     ):
-        token = _normalize_text(resolver(secret_name))
+        token = normalize_text(resolver(secret_name))
         if token:
             return token
     return None
@@ -374,7 +369,7 @@ def _bootstrap_env_local_rank() -> int:
 
 
 def _bootstrap_launch_key() -> str:
-    override = _normalize_text(os.environ.get("OUROBOROS_BOOTSTRAP_LAUNCH_KEY"))
+    override = normalize_text(os.environ.get("OUROBOROS_BOOTSTRAP_LAUNCH_KEY"))
     if override is not None:
         return override
 
@@ -518,12 +513,12 @@ def _bootstrap_shared_install_phases() -> None:
 
 
 def _bootstrap_shared_install_requested() -> bool:
-    text = _normalize_text(os.environ.get("OUROBOROS_BOOTSTRAP_SHARED_INSTALL"))
+    text = normalize_text(os.environ.get("OUROBOROS_BOOTSTRAP_SHARED_INSTALL"))
     return text is not None and text.lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _bootstrap_kaggle_preflight_done() -> bool:
-    text = _normalize_text(os.environ.get("OUROBOROS_KAGGLE_PREFLIGHT_DONE"))
+    text = normalize_text(os.environ.get("OUROBOROS_KAGGLE_PREFLIGHT_DONE"))
     return text is not None and text.lower() in {"1", "true", "yes", "y", "on"}
 
 

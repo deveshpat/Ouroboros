@@ -23,7 +23,7 @@ from ouroboros.coconut import HaltGate
 from ouroboros.coconut import decode_from_latent_context, prepare_latent_runtime, run_latent_passes
 from ouroboros.models import MODEL_ID, load_base_model_and_tokenizer
 from ouroboros.models.loading import _amp_dtype, _get_embed_tokens, module_first_device
-from ouroboros.utils.runtime_env import resolve_hf_token
+from ouroboros.utils.runtime_env import env_bool, normalize_text, resolve_hf_token
 
 DEFAULT_ADAPTER_REPO = "WeirdRunner/Ouroboros"
 DEFAULT_ADAPTER_SUBFOLDER = "diloco_state/anchor"
@@ -56,33 +56,19 @@ class InferenceResult:
     prompt_budget: dict[str, Any]
 
 
-def _normalize_text(value: object | None) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
 def _env(env: Mapping[str, str], name: str, default: str) -> str:
-    return _normalize_text(env.get(name)) or default
-
-
-def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
-    text = _normalize_text(env.get(name))
-    if text is None:
-        return default
-    return text.lower() in {"1", "true", "yes", "y", "on"}
+    return normalize_text(env.get(name)) or default
 
 
 def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | None = None) -> argparse.Namespace:
     env = os.environ if env is None else env
     parser = argparse.ArgumentParser(description="Run Ouroboros adapter/DGAC inference")
-    parser.add_argument("--prompt", default=_normalize_text(env.get("OUROBOROS_INFERENCE_PROMPT")))
-    parser.add_argument("--prompt_file", default=_normalize_text(env.get("OUROBOROS_INFERENCE_PROMPT_FILE")))
+    parser.add_argument("--prompt", default=normalize_text(env.get("OUROBOROS_INFERENCE_PROMPT")))
+    parser.add_argument("--prompt_file", default=normalize_text(env.get("OUROBOROS_INFERENCE_PROMPT_FILE")))
     parser.add_argument("--base_model", default=_env(env, "OUROBOROS_INFERENCE_BASE_MODEL", MODEL_ID))
     parser.add_argument("--adapter_repo", default=_env(env, "OUROBOROS_INFERENCE_ADAPTER_REPO", DEFAULT_ADAPTER_REPO))
     parser.add_argument("--adapter_subfolder", default=_env(env, "OUROBOROS_INFERENCE_ADAPTER_SUBFOLDER", DEFAULT_ADAPTER_SUBFOLDER))
-    parser.add_argument("--adapter_dir", default=_normalize_text(env.get("OUROBOROS_INFERENCE_ADAPTER_DIR")))
+    parser.add_argument("--adapter_dir", default=normalize_text(env.get("OUROBOROS_INFERENCE_ADAPTER_DIR")))
     parser.add_argument("--adapter_cache_dir", default=_env(env, "OUROBOROS_INFERENCE_ADAPTER_CACHE_DIR", DEFAULT_ADAPTER_CACHE_DIR))
     parser.add_argument("--device", default=_env(env, "OUROBOROS_INFERENCE_DEVICE", "auto"))
     parser.add_argument("--dtype", default=_env(env, "OUROBOROS_INFERENCE_DTYPE", "auto"))
@@ -96,13 +82,13 @@ def parse_args(argv: Iterable[str] | None = None, *, env: Mapping[str, str] | No
     parser.add_argument("--max_new_tokens", type=int, default=int(_env(env, "OUROBOROS_INFERENCE_MAX_NEW_TOKENS", str(DEFAULT_MAX_NEW_TOKENS))))
     parser.add_argument("--max_seq_len", type=int, default=int(_env(env, "OUROBOROS_INFERENCE_MAX_SEQ_LEN", str(DEFAULT_MAX_SEQ_LEN))))
     parser.add_argument("--halt_threshold", type=float, default=float(_env(env, "OUROBOROS_INFERENCE_HALT_THRESHOLD", str(DEFAULT_HALT_THRESHOLD))))
-    parser.add_argument("--use_chat_template", action="store_true", default=_env_bool(env, "OUROBOROS_INFERENCE_USE_CHAT_TEMPLATE", True))
+    parser.add_argument("--use_chat_template", action="store_true", default=env_bool(env, "OUROBOROS_INFERENCE_USE_CHAT_TEMPLATE", default=True))
     parser.add_argument("--no_chat_template", dest="use_chat_template", action="store_false")
-    parser.add_argument("--use_halt_gate", action="store_true", default=_env_bool(env, "OUROBOROS_INFERENCE_USE_HALT_GATE", True))
+    parser.add_argument("--use_halt_gate", action="store_true", default=env_bool(env, "OUROBOROS_INFERENCE_USE_HALT_GATE", default=True))
     parser.add_argument("--no_halt_gate", dest="use_halt_gate", action="store_false")
-    parser.add_argument("--use_4bit", action="store_true", default=_env_bool(env, "OUROBOROS_INFERENCE_USE_4BIT", False))
-    parser.add_argument("--disable_mamba_kernels", action="store_true", default=_env_bool(env, "OUROBOROS_INFERENCE_DISABLE_MAMBA_KERNELS", False))
-    parser.add_argument("--json", action="store_true", default=_env_bool(env, "OUROBOROS_INFERENCE_JSON", False))
+    parser.add_argument("--use_4bit", action="store_true", default=env_bool(env, "OUROBOROS_INFERENCE_USE_4BIT", default=False))
+    parser.add_argument("--disable_mamba_kernels", action="store_true", default=env_bool(env, "OUROBOROS_INFERENCE_DISABLE_MAMBA_KERNELS", default=False))
+    parser.add_argument("--json", action="store_true", default=env_bool(env, "OUROBOROS_INFERENCE_JSON", default=False))
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -156,24 +142,10 @@ def download_adapter_snapshot(
 def resolve_prompt(args: argparse.Namespace) -> str:
     if args.prompt_file:
         return Path(args.prompt_file).read_text(encoding="utf-8").strip()
-    prompt = _normalize_text(args.prompt)
+    prompt = normalize_text(args.prompt)
     if prompt is None:
         raise SystemExit("Provide --prompt or --prompt_file for inference.")
     return prompt
-
-
-def _load_tokenizer(base_model: str):
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-    lat_token = "<|lat|>"
-    existing_id = tokenizer.convert_tokens_to_ids(lat_token)
-    if existing_id is None or existing_id == tokenizer.unk_token_id:
-        tokenizer.add_special_tokens({"additional_special_tokens": [lat_token]})
-    return tokenizer
 
 
 def load_components(args: argparse.Namespace):
