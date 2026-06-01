@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from transformers.optimization import get_cosine_with_min_lr_schedule_with_warmup
 from tqdm.auto import tqdm
 
 from ouroboros.coconut.data import build_sample_at_stage, collate_stage_k
@@ -74,14 +75,13 @@ def build_optimizer_and_scheduler(
         eps=1e-8,
     )
 
-    def lr_lambda(step: int) -> float:
-        if step < args.warmup_steps:
-            return (step + 1) / max(args.warmup_steps, 1)
-        progress = (step - args.warmup_steps) / max(total_steps - args.warmup_steps, 1)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
-        return args.min_lr_ratio + (1.0 - args.min_lr_ratio) * cosine
-
-    return optimizer, LambdaLR(optimizer, lr_lambda)
+    scheduler = get_cosine_with_min_lr_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=max(int(args.warmup_steps), 0),
+        num_training_steps=max(int(total_steps), 1),
+        min_lr_rate=float(args.min_lr_ratio),
+    )
+    return optimizer, scheduler
 
 
 def make_timeout_checker(

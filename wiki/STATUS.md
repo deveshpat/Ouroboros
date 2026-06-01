@@ -30,6 +30,7 @@ infer        -> faithful adapter/DGAC inference smoke
 infer_edge   -> 4-bit edge-oriented inference smoke
 train_canary -> short QLoRA canary
 eval_lm      -> lm-eval stock HF/PEFT smoke
+eval_compare -> faithful generated-answer comparison artifacts for the readiness gate
 eval_gate    -> read existing eval artifacts and report whether architecture work is unblocked
 ```
 

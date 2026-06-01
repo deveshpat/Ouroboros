@@ -42,6 +42,7 @@ Kaggle notebook smoke
 -> normal inference launch
 -> 4-bit edge inference launch
 -> short training canary
+-> generated-answer comparison artifacts
 -> lm-eval stock HF/PEFT smoke
 -> artifact-only experiment-readiness gate
 -> decide next architecture experiment

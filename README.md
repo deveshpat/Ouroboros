@@ -34,6 +34,7 @@ infer        -> normal faithful adapter/DGAC inference smoke
 infer_edge   -> 4-bit edge-oriented inference smoke
 train_canary -> short QLoRA training canary
 eval_lm      -> lm-eval stock HF/PEFT smoke; not latent-aware scoring
+eval_compare -> faithful generated-answer comparison artifacts
 eval_gate    -> artifact-only readiness check before architecture experiments
 ```
 
@@ -93,7 +94,16 @@ python -m ouroboros.coconut \
 Coconut generated-answer comparison remains the faithful latent runtime path:
 
 ```bash
-python -m ouroboros.eval compare-coconut-val ...
+python -m ouroboros.eval compare-coconut-val \
+  --data_dir data/coconut_v1 \
+  --dataset_repo WeirdRunner/Ouroboros \
+  --dataset_config coconut-v1 \
+  --dataset_split validation \
+  --dataset_revision 6a52cd0c47be1e7b85d9018225387950aefc4631 \
+  --baseline_model_id ai21labs/AI21-Jamba-Reasoning-3B \
+  --candidate_repo_id WeirdRunner/Ouroboros \
+  --candidate_subdir diloco_state/anchor \
+  --output_dir runs/coconut_val_compare
 ```
 
 lm-eval integration is available for standard HF/PEFT smoke tests:
