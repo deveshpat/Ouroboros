@@ -165,11 +165,6 @@ def generate_baseline_result(runtime: BaselineRuntime, question: str, args) -> B
     )
 
 
-def generate_baseline(runtime: BaselineRuntime, question: str, args) -> str:
-    """Backward-compatible baseline text generation helper."""
-    return generate_baseline_result(runtime, question, args).text
-
-
 @torch.no_grad()
 def generate_candidate(runtime: CandidateRuntime, question: str, args):
     candidate_args = SimpleNamespace(

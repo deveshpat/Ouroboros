@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -189,32 +189,6 @@ def evaluate_stage_health_metrics(
             f"range=[{tf['actual_latents_min']:.0f}, {tf['actual_latents_max']:.0f}]"
         )
     return metrics
-
-
-@torch.no_grad()
-def evaluate_stage(
-    model,
-    val_samples: List[Dict[str, Any]],
-    tokenizer,
-    lat_token_id: int,
-    stage_k: int,
-    device: torch.device,
-    args: argparse.Namespace,
-    halt_gate: Optional[HaltGate] = None,
-) -> Tuple[float, float]:
-    """Backward-compatible teacher-forced validation API."""
-    metrics = evaluate_stage_health_metrics(
-        model=model,
-        val_samples=val_samples,
-        tokenizer=tokenizer,
-        lat_token_id=lat_token_id,
-        stage_k=stage_k,
-        device=device,
-        args=args,
-        halt_gate=halt_gate,
-    )
-    tf = metrics["health_metrics"]["teacher_forced"]
-    return float(tf["ce"]), float(tf["token_acc"])
 
 
 def run_eval_only(

@@ -11,13 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ouroboros.coconut.latent import (
-    build_question_context as _build_question_context,
-    collect_latent_hidden_sequences as _collect_latent_hidden_sequences,
-    compute_ce_mean_by_row as _compute_ce_mean_by_row,
-    compute_ce_sum_and_count as _compute_ce_sum_and_count,
     forward_latent_batch,
     prepare_latent_runtime,
-    run_latent_passes,
 )
 
 _LAST_NUM = _re.compile(r"[\d,]+(?:\.\d+)?")
@@ -192,28 +187,6 @@ def _compute_supervised_halt_loss(
     }
 
 
-def _run_latent_passes(
-    model,
-    ctx: torch.Tensor,
-    ctx_mask: torch.Tensor,
-    n_latent,
-    halt_gate: Optional[HaltGate],
-    args: argparse.Namespace,
-    device: torch.device,
-    amp_dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor, Any]:
-    """Compatibility wrapper for callers that still use the old DGAC path."""
-    runtime = prepare_latent_runtime(model, device, amp_dtype)
-    return run_latent_passes(
-        runtime=runtime,
-        ctx=ctx,
-        ctx_mask=ctx_mask,
-        n_latent=n_latent,
-        halt_gate=halt_gate,
-        args=args,
-    )
-
-
 def _compute_batched_halt_metrics(
     hidden_sequences: List[List[torch.Tensor]],
     actual_n_latents: torch.Tensor,
@@ -305,45 +278,6 @@ def _attach_halt_metrics(
     if halt_metrics is not None:
         result.update(halt_metrics)
     return result
-
-
-def _forward_batched_latent(
-    model,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    labels: torch.Tensor,
-    q_lens: torch.Tensor,
-    n_latents: torch.Tensor,
-    pad_id: torch.Tensor,
-    device: torch.device,
-    halt_gate: Optional[HaltGate],
-    args: argparse.Namespace,
-    step_in_phase: int,
-    amp_dtype: torch.dtype,
-) -> Dict[str, Any]:
-    """Compatibility wrapper for the former DGAC-owned latent batch path."""
-    runtime = prepare_latent_runtime(model, device, amp_dtype)
-    batch = {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
-        "q_lens": q_lens,
-        "n_latents": n_latents,
-        "pad_id": pad_id,
-    }
-    result = forward_latent_batch(
-        runtime=runtime,
-        batch=batch,
-        args=args,
-        include_hidden_sequences=halt_gate is not None,
-    )
-    return _attach_halt_metrics(
-        result=result,
-        halt_gate=halt_gate,
-        device=device,
-        args=args,
-        step_in_phase=step_in_phase,
-    )
 
 
 def coconut_forward(
