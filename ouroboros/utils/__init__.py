@@ -1,7 +1,7 @@
-"""Utils public interface: provider/env/Hub/W&B helpers.
+"""Utils public interface: environment and W&B helpers.
 
 Importing this package is intentionally lightweight. Expensive or cyclic helpers
-remain available from their owning submodules, e.g. ``ouroboros.utils.hub``.
+remain available from the modules that own the runtime behavior.
 """
 
 from __future__ import annotations

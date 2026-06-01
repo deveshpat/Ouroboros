@@ -13,7 +13,6 @@ import torch
 from ouroboros.bootstrap.runtime import _wandb_credentials_available
 from ouroboros.coconut.data import get_max_stage, load_canonical_dataset
 from ouroboros.coconut.dgac import HaltGate
-from ouroboros.utils.hub import _resolve_hf_token
 from ouroboros.models import barrier, load_model_and_tokenizer
 from ouroboros.models.loading import (
     _distributed_is_initialized,
@@ -25,7 +24,7 @@ from ouroboros.models.loading import (
     get_trainable_parameters,
     set_seed,
 )
-from ouroboros.utils.runtime_env import is_main_process
+from ouroboros.utils.runtime_env import is_main_process, resolve_hf_token
 from ouroboros.coconut.checkpointing import (
     _cleanup_distributed_resume_artifacts,
     _distributed_resume_marker,
@@ -123,7 +122,7 @@ def run_training_session(args: argparse.Namespace, *, script_start: float) -> No
             "This flag is only valid for Phase 3.4 DGAC training."
         )
 
-    hf_token = _resolve_hf_token(getattr(args, "hf_token", None))
+    hf_token = resolve_hf_token(getattr(args, "hf_token", None))
     args._resolved_hf_token = hf_token
     if resume_from_anchor and not hf_token:
         raise ValueError(

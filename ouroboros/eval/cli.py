@@ -149,6 +149,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lm_eval_hf.add_argument("--model_id", default="ai21labs/AI21-Jamba-Reasoning-3B")
     lm_eval_hf.add_argument("--adapter", help="Optional PEFT adapter repo id or local path.")
+    lm_eval_hf.add_argument(
+        "--adapter_subfolder",
+        default="",
+        help="Optional Hub/local subfolder containing adapter_config.json before handing off to lm-eval.",
+    )
+    lm_eval_hf.add_argument(
+        "--adapter_cache_dir",
+        default="runs/lm_eval_adapter",
+        help="Local cache target when --adapter is a Hub repo and --adapter_subfolder is set.",
+    )
     lm_eval_hf.add_argument("--tasks", required=True, help="Comma-separated lm-eval tasks.")
     lm_eval_hf.add_argument("--limit", type=int)
     lm_eval_hf.add_argument("--batch_size", default="auto")

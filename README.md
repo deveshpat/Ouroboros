@@ -12,7 +12,7 @@ coconut     -> dataset, latent passes, DGAC HaltGate, training, checkpoints
 models      -> Transformers/PEFT loading, dtype, quant, runtime probes
 inference   -> faithful adapter + latent generation smoke path
 eval        -> Coconut artifacts plus generated-answer and lm-eval smoke paths
-utils       -> small env, Hub, W&B helpers
+utils       -> small env and W&B helpers
 ```
 
 There is no active multi-worker control loop. The older orchestration lessons remain documented as failure patterns, but Kaggle runs now go through the visible `kaggle-utils.ipynb` command cell.
@@ -101,6 +101,7 @@ lm-eval integration is available for standard HF/PEFT smoke tests:
 python -m ouroboros.eval lm-eval-hf \
   --model_id ai21labs/AI21-Jamba-Reasoning-3B \
   --adapter WeirdRunner/Ouroboros \
+  --adapter_subfolder diloco_state/anchor \
   --tasks arc_easy \
   --limit 10 \
   --output_path runs/lm_eval_smoke

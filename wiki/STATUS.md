@@ -10,7 +10,7 @@ Coconut -> training, latent passes, DGAC/HaltGate, checkpoints
 Models -> HF/PEFT loading, dtype, quant, runtime probes
 Inference -> faithful adapter + latent generation
 Eval -> Coconut artifacts plus lm-eval stock HF/PEFT smoke
-Utils -> small provider helpers
+Utils -> small env/W&B helpers
 ```
 
 ## Current Goal

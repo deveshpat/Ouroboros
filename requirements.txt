@@ -1,4 +1,4 @@
-# Local custom modules with installation constraints
+# Cached binary wheels needed for the Jamba/Mamba fast path on Kaggle
 ./hf_cache/wheels/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl
 ./hf_cache/wheels/mamba_ssm-1.2.2-cp312-cp312-linux_x86_64.whl
 

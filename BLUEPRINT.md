@@ -11,7 +11,7 @@ Goal -> make architecture experiments easy to run while preserving runtime fixes
 | Models | Transformers/PEFT loading, dtype, quant, Accelerate device maps, runtime probes | `ouroboros.models` |
 | Inference | faithful adapter + latent decode | `python -m ouroboros.inference ...` |
 | Eval | Coconut artifacts, generated-answer comparison, lm-eval stock HF smoke | `python -m ouroboros.eval ...` |
-| Utils | small env, Hub, W&B helpers | helper layer only |
+| Utils | small env and W&B helpers | helper layer only |
 
 ## Active Commands
 

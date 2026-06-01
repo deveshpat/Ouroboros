@@ -18,7 +18,6 @@ from tqdm.auto import tqdm
 
 from ouroboros.coconut.data import build_sample_at_stage, collate_stage_k
 from ouroboros.coconut.dgac import HaltGate, coconut_forward
-from ouroboros.utils.hub import _read_training_state
 from ouroboros.models import barrier
 from ouroboros.models.loading import (
     _rank,
@@ -30,6 +29,7 @@ from ouroboros.models.loading import (
 from ouroboros.coconut.checkpointing import (
     load_checkpoint,
     prune_epoch_checkpoints,
+    read_training_state,
     save_checkpoint,
 )
 from ouroboros.coconut.evaluation import evaluate_stage_health_metrics
@@ -118,7 +118,7 @@ def _best_state_for_stage(stage_dir: Path) -> Tuple[float, float, Optional[Path]
     best_dir = stage_dir / "best"
     if not (best_dir / "training_state.pt").exists():
         return -1.0, float("inf"), None
-    state = _read_training_state(best_dir, map_location="cpu")
+    state = read_training_state(best_dir, map_location="cpu")
     val_acc = float(state.get("val_acc", -1.0) if state.get("val_acc") is not None else -1.0)
     val_ce  = float(state.get("val_ce", float("inf")) if state.get("val_ce") is not None else float("inf"))
     return val_acc, val_ce, best_dir
