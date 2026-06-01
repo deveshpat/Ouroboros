@@ -10,7 +10,7 @@ Goal -> make architecture experiments easy to run while preserving runtime fixes
 | Coconut | curriculum, latent passes, DGAC/HaltGate, train/checkpoint/resume | `python -m ouroboros.coconut ...` |
 | Models | Transformers/PEFT loading, dtype, quant, Accelerate device maps, runtime probes | `ouroboros.models` |
 | Inference | faithful adapter + latent decode | `python -m ouroboros.inference ...` |
-| Eval | Coconut artifacts, generated-answer comparison, lm-eval stock HF smoke | `python -m ouroboros.eval ...` |
+| Eval | Coconut artifacts, generated-answer comparison, lm-eval stock HF smoke, experiment-readiness gate | `python -m ouroboros.eval ...` |
 | Utils | small env and W&B helpers | helper layer only |
 
 ## Active Commands
@@ -20,6 +20,7 @@ python -m ouroboros.coconut --help
 python -m ouroboros.inference --help
 python -m ouroboros.eval --help
 python -m ouroboros.eval lm-eval-hf --help
+python -m ouroboros.eval gate-experiment-readiness --help
 ```
 
 ## Removed From Active Path
@@ -42,6 +43,7 @@ Kaggle notebook smoke
 -> 4-bit edge inference launch
 -> short training canary
 -> lm-eval stock HF/PEFT smoke
+-> artifact-only experiment-readiness gate
 -> decide next architecture experiment
 -> only then JEPA/curriculum/HaltGate redesign
 ```
@@ -53,4 +55,5 @@ python -m compileall -q ouroboros
 python -m ouroboros.coconut --help
 python -m ouroboros.inference --help
 python -m ouroboros.eval lm-eval-hf --help
+python -m ouroboros.eval gate-experiment-readiness --help
 ```

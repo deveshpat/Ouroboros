@@ -2,7 +2,7 @@
 
 Status -> research parking lot only.
 Current runtime -> do not widen for JEPA yet.
-Current project gate -> eval/generation-harness sanity before JEPA/curriculum work.
+Current project gate -> `python -m ouroboros.eval gate-experiment-readiness` before JEPA/curriculum work.
 
 ## Direction
 
@@ -40,7 +40,7 @@ latent curriculum weakness
 
 Do not add JEPA abstractions now.
 
-Allowed next step only after eval sanity:
+Allowed next step only after the readiness gate says ready:
 
 ```text
 benchmark need -> PRD -> tracer slice -> package owner -> isolated branch

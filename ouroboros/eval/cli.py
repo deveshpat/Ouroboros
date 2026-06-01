@@ -171,6 +171,40 @@ def build_parser() -> argparse.ArgumentParser:
     lm_eval_hf.add_argument("--output_path")
     lm_eval_hf.set_defaults(_handler="lm_eval_hf")
 
+    readiness = subparsers.add_parser(
+        "gate-experiment-readiness",
+        help="Read eval artifacts and decide whether architecture experimentation is unblocked.",
+    )
+    readiness.add_argument("--comparison_dir", required=True, help="Artifact directory from compare-coconut-val.")
+    readiness.add_argument("--lm_eval_dir", default="", help="Optional artifact directory from lm-eval-hf.")
+    readiness.add_argument(
+        "--require_lm_eval",
+        action="store_true",
+        help="Block unless lm-evaluation-harness wrote JSON result artifacts.",
+    )
+    readiness.add_argument(
+        "--allow_diagnostic_score",
+        action="store_true",
+        help="Warn instead of blocking when the generated-answer score is diagnostic rather than full-release clean.",
+    )
+    readiness.add_argument(
+        "--allow_candidate_regression",
+        action="store_true",
+        help="Warn instead of blocking when the candidate misses the configured baseline margin.",
+    )
+    readiness.add_argument(
+        "--allow_halt_gate_suspect",
+        action="store_true",
+        help="Warn instead of blocking when HaltGate looks collapsed to one-latent behavior.",
+    )
+    readiness.add_argument(
+        "--allow_not_ready",
+        action="store_true",
+        help="Always exit 0 after printing/writing the readiness report.",
+    )
+    readiness.add_argument("--output_path", help="Optional JSON report path.")
+    readiness.set_defaults(_handler="gate_experiment_readiness")
+
     return parser
 
 
@@ -186,6 +220,10 @@ def main(argv: Iterable[str] | None = None) -> None:
         from ouroboros.eval.lm_eval_bridge import run_lm_eval_hf
 
         handler = run_lm_eval_hf
+    elif args._handler == "gate_experiment_readiness":
+        from ouroboros.eval.readiness import run_experiment_readiness_gate
+
+        handler = run_experiment_readiness_gate
     else:
         from ouroboros.eval import coconut_val
 

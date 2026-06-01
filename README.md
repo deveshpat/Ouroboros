@@ -34,6 +34,7 @@ infer        -> normal faithful adapter/DGAC inference smoke
 infer_edge   -> 4-bit edge-oriented inference smoke
 train_canary -> short QLoRA training canary
 eval_lm      -> lm-eval stock HF/PEFT smoke; not latent-aware scoring
+eval_gate    -> artifact-only readiness check before architecture experiments
 ```
 
 The notebook prints the exact command before launching it.
@@ -108,6 +109,17 @@ python -m ouroboros.eval lm-eval-hf \
 ```
 
 Boundary: `lm-eval-hf` uses lm-evaluation-harness' stock HF backend. It is useful for harness setup and PEFT smoke testing, but it does not execute Coconut latent passes yet.
+
+Before widening into JEPA/curriculum/HaltGate redesign, read the generated artifacts with the readiness gate:
+
+```bash
+python -m ouroboros.eval gate-experiment-readiness \
+  --comparison_dir runs/coconut_val_compare \
+  --lm_eval_dir runs/lm_eval_smoke \
+  --output_path runs/experiment_readiness.json
+```
+
+This gate loads no model weights. It checks whether the generated-answer comparison was clean, prompt budgets were not truncated, candidate scoring did not regress, HaltGate behavior was not suspicious, and optional lm-eval smoke artifacts exist.
 
 ## Guardrails Kept
 
