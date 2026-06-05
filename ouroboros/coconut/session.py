@@ -1,4 +1,4 @@
-"""Post-CLI training-session orchestration."""
+"""Post-CLI training-session driver."""
 
 from __future__ import annotations
 

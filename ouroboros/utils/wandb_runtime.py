@@ -1,4 +1,4 @@
-"""Small W&B runtime helpers shared by local and worker entrypoints."""
+"""Small W&B runtime helpers shared by local and distributed entrypoints."""
 
 from __future__ import annotations
 

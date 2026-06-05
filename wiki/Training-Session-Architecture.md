@@ -5,7 +5,7 @@ Coconut -> package, not script.
 ## Owners
 
 CLI/help -> `ouroboros.coconut.cli`.
-session orchestration -> `session`.
+session driver -> `session`.
 stage loop -> `stage_runner`.
 data shaping -> `data`.
 DGAC/HaltGate -> `dgac`.
@@ -29,7 +29,7 @@ python -m ouroboros.coconut
 
 operator code -> package root.
 package tests -> may inspect submodule seams.
-Coordinator import inside stage loop -> no.
+Cross-stage control-loop import inside stage loop -> no.
 
 ## Preserved contracts
 

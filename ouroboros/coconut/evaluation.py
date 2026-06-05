@@ -1,4 +1,4 @@
-"""Evaluation orchestration."""
+"""Coconut validation and generation hooks."""
 
 from __future__ import annotations
 

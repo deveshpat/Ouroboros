@@ -1,14 +1,24 @@
-"""Thin lm-evaluation-harness launcher.
+"""lm-evaluation-harness launcher (HF/PEFT backend).
 
-This bridge intentionally uses EleutherAI's stock CLI instead of reimplementing
-benchmark plumbing. It is for standard HF/PEFT benchmark smoke tests. The
-latent-aware generated-answer harness remains in ``compare-coconut-val`` until a
-faithful lm-eval model wrapper supports Coconut latent passes and loglikelihood.
+This bridge intentionally drives EleutherAI's stock harness instead of
+reimplementing benchmark plumbing. It supports three launch modes that mirror
+the harness' own documented options:
+
+* single GPU            -> ``python -m lm_eval ... --device <dev>``
+* data parallel (DP)    -> ``accelerate launch -m lm_eval ...`` (one full model
+  copy per GPU, data split across them) -- ``--device`` must NOT be passed.
+* model parallel (MP)   -> ``python -m lm_eval ... --model_args ...,parallelize=True``
+  (one model sharded across GPUs) -- run outside the accelerate launcher.
+
+The latent-aware generated-answer harness remains in ``compare-coconut-val``
+until a faithful lm-eval model wrapper supports Coconut latent passes and
+loglikelihood. ``lm-eval-hf`` scores the stock HF/PEFT model, not Coconut.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -19,13 +29,77 @@ from typing import Any
 from ouroboros.utils.runtime_env import resolve_hf_token
 
 
+# Curated task suites for AI21-Jamba-Reasoning-3B. Each suite fixes the tasks
+# plus the conventional few-shot / chat-template / generation defaults so a
+# score is meaningful and comparable. Explicit CLI flags always override these.
+#   tasks            : comma-separated lm-eval task or group names
+#   num_fewshot      : conventional shot count for this suite
+#   apply_chat_template / fewshot_as_multiturn : sensible for instruct/reasoning
+#   gen_kwargs       : required for generative tasks (e.g. gsm8k, ifeval)
+TASK_SUITES: dict[str, dict[str, Any]] = {
+    "smoke": {
+        "tasks": "arc_easy",
+        "num_fewshot": 0,
+        "apply_chat_template": False,
+        "fewshot_as_multiturn": False,
+        "gen_kwargs": "",
+    },
+    "reasoning_core": {
+        "tasks": "arc_challenge,hellaswag,winogrande,piqa,openbookqa",
+        "num_fewshot": 0,
+        "apply_chat_template": False,
+        "fewshot_as_multiturn": False,
+        "gen_kwargs": "",
+    },
+    "knowledge": {
+        "tasks": "mmlu",
+        "num_fewshot": 5,
+        "apply_chat_template": False,
+        "fewshot_as_multiturn": False,
+        "gen_kwargs": "",
+    },
+    "math": {
+        "tasks": "gsm8k",
+        "num_fewshot": 5,
+        "apply_chat_template": True,
+        "fewshot_as_multiturn": True,
+        "gen_kwargs": "max_gen_toks=512,do_sample=False,temperature=0.0",
+    },
+    "instruction": {
+        "tasks": "ifeval",
+        "num_fewshot": 0,
+        "apply_chat_template": True,
+        "fewshot_as_multiturn": False,
+        "gen_kwargs": "max_gen_toks=1280,do_sample=False,temperature=0.0",
+    },
+    "truthful": {
+        "tasks": "truthfulqa_mc2",
+        "num_fewshot": 0,
+        "apply_chat_template": False,
+        "fewshot_as_multiturn": False,
+        "gen_kwargs": "",
+    },
+    # Open-LLM-Leaderboard-v1-style mix. NOTE: the official leaderboard uses
+    # mixed per-task few-shot (arc 25 / hella 10 / mmlu 5 / wino 5 / gsm8k 5).
+    # A single CLI --num_fewshot cannot express that; this suite leaves shots at
+    # the harness/per-task default and is therefore approximate. For exact
+    # reproduction use a per-task group config, not this preset.
+    "leaderboard": {
+        "tasks": "arc_challenge,hellaswag,mmlu,truthfulqa_mc2,winogrande,gsm8k",
+        "num_fewshot": None,
+        "apply_chat_template": True,
+        "fewshot_as_multiturn": True,
+        "gen_kwargs": "max_gen_toks=512,do_sample=False,temperature=0.0",
+    },
+}
+
+
 def _resolve_adapter_for_lm_eval(args: argparse.Namespace) -> str | None:
     """Return a PEFT path/repo that lm-eval can pass directly to PEFT.
 
-    lm-eval's stock HF backend is intentionally kept in charge of benchmark
-    execution. When an adapter lives in a Hub subfolder, resolve that subfolder
-    first with Hugging Face Hub so the harness receives a normal local PEFT
-    adapter directory containing ``adapter_config.json``.
+    When an adapter lives in a Hub subfolder, resolve that subfolder first with
+    Hugging Face Hub so the harness receives a normal local PEFT adapter
+    directory containing ``adapter_config.json``.
     """
     adapter = (args.adapter or "").strip()
     if not adapter:
@@ -54,8 +128,48 @@ def _resolve_adapter_for_lm_eval(args: argparse.Namespace) -> str | None:
     return str(resolved)
 
 
-def _model_args(args: argparse.Namespace, resolved_adapter: str | None) -> str:
-    pairs = [
+def resolve_eval_plan(args: argparse.Namespace) -> dict[str, Any]:
+    """Merge an optional --suite preset with explicit CLI flags (flags win).
+
+    Tri-state flags (``apply_chat_template``/``fewshot_as_multiturn``/
+    ``log_samples``) arrive as None when unset so a suite default can apply.
+    """
+    suite_name = (getattr(args, "suite", "") or "").strip()
+    suite = TASK_SUITES.get(suite_name, {}) if suite_name else {}
+    if suite_name and not suite:
+        raise SystemExit(
+            f"Unknown --suite {suite_name!r}. Choices: {', '.join(sorted(TASK_SUITES))}."
+        )
+
+    tasks = (getattr(args, "tasks", "") or "").strip() or suite.get("tasks")
+    if not tasks:
+        raise SystemExit("Provide --tasks or a known --suite.")
+
+    def _pick(flag: str, suite_key: str, fallback: Any) -> Any:
+        val = getattr(args, flag, None)
+        if val is not None:
+            return val
+        if suite_key in suite:
+            return suite[suite_key]
+        return fallback
+
+    num_fewshot = getattr(args, "num_fewshot", None)
+    if num_fewshot is None:
+        num_fewshot = suite.get("num_fewshot")  # may stay None -> harness default
+
+    return {
+        "tasks": tasks,
+        "num_fewshot": num_fewshot,
+        "apply_chat_template": bool(_pick("apply_chat_template", "apply_chat_template", False)),
+        "fewshot_as_multiturn": bool(_pick("fewshot_as_multiturn", "fewshot_as_multiturn", False)),
+        "gen_kwargs": _pick("gen_kwargs", "gen_kwargs", "") or "",
+        "log_samples": bool(_pick("log_samples", "log_samples", True)),
+        "suite": suite_name or None,
+    }
+
+
+def _model_args(args: argparse.Namespace, resolved_adapter: str | None, *, parallelize: bool) -> str:
+    pairs: list[tuple[str, str]] = [
         ("pretrained", args.model_id),
         ("trust_remote_code", "True" if args.trust_remote_code else "False"),
     ]
@@ -65,67 +179,167 @@ def _model_args(args: argparse.Namespace, resolved_adapter: str | None) -> str:
         pairs.append(("dtype", args.dtype))
     if args.load_in_4bit:
         pairs.append(("load_in_4bit", "True"))
-    if args.extra_model_args:
-        raw = args.extra_model_args.strip().strip(",")
-        extra = f",{raw}" if raw else ""
-    else:
-        extra = ""
+    if parallelize:
+        # Model-parallel: shard one model copy across visible GPUs.
+        pairs.append(("parallelize", "True"))
+    raw = (getattr(args, "extra_model_args", "") or "").strip().strip(",")
+    extra = f",{raw}" if raw else ""
     return ",".join(f"{key}={value}" for key, value in pairs) + extra
 
 
-def _write_run_config(args: argparse.Namespace, command: list[str], resolved_adapter: str | None) -> None:
+def build_command(args: argparse.Namespace, resolved_adapter: str | None, plan: dict[str, Any]) -> list[str]:
+    """Build the harness command for single / data-parallel / model-parallel.
+
+    Pure function (no I/O) so it can be unit-tested without a GPU or weights.
+    """
+    data_parallel = int(getattr(args, "data_parallel", 1) or 1)
+    model_parallel = bool(getattr(args, "model_parallel", False))
+    if data_parallel > 1 and model_parallel:
+        # The harness does support DP x MP hybrid, but it is an advanced footgun
+        # on small models; require an explicit opt-in flag to combine them.
+        if not getattr(args, "allow_dp_mp_hybrid", False):
+            raise SystemExit(
+                "--data_parallel > 1 with --model_parallel is the DP x MP hybrid. "
+                "Pass --allow_dp_mp_hybrid to confirm, or pick one."
+            )
+
+    use_accelerate = data_parallel > 1
+    parallelize = model_parallel
+
+    if use_accelerate:
+        launcher = ["accelerate", "launch", "--multi_gpu", "--num_processes", str(data_parallel)]
+        port = getattr(args, "main_process_port", None)
+        if port:
+            launcher += ["--main_process_port", str(port)]
+        command = launcher + ["-m", "lm_eval"]
+    else:
+        command = [sys.executable, "-m", "lm_eval"]
+
+    command += [
+        "--model", "hf",
+        "--model_args", _model_args(args, resolved_adapter, parallelize=parallelize),
+        "--tasks", plan["tasks"],
+        "--batch_size", str(args.batch_size),
+    ]
+
+    # --device is single-GPU only; accelerate (DP) and parallelize (MP) place
+    # devices themselves, and passing --device alongside them is an error.
+    if not use_accelerate and not parallelize and args.device:
+        command += ["--device", args.device]
+
+    if plan.get("num_fewshot") is not None:
+        command += ["--num_fewshot", str(plan["num_fewshot"])]
+    if plan.get("apply_chat_template"):
+        command += ["--apply_chat_template"]
+        if plan.get("fewshot_as_multiturn"):
+            command += ["--fewshot_as_multiturn"]
+    system_instruction = (getattr(args, "system_instruction", "") or "").strip()
+    if system_instruction:
+        command += ["--system_instruction", system_instruction]
+    if plan.get("gen_kwargs"):
+        command += ["--gen_kwargs", plan["gen_kwargs"]]
+    seed = (getattr(args, "seed", "") or "").strip()
+    if seed:
+        command += ["--seed", seed]
+    if args.trust_remote_code:
+        command += ["--trust_remote_code"]
+    if args.limit:
+        command += ["--limit", str(args.limit)]
+    if args.output_path:
+        command += ["--output_path", args.output_path]
+        if plan.get("log_samples"):
+            command += ["--log_samples"]
+    return command
+
+
+def _preflight(args: argparse.Namespace) -> None:
+    """Fail fast before a multi-GPU run instead of crashing mid-eval."""
+    if importlib.util.find_spec("lm_eval") is None:
+        raise SystemExit("lm-evaluation-harness not importable. Install with: pip install lm_eval>=0.4.5")
+    if int(getattr(args, "data_parallel", 1) or 1) > 1 and importlib.util.find_spec("accelerate") is None:
+        raise SystemExit("--data_parallel needs accelerate. Install with: pip install accelerate>=1.0")
+
+    if getattr(args, "bootstrap", False):
+        # Opt-in: run the full Kaggle/runtime bootstrap (installs cached Mamba
+        # wheels and applies the triton log1p source patch) so accelerate's
+        # subprocesses inherit the fast path. Heavy + Kaggle-shaped.
+        from ouroboros.bootstrap import ensure_environment
+
+        ensure_environment()
+        return
+
+    # Light Mamba/Jamba fast-path check. The stock harness loads the model in a
+    # fresh subprocess, so Ouroboros' import-time patches do not run there; the
+    # on-disk wheel + source patch from a prior bootstrap must already be in the
+    # env. Preserved guardrail: do not enter generation/eval loops with a broken
+    # fast path. Warn by default; hard-fail under --require_fast_path.
+    if importlib.util.find_spec("mamba_ssm") is None:
+        msg = (
+            "[lm-eval] WARNING: mamba_ssm not importable; the Jamba/Mamba fast "
+            "path is unavailable. On Kaggle run bootstrap first (set --bootstrap "
+            "or run the notebook bootstrap cell)."
+        )
+        if getattr(args, "require_fast_path", False):
+            raise SystemExit(msg.replace("WARNING", "ERROR"))
+        print(msg)
+
+
+def _write_run_config(
+    args: argparse.Namespace, command: list[str], resolved_adapter: str | None, plan: dict[str, Any]
+) -> None:
     if not args.output_path:
         return
     output = Path(args.output_path)
     output.mkdir(parents=True, exist_ok=True)
+    if int(getattr(args, "data_parallel", 1) or 1) > 1:
+        launch_mode = f"data_parallel x{args.data_parallel} (accelerate launch)"
+    elif getattr(args, "model_parallel", False):
+        launch_mode = "model_parallel (parallelize=True)"
+    else:
+        launch_mode = "single_process"
     config: dict[str, Any] = {
         "runtime": "lm-evaluation-harness stock hf backend",
+        "launch_mode": launch_mode,
         "model_id": args.model_id,
         "adapter": args.adapter,
         "adapter_subfolder": getattr(args, "adapter_subfolder", ""),
         "resolved_adapter": resolved_adapter,
-        "tasks": args.tasks,
+        "suite": plan.get("suite"),
+        "tasks": plan["tasks"],
+        "num_fewshot": plan.get("num_fewshot"),
+        "apply_chat_template": plan.get("apply_chat_template"),
+        "fewshot_as_multiturn": plan.get("fewshot_as_multiturn"),
+        "gen_kwargs": plan.get("gen_kwargs"),
         "limit": args.limit,
         "batch_size": args.batch_size,
-        "device": args.device,
+        "device": None if launch_mode != "single_process" else args.device,
         "dtype": args.dtype,
         "load_in_4bit": bool(args.load_in_4bit),
         "command": command,
         "boundary": (
-            "This is a standard HF/PEFT lm-eval smoke path. It does not execute "
+            "This is a standard HF/PEFT lm-eval path. It does not execute "
             "Ouroboros Coconut latent passes."
         ),
     }
     (output / "ouroboros_lm_eval_run_config.json").write_text(
-        json.dumps(config, indent=2),
-        encoding="utf-8",
+        json.dumps(config, indent=2), encoding="utf-8"
     )
 
 
 def run_lm_eval_hf(args: argparse.Namespace) -> None:
+    plan = resolve_eval_plan(args)
+    _preflight(args)
     resolved_adapter = _resolve_adapter_for_lm_eval(args)
-    command = [
-        sys.executable,
-        "-m",
-        "lm_eval",
-        "--model",
-        "hf",
-        "--model_args",
-        _model_args(args, resolved_adapter),
-        "--tasks",
-        args.tasks,
-        "--batch_size",
-        str(args.batch_size),
-    ]
-    if args.device:
-        command.extend(["--device", args.device])
-    if args.limit:
-        command.extend(["--limit", str(args.limit)])
-    if args.output_path:
-        command.extend(["--output_path", args.output_path])
-    _write_run_config(args, command, resolved_adapter)
+    command = build_command(args, resolved_adapter, plan)
+    _write_run_config(args, command, resolved_adapter, plan)
+
+    env = os.environ.copy()
+    if args.trust_remote_code:
+        # Some task datasets gate download behind this env in recent datasets.
+        env.setdefault("HF_DATASETS_TRUST_REMOTE_CODE", "1")
+
     print("[lm-eval] " + " ".join(command))
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=env)
 
 
-__all__ = ("run_lm_eval_hf",)
+__all__ = ("run_lm_eval_hf", "build_command", "resolve_eval_plan", "TASK_SUITES")

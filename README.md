@@ -106,7 +106,7 @@ python -m ouroboros.eval compare-coconut-val \
   --output_dir runs/coconut_val_compare
 ```
 
-lm-eval integration is available for standard HF/PEFT smoke tests:
+lm-eval integration drives the stock HF/PEFT backend. Single-GPU smoke:
 
 ```bash
 python -m ouroboros.eval lm-eval-hf \
@@ -118,7 +118,55 @@ python -m ouroboros.eval lm-eval-hf \
   --output_path runs/lm_eval_smoke
 ```
 
-Boundary: `lm-eval-hf` uses lm-evaluation-harness' stock HF backend. It is useful for harness setup and PEFT smoke testing, but it does not execute Coconut latent passes yet.
+Multi-GPU data parallelism (one full model copy per GPU, data split across them;
+the launcher shells out to `accelerate launch -m lm_eval` per the harness docs).
+Do not pass `--device` here — accelerate places the replicas:
+
+```bash
+python -m ouroboros.eval lm-eval-hf \
+  --adapter WeirdRunner/Ouroboros --adapter_subfolder diloco_state/anchor \
+  --suite reasoning_core \
+  --data_parallel 2 --main_process_port 29501 \
+  --batch_size auto \
+  --output_path runs/lm_eval_reasoning
+```
+
+Model parallelism (shard one copy across GPUs for a model too big for one card;
+runs outside accelerate via `parallelize=True`): `--model_parallel`.
+
+Curated `--suite` presets fix the tasks plus conventional few-shot / chat-template
+/ generation defaults so a score is meaningful and comparable:
+
+```text
+smoke           arc_easy                                            0-shot
+reasoning_core  arc_challenge,hellaswag,winogrande,piqa,openbookqa  0-shot
+knowledge       mmlu                                                5-shot
+math            gsm8k                                               5-shot, chat, gen
+instruction     ifeval                                              0-shot, chat, gen
+truthful        truthfulqa_mc2                                      0-shot
+leaderboard     arc_c,hellaswag,mmlu,truthfulqa_mc2,winogrande,gsm8k  approximate*
+```
+
+Any explicit flag (`--tasks`, `--num_fewshot`, `--apply_chat_template`/
+`--no_apply_chat_template`, `--gen_kwargs`, ...) overrides the preset. For the
+instruct/reasoning model, chat-template usually gives the most representative
+numbers; multiple-choice loglikelihood tasks are often reported without it, so
+choose deliberately. `--log_samples` (on by default with `--output_path`) keeps
+per-sample outputs for the raw-output inspection the Lessons-Learned require.
+
+\* `leaderboard` uses a single global `--num_fewshot`; the official Open LLM
+Leaderboard v1 uses mixed per-task shots (arc 25 / hella 10 / mmlu 5 / wino 5 /
+gsm8k 5), which needs a per-task group config rather than this preset.
+
+Boundary 1: `lm-eval-hf` uses lm-evaluation-harness' stock HF backend. It scores
+the plain HF/PEFT model and does not execute Coconut latent passes yet.
+
+Boundary 2: the harness loads the model in a fresh subprocess, so Ouroboros'
+import-time Jamba/Mamba fast-path patches do not run inside it. The cached Mamba
+wheel + triton source patch from a prior bootstrap must already be in the
+environment. On Kaggle, run the notebook bootstrap cell first, or pass
+`--bootstrap` (full runtime setup) / `--require_fast_path` (hard-fail instead of
+warn) before a long multi-GPU run.
 
 Before widening into JEPA/curriculum/HaltGate redesign, read the generated artifacts with the readiness gate:
 

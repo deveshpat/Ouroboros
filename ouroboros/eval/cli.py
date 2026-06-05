@@ -159,10 +159,97 @@ def build_parser() -> argparse.ArgumentParser:
         default="runs/lm_eval_adapter",
         help="Local cache target when --adapter is a Hub repo and --adapter_subfolder is set.",
     )
-    lm_eval_hf.add_argument("--tasks", required=True, help="Comma-separated lm-eval tasks.")
+    lm_eval_hf.add_argument(
+        "--tasks",
+        default=None,
+        help="Comma-separated lm-eval tasks. Optional if --suite is given (suite tasks then apply).",
+    )
+    lm_eval_hf.add_argument(
+        "--suite",
+        default="",
+        help=(
+            "Curated task preset (sets tasks + conventional few-shot/chat/gen defaults). "
+            "Choices: smoke, reasoning_core, knowledge, math, instruction, truthful, leaderboard. "
+            "Explicit flags override the preset."
+        ),
+    )
+    # ---- multi-GPU placement (mirrors lm-eval docs) ----
+    lm_eval_hf.add_argument(
+        "--data_parallel",
+        type=int,
+        default=1,
+        metavar="N",
+        help="N>1 launches via `accelerate launch -m lm_eval` with one full model copy per GPU (data split across them).",
+    )
+    lm_eval_hf.add_argument(
+        "--model_parallel",
+        action="store_true",
+        help="Shard ONE model copy across visible GPUs via model_args parallelize=True (run outside accelerate).",
+    )
+    lm_eval_hf.add_argument(
+        "--allow_dp_mp_hybrid",
+        action="store_true",
+        help="Confirm the advanced DP x MP hybrid when both --data_parallel>1 and --model_parallel are set.",
+    )
+    lm_eval_hf.add_argument(
+        "--main_process_port",
+        type=int,
+        help="Optional accelerate rendezvous port for --data_parallel runs (avoids clashes).",
+    )
+    # ---- benchmarking knobs that make scores meaningful/comparable ----
+    lm_eval_hf.add_argument("--num_fewshot", type=int, help="Few-shot examples per task (overrides any suite default).")
+    lm_eval_hf.add_argument(
+        "--apply_chat_template",
+        dest="apply_chat_template",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Apply the model's chat template (recommended for the instruct/reasoning model).",
+    )
+    lm_eval_hf.add_argument(
+        "--no_apply_chat_template", dest="apply_chat_template", action="store_const", const=False
+    )
+    lm_eval_hf.add_argument(
+        "--fewshot_as_multiturn",
+        dest="fewshot_as_multiturn",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Render few-shot shots as chat turns (requires chat template).",
+    )
+    lm_eval_hf.add_argument(
+        "--no_fewshot_as_multiturn", dest="fewshot_as_multiturn", action="store_const", const=False
+    )
+    lm_eval_hf.add_argument("--system_instruction", default="", help="Optional system prompt passed to the harness.")
+    lm_eval_hf.add_argument(
+        "--gen_kwargs",
+        default=None,
+        help="Generation kwargs for generative tasks, e.g. 'max_gen_toks=512,do_sample=False'.",
+    )
+    lm_eval_hf.add_argument("--seed", default="0", help="lm-eval seed (single int or 'a,b,c,d').")
+    lm_eval_hf.add_argument(
+        "--log_samples",
+        dest="log_samples",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Persist per-sample outputs for inspection (needs --output_path). Default on.",
+    )
+    lm_eval_hf.add_argument("--no_log_samples", dest="log_samples", action="store_const", const=False)
+    # ---- runtime / fast-path preflight ----
+    lm_eval_hf.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="Run the full Ouroboros runtime bootstrap (cached Mamba wheels + triton patch) before launching.",
+    )
+    lm_eval_hf.add_argument(
+        "--require_fast_path",
+        action="store_true",
+        help="Hard-fail (instead of warn) if the Jamba/Mamba fast path is unavailable.",
+    )
     lm_eval_hf.add_argument("--limit", type=int)
     lm_eval_hf.add_argument("--batch_size", default="auto")
-    lm_eval_hf.add_argument("--device", default="cuda:0")
+    lm_eval_hf.add_argument("--device", default="cuda:0", help="Single-GPU only; ignored under --data_parallel/--model_parallel.")
     lm_eval_hf.add_argument("--dtype", default="float16")
     lm_eval_hf.add_argument("--load_in_4bit", action="store_true")
     lm_eval_hf.add_argument("--trust_remote_code", action="store_true", default=True)
