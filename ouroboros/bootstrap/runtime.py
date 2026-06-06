@@ -420,7 +420,8 @@ def _bootstrap_shared_install_phases() -> None:
          "huggingface_hub",
          "ninja",
          "einops",
-         "safetensors"],
+         "safetensors",
+         "lm-eval>=0.4",],
         check=False,
     )
     if _r1.returncode != 0:
