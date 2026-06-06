@@ -254,11 +254,6 @@ def build_command(args: argparse.Namespace, resolved_adapter: str | None, plan: 
 
 def _preflight(args: argparse.Namespace) -> None:
     """Fail fast before a multi-GPU run instead of crashing mid-eval."""
-    if importlib.util.find_spec("lm_eval") is None:
-        raise SystemExit("lm-evaluation-harness not importable. Install with: pip install lm_eval>=0.4.5")
-    if int(getattr(args, "data_parallel", 1) or 1) > 1 and importlib.util.find_spec("accelerate") is None:
-        raise SystemExit("--data_parallel needs accelerate. Install with: pip install accelerate>=1.0")
-
     if getattr(args, "bootstrap", False):
         # Opt-in: run the full Kaggle/runtime bootstrap (installs cached Mamba
         # wheels and applies the triton log1p source patch) so accelerate's
@@ -266,7 +261,11 @@ def _preflight(args: argparse.Namespace) -> None:
         from ouroboros.bootstrap import ensure_environment
 
         ensure_environment()
-        return
+      
+    if importlib.util.find_spec("lm_eval") is None:
+        raise SystemExit("lm-evaluation-harness not importable. Install with: pip install lm_eval>=0.4.5")
+    if int(getattr(args, "data_parallel", 1) or 1) > 1 and importlib.util.find_spec("accelerate") is None:
+        raise SystemExit("--data_parallel needs accelerate. Install with: pip install accelerate>=1.0")
 
     # Light Mamba/Jamba fast-path check. The stock harness loads the model in a
     # fresh subprocess, so Ouroboros' import-time patches do not run there; the
