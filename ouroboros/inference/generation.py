@@ -31,7 +31,7 @@ DEFAULT_ADAPTER_CACHE_DIR = "/kaggle/working/ouroboros_inference_adapter"
 DEFAULT_STAGE_K = 10
 DEFAULT_MAX_NEW_TOKENS = 128
 DEFAULT_MAX_SEQ_LEN = 512
-DEFAULT_HALT_THRESHOLD = 0.5
+DEFAULT_HALT_THRESHOLD = 0.9
 
 
 @dataclass(frozen=True)
