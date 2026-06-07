@@ -8,12 +8,14 @@ instead of the stock HF/PEFT backend, fixing both README boundaries:
   Boundary 2 — OuroborosLM.__init__ calls ensure_environment() inside each
                accelerate worker subprocess when bootstrap=True is in model_args.
 
-Three launch modes mirror the harness' own documented options:
+Three launch modes mirror the harness' own documented options. Each runs through
+the ``ouroboros.eval.lm_eval_runner`` wrapper (which registers OuroborosLM before
+delegating to the harness) rather than bare ``lm_eval``:
 
-* single GPU         -> ``python -m lm_eval ... --device <dev>``
-* data parallel (DP) -> ``accelerate launch -m lm_eval ...`` (one full model
-  copy per GPU, data split across them) -- ``--device`` must NOT be passed.
-* model parallel (MP) -> ``python -m lm_eval ... --model_args ...,parallelize=True``
+* single GPU         -> ``python -m ouroboros.eval.lm_eval_runner ... --device <dev>``
+* data parallel (DP) -> ``accelerate launch -m ouroboros.eval.lm_eval_runner ...``
+  (one full model copy per GPU, data split across them) -- ``--device`` must NOT be passed.
+* model parallel (MP) -> ``python -m ouroboros.eval.lm_eval_runner ... --model_args ...,parallelize=True``
   (one model sharded across GPUs) -- run outside the accelerate launcher.
 """
 
@@ -216,16 +218,23 @@ def build_command(args: argparse.Namespace, resolved_adapter: str | None, plan: 
 
     use_accelerate = data_parallel > 1
 
+    # Launch the harness via our wrapper module, not bare ``lm_eval``. The wrapper
+    # imports lm_eval_model first, running @register_model("ouroboros") in this
+    # process (and in every accelerate worker), so --model ouroboros resolves.
+    entrypoint = "ouroboros.eval.lm_eval_runner"
+
     if use_accelerate:
         launcher = ["accelerate", "launch", "--multi_gpu", "--num_processes", str(data_parallel)]
         port = getattr(args, "main_process_port", None)
         if port:
             launcher += ["--main_process_port", str(port)]
-        command = launcher + ["-m", "lm_eval"]
+        command = launcher + ["-m", entrypoint]
     else:
-        command = [sys.executable, "-m", "lm_eval"]
+        command = [sys.executable, "-m", entrypoint]
 
-    # --include_path so lm-eval discovers the @register_model("ouroboros") class.
+    # --include_path makes any task-config YAMLs placed in the eval package
+    # discoverable. (Model registration is handled by the wrapper above, not by
+    # --include_path, which only loads task YAMLs — never Python registrations.)
     import ouroboros.eval as _ouro_eval_pkg
     _eval_dir = str(pathlib.Path(_ouro_eval_pkg.__file__).parent)
 
