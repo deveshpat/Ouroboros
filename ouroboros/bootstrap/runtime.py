@@ -421,7 +421,7 @@ def _bootstrap_shared_install_phases() -> None:
          "ninja",
          "einops",
          "safetensors",
-         "lm-eval>=0.4",],
+         "lm-eval>=0.4.5",],
         check=False,
     )
     if _r1.returncode != 0:
