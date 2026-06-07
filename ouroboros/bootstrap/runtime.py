@@ -461,7 +461,7 @@ def _bootstrap_shared_install_phases() -> None:
         )
 
     for _base in _wheel_bases:
-        _hub_filename   = f"{_base}-{_arch_suffix}.whl"
+        _hub_filename   = f"wheels/{_base}-{_arch_suffix}.whl"
         _local_filename = f"{_base}.whl"
         _local_path     = _wheel_dir / _local_filename
 
