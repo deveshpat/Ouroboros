@@ -145,7 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     lm_eval_hf = subparsers.add_parser(
         "lm-eval-hf",
-        help="Run lm-evaluation-harness using its stock HF/PEFT backend.",
+        help="Run lm-evaluation-harness using the faithful OuroborosLM backend.",
     )
     lm_eval_hf.add_argument("--model_id", default="ai21labs/AI21-Jamba-Reasoning-3B")
     lm_eval_hf.add_argument("--adapter", help="Optional PEFT adapter repo id or local path.")
@@ -173,6 +173,19 @@ def build_parser() -> argparse.ArgumentParser:
             "Explicit flags override the preset."
         ),
     )
+    # ---- Ouroboros latent configuration ------------------------------------
+    lm_eval_hf.add_argument(
+        "--stage_k",
+        type=int,
+        default=10,
+        help="Number of Coconut latent passes for OuroborosLM (default: 10).",
+    )
+    lm_eval_hf.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=4096,
+        help="Context budget (tokens) for OuroborosLM inference (default: 4096).",
+    )
     # ---- multi-GPU placement (mirrors lm-eval docs) ----
     lm_eval_hf.add_argument(
         "--data_parallel",
@@ -184,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     lm_eval_hf.add_argument(
         "--model_parallel",
         action="store_true",
-        help="Shard ONE model copy across visible GPUs via model_args parallelize=True (run outside accelerate).",
+        help="Shard ONE model copy across visible GPUs (run outside accelerate via parallelize=True).",
     )
     lm_eval_hf.add_argument(
         "--allow_dp_mp_hybrid",
@@ -249,7 +262,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lm_eval_hf.add_argument("--limit", type=int)
     lm_eval_hf.add_argument("--batch_size", default="auto")
-    lm_eval_hf.add_argument("--device", default="cuda:0", help="Single-GPU only; ignored under --data_parallel/--model_parallel.")
+    lm_eval_hf.add_argument(
+        "--device",
+        default="cuda:0",
+        help="Kept for backward compatibility; OuroborosLM resolves device internally.",
+    )
     lm_eval_hf.add_argument("--dtype", default="float16")
     lm_eval_hf.add_argument("--load_in_4bit", action="store_true")
     lm_eval_hf.add_argument("--trust_remote_code", action="store_true", default=True)

@@ -1,18 +1,20 @@
-"""lm-evaluation-harness launcher (HF/PEFT backend).
+"""lm-evaluation-harness launcher (OuroborosLM backend).
 
-This bridge intentionally drives EleutherAI's stock harness instead of
-reimplementing benchmark plumbing. It supports three launch modes that mirror
-the harness' own documented options:
+This bridge drives EleutherAI's harness with the custom OuroborosLM model class
+instead of the stock HF/PEFT backend, fixing both README boundaries:
 
-* single GPU            -> ``python -m lm_eval ... --device <dev>``
-* data parallel (DP)    -> ``accelerate launch -m lm_eval ...`` (one full model
+  Boundary 1 — OuroborosLM uses load_components + run_single_prompt; correct
+               vocab size (65537 with <|lat|>), latent passes, optional HaltGate.
+  Boundary 2 — OuroborosLM.__init__ calls ensure_environment() inside each
+               accelerate worker subprocess when bootstrap=True is in model_args.
+
+Three launch modes mirror the harness' own documented options:
+
+* single GPU         -> ``python -m lm_eval ... --device <dev>``
+* data parallel (DP) -> ``accelerate launch -m lm_eval ...`` (one full model
   copy per GPU, data split across them) -- ``--device`` must NOT be passed.
-* model parallel (MP)   -> ``python -m lm_eval ... --model_args ...,parallelize=True``
+* model parallel (MP) -> ``python -m lm_eval ... --model_args ...,parallelize=True``
   (one model sharded across GPUs) -- run outside the accelerate launcher.
-
-The latent-aware generated-answer harness remains in ``compare-coconut-val``
-until a faithful lm-eval model wrapper supports Coconut latent passes and
-loglikelihood. ``lm-eval-hf`` scores the stock HF/PEFT model, not Coconut.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import argparse
 import importlib.util
 import json
 import os
+import pathlib
 import subprocess
 import sys
 from pathlib import Path
@@ -82,8 +85,7 @@ TASK_SUITES: dict[str, dict[str, Any]] = {
     # Open-LLM-Leaderboard-v1-style mix. NOTE: the official leaderboard uses
     # mixed per-task few-shot (arc 25 / hella 10 / mmlu 5 / wino 5 / gsm8k 5).
     # A single CLI --num_fewshot cannot express that; this suite leaves shots at
-    # the harness/per-task default and is therefore approximate. For exact
-    # reproduction use a per-task group config, not this preset.
+    # the harness/per-task default and is therefore approximate.
     "leaderboard": {
         "tasks": "arc_challenge,hellaswag,mmlu,truthfulqa_mc2,winogrande,gsm8k",
         "num_fewshot": None,
@@ -95,10 +97,10 @@ TASK_SUITES: dict[str, dict[str, Any]] = {
 
 
 def _resolve_adapter_for_lm_eval(args: argparse.Namespace) -> str | None:
-    """Return a PEFT path/repo that lm-eval can pass directly to PEFT.
+    """Return a local PEFT adapter path that OuroborosLM can pass to load_components.
 
     When an adapter lives in a Hub subfolder, resolve that subfolder first with
-    Hugging Face Hub so the harness receives a normal local PEFT adapter
+    Hugging Face Hub so the model class receives a normal local PEFT adapter
     directory containing ``adapter_config.json``.
     """
     adapter = (args.adapter or "").strip()
@@ -168,23 +170,32 @@ def resolve_eval_plan(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _model_args(args: argparse.Namespace, resolved_adapter: str | None, *, parallelize: bool) -> str:
+def _ouroboros_model_args(args: argparse.Namespace, resolved_adapter: str | None) -> str:
+    """Build model_args string for OuroborosLM (replaces stock HF model_args).
+
+    OuroborosLM.__init__ accepts keyword arguments parsed from this string by
+    lm-eval's model_args parser. Device placement is handled internally by
+    load_components; do not pass --device alongside this model class.
+    """
     pairs: list[tuple[str, str]] = [
-        ("pretrained", args.model_id),
-        ("trust_remote_code", "True" if args.trust_remote_code else "False"),
+        ("base_model", args.model_id),
+        ("stage_k", str(getattr(args, "stage_k", 10))),
+        ("use_halt_gate", "True"),
+        ("dtype", args.dtype or "auto"),
+        ("max_seq_len", str(getattr(args, "max_seq_len", 4096))),
     ]
     if resolved_adapter:
-        pairs.append(("peft", resolved_adapter))
-    if args.dtype:
-        pairs.append(("dtype", args.dtype))
-    if args.load_in_4bit:
-        pairs.append(("load_in_4bit", "True"))
-    if parallelize:
-        # Model-parallel: shard one model copy across visible GPUs.
-        pairs.append(("parallelize", "True"))
+        # Pass resolved local path so OuroborosLM skips the Hub download.
+        pairs.append(("adapter_dir", resolved_adapter))
+    if bool(args.load_in_4bit):
+        pairs.append(("use_4bit", "True"))
+    if getattr(args, "bootstrap", False):
+        # Propagate into each accelerate worker; OuroborosLM.__init__ calls
+        # ensure_environment() there — this is Boundary 2 fix.
+        pairs.append(("bootstrap", "True"))
     raw = (getattr(args, "extra_model_args", "") or "").strip().strip(",")
     extra = f",{raw}" if raw else ""
-    return ",".join(f"{key}={value}" for key, value in pairs) + extra
+    return ",".join(f"{k}={v}" for k, v in pairs) + extra
 
 
 def build_command(args: argparse.Namespace, resolved_adapter: str | None, plan: dict[str, Any]) -> list[str]:
@@ -204,7 +215,6 @@ def build_command(args: argparse.Namespace, resolved_adapter: str | None, plan: 
             )
 
     use_accelerate = data_parallel > 1
-    parallelize = model_parallel
 
     if use_accelerate:
         launcher = ["accelerate", "launch", "--multi_gpu", "--num_processes", str(data_parallel)]
@@ -215,17 +225,21 @@ def build_command(args: argparse.Namespace, resolved_adapter: str | None, plan: 
     else:
         command = [sys.executable, "-m", "lm_eval"]
 
+    # --include_path so lm-eval discovers the @register_model("ouroboros") class.
+    import ouroboros.eval as _ouro_eval_pkg
+    _eval_dir = str(pathlib.Path(_ouro_eval_pkg.__file__).parent)
+
     command += [
-        "--model", "hf",
-        "--model_args", _model_args(args, resolved_adapter, parallelize=parallelize),
+        "--include_path", _eval_dir,
+        "--model", "ouroboros",
+        "--model_args", _ouroboros_model_args(args, resolved_adapter),
         "--tasks", plan["tasks"],
         "--batch_size", str(args.batch_size),
     ]
 
-    # --device is single-GPU only; accelerate (DP) and parallelize (MP) place
-    # devices themselves, and passing --device alongside them is an error.
-    if not use_accelerate and not parallelize and args.device:
-        command += ["--device", args.device]
+    # NOTE: --device is intentionally omitted. OuroborosLM.load_components()
+    # resolves device internally; passing --device alongside the ouroboros model
+    # class would be ignored or cause confusion.
 
     if plan.get("num_fewshot") is not None:
         command += ["--num_fewshot", str(plan["num_fewshot"])]
@@ -253,25 +267,30 @@ def build_command(args: argparse.Namespace, resolved_adapter: str | None, plan: 
 
 
 def _preflight(args: argparse.Namespace) -> None:
-    """Fail fast before a multi-GPU run instead of crashing mid-eval."""
-    if getattr(args, "bootstrap", False):
-        # Opt-in: run the full Kaggle/runtime bootstrap (installs cached Mamba
-        # wheels and applies the triton log1p source patch) so accelerate's
-        # subprocesses inherit the fast path. Heavy + Kaggle-shaped.
-        from ouroboros.bootstrap import ensure_environment
+    """Fail fast before a multi-GPU run instead of crashing mid-eval.
 
+    Boundary 2 note: bootstrap in the parent process here ensures the on-disk
+    Mamba wheel + Triton source patch exist before accelerate forks workers.
+    OuroborosLM.__init__ then calls ensure_environment() again inside each worker
+    (the actual Boundary 2 fix) to load the shims into that subprocess's address
+    space.
+    """
+    if getattr(args, "bootstrap", False):
+        from ouroboros.bootstrap import ensure_environment
         ensure_environment()
-      
+        # After bootstrap, continue preflight checks.
+
     if importlib.util.find_spec("lm_eval") is None:
-        raise SystemExit("lm-evaluation-harness not importable. Install with: pip install lm_eval>=0.4.5")
+        raise SystemExit(
+            "lm-evaluation-harness not importable. Install with: pip install lm_eval>=0.4.5"
+        )
     if int(getattr(args, "data_parallel", 1) or 1) > 1 and importlib.util.find_spec("accelerate") is None:
         raise SystemExit("--data_parallel needs accelerate. Install with: pip install accelerate>=1.0")
 
     # Light Mamba/Jamba fast-path check. The stock harness loads the model in a
     # fresh subprocess, so Ouroboros' import-time patches do not run there; the
     # on-disk wheel + source patch from a prior bootstrap must already be in the
-    # env. Preserved guardrail: do not enter generation/eval loops with a broken
-    # fast path. Warn by default; hard-fail under --require_fast_path.
+    # env. Warn by default; hard-fail under --require_fast_path.
     if importlib.util.find_spec("mamba_ssm") is None:
         msg = (
             "[lm-eval] WARNING: mamba_ssm not importable; the Jamba/Mamba fast "
@@ -297,7 +316,7 @@ def _write_run_config(
     else:
         launch_mode = "single_process"
     config: dict[str, Any] = {
-        "runtime": "lm-evaluation-harness stock hf backend",
+        "runtime": "ouroboros custom lm-eval model (OuroborosLM)",
         "launch_mode": launch_mode,
         "model_id": args.model_id,
         "adapter": args.adapter,
@@ -311,14 +330,14 @@ def _write_run_config(
         "gen_kwargs": plan.get("gen_kwargs"),
         "limit": args.limit,
         "batch_size": args.batch_size,
-        "device": None if launch_mode != "single_process" else args.device,
+        "device": "auto (OuroborosLM resolves internally)",
         "dtype": args.dtype,
         "load_in_4bit": bool(args.load_in_4bit),
+        "stage_k": getattr(args, "stage_k", 10),
+        "max_seq_len": getattr(args, "max_seq_len", 4096),
         "command": command,
-        "boundary": (
-            "This is a standard HF/PEFT lm-eval path. It does not execute "
-            "Ouroboros Coconut latent passes."
-        ),
+        "boundary_1": "OuroborosLM: load_components path with <|lat|> + latent passes.",
+        "boundary_2": "OuroborosLM: bootstrap runs in each accelerate worker.",
     }
     (output / "ouroboros_lm_eval_run_config.json").write_text(
         json.dumps(config, indent=2), encoding="utf-8"
