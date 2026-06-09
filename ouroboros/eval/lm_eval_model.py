@@ -364,3 +364,29 @@ class OuroborosLM(LM):
 
             results.append(total_ll)
         return results
+
+    def apply_chat_template(self, chat_history):
+      """
+      Convert lm-eval chat turns into a formatted prompt using
+      the tokenizer's native chat template.
+      """
+  
+      if hasattr(self._tokenizer, "apply_chat_template"):
+          return self._tokenizer.apply_chat_template(
+              chat_history,
+              tokenize=False,
+              add_generation_prompt=True,
+          )
+  
+      # Fallback for tokenizers without native templates
+      prompt = ""
+  
+      for turn in chat_history:
+          role = turn.get("role", "user")
+          content = turn.get("content", "")
+  
+          prompt += f"<|{role}|>\n{content}\n"
+  
+      prompt += "<|assistant|>\n"
+  
+      return prompt
