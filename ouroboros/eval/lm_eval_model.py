@@ -134,6 +134,14 @@ class OuroborosLM(LM):
     def device(self) -> torch.device:
         return self._device
 
+    @property
+    def tokenizer_name(self) -> str:
+        return getattr(
+            self._tokenizer,
+            "name_or_path",
+            self._model.config._name_or_path,
+        )
+
     # ── tokenizer helpers ──────────────────────────────────────────────────
 
     def tok_encode(self, string: str, **kwargs: Any) -> list[int]:
