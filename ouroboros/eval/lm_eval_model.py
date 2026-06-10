@@ -365,11 +365,16 @@ class OuroborosLM(LM):
             results.append(total_ll)
         return results
 
-    def apply_chat_template(self, chat_history):
+    def apply_chat_template(self, chat_history, **kwargs):
       """
       Convert lm-eval chat turns into a formatted prompt using
       the tokenizer's native chat template.
+
+      Accepts **kwargs so newer lm-eval versions can pass add_generation_prompt
+      (and any future arguments) without raising a TypeError.
       """
+      
+      add_generation_prompt = kwargs.get("add_generation_prompt", True)
   
       if hasattr(self._tokenizer, "apply_chat_template"):
           return self._tokenizer.apply_chat_template(
