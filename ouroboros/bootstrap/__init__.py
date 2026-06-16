@@ -1,15 +1,29 @@
+"""Bootstrap: dependency install, runtime patches, and Jamba/Mamba fast-path setup.
+
+Imported by the CLI before any ML dependency exists. All stdlib imports are at
+module scope. torch/transformers/mamba imports happen inside methods, after the
+pip phase has completed.
+"""
+
+from __future__ import annotations
+
+import importlib
+import importlib.util as ilu
+import shutil
+import subprocess
+import sys
+import warnings
+from pathlib import Path
+from typing import List, Optional
+
+
 # =====================================================================
 # 1. HARDWARE LAYER: CUDA Architecture Identification
 # =====================================================================
 class CUDAHardwareProfile:
-    """Encapsulates all GPU-specific metadata, capability checks, and platform attributes."""
-    
-    KNOWN_ARCH_SUFFIXES = {
-        "sm60", "sm70", "sm72", "sm75", "sm80", "sm86", "sm87", "sm89",
-        "sm90", "sm100", "sm120", "smunknown"
-    }
+    """GPU-specific metadata, capability checks, and platform attributes."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         import torch
         self.is_available = torch.cuda.is_available()
         self.capability = torch.cuda.get_device_capability() if self.is_available else (0, 0)
@@ -19,15 +33,15 @@ class CUDAHardwareProfile:
 
     @property
     def flash_attention_supported(self) -> bool:
-        """FlashAttention 2 requires Ampere, Ada, or Hopper architectures (sm80+)."""
+        """FlashAttention 2 requires Ampere+ (sm80+)."""
         return self.capability >= (8, 0)
 
 
 # =====================================================================
-# 2. RUNTIME PATCH LAYER: Monkeypatching & AST Source Code Corrections
+# 2. RUNTIME PATCH LAYER: Shims, source fixes, and symbol promotion
 # =====================================================================
 class EnvironmentPatcher:
-    """Handles runtime shims, AST source patching, and symbol manipulation across libraries."""
+    """Runtime shims and symbol promotion for Mamba/Transformers compatibility."""
 
     MAMBA_TRITON_LOG1P_REPLACEMENTS = {
         "tl.math.log1p(tl.exp(dt))": "tl.log(1.0 + tl.exp(dt))",
@@ -48,7 +62,7 @@ class EnvironmentPatcher:
 
     @staticmethod
     def patch_transformers_generation() -> List[str]:
-        """Aligns backward-compatible output definitions in transformers generation module."""
+        """Back-fill removed transformers.generation output class names."""
         try:
             import transformers.generation as tg_mod
             patched = []
@@ -64,7 +78,7 @@ class EnvironmentPatcher:
 
     @staticmethod
     def patch_triton_math_log1p() -> List[str]:
-        """Restores missing or relocated tl.math.log1p symbols back into Triton."""
+        """Restore tl.math.log1p if absent (Triton 3.x removed it)."""
         try:
             import triton
             import triton.language as tl
@@ -87,12 +101,12 @@ class EnvironmentPatcher:
 
     @classmethod
     def patch_mamba_triton_source(cls) -> List[str]:
-        """Applies source code repair to mamba_ssm Triton files before compilation."""
+        """Replace tl.math.log1p call in mamba_ssm Triton source before JIT compilation."""
         try:
             spec = ilu.find_spec("mamba_ssm")
         except Exception:
             return []
-            
+
         search_locations = list(getattr(spec, "submodule_search_locations", None) or [])
         if not search_locations:
             return []
@@ -107,21 +121,18 @@ class EnvironmentPatcher:
                     source = source_path.read_text(encoding="utf-8")
                 except OSError:
                     continue
-                
                 updated = source
                 for old, new in cls.MAMBA_TRITON_LOG1P_REPLACEMENTS.items():
                     updated = updated.replace(old, new)
-                
                 if updated == source:
                     continue
-                
                 source_path.write_text(updated, encoding="utf-8")
                 patched_paths.append(str(source_path))
         return patched_paths
 
     @classmethod
     def load_and_export_mamba_symbols(cls) -> List[str]:
-        """Loads specialized fast paths and promotes them to top-level module namespace exports."""
+        """Patch Mamba source, then load and promote fast-path symbols to top-level namespace."""
         cls.patch_mamba_triton_source()
         cls.patch_triton_math_log1p()
         importlib.invalidate_caches()
@@ -144,10 +155,10 @@ class EnvironmentPatcher:
             causal_conv1d_mod: {
                 "causal_conv1d_fn": causal_conv1d_fn,
                 "causal_conv1d_update": causal_conv1d_update,
-            }
+            },
         }
 
-        patched_exports = []
+        patched_exports: List[str] = []
         for target_module, symbols in exports.items():
             for name, value in symbols.items():
                 if getattr(target_module, name, None) is not value:
@@ -157,15 +168,15 @@ class EnvironmentPatcher:
 
 
 # =====================================================================
-# 3. PIPELINE LAYER: Package Acquisition & Deployment Strategy
+# 3. PIPELINE LAYER: Dependency Acquisition
 # =====================================================================
 class DependencyInstaller:
-    """Manages Phase 1 Pip requirements, local platform dataset caching, and remote wheel fetch pipelines."""
+    """pip + Hub wheel installation for the Kaggle runtime."""
 
     PURE_PYTHON_DEPS = [
         "transformers>=4.54.0", "peft", "datasets", "tqdm", "wandb",
         "bitsandbytes>=0.46.1", "accelerate", "huggingface_hub", "ninja",
-        "einops", "safetensors", "lm-eval>=0.4.5"
+        "einops", "safetensors", "lm-eval>=0.4.5",
     ]
 
     MAMBA_WHEEL_BASES = [
@@ -174,13 +185,12 @@ class DependencyInstaller:
     ]
     FLASH_ATTN_WHEEL_BASE = "flash_attn-2.8.3-cp312-cp312-linux_x86_64"
 
-    def __init__(self, hardware: CUDAHardwareProfile):
+    def __init__(self, hardware: CUDAHardwareProfile) -> None:
         self.hardware = hardware
         self.wheel_dir = Path("/tmp/ouroboros_wheels")
         self.wheel_dir.mkdir(exist_ok=True)
 
     def install_pure_python_dependencies(self) -> None:
-        """Executes targeted background installation for pure python system context."""
         print("[bootstrap] Phase 1: pure-Python deps...")
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q"] + self.PURE_PYTHON_DEPS,
@@ -190,60 +200,53 @@ class DependencyInstaller:
             print("[bootstrap] WARNING: Phase 1 pip returned non-zero — check output above.")
 
     def _resolve_target_wheels(self) -> List[str]:
-        """Filters architecture-dependent binaries based on the hardware footprint context."""
         bases = list(self.MAMBA_WHEEL_BASES)
         if self.hardware.flash_attention_supported:
             bases.append(self.FLASH_ATTN_WHEEL_BASE)
         return bases
 
     def install_architecture_wheels(self) -> None:
-        """Resolves local environments (e.g. Kaggle cache maps) or securely logs into HF Hub to load wheels."""
         print("[bootstrap] Phase 2: arch-aware Hub wheel install...")
-        
         importlib.invalidate_caches()
-        from huggingface_hub import hf_hub_download  # Safe to import now post-Phase 1
+        from huggingface_hub import hf_hub_download
 
         print(f"[bootstrap]   GPU arch: {self.hardware.arch_suffix} (TORCH_CUDA_ARCH_LIST={self.hardware.torch_cuda_arch_list})")
-        
         wheel_bases = self._resolve_target_wheels()
         if self.FLASH_ATTN_WHEEL_BASE not in wheel_bases:
-            print(f"[bootstrap]   flash-attn skipped on {self.hardware.arch_suffix}: FlashAttention 2 requires sm80+.")
+            print(f"[bootstrap]   flash-attn skipped ({self.hardware.arch_suffix} < sm80).")
 
         for base in wheel_bases:
             hub_filename = f"wheels/{base}-{self.hardware.arch_suffix}.whl"
             local_path = self.wheel_dir / f"{base}.whl"
-            
             try:
-                downloaded_file = hf_hub_download(
+                downloaded = hf_hub_download(
                     repo_id="WeirdRunner/Ouroboros",
                     filename=hub_filename,
                     local_dir=str(self.wheel_dir),
                 )
-                shutil.copy2(downloaded_file, str(local_path))
+                shutil.copy2(downloaded, str(local_path))
                 print(f"[bootstrap]   Downloaded {hub_filename} ✓")
-                
             except Exception as err:
                 print(f"[bootstrap]   {hub_filename} not on Hub ({type(err).__name__}).")
                 sys.exit(1)
 
-            # Execution block for low-level pip package assignment
-            install_result = subprocess.run(
+            result = subprocess.run(
                 [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", str(local_path)],
                 check=False,
             )
-            if install_result.returncode != 0:
+            if result.returncode != 0:
                 print(f"[bootstrap] FATAL: pip install failed for {local_path.name}.")
                 sys.exit(1)
             print(f"[bootstrap]   Installed {local_path.name} ✓")
 
 
 # =====================================================================
-# 4. ORCHESTRATION FACADE: Entrypoint Controller (Singleton Pattern)
+# 4. ORCHESTRATION FACADE (Singleton)
 # =====================================================================
 class OuroborosBootstrap:
-    """Orchestrates system startup setup, validation sequences, and guards against multiple calls."""
-    
-    _instance: Optional['OuroborosBootstrap'] = None
+    """Coordinates bootstrap phases; runs exactly once per process."""
+
+    _instance: Optional["OuroborosBootstrap"] = None
     _bootstrap_complete: bool = False
 
     def __new__(cls, *args, **kwargs):
@@ -251,35 +254,27 @@ class OuroborosBootstrap:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, model_id: str = "WeirdRunner/Ouroboros"):
-        # Prevent re-initialization variables logic inside the singleton
+    def __init__(self) -> None:
         if not hasattr(self, "_initialized"):
-            self.model_id = model_id
             self.hardware = CUDAHardwareProfile()
             self.installer = DependencyInstaller(self.hardware)
             self._initialized = True
 
     def ensure_environment(self) -> None:
-        """Coordinates deployment setups, patches environment paths, and runs validation benchmarks."""
-        if self._bootstrap_complete:
+        """Run all bootstrap phases. Idempotent: no-ops if already complete."""
+        if self.__class__._bootstrap_complete:
             return
-
-        # Skip process completely if help logs are invoked
         if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
             return
 
-        # 1. Dependency Resolution Stage
         self.installer.install_pure_python_dependencies()
         self.installer.install_architecture_wheels()
 
-        # 2. Local Environment Activation & Refresh
         import torch
-        """Prepares the local CUDA context."""
         if torch.cuda.is_available():
             torch.cuda.init()
         importlib.invalidate_caches()
 
-        # 3. Dynamic Application Patching 
         patched_shims = EnvironmentPatcher.patch_transformers_generation()
         if patched_shims:
             print(f"Shim: patched {len(patched_shims)} removed transformers.generation names ✓")
@@ -291,10 +286,6 @@ class OuroborosBootstrap:
             print("Kernel export shim: " + ", ".join(mamba_patches) + " ✓")
         else:
             print("Kernel export shim: already aligned")
-
-        triton_math_patches = EnvironmentPatcher.patch_triton_math_log1p()
-        if triton_math_patches:
-            print("Triton math shim: " + ", ".join(triton_math_patches) + " ✓")
 
         print(
             f"  ABI fingerprint: GPU={self.hardware.device_name} {self.hardware.arch_suffix} | "
