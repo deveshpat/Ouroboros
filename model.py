@@ -173,7 +173,7 @@ class Ouroboros(JambaForCausalLM):
         target_vocab_size = len(tokenizer)
 
         config = OuroborosConfig.from_pretrained(base_model_id, token=token)
-        config.use_fast_kernels = torch.cuda.is_available()
+        config.use_mamba_kernels = torch.cuda.is_available()
         config.lat_token_id = int(lat_id)
         config.halt_threshold = float(halt_threshold)
         config.use_halt_gate = bool(use_halt_gate)
