@@ -179,6 +179,16 @@ class Ouroboros(JambaForCausalLM):
 
         resolved_dtype = cls._resolve_dtype(torch_dtype)
         load_kwargs: dict[str, Any] = dict(token=token, **kwargs)
+
+        load_kwargs: Dict[str, Any] = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+        "attn_implementation": 'eager',
+    }
+    
+        mamba_fast_path = device.type == "cuda"
+        load_kwargs["use_mamba_kernels"] = mamba_fast_path
+
         if load_in_4bit:
             load_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
