@@ -173,7 +173,6 @@ class Ouroboros(JambaForCausalLM):
         target_vocab_size = len(tokenizer)
 
         config = OuroborosConfig.from_pretrained(base_model_id, token=token)
-        config.use_fast_kernels = torch.cuda.is_available()
         config.lat_token_id = int(lat_id)
         config.halt_threshold = float(halt_threshold)
         config.use_halt_gate = bool(use_halt_gate)
@@ -182,11 +181,13 @@ class Ouroboros(JambaForCausalLM):
         load_kwargs: dict[str, Any] = dict(token=token, **kwargs)
 
         load_kwargs: Dict[str, Any] = {
-        "trust_remote_code": True,
-        "low_cpu_mem_usage": True,
-        "attn_implementation": 'eager',
-    }
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+            "attn_implementation": 'eager',
+        }
 
+        load_kwargs["use_mamba_kernels"] = torch.cuda.is_available()
+        
         if load_in_4bit:
             load_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
