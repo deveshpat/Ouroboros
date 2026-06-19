@@ -251,7 +251,6 @@ class Ouroboros(JambaForCausalLM):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_sequences: bool = False,
         return_dict: Optional[bool] = None,
-        n_latents: Optional[int] = None,
         **kwargs: Any,
     ) -> Union[OuroborosCausalLMOutputWithPast, MoeCausalLMOutputWithPast, tuple]:
         """
@@ -281,7 +280,6 @@ class Ouroboros(JambaForCausalLM):
                 inputs_embeds,
                 attention_mask,
                 output_hidden_sequences=output_hidden_sequences,
-                n_latents=n_latents,
             )
 
         # return_dict is forced True here regardless of the caller's wish so
@@ -320,7 +318,6 @@ class Ouroboros(JambaForCausalLM):
         attention_mask: Optional[torch.Tensor],
         *,
         output_hidden_sequences: bool,
-        n_latents: int = None,
     ) -> tuple[torch.FloatTensor, torch.LongTensor, Optional[List[List[torch.Tensor]]]]:
         """
         Derive q_lens / n_latents directly from <|lat|> token positions in
@@ -338,11 +335,11 @@ class Ouroboros(JambaForCausalLM):
         B, L = input_ids.shape
         device = input_ids.device
 
-        if not n_latents:
-            is_lat = input_ids == self.config.lat_token_id          # [B, L] bool
-            n_latents = is_lat.sum(dim=1)                            # [B] long
-        else:
-            n_latents = n_latents
+        is_lat = input_ids == self.config.lat_token_id          # [B, L] bool
+        n_latents = is_lat.sum(dim=1)                            # [B] long
+        
+        if n_latents == 0:
+            n_latents = 10
 
         # First <|lat|> position per row, or L (past every real index) for
         # rows with none — unambiguous regardless of argmax tie-breaking,
