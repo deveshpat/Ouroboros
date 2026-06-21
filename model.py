@@ -1,6 +1,6 @@
 """
-ouroboros/ouroboros.py
-======================
+model.py
+========
 Ouroboros: Coconut latent-reasoning Jamba. A real JambaForCausalLM subclass —
 not a wrapper around one — so every standard causal-LM entry point
 (forward, generate, gradient_checkpointing_enable, save_pretrained, .device,
@@ -145,6 +145,7 @@ class Ouroboros(JambaForCausalLM):
         load_in_4bit: bool = False,
         halt_threshold: float = _DEFAULT_HALT_THRESHOLD,
         use_halt_gate: bool = True,
+        halt_gate_subfolder: str = "",
         token: Optional[str] = None,
         **kwargs: Any,
     ) -> "Ouroboros":
@@ -157,6 +158,13 @@ class Ouroboros(JambaForCausalLM):
         would load — named adapter_repo rather than the conventional
         pretrained_model_name_or_path specifically so that two-repo reality
         is visible at the call site instead of implied.
+
+        halt_gate_subfolder defaults to the adapter repo root. Pass it
+        explicitly (e.g. "diloco_state/anchor") when the gate checkpoint
+        you want lives in a subfolder instead — deliberately not auto-
+        discovered, so loading a specific (possibly experimental/undertrained)
+        gate checkpoint is always something the caller opted into, not
+        something that happened to be found.
         """
         from huggingface_hub import hf_hub_download
         from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
@@ -179,12 +187,12 @@ class Ouroboros(JambaForCausalLM):
         config.use_halt_gate = bool(use_halt_gate)
 
         resolved_dtype = cls._resolve_dtype(torch_dtype)
-        load_kwargs: dict[str, Any] = dict(token=token, **kwargs)
-
         load_kwargs: Dict[str, Any] = {
             "trust_remote_code": True,
             "low_cpu_mem_usage": True,
-            "attn_implementation": 'eager',
+            "attn_implementation": "eager",
+            "token": token,
+            **kwargs,
         }
 
         if load_in_4bit:
@@ -222,10 +230,16 @@ class Ouroboros(JambaForCausalLM):
         set_peft_model_state_dict(model, load_file(adapter_weights_path))
 
         if model.halt_gate is not None:
+            gate_filename = f"{halt_gate_subfolder.strip('/')}/halt_gate.pt".lstrip("/")
             try:
-                gate_path = hf_hub_download(adapter_repo, "halt_gate.pt", token=token)
-            except Exception:
-                model.halt_gate = None  # absent on the Hub -> fixed-depth fallback
+                gate_path = hf_hub_download(adapter_repo, gate_filename, token=token)
+            except Exception as exc:
+                print(
+                    f"  [warn] {adapter_repo}/{gate_filename} not found ({type(exc).__name__}); "
+                    "running with halt_gate=None (fixed-depth latent inference — full requested "
+                    "depth every call, no early stop)."
+                )
+                model.halt_gate = None  # absent -> fixed-depth fallback
             else:
                 state = torch.load(gate_path, map_location="cpu", weights_only=True)
                 model.halt_gate.load_state_dict(state)
@@ -233,6 +247,7 @@ class Ouroboros(JambaForCausalLM):
                 # dtype-cast exemption mechanism — simple, and impossible to
                 # get subtly wrong regardless of internal cast ordering.
                 model.halt_gate = model.halt_gate.float().to(model.device)
+                print(f"  [info] loaded halt_gate.pt from {adapter_repo}/{gate_filename}")
 
         return model.eval()
 
