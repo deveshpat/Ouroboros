@@ -39,7 +39,21 @@ __all__ = ["Ouroboros", "OuroborosConfig", "OuroborosCausalLMOutputWithPast", "H
 _DEFAULT_ADAPTER_REPO = "WeirdRunner/Ouroboros"
 _DEFAULT_BASE_MODEL = "ai21labs/AI21-Jamba-Reasoning-3B"
 _LAT_TOKEN = "<|lat|>"
-_DEFAULT_HALT_THRESHOLD = 0.5
+# B4: 0.9, not 0.5. A barely-trained gate oscillates around 0.5, so a strict
+# prob > 0.5 there is maximally sensitive to noise. 0.9 is the value that
+# works once the gate has had any DGAC supervision at all; 0.5 is only
+# appropriate for a fully-trained gate, which is never the case mid-curriculum.
+# Calibrate after DGAC training if a different threshold fits a given checkpoint.
+_DEFAULT_HALT_THRESHOLD = 0.9
+
+# LoRA target modules for Jamba's hybrid attention+Mamba+MoE stack: the four
+# attention projections plus the three Mamba SSM projections plus the MoE
+# expert output projection. Kept here (not imported from a deleted module) so
+# model.py stays self-contained.
+_DEFAULT_LORA_TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "in_proj", "x_proj", "dt_proj", "out_proj",
+]
 
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -63,6 +77,16 @@ class OuroborosConfig(JambaConfig):
     lat_token_id: int = 65536       # overwritten with the real id in from_pretrained
     halt_threshold: float = _DEFAULT_HALT_THRESHOLD
     use_halt_gate: bool = True
+    # B7: never tie embed_tokens to lm_head. After resize_token_embeddings adds
+    # the <|lat|> row, tying would overwrite lm_head's new row with embed's (or
+    # vice versa) and pollute every load report with "will NOT tie them".
+    # Set explicitly in the load classmethods too (instance attr before resize)
+    # because JambaConfig's __init__ may not forward this kwarg.
+    tie_word_embeddings: bool = False
+    # P0: opt-in Mamba/KV cache for the latent-pass loop. Default False keeps
+    # _run_latent_passes byte-identical to the use_cache=False recompute path;
+    # the cache path is inference-only (gated on not torch.is_grad_enabled()).
+    use_latent_cache: bool = False
 
 
 # ── output ───────────────────────────────────────────────────────────────────
@@ -185,6 +209,8 @@ class Ouroboros(JambaForCausalLM):
         config.lat_token_id = int(lat_id)
         config.halt_threshold = float(halt_threshold)
         config.use_halt_gate = bool(use_halt_gate)
+        config.tie_word_embeddings = False   # B7: set on the instance before resize
+        config.use_latent_cache = False      # P0: off by default at load time
 
         resolved_dtype = cls._resolve_dtype(torch_dtype)
         load_kwargs: Dict[str, Any] = {
@@ -250,6 +276,171 @@ class Ouroboros(JambaForCausalLM):
                 print(f"  [info] loaded halt_gate.pt from {adapter_repo}/{gate_filename}")
 
         return model.eval()
+
+    # ── construction: training ──────────────────────────────────────────
+
+    @classmethod
+    def for_training(
+        cls,
+        base_model_id: str = _DEFAULT_BASE_MODEL,
+        tokenizer: Any = None,
+        *,
+        lora_r: int = 32,
+        lora_alpha: int = 64,
+        lora_dropout: float = 0.05,
+        lora_target_modules: Optional[list[str]] = None,
+        use_halt_gate: bool = True,
+        halt_threshold: float = _DEFAULT_HALT_THRESHOLD,
+        device: Optional[torch.device] = None,
+        torch_dtype: Union[str, torch.dtype] = "auto",
+        **kwargs: Any,
+    ) -> "Ouroboros":
+        """
+        Training constructor: a real Ouroboros (so Ouroboros.forward runs the
+        latent passes) over freshly-loaded base Jamba weights with a FRESH,
+        randomly-initialized LoRA adapter injected in place and a zero-init
+        HaltGate. Nothing is loaded from an adapter repo — this is the start of
+        a curriculum, not a resume.
+
+        Mirrors from_pretrained's two-step shape (base weights + in-place LoRA)
+        but skips every "load existing adapter/gate" step and instead freezes
+        the base so only LoRA + halt_gate + the resized embed/lm_head rows train.
+
+        tokenizer must already have <|lat|> added; it is read transiently to
+        size the vocab and find lat's id (not stored on the model — tokenization
+        is a caller concern, same as from_pretrained).
+        """
+        from peft import LoraConfig, inject_adapter_in_model
+
+        if tokenizer is None:
+            raise ValueError("for_training requires a tokenizer with <|lat|> already added.")
+        lat_id = tokenizer.convert_tokens_to_ids(_LAT_TOKEN)
+        if lat_id is None or lat_id == tokenizer.unk_token_id:
+            raise ValueError(f"{_LAT_TOKEN!r} not found in the tokenizer vocab.")
+        target_vocab_size = len(tokenizer)
+
+        config = OuroborosConfig.from_pretrained(base_model_id)
+        config.use_mamba_kernels = torch.cuda.is_available()
+        config.lat_token_id = int(lat_id)
+        config.halt_threshold = float(halt_threshold)
+        config.use_halt_gate = bool(use_halt_gate)
+        config.tie_word_embeddings = False   # B7
+        config.use_latent_cache = False      # P0: training always uses the no-cache path
+
+        resolved_dtype = cls._resolve_dtype(torch_dtype)
+        load_kwargs: dict[str, Any] = {
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+            "attn_implementation": "eager",
+            "torch_dtype": resolved_dtype,
+            **kwargs,
+        }
+        if device is not None and device.type == "cuda":
+            load_kwargs["device_map"] = {"": device.index if device.index is not None else 0}
+
+        model = super().from_pretrained(base_model_id, config=config, **load_kwargs)
+        model.config.use_cache = False
+
+        if target_vocab_size != model.config.vocab_size:
+            model.resize_token_embeddings(target_vocab_size)
+
+        # In-place LoRA injection (NOT get_peft_model) keeps the object an
+        # Ouroboros, so model.forward stays OUR forward. Fresh A/B weights — no
+        # set_peft_model_state_dict call — the adapter starts at zero delta.
+        lora_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules or _DEFAULT_LORA_TARGET_MODULES,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        inject_adapter_in_model(lora_config, model)
+
+        # inject_adapter_in_model does NOT freeze the base the way get_peft_model
+        # does, so freeze everything then unfreeze exactly what should train:
+        # the LoRA deltas, the HaltGate, and the resized embedding/lm_head rows
+        # (the <|lat|> row must be learned; the rest of embed/lm_head stays
+        # trainable too, matching how the existing checkpoint treats them as
+        # modules_to_save).
+        for param in model.parameters():
+            param.requires_grad_(False)
+        for name, param in model.named_parameters():
+            if "lora_" in name or "halt_gate" in name:
+                param.requires_grad_(True)
+        for embed_name in ("model.embed_tokens.weight", "lm_head.weight"):
+            try:
+                model.get_parameter(embed_name).requires_grad_(True)
+            except Exception:
+                pass  # sharded/renamed path — embed/lm_head freezing is best-effort
+
+        if model.halt_gate is not None:
+            model.halt_gate = model.halt_gate.float()
+        if device is not None and device.type != "cuda":
+            model = model.to(device)
+
+        return model.train()
+
+    # ── checkpointing: adapter-only save ────────────────────────────────
+
+    def save_adapter(self, output_dir: str) -> None:
+        """
+        Save ONLY the trained delta — LoRA weights, the HaltGate, and the
+        resized embed_tokens/lm_head — not the ~6GB base model. The base
+        Jamba weights are frozen and reloaded from the base repo, so writing
+        them would be pure disk waste (the disk-overflow trap on Kaggle).
+
+        Format mirrors from_pretrained's load contract: adapter_model.safetensors
+        (lora_* keys + embed_tokens/lm_head) + halt_gate.pt + adapter_config.json,
+        reloadable by set_peft_model_state_dict + a strict=False embed/lm_head load.
+        """
+        import json
+        import os
+
+        from peft import get_peft_model_state_dict
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # LoRA delta (+ resized embed/lm_head, which carry the trained <|lat|> row).
+        try:
+            adapter_sd = get_peft_model_state_dict(self)
+        except Exception:
+            # Fallback for an in-place-injected (non-PeftModel) adapter: the
+            # lora_ keys + the modules_to_save embeddings. Guaranteed-correct
+            # even if get_peft_model_state_dict expects a peft_config attribute.
+            keep = ("lora_",)
+            adapter_sd = {
+                k: v for k, v in self.state_dict().items()
+                if any(kk in k for kk in keep)
+            }
+            for embed_name in ("model.embed_tokens.weight", "lm_head.weight"):
+                if embed_name in self.state_dict():
+                    adapter_sd[embed_name] = self.state_dict()[embed_name]
+
+        try:
+            from safetensors.torch import save_file
+            save_file(adapter_sd, os.path.join(output_dir, "adapter_model.safetensors"))
+        except ImportError:
+            torch.save(adapter_sd, os.path.join(output_dir, "adapter_model.bin"))
+
+        if self.halt_gate is not None:
+            torch.save(self.halt_gate.state_dict(), os.path.join(output_dir, "halt_gate.pt"))
+
+        # Minimal adapter_config.json so the adapter is self-describing and
+        # PeftModel.from_pretrained / set_peft_model_state_dict can reload it.
+        # r/alpha aren't recoverable from an in-place-injected model (no
+        # peft_config), so best-effort: the loader mainly needs target_modules
+        # + base_model_name_or_path + modules_to_save.
+        adapter_config = {
+            "peft_type": "LORA",
+            "base_model_name_or_path": getattr(self.config, "_name_or_path", _DEFAULT_BASE_MODEL),
+            "target_modules": _DEFAULT_LORA_TARGET_MODULES,
+            "bias": "none",
+            "task_type": "CAUSAL_LM",
+            "modules_to_save": ["embed_tokens", "lm_head"],
+        }
+        with open(os.path.join(output_dir, "adapter_config.json"), "w", encoding="utf-8") as fh:
+            json.dump(adapter_config, fh, indent=2)
 
     # ── forward: the one structural override ────────────────────────────
 
@@ -422,6 +613,17 @@ class Ouroboros(JambaForCausalLM):
         if max_k <= 0:
             return ctx, ctx_mask, torch.zeros(B, dtype=torch.long, device=device)
 
+        # P0: the cache path is INFERENCE-ONLY (no grad) AND opt-in. Under
+        # training (grad enabled) or when the flag is off, the original
+        # use_cache=False recompute path below runs unchanged — byte-identical
+        # to pre-P0 behaviour, so training math is provably unaffected. The
+        # O(stage_k^2)->O(stage_k) win is realized at inference/generation,
+        # where stage_k is largest; threading cache under grad would reintroduce
+        # the in-place-cache-mutation autograd problem (the reason the training
+        # path uses use_cache=False in the first place).
+        if self.config.use_latent_cache and not torch.is_grad_enabled():
+            return self._run_latent_passes_cached(ctx, ctx_mask, target_k, halt_gate)
+
         actual_k = torch.zeros(B, dtype=torch.long, device=device)
         halted = torch.zeros(B, dtype=torch.bool, device=device)
         prev_h = ctx.new_zeros(B, ctx.size(-1))
@@ -437,7 +639,7 @@ class Ouroboros(JambaForCausalLM):
             pmask = torch.arange(max_pl, device=device).unsqueeze(0) < plen.unsqueeze(1)
             pfx = torch.where(pmask.unsqueeze(-1), pfx, pfx.new_zeros(1, 1, pfx.size(-1)))
 
-            out = self.model(inputs_embeds=pfx, attention_mask=pmask, use_cache=True)
+            out = self.model(inputs_embeds=pfx, attention_mask=pmask, use_cache=False)
             h = out.last_hidden_state
             last = (plen - 1).clamp(min=0)
             h_step = h[torch.arange(active.numel(), device=h.device), last.to(h.device)].to(device)
@@ -464,6 +666,97 @@ class Ouroboros(JambaForCausalLM):
 
             ctx = torch.cat([ctx, new_col], dim=1)
             ctx_mask = torch.cat([ctx_mask, new_mask], dim=1)
+
+        return ctx, ctx_mask, actual_k
+
+    def _run_latent_passes_cached(
+        self,
+        ctx: torch.Tensor,
+        ctx_mask: torch.Tensor,
+        target_k: torch.Tensor,
+        halt_gate: Optional["HaltGate"],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        P0: inference-only cache-backed latent passes. Forward the question
+        prefix ONCE with use_cache=True, then forward only the single new
+        latent column each step with past_key_values=<live cache> — attention
+        sublayers go O(stage_k^2)->O(stage_k), and Mamba SSM state goes to
+        genuinely O(1) per step IF Jamba's hybrid cache supports single-token
+        incremental update (runtime-verify; if not, the attention win alone
+        stands and correctness is unaffected).
+
+        Reached only when config.use_latent_cache and not torch.is_grad_enabled()
+        (see _run_latent_passes), so no cache-cloning-for-autograd is needed.
+
+        HaltGate + shared batch cache: forward the new column for the FULL
+        batch, gate AFTER. The cache advances by 1 position for every row
+        uniformly, so per-row sequence positions stay aligned. Halted rows get
+        a zero column forwarded (their cache position advances over a masked
+        position) but the column is discarded — never appended to ctx, never
+        read again (their actual_k is frozen). The dirty halted-row Mamba state
+        is harmless because this cache is local and dropped after the loop; only
+        ctx/ctx_mask/actual_k escape, matching the no-cache path's contract.
+        If the backbone returns no cache, fall back to the no-cache path.
+        """
+        device = ctx.device
+        B = ctx.size(0)
+
+        initial_embeds = torch.where(
+            ctx_mask.unsqueeze(-1), ctx, ctx.new_zeros((1, 1, ctx.size(-1)))
+        )
+        out0 = self.model(inputs_embeds=initial_embeds, attention_mask=ctx_mask, use_cache=True)
+        cache = getattr(out0, "past_key_values", None)
+        if cache is None:
+            # Cache unsupported here — re-run the proven no-cache path.
+            return self._run_latent_passes(ctx, ctx_mask, target_k)
+
+        h = out0.last_hidden_state
+        prefix_lens = ctx_mask.sum(dim=1).to(dtype=torch.long).clamp_min(1)
+        last_pos = (prefix_lens - 1).to(h.device)
+        h_step = h[torch.arange(B, device=h.device), last_pos, :].to(device)
+
+        actual_k = torch.zeros(B, dtype=torch.long, device=device)
+        halted = torch.zeros(B, dtype=torch.bool, device=device)
+        prev_h = ctx.new_zeros(B, ctx.size(-1))
+        max_k = int(target_k.max().item()) if target_k.numel() else 0
+
+        for step in range(max_k):
+            active = ((target_k > step) & ~halted).nonzero(as_tuple=False).flatten()
+            if active.numel() == 0:
+                break
+
+            append = torch.ones(B, dtype=torch.bool, device=device)
+            if halt_gate is not None and step > 0:
+                has_prev = actual_k > 0
+                gateable = has_prev & ~halted
+                if bool(gateable.any()):
+                    prob = halt_gate(h_step.float(), prev_h.float())
+                    stop = prob > self.config.halt_threshold
+                    append = append & ~(gateable & stop)
+                    halted = halted | (gateable & stop)
+
+            append_active = append & ~halted
+            new_col = ctx.new_zeros(B, 1, ctx.size(-1))
+            new_mask = append_active.view(B, 1)
+            if bool(append_active.any()):
+                new_col[append_active, 0] = h_step[append_active].to(ctx.dtype)
+                actual_k[append_active] += 1
+                prev_h[append_active] = h_step[append_active]
+
+            ctx = torch.cat([ctx, new_col], dim=1)
+            ctx_mask = torch.cat([ctx_mask, new_mask], dim=1)
+
+            if step + 1 >= max_k:
+                break
+            # Forward the single new column through the cache for the FULL batch
+            # (halted rows forward a zero column at a masked position — advances
+            # their cache position uniformly, keeping all rows aligned).
+            out = self.model(
+                inputs_embeds=new_col, attention_mask=ctx_mask,
+                past_key_values=cache, use_cache=True,
+            )
+            cache = out.past_key_values
+            h_step = out.last_hidden_state[:, -1, :].to(device)
 
         return ctx, ctx_mask, actual_k
 
@@ -512,3 +805,23 @@ class Ouroboros(JambaForCausalLM):
         if torch.cuda.is_available():
             return torch.bfloat16 if torch.cuda.get_device_capability(0) >= (8, 0) else torch.float16
         return torch.float32
+
+
+# ── Auto registration (B5) ───────────────────────────────────────────────────
+# Without this, a saved config.json saying "model_type": "ouroboros" can only
+# be reloaded via AutoModel.from_pretrained(..., trust_remote_code=True), and HF
+# warns "using a model of type jamba to instantiate a model of type ouroboros"
+# on our own loads. Registering the config/model_type pair makes the Ouroboros
+# class the canonical mapping. Idempotent: register is dict-keyed, so re-import
+# is a no-op; the try/except guards any version quirk where double-register
+# raises. Runs at import time — safe because model.py already imports
+# transformers unconditionally at module top.
+try:
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    AutoConfig.register("ouroboros", OuroborosConfig)
+    AutoModelForCausalLM.register(OuroborosConfig, Ouroboros)
+except Exception:
+    # Already registered, or a transformers version that rejects it. Either way
+    # not fatal: callers can still construct Ouroboros directly.
+    pass
