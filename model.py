@@ -369,7 +369,7 @@ class Ouroboros(JambaForCausalLM):
         latent_ctx, _, actual_k = self._run_latent_passes(inputs_embeds, ctx_mask, n_latents)
 
         patched = inputs_embeds.clone()
-        max_k = int(actual_k.max().item()) if actual_k.numel() else 10
+        max_k = int(actual_k.max().item()) if actual_k.numel() else 0
         for step in range(max_k):
             active = (actual_k > step).nonzero(as_tuple=False).flatten()
             if active.numel() == 0:
@@ -418,7 +418,7 @@ class Ouroboros(JambaForCausalLM):
         target_k = target_k.to(device=device, dtype=torch.long)
         halt_gate = self.halt_gate if self.config.use_halt_gate else None
 
-        max_k = int(target_k.max().item()) if target_k.numel() else 10
+        max_k = int(target_k.max().item()) if target_k.numel() else 0
         if max_k <= 0:
             return ctx, ctx_mask, torch.zeros(B, dtype=torch.long, device=device)
 
