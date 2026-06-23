@@ -586,7 +586,43 @@ class Ouroboros(JambaForCausalLM):
         target_k: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Run up to target_k.max() Coconut latent passes in embedding space.
+        Dispatch: P0 cache path (inference-only + opt-in) or the proven no-cache
+        recompute path. The no-cache path is what training always uses (and the
+        cache path's correctness fallback), so it lives in its own method —
+        _run_latent_passes_nocache — to let the cache path fall back WITHOUT
+        re-entering this dispatch (which would recurse under use_latent_cache +
+        no_grad).
+        """
+        device = ctx.device
+        B = ctx.size(0)
+        target_k = target_k.to(device=device, dtype=torch.long)
+        max_k = int(target_k.max().item()) if target_k.numel() else 0
+        if max_k <= 0:
+            return ctx, ctx_mask, torch.zeros(B, dtype=torch.long, device=device)
+
+        # P0: the cache path is INFERENCE-ONLY (no grad) AND opt-in. Under
+        # training (grad enabled) or when the flag is off, the no-cache path
+        # runs unchanged — byte-identical to pre-P0 behaviour, so training math
+        # is provably unaffected. The O(stage_k^2)->O(stage_k) win is realized
+        # at inference/generation, where stage_k is largest; threading cache
+        # under grad would reintroduce the in-place-cache-mutation autograd
+        # problem (the reason the training path uses use_cache=False in the
+        # first place).
+        halt_gate = self.halt_gate if self.config.use_halt_gate else None
+        if self.config.use_latent_cache and not torch.is_grad_enabled():
+            return self._run_latent_passes_cached(ctx, ctx_mask, target_k, halt_gate)
+        return self._run_latent_passes_nocache(ctx, ctx_mask, target_k, halt_gate)
+
+    def _run_latent_passes_nocache(
+        self,
+        ctx: torch.Tensor,
+        ctx_mask: torch.Tensor,
+        target_k: torch.Tensor,
+        halt_gate: Optional["HaltGate"],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        The proven use_cache=False recompute path: run up to target_k.max()
+        Coconut latent passes in embedding space.
 
         Each pass: forward self.model over each active row's current
         question+latents prefix, take the last valid hidden state, optionally
@@ -606,23 +642,7 @@ class Ouroboros(JambaForCausalLM):
         """
         device = ctx.device
         B = ctx.size(0)
-        target_k = target_k.to(device=device, dtype=torch.long)
-        halt_gate = self.halt_gate if self.config.use_halt_gate else None
-
         max_k = int(target_k.max().item()) if target_k.numel() else 0
-        if max_k <= 0:
-            return ctx, ctx_mask, torch.zeros(B, dtype=torch.long, device=device)
-
-        # P0: the cache path is INFERENCE-ONLY (no grad) AND opt-in. Under
-        # training (grad enabled) or when the flag is off, the original
-        # use_cache=False recompute path below runs unchanged — byte-identical
-        # to pre-P0 behaviour, so training math is provably unaffected. The
-        # O(stage_k^2)->O(stage_k) win is realized at inference/generation,
-        # where stage_k is largest; threading cache under grad would reintroduce
-        # the in-place-cache-mutation autograd problem (the reason the training
-        # path uses use_cache=False in the first place).
-        if self.config.use_latent_cache and not torch.is_grad_enabled():
-            return self._run_latent_passes_cached(ctx, ctx_mask, target_k, halt_gate)
 
         actual_k = torch.zeros(B, dtype=torch.long, device=device)
         halted = torch.zeros(B, dtype=torch.bool, device=device)
@@ -698,6 +718,36 @@ class Ouroboros(JambaForCausalLM):
         ctx/ctx_mask/actual_k escape, matching the no-cache path's contract.
         If the backbone returns no cache, fall back to the no-cache path.
         """
+        device = ctx.device
+        B = ctx.size(0)
+
+        # The cache path is best-effort: some configs can't drive use_cache=True
+        # through Jamba's hybrid cache. The concrete case is an all-attention
+        # config (no Mamba/LinearAttention layers): JambaModel._update_mamba_mask
+        # calls past_key_values.has_previous_state(), which raises ValueError
+        # "can only be called on LinearAttention layers" when the cache holds
+        # only attention layers. Rather than special-case that, fall back to the
+        # proven no-cache path on ANY backbone error here — correctness always
+        # wins over the O(stage_k^2)->O(stage_k) speedup, and the fallback is
+        # the exact path training uses (so outputs match). The real Jamba-3B
+        # (which has Mamba layers) does NOT hit this and enjoys the cache win.
+        try:
+            return self._run_latent_passes_cached_impl(ctx, ctx_mask, target_k, halt_gate)
+        except Exception:
+            # Fall back to the no-cache path DIRECTLY (not via _run_latent_passes,
+            # which would re-enter the dispatch and recurse under
+            # use_latent_cache + no_grad). Correctness over the speedup.
+            return self._run_latent_passes_nocache(ctx, ctx_mask, target_k, halt_gate)
+
+    def _run_latent_passes_cached_impl(
+        self,
+        ctx: torch.Tensor,
+        ctx_mask: torch.Tensor,
+        target_k: torch.Tensor,
+        halt_gate: Optional["HaltGate"],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cache-path body. Raises if the backbone rejects use_cache=True; the
+        caller (_run_latent_passes_cached) catches and falls back to no-cache."""
         device = ctx.device
         B = ctx.size(0)
 
