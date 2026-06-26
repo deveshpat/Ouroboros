@@ -210,6 +210,16 @@ class DependencyInstaller:
         importlib.invalidate_caches()
         from huggingface_hub import hf_hub_download
 
+        # The mamba_ssm / causal_conv1d / flash_attn wheels are CUDA-only. On a
+        # non-CUDA host (MPS/CPU), transformers falls back to its pure-torch
+        # Mamba slow path (verified working), so skipping them is correct — and
+        # the old `sys.exit(1)` on a missing wheel hard-aborted eval/training on
+        # any non-CUDA machine, since `sm00` wheels don't exist on the Hub.
+        if not self.hardware.is_available:
+            print(f"[bootstrap]   no CUDA GPU (arch={self.hardware.arch_suffix}); "
+                  "skipping CUDA-only wheels — Jamba runs via the torch Mamba slow path.")
+            return
+
         print(f"[bootstrap]   GPU arch: {self.hardware.arch_suffix} (TORCH_CUDA_ARCH_LIST={self.hardware.torch_cuda_arch_list})")
         wheel_bases = self._resolve_target_wheels()
         if self.FLASH_ATTN_WHEEL_BASE not in wheel_bases:
@@ -281,11 +291,18 @@ class OuroborosBootstrap:
         else:
             print("Shim: all generation names present (no patch needed)")
 
-        mamba_patches = EnvironmentPatcher.load_and_export_mamba_symbols()
-        if mamba_patches:
-            print("Kernel export shim: " + ", ".join(mamba_patches) + " ✓")
+        # The mamba_ssm/causal_conv1d kernel symbols only exist on a CUDA host
+        # where the wheels were installed. On MPS/CPU the fast path is absent by
+        # design (transformers uses its pure-torch Mamba slow path), so skip the
+        # kernel export rather than aborting the whole run on ImportError.
+        if not self.hardware.is_available:
+            print("Kernel export shim: skipped (no CUDA GPU; torch Mamba slow path in use)")
         else:
-            print("Kernel export shim: already aligned")
+            mamba_patches = EnvironmentPatcher.load_and_export_mamba_symbols()
+            if mamba_patches:
+                print("Kernel export shim: " + ", ".join(mamba_patches) + " ✓")
+            else:
+                print("Kernel export shim: already aligned")
 
         print(
             f"  ABI fingerprint: GPU={self.hardware.device_name} {self.hardware.arch_suffix} | "
