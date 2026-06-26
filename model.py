@@ -254,28 +254,9 @@ class Ouroboros(JambaForCausalLM):
         inject_adapter_in_model(lora_config, model)
         adapter_weights_path = hf_hub_download(adapter_repo, "adapter_model.safetensors", token=token)
         raw_state = load_file(adapter_weights_path)
-        # The pre-rewrite (May-15) anchor saves keys under
-        # base_model.model._ouro_cache_backbone...; the flat rewrite renamed that
-        # namespace to model.layers... (same weights, same latent-pass math — see
-        # remap_adapter.py). Remap old-format checkpoints into the current
-        # namespace before load; post-rewrite saves pass through unchanged.
-        from remap_adapter import load_remapped, load_lora_into_model
-        remapped = load_remapped(raw_state)
-        # Load the adapter directly. peft.set_peft_model_state_dict's
-        # transformers-v5 conversion path is broken on peft 0.19.1 +
-        # transformers 5.10.2 (WeightConverter kwarg mismatch in the MoE branch,
-        # hit even for num_experts=1), and the conversion is unnecessary here —
-        # load_remapped already yields the canonical key format. load_lora_into_model
-        # matches each saved tensor to its model parameter and returns counts so a
-        # wrong remap (silently-zero LoRA / untrained base) is caught, not hidden.
-        loaded, skipped = load_lora_into_model(model, remapped)
-        n_saved = len(remapped)
-        if loaded != n_saved:
-            raise RuntimeError(
-                f"Adapter load mismatch: {loaded}/{n_saved} trained tensors loaded "
-                f"({skipped} had no matching parameter). The remap is likely wrong for this checkpoint."
-            )
 
+        loaded, skipped = load_lora_into_model(model, raw_state)
+        
         if model.halt_gate is not None:
             gate_filename = f"{halt_gate_subfolder.strip('/')}/halt_gate.pt".lstrip("/")
             try:
