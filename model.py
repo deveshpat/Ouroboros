@@ -191,7 +191,7 @@ class Ouroboros(JambaForCausalLM):
         something that happened to be found.
         """
         from huggingface_hub import hf_hub_download
-        from peft import LoraConfig, inject_adapter_in_model
+        from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
         from safetensors.torch import load_file
         from transformers import AutoTokenizer, BitsAndBytesConfig
 
@@ -253,10 +253,8 @@ class Ouroboros(JambaForCausalLM):
         lora_config = LoraConfig.from_pretrained(adapter_repo, token=token)
         inject_adapter_in_model(lora_config, model)
         adapter_weights_path = hf_hub_download(adapter_repo, "adapter_model.safetensors", token=token)
-        raw_state = load_file(adapter_weights_path)
+        set_peft_model_state_dict(model, load_file(adapter_weights_path))
 
-        loaded, skipped = load_lora_into_model(model, raw_state)
-        
         if model.halt_gate is not None:
             gate_filename = f"{halt_gate_subfolder.strip('/')}/halt_gate.pt".lstrip("/")
             try:
