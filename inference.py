@@ -314,6 +314,7 @@ def load_baseline_components(args: argparse.Namespace):
         "low_cpu_mem_usage": True,
         "attn_implementation": "eager",
         "token": token,
+        "use_mamba_kernels": torch.cuda.is_available(),
     }
     if bool(args.use_4bit):
         if device.type != "cuda":
