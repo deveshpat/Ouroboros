@@ -326,7 +326,7 @@ def load_baseline_components(args: argparse.Namespace):
             bnb_4bit_use_double_quant=True,
         )
     else:
-        load_kwargs["torch_dtype"] = dtype
+        load_kwargs["dtype"] = dtype
     if device_map is not None:
         load_kwargs["device_map"] = device_map
     elif device.type == "cuda":
