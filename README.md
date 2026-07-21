@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/ouroboros.png" alt="Ouroboros" width="420">
+  <img src="ouroboros.png" alt="Ouroboros" width="420">
   <br><em>Teaching a small LLM to think in latent space before it speaks.</em>
 </p>
 
